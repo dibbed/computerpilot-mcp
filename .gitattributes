@@ -1,0 +1,27 @@
+# Set default behavior to automatically handle line endings
+* text=auto
+
+# Executable binaries and archives must be treated as binary data
+*.exe binary
+*.dll binary
+*.zip binary
+*.tar.gz binary
+*.tgz binary
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+
+# Windows batch files and PowerShell scripts require CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Python, Markdown, JSON, and configs prefer LF
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

@@ -1,0 +1,10 @@
+Ali Windows Agent MCP
+Copyright 2026 Ali Khalili
+
+This product includes software developed by Ali Khalili (https://github.com/dibbed/).
+
+This product includes third-party software:
+- OpenAI Secure MCP Tunnel Client (Copyright 2026 OpenAI)
+- Cloudflare Tunnel (Copyright Cloudflare, Inc.)
+
+See THIRD_PARTY_NOTICES.md and third_party/ for detailed third-party licenses and notices.

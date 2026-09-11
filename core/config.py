@@ -1,0 +1,70 @@
+"""Runtime configuration and path handling."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return min(max(value, minimum), maximum)
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    """Small immutable runtime configuration."""
+
+    server_name: str = "ali_windows_agent_mcp"
+    version: str = "1.0.0"
+    default_list_limit: int = _env_int("MCP_DEFAULT_LIST_LIMIT", 50, 1, 500)
+    max_list_limit: int = _env_int("MCP_MAX_LIST_LIMIT", 500, 10, 5_000)
+    max_file_write_chars: int = _env_int("MCP_MAX_FILE_WRITE_CHARS", 2_000_000, 1_024, 20_000_000)
+    state_dir: Path = PROJECT_ROOT / ".agent_state"
+    memory_dir: Path = PROJECT_ROOT / "memory"
+
+    @property
+    def audit_log(self) -> Path:
+        return self.state_dir / "audit.jsonl"
+
+    @property
+    def backup_dir(self) -> Path:
+        return self.state_dir / "backups"
+
+    @property
+    def screenshot_dir(self) -> Path:
+        return self.state_dir / "screenshots"
+
+
+SETTINGS = Settings()
+
+
+def ensure_runtime_dirs() -> None:
+    """Create local state directories without touching user project paths."""
+
+    for path in (
+        SETTINGS.state_dir,
+        SETTINGS.backup_dir,
+        SETTINGS.screenshot_dir,
+        SETTINGS.memory_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_path(value: str | Path, *, base: str | Path | None = None) -> Path:
+    """Resolve absolute or project-relative paths without restricting full access."""
+
+    expanded = Path(os.path.expandvars(os.path.expanduser(str(value))))
+    if not expanded.is_absolute():
+        root = Path(base) if base is not None else PROJECT_ROOT
+        expanded = root / expanded
+    return expanded.resolve(strict=False)

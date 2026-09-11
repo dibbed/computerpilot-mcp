@@ -1,0 +1,59 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets and local credentials (CRITICAL: NEVER COMMIT)
+.secrets/
+.env
+.env.*
+!.env.example
+
+# Runtime caches and test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+playwright-report/
+test-results/
+
+# Agent local state, logs, and generated artifacts
+.agent_state/
+.playwright-cli/
+output/
+graphify-out/
+*.log
+
+# Project memory (persisted local user/project data)
+memory/*.json
+!memory/*.example.json
+
+# Local unversioned/experimental tunnel runtime downloads
+tunnel-client-runtime*
+
+# Local SQLite databases and write-ahead logs
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Editor and OS artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store

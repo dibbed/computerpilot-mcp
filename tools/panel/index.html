@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>وضعیت Windows Agent MCP</title>
+<style>
+body{margin:0;background:#101923;color:#e3edf5;font:16px Tahoma, sans-serif}main{max-width:1100px;margin:40px auto;padding:20px}
+h1{font-size:26px}header{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin:28px 0}
+article,section{background:#192735;border:1px solid #344453;border-radius:12px;padding:20px}article strong{display:block;margin-top:14px;font-size:24px}
+button{border:0;border-radius:8px;padding:12px 18px;cursor:pointer;background:#69d3b2;color:#101923;font:inherit;margin:4px}
+button.stop{background:#ffb6a8}button:disabled{opacity:.5;cursor:wait}small,#notice{color:#aac0d0}
+section{margin:16px 0;overflow:auto}table{width:100%;border-collapse:collapse;text-align:right}td,th{padding:12px;border-bottom:1px solid #344453}
+pre{direction:ltr;text-align:left;white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;font:13px Consolas,monospace}
+.error{color:#ffb6a8}a{color:#69d3b2}#updated{font-size:13px}
+</style>
+<main>
+<header><div><small>WINDOWS AGENT · LOCAL CONTROL</small><h1>وضعیت MCP</h1><span id="updated">در حال اتصال…</span></div>
+<div><button id="restart">راه‌اندازی مجدد</button><button id="stop" class="stop">توقف</button></div></header>
+<p id="notice" role="status">برای ادامهٔ اجرا، پنجرهٔ START_MCP را باز نگه دارید.</p>
+<div class="cards">
+<article>وضعیت اجرا<strong id="state">—</strong></article><article>سلامت MCP<strong id="mcp">—</strong></article>
+<article>سلامت Tunnel<strong id="tunnel">—</strong></article><article>راه‌اندازی مجدد<strong id="count">۰</strong></article>
+<article>فضای خروجی‌ها<strong id="storage">—</strong></article></div>
+<p id="error" class="error"></p>
+<section><h2>پروسس‌های اجرا</h2><p id="processes" dir="ltr">—</p></section>
+<section><h2>کارهای اخیر</h2><p>۲۰ کار اخیر؛ برای مشاهدهٔ همه از ابزار list_jobs استفاده کنید.</p>
+<table><thead><tr><th>شناسه</th><th>وضعیت</th><th>PID</th><th>کد خروج</th></tr></thead><tbody id="jobs"></tbody></table></section>
+<section><h2>رویدادها و خطاها</h2><pre id="logs">هنوز رویدادی ثبت نشده است.</pre></section>
+</main>
+<script>
+const token='__CONTROL_TOKEN__';
+const el=id=>document.getElementById(id);
+const labels={starting:'در حال شروع',running:'در حال اجرا',unhealthy:'بدون پاسخ',retrying:'در انتظار اجرای مجدد',stopped:'متوقف',
+queued:'در صف',succeeded:'موفق',failed:'ناموفق',cancelled:'لغوشده',timed_out:'پایان مهلت',interrupted:'قطع‌شده',orphaned:'بدون ناظر'};
+let stopped=false;
+async function refresh(){
+  if(stopped)return;
+  try{
+    const response=await fetch('/api/status');if(!response.ok)throw Error(response.status);
+    const data=await response.json();el('state').textContent=labels[data.state]||data.state;
+    el('mcp').textContent=data.mcp_healthy?'سالم':'در انتظار / بدون پاسخ';
+    el('tunnel').textContent=data.tunnel_healthy===null?'حالت محلی':data.tunnel_healthy?'سالم':'بدون پاسخ';
+    el('count').textContent=data.restart_count;el('storage').textContent=((data.storage_bytes.jobs+data.storage_bytes.artifacts)/1048576).toFixed(1)+' MiB';
+    el('error').textContent=data.last_error?'آخرین خطا / علت بازیابی: '+data.last_error:'';
+    el('processes').textContent=data.active_processes.map(p=>p.name+' · PID '+p.pid+' · '+p.status).join(' | ')||'پروسس فعالی نیست.';
+    el('logs').textContent=data.logs.join('\n')||'هنوز رویدادی ثبت نشده است.';
+    el('jobs').replaceChildren();for(const job of data.jobs.items){const tr=document.createElement('tr');
+      for(const value of [job.job_id,labels[job.status]||job.status,job.pid??'—',job.exit_code??'—']){const td=document.createElement('td');td.textContent=value;tr.append(td);}el('jobs').append(tr);}
+    if(!data.jobs.items.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=4;td.textContent='هنوز کاری ثبت نشده است.';tr.append(td);el('jobs').append(tr);}
+    el('updated').textContent='آخرین دریافت: '+new Date().toLocaleTimeString('fa-IR');
+  }catch(error){el('updated').textContent='ارتباط با پنل قطع است؛ پنجرهٔ اجرا را بررسی کنید.';}
+}
+for(const action of ['restart','stop'])el(action).onclick=async()=>{
+  el(action).disabled=true;
+  try{const response=await fetch('/api/'+action,{method:'POST',headers:{'X-Control-Token':token}});
+    if(!response.ok)throw Error(response.status);
+    el('notice').textContent=action==='stop'?'اجرا متوقف شد. برای شروع دوباره START_MCP را باز کنید.':'درخواست راه‌اندازی مجدد ثبت شد.';
+    if(action==='stop'){stopped=true;el('state').textContent='متوقف';}
+  }catch(error){el('notice').textContent='ارسال درخواست انجام نشد؛ وضعیت اتصال را بررسی کنید.';}
+  finally{el(action).disabled=false;}
+};
+refresh();setInterval(refresh,3000);
+</script></html>

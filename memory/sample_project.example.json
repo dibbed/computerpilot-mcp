@@ -1,0 +1,19 @@
+﻿{
+  \ project\: \sample_project\,
+  \updated_at\: \2026-01-01T00:00:00Z\,
+  \architecture_decisions\: [
+    \Use SQLite for background job persistence\,
+    \Loopback-only binding for local operator interface\
+  ],
+  \important_paths\: [
+    \core/\,
+    \tools/\,
+    \scripts/\
+  ],
+  \user_preferences\: [
+    \Prefer exact string replacement over complete file rewrite\
+  ],
+  \previous_fixes\: [
+    \Ensured subprocess streams rollover to disk beyond 1 MiB\
+  ]
+}
