@@ -39,6 +39,8 @@ class OutputCapture:
             tempfile.SpooledTemporaryFile(max_size=SPOOL_MEMORY_BYTES, mode="w+b") if self.limit is None else None
         )
         self._closed = False
+        self.read_error: str | None = None
+        self._deliveries: dict[tuple, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
     def feed(self, chunk: bytes) -> None:
@@ -73,16 +75,36 @@ class OutputCapture:
             if len(self._tail) > tail_limit:
                 del self._tail[: len(self._tail) - tail_limit]
 
-    def result(self, encoding: str, *, since_byte: int | None = None,
-               delivery: Delivery = "inline", final: bool = True) -> dict[str, Any]:
+    def result(self, encoding: str, *, since_byte: int | None = None, delivery: Delivery = "inline", final: bool = True) -> dict[str, Any]:
         with self._lock:
             if self._closed:
                 raise RuntimeError("Output capture is closed.")
             if self.limit is None:
                 assert self._spool is not None
+                key = (
+                    self.total,
+                    since_byte or 0,
+                    encoding,
+                    delivery,
+                    final,
+                )
+                cached = self._deliveries.get(key)
+                if cached is not None and Path(cached["path"]).is_file():
+                    return {**cached, **({"preview": dict(cached["preview"])} if "preview" in cached else {})}
                 try:
-                    return deliver_stream(cast(BinaryIO, self._spool), encoding=encoding, total=self.total,
-                                          offset=since_byte or 0, delivery=delivery, final=final)
+                    result = deliver_stream(
+                        cast(BinaryIO, self._spool),
+                        encoding=encoding,
+                        total=self.total,
+                        offset=since_byte or 0,
+                        delivery=delivery,
+                        final=final,
+                    )
+                    if "path" in result:
+                        if len(self._deliveries) >= 8:
+                            self._deliveries.pop(next(iter(self._deliveries)))
+                        self._deliveries[key] = result
+                    return {**result, **({"preview": dict(result["preview"])} if "preview" in result else {})}
                 finally:
                     self._spool.seek(0, os.SEEK_END)
             elif since_byte is not None:
@@ -138,6 +160,8 @@ def _read_pipe(pipe: BinaryIO | None, capture: OutputCapture) -> None:
             if not chunk:
                 break
             capture.feed(chunk)
+    except Exception as exc:
+        capture.read_error = f"{type(exc).__name__}: {exc}"
     finally:
         pipe.close()
 
@@ -241,11 +265,18 @@ def run_bounded(
         with timing_span("process_drain"):
             stdout_thread.join(timeout=2.0)
             stderr_thread.join(timeout=2.0)
+        capture_complete = not (stdout_thread.is_alive() or stderr_thread.is_alive() or stdout.read_error or stderr.read_error)
         with timing_span("output_delivery"):
-            stdout_result = stdout.result(chosen_encoding, delivery=delivery)
-            stderr_result = stderr.result(chosen_encoding, delivery=delivery)
+            stdout_result = stdout.result(chosen_encoding, delivery=delivery, final=capture_complete)
+            stderr_result = stderr.result(chosen_encoding, delivery=delivery, final=capture_complete)
         return {
-            "ok": exit_code == 0 and not timed_out,
+            "ok": exit_code == 0 and not timed_out and capture_complete,
+            "capture_complete": capture_complete,
+            **(
+                {"capture_error": stdout.read_error or stderr.read_error or "Output pipes did not drain before deadline."}
+                if not capture_complete
+                else {}
+            ),
             "pid": process.pid,
             "exit_code": exit_code,
             "timed_out": timed_out,
@@ -341,8 +372,9 @@ def start_background(
     }
 
 
-def background_output(pid: int, *, since_byte: int | None = None,
-                      stderr_since_byte: int | None = None, delivery: Delivery = "inline") -> dict[str, Any]:
+def background_output(
+    pid: int, *, since_byte: int | None = None, stderr_since_byte: int | None = None, delivery: Delivery = "inline"
+) -> dict[str, Any]:
     with _BACKGROUND_LOCK:
         record = _BACKGROUND.get(pid)
     if record is None:
@@ -360,16 +392,18 @@ def background_output(pid: int, *, since_byte: int | None = None,
             record.encoding,
             since_byte=since_byte,
             delivery=delivery,
-            final=not record.stdout_thread.is_alive(),
+            final=not record.stdout_thread.is_alive() and record.stdout.read_error is None,
         )
         stderr_result = record.stderr.result(
             record.encoding,
             since_byte=stderr_since_byte,
             delivery=delivery,
-            final=not record.stderr_thread.is_alive(),
+            final=not record.stderr_thread.is_alive() and record.stderr.read_error is None,
         )
+    capture_error = record.stdout.read_error or record.stderr.read_error
     return {
-        "ok": True,
+        "ok": capture_error is None,
+        **({"capture_error": capture_error} if capture_error else {}),
         "pid": pid,
         "running": exit_code is None,
         "exit_code": exit_code,
