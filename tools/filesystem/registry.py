@@ -16,6 +16,7 @@ from core.artifacts import deliver_text
 from core.audit import audit_action
 from core.config import resolve_path
 from core.errors import ToolError
+from core.resource_locks import RESOURCE_LOCKS
 from core.response import ok, page
 from core.tooling import DESTRUCTIVE, MUTATING, READ_ONLY, PathArg, compact_errors
 from tools.filesystem import service
@@ -112,23 +113,23 @@ def register(mcp: MCPServer) -> None:
         expected_sha256: Annotated[str | None, Field(pattern=r"^[0-9a-fA-F]{64}$")] = None,
     ) -> dict[str, Any]:
         """Atomically replace an entire file; prefer surgical edit tools for small changes."""
-
-        target = resolve_path(path)
-        if not target.exists() and not create_if_missing:
-            raise FileNotFoundError(f"File not found: {target}")
-        if target.exists() and expected_sha256 and _hash_file(target).lower() != expected_sha256.lower():
-            raise ToolError("stale_file", "File hash changed; refusing to overwrite stale content.")
-        audit_action("write_file", target=target, details={"content_chars": len(content)})
-        result = service.atomic_write(
-            target,
-            content,
-            encoding=encoding,
-            create_parents=create_parents,
-            backup=backup,
-            validate_python=validate_python,
-        )
-        audit_action("write_file", target=target, outcome="succeeded", details={"changed": result["changed"]})
-        return result
+        with RESOURCE_LOCKS.sync(path):
+            target = resolve_path(path)
+            if not target.exists() and not create_if_missing:
+                raise FileNotFoundError(f"File not found: {target}")
+            if target.exists() and expected_sha256 and _hash_file(target).lower() != expected_sha256.lower():
+                raise ToolError("stale_file", "File hash changed; refusing to overwrite stale content.")
+            audit_action("write_file", target=target, details={"content_chars": len(content)})
+            result = service.atomic_write(
+                target,
+                content,
+                encoding=encoding,
+                create_parents=create_parents,
+                backup=backup,
+                validate_python=validate_python,
+            )
+            audit_action("write_file", target=target, outcome="succeeded", details={"changed": result["changed"]})
+            return result
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("create_file")
@@ -140,22 +141,22 @@ def register(mcp: MCPServer) -> None:
         validate_python: bool = True,
     ) -> dict[str, Any]:
         """Create one new file and fail if it already exists."""
-
-        target = resolve_path(path)
-        if target.exists():
-            raise FileExistsError(f"Target already exists: {target}")
-        audit_action("create_file", target=target, details={"content_chars": len(content)})
-        result = service.atomic_write(
-            target,
-            content,
-            encoding=encoding,
-            create_parents=create_parents,
-            backup=False,
-            validate_python=validate_python,
-            exclusive_create=True,
-        )
-        audit_action("create_file", target=target, outcome="succeeded")
-        return result
+        with RESOURCE_LOCKS.sync(path):
+            target = resolve_path(path)
+            if target.exists():
+                raise FileExistsError(f"Target already exists: {target}")
+            audit_action("create_file", target=target, details={"content_chars": len(content)})
+            result = service.atomic_write(
+                target,
+                content,
+                encoding=encoding,
+                create_parents=create_parents,
+                backup=False,
+                validate_python=validate_python,
+                exclusive_create=True,
+            )
+            audit_action("create_file", target=target, outcome="succeeded")
+            return result
 
     @mcp.tool(annotations=DESTRUCTIVE, structured_output=True)
     @compact_errors("delete_file")
@@ -165,24 +166,24 @@ def register(mcp: MCPServer) -> None:
         missing_ok: bool = False,
     ) -> dict[str, Any]:
         """Permanently delete a file or, with recursive=true, a directory tree."""
-
-        target = resolve_path(path)
-        if not target.exists() and not target.is_symlink():
-            if missing_ok:
-                return ok(path=str(target), deleted=False, reason="missing")
-            raise FileNotFoundError(f"Target not found: {target}")
-        target_type = "directory" if target.is_dir() and not target.is_symlink() else "file"
-        size = target.stat().st_size if target_type == "file" else None
-        audit_action("delete_file", target=target, details={"recursive": recursive, "type": target_type})
-        if target_type == "directory":
-            if not recursive:
-                target.rmdir()
+        with RESOURCE_LOCKS.sync(path):
+            target = resolve_path(path)
+            if not target.exists() and not target.is_symlink():
+                if missing_ok:
+                    return ok(path=str(target), deleted=False, reason="missing")
+                raise FileNotFoundError(f"Target not found: {target}")
+            target_type = "directory" if target.is_dir() and not target.is_symlink() else "file"
+            size = target.stat().st_size if target_type == "file" else None
+            audit_action("delete_file", target=target, details={"recursive": recursive, "type": target_type})
+            if target_type == "directory":
+                if not recursive:
+                    target.rmdir()
+                else:
+                    shutil.rmtree(target)
             else:
-                shutil.rmtree(target)
-        else:
-            target.unlink()
-        audit_action("delete_file", target=target, outcome="succeeded", details={"type": target_type})
-        return ok(path=str(target), deleted=True, type=target_type, bytes_removed=size, recoverable=False)
+                target.unlink()
+            audit_action("delete_file", target=target, outcome="succeeded", details={"type": target_type})
+            return ok(path=str(target), deleted=True, type=target_type, bytes_removed=size, recoverable=False)
 
     @mcp.tool(annotations=DESTRUCTIVE, structured_output=True)
     @compact_errors("move_file")
@@ -193,28 +194,28 @@ def register(mcp: MCPServer) -> None:
         create_parents: bool = False,
     ) -> dict[str, Any]:
         """Move or rename one file or directory with explicit overwrite semantics."""
-
-        src = resolve_path(source)
-        dst = resolve_path(destination)
-        if not src.exists() and not src.is_symlink():
-            raise FileNotFoundError(f"Source not found: {src}")
-        if src == dst:
-            raise ToolError("same_path", "Source and destination resolve to the same path.")
-        if src.is_dir() and dst.is_relative_to(src):
-            raise ToolError("destination_inside_source", "A directory cannot be moved inside itself.")
-        if dst.exists() or dst.is_symlink():
-            if not overwrite:
-                raise FileExistsError(f"Destination exists: {dst}")
-            audit_action("move_file_overwrite", target=dst, details={"source": str(src)})
-            shutil.rmtree(dst) if dst.is_dir() and not dst.is_symlink() else dst.unlink()
-        if create_parents:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-        if not dst.parent.is_dir():
-            raise FileNotFoundError(f"Destination parent not found: {dst.parent}")
-        audit_action("move_file", target=src, details={"destination": str(dst), "overwrite": overwrite})
-        shutil.move(str(src), str(dst))
-        audit_action("move_file", target=src, outcome="succeeded", details={"destination": str(dst)})
-        return ok(source=str(src), destination=str(dst), moved=True)
+        with RESOURCE_LOCKS.sync(source, destination):
+            src = resolve_path(source)
+            dst = resolve_path(destination)
+            if not src.exists() and not src.is_symlink():
+                raise FileNotFoundError(f"Source not found: {src}")
+            if src == dst:
+                raise ToolError("same_path", "Source and destination resolve to the same path.")
+            if src.is_dir() and dst.is_relative_to(src):
+                raise ToolError("destination_inside_source", "A directory cannot be moved inside itself.")
+            if dst.exists() or dst.is_symlink():
+                if not overwrite:
+                    raise FileExistsError(f"Destination exists: {dst}")
+                audit_action("move_file_overwrite", target=dst, details={"source": str(src)})
+                shutil.rmtree(dst) if dst.is_dir() and not dst.is_symlink() else dst.unlink()
+            if create_parents:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.parent.is_dir():
+                raise FileNotFoundError(f"Destination parent not found: {dst.parent}")
+            audit_action("move_file", target=src, details={"destination": str(dst), "overwrite": overwrite})
+            shutil.move(str(src), str(dst))
+            audit_action("move_file", target=src, outcome="succeeded", details={"destination": str(dst)})
+            return ok(source=str(src), destination=str(dst), moved=True)
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("copy_file")
@@ -226,23 +227,23 @@ def register(mcp: MCPServer) -> None:
         preserve_metadata: bool = True,
     ) -> dict[str, Any]:
         """Copy one regular file and return structured metadata."""
-
-        src = resolve_path(source)
-        dst = resolve_path(destination)
-        if not src.is_file():
-            raise FileNotFoundError(f"Source file not found: {src}")
-        if dst.is_dir():
-            raise ToolError("destination_is_directory", f"Destination must be a file path: {dst}")
-        if dst.exists() and not overwrite:
-            raise FileExistsError(f"Destination exists: {dst}")
-        if create_parents:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-        if not dst.parent.is_dir():
-            raise FileNotFoundError(f"Destination parent not found: {dst.parent}")
-        audit_action("copy_file", target=src, details={"destination": str(dst), "overwrite": overwrite})
-        (shutil.copy2 if preserve_metadata else shutil.copyfile)(src, dst)
-        audit_action("copy_file", target=src, outcome="succeeded", details={"destination": str(dst)})
-        return ok(source=str(src), destination=str(dst), copied=True, bytes=dst.stat().st_size, sha256=_hash_file(dst))
+        with RESOURCE_LOCKS.sync(source, destination):
+            src = resolve_path(source)
+            dst = resolve_path(destination)
+            if not src.is_file():
+                raise FileNotFoundError(f"Source file not found: {src}")
+            if dst.is_dir():
+                raise ToolError("destination_is_directory", f"Destination must be a file path: {dst}")
+            if dst.exists() and not overwrite:
+                raise FileExistsError(f"Destination exists: {dst}")
+            if create_parents:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.parent.is_dir():
+                raise FileNotFoundError(f"Destination parent not found: {dst.parent}")
+            audit_action("copy_file", target=src, details={"destination": str(dst), "overwrite": overwrite})
+            (shutil.copy2 if preserve_metadata else shutil.copyfile)(src, dst)
+            audit_action("copy_file", target=src, outcome="succeeded", details={"destination": str(dst)})
+            return ok(source=str(src), destination=str(dst), copied=True, bytes=dst.stat().st_size, sha256=_hash_file(dst))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("search_files")
@@ -375,14 +376,14 @@ def register(mcp: MCPServer) -> None:
         validate_python: bool = True,
     ) -> dict[str, Any]:
         """Replace an exact small fragment only when its match count is known."""
-
-        target, before, used_encoding = service.load_text(path, encoding)
-        after, count = service.exact_replace(before, old, new, expected_count)
-        audit_action("replace_exact", target=target, details={"expected_count": expected_count})
-        result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=validate_python)
-        result["replacements"] = count
-        audit_action("replace_exact", target=target, outcome="succeeded", details={"replacements": count})
-        return result
+        with RESOURCE_LOCKS.sync(path):
+            target, before, used_encoding = service.load_text(path, encoding)
+            after, count = service.exact_replace(before, old, new, expected_count)
+            audit_action("replace_exact", target=target, details={"expected_count": expected_count})
+            result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=validate_python)
+            result["replacements"] = count
+            audit_action("replace_exact", target=target, outcome="succeeded", details={"replacements": count})
+            return result
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("replace_between_anchors")
@@ -397,13 +398,13 @@ def register(mcp: MCPServer) -> None:
         validate_python: bool = True,
     ) -> dict[str, Any]:
         """Replace one uniquely anchored region without touching the rest of the file."""
-
-        target, before, used_encoding = service.load_text(path, encoding)
-        after = service.anchor_replace(before, start_marker, end_marker, replacement, include_markers)
-        audit_action("replace_between_anchors", target=target, details={"include_markers": include_markers})
-        result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=validate_python)
-        audit_action("replace_between_anchors", target=target, outcome="succeeded")
-        return result
+        with RESOURCE_LOCKS.sync(path):
+            target, before, used_encoding = service.load_text(path, encoding)
+            after = service.anchor_replace(before, start_marker, end_marker, replacement, include_markers)
+            audit_action("replace_between_anchors", target=target, details={"include_markers": include_markers})
+            result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=validate_python)
+            audit_action("replace_between_anchors", target=target, outcome="succeeded")
+            return result
 
     def replace_python_body(
         path: str,
@@ -413,14 +414,15 @@ def register(mcp: MCPServer) -> None:
         encoding: str,
         backup: bool,
     ) -> dict[str, Any]:
-        target, before, used_encoding = service.load_text(path, encoding)
-        service._validate_python(target, before)
-        after = service.replace_symbol_body(before, qualified_name, new_body, kind)
-        audit_action(f"replace_{kind}", target=target, details={"symbol": qualified_name})
-        result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=True)
-        result["symbol"] = qualified_name
-        audit_action(f"replace_{kind}", target=target, outcome="succeeded", details={"symbol": qualified_name})
-        return result
+        with RESOURCE_LOCKS.sync(path):
+            target, before, used_encoding = service.load_text(path, encoding)
+            service._validate_python(target, before)
+            after = service.replace_symbol_body(before, qualified_name, new_body, kind)
+            audit_action(f"replace_{kind}", target=target, details={"symbol": qualified_name})
+            result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=True)
+            result["symbol"] = qualified_name
+            audit_action(f"replace_{kind}", target=target, outcome="succeeded", details={"symbol": qualified_name})
+            return result
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("replace_function")
@@ -459,27 +461,25 @@ def register(mcp: MCPServer) -> None:
         timeout_sec: Annotated[float, Field(gt=0, le=600)] = 60,
     ) -> dict[str, Any]:
         """Validate, back up, atomically edit, test, and roll back on validation failure."""
-
-        target = resolve_path(path)
-        details: dict[str, Any] = {"edit_count": len(edits), "has_validation": bool(validation_command)}
-        if validation_command:
-            details.update(
-                {
-                    "validation_executable": validation_command[0],
-                    "validation_argument_count": len(validation_command) - 1,
-                    "validation_sha256": hashlib.sha256(
-                        "\0".join(validation_command).encode("utf-8", errors="replace")
-                    ).hexdigest(),
-                }
+        with RESOURCE_LOCKS.sync(path):
+            target = resolve_path(path)
+            details: dict[str, Any] = {"edit_count": len(edits), "has_validation": bool(validation_command)}
+            if validation_command:
+                details.update(
+                    {
+                        "validation_executable": validation_command[0],
+                        "validation_argument_count": len(validation_command) - 1,
+                        "validation_sha256": hashlib.sha256("\0".join(validation_command).encode("utf-8", errors="replace")).hexdigest(),
+                    }
+                )
+            audit_action("safe_refactor", target=target, details=details)
+            result = service.apply_safe_refactor(
+                path,
+                edits,
+                encoding=encoding,
+                validation_command=validation_command,
+                validation_cwd=validation_cwd,
+                timeout_sec=timeout_sec,
             )
-        audit_action("safe_refactor", target=target, details=details)
-        result = service.apply_safe_refactor(
-            path,
-            edits,
-            encoding=encoding,
-            validation_command=validation_command,
-            validation_cwd=validation_cwd,
-            timeout_sec=timeout_sec,
-        )
-        audit_action("safe_refactor", target=target, outcome="succeeded", details={"edit_count": len(edits)})
-        return result
+            audit_action("safe_refactor", target=target, outcome="succeeded", details={"edit_count": len(edits)})
+            return result
