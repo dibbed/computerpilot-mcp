@@ -25,7 +25,7 @@ The application runs in two primary modes:
 
 1. **Secure MCP Tunnel Mode (Default)**:
    - `START_MCP.bat` launches `scripts/bootstrap.ps1`.
-   - Bootstraps `.venv` (Python 3.10+), installs requirements, and executes startup smoke checks.
+   - Bootstraps `.venv` (Python 3.10+) and uses a successful-validation fingerprint for a fast preflight; full dependency/MCP/Tunnel checks run only when validation is required or when `scripts.doctor` is invoked explicitly.
    - Launches `scripts/supervisor.py` managing `tunnel-client.exe`.
    - `tunnel-client.exe` creates an outbound encrypted tunnel to the OpenAI control plane, invoking companion `cloudflared.exe` for Cloudflare edge routing.
    - Outbound requests from the control plane are forwarded over loopback to the local MCP server (`main.py`).
@@ -53,7 +53,7 @@ The application runs in two primary modes:
    ```cmd
    START_MCP.bat
    ```
-2. Keep the launcher window open. The launcher runs dependency checks, smoke validation, and starts the runtime supervisor.
+2. Keep the launcher window open. On a valid fingerprint the launcher performs only the fast preflight; otherwise it runs the full doctor before starting the runtime supervisor.
 3. Access the local operator panel at `http://127.0.0.1:8766/`.
 
 To stop the service, press `Ctrl+C` in the terminal window or click **Stop** in the local control panel.
@@ -71,6 +71,18 @@ $env:MCP_START_MODE = 'local-http'
 
 The local Streamable HTTP MCP endpoint will be available at:
 `http://127.0.0.1:8765/mcp`
+
+### Fast Startup and Full Doctor
+
+A successful full validation is fingerprinted in ignored local state. Normal startup checks that fingerprint and skips the expensive dependency/MCP smoke path when the validated inputs have not changed. Changes to Python, requirements, project source, relevant package metadata, tunnel binaries/profile configuration, or relevant runtime environment invalidate the fingerprint and force full validation.
+
+Run the complete diagnostic path explicitly with:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.doctor
+```
+
+The full doctor runs dependency imports, `pip check`, MCP/filesystem/terminal smoke checks, optional browser validation, content-search backend diagnostics, and Tunnel doctor checks in Tunnel mode. Search diagnostics report `content_search_backend`, `ripgrep_path`, and `ripgrep_version` without logging file contents or credentials.
 
 ---
 
@@ -101,6 +113,26 @@ By default, the launcher automatically detects any configured local tunnel profi
 $env:MCP_TUNNEL_PROFILE = "<your-profile>"
 .\START_MCP.bat
 ```
+
+### Bounded Output Delivery
+
+Command tools preserve the legacy full-inline default unless the controlled migration flag is enabled. To make large command responses bounded by default:
+
+```powershell
+$env:MCP_OUTPUT_DEFAULT = 'auto'
+```
+
+`delivery="inline"` remains an explicit full-inline request. `delivery="auto"` keeps small output inline, returns a bounded preview plus cursor/full-source metadata for medium output, and returns an artifact descriptor plus bounded preview for large output. Full bytes are retained; auto delivery does not discard command output.
+
+Optional policy controls:
+
+```text
+MCP_INLINE_SOFT_LIMIT_BYTES   # default: 131072 (128 KiB)
+MCP_INLINE_HARD_LIMIT_BYTES   # unset by default; safety ceiling for explicit inline
+MCP_PREVIEW_BYTES             # default: 262144 (256 KiB), internally capped at 1 MiB
+```
+
+The artifact descriptor includes a stable path/SHA-256 for finalized snapshots, and repeated final file delivery reuses the existing descriptor instead of copying and hashing the same output again.
 
 ---
 

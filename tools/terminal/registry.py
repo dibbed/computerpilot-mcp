@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal
 from mcp.server import MCPServer
 from pydantic import Field
 
+from core.artifacts import default_delivery
 from core.audit import audit_action
 from core.config import PROJECT_ROOT, resolve_path
 from core.errors import ToolError
@@ -35,6 +36,8 @@ def _audit_command(operation: str, command: list[str], cwd: Path, *, script_char
 
 
 def register(mcp: MCPServer) -> None:
+    output_default = default_delivery()
+
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("run_process")
     def run_process(
@@ -47,7 +50,7 @@ def register(mcp: MCPServer) -> None:
         output_mode: Literal["head", "tail", "both"] = "tail",
         env: Annotated[dict[str, str] | None, Field(max_length=100)] = None,
         stdin_text: Annotated[str | None, Field(max_length=100_000)] = None,
-        delivery: Literal["inline", "file", "auto"] = "inline",
+        delivery: Literal["inline", "file", "auto"] = output_default,
     ) -> dict[str, Any]:
         """Run an executable with a timeout and optional per-stream output limits."""
 
@@ -80,7 +83,7 @@ def register(mcp: MCPServer) -> None:
         stderr_limit: Annotated[int | None, Field(ge=0)] = None,
         output_mode: Literal["head", "tail", "both"] = "tail",
         env: Annotated[dict[str, str] | None, Field(max_length=100)] = None,
-        delivery: Literal["inline", "file", "auto"] = "inline",
+        delivery: Literal["inline", "file", "auto"] = output_default,
     ) -> dict[str, Any]:
         """Run PowerShell non-interactively with optional output limits and a hard timeout."""
 
@@ -116,7 +119,7 @@ def register(mcp: MCPServer) -> None:
         stderr_limit: Annotated[int | None, Field(ge=0)] = None,
         output_mode: Literal["head", "tail", "both"] = "tail",
         env: Annotated[dict[str, str] | None, Field(max_length=100)] = None,
-        delivery: Literal["inline", "file", "auto"] = "inline",
+        delivery: Literal["inline", "file", "auto"] = output_default,
     ) -> dict[str, Any]:
         """Run one Windows CMD command line with optional output limits and a hard timeout."""
 

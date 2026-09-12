@@ -16,6 +16,8 @@ JobId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
 
 
 def register(mcp: MCPServer) -> None:
+    store = JobStore()
+
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("submit_job")
     def submit_job(
@@ -31,20 +33,20 @@ def register(mcp: MCPServer) -> None:
         Output is UTF-8; uncertain jobs are never retried automatically.
         """
         audit_action("submit_job", target=resolve_path(cwd), details={"executable": executable})
-        return JobStore().submit([executable, *(args or [])], resolve_path(cwd), timeout_sec, idempotency_key, encoding)
+        return store.submit([executable, *(args or [])], resolve_path(cwd), timeout_sec, idempotency_key, encoding)
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_status")
     def job_status(job_id: JobId) -> dict[str, Any]:
         """Read a durable job status by ID after reconnect or server restart."""
-        return {"ok": True, **JobStore().get(job_id)}
+        return {"ok": True, **store.get(job_id)}
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("list_jobs")
     def list_jobs(offset: Annotated[int, Field(ge=0)] = 0,
                   max_items: Annotated[int, Field(ge=1, le=500)] = 50) -> dict[str, Any]:
         """List persistent jobs, newest first, with pagination."""
-        return JobStore().list(offset, max_items)
+        return store.list(offset, max_items)
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_output")
@@ -52,11 +54,11 @@ def register(mcp: MCPServer) -> None:
                    stderr_since_byte: Annotated[int, Field(ge=0)] = 0,
                    delivery: Literal["inline", "file", "auto"] = "inline") -> dict[str, Any]:
         """Read full or incremental durable output; file/auto returns a snapshot path and SHA-256."""
-        return JobStore().output(job_id, since_byte, stderr_since_byte, delivery)
+        return store.output(job_id, since_byte, stderr_since_byte, delivery)
 
     @mcp.tool(annotations=DESTRUCTIVE, structured_output=True)
     @compact_errors("cancel_job")
     def cancel_job(job_id: JobId) -> dict[str, Any]:
         """Request cancellation of a job and its command process tree."""
         audit_action("cancel_job", target=job_id)
-        return JobStore().cancel(job_id)
+        return store.cancel(job_id)

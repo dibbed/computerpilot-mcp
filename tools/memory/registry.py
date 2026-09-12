@@ -16,6 +16,7 @@ from pydantic import Field
 from core.audit import audit_action
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.errors import ToolError
+from core.resource_locks import RESOURCE_LOCKS
 from core.response import page
 from core.tooling import MUTATING, READ_ONLY, compact_errors
 
@@ -121,31 +122,33 @@ def register(mcp: MCPServer) -> None:
         replace: bool = False,
     ) -> dict[str, Any]:
         """Merge or replace bounded project memory without storing arbitrary raw transcripts."""
-
-        path = _path(project_name)
-        current = _empty(project_name) if replace else _load(project_name)
-        incoming = {
-            "architecture_decisions": architecture_decisions or [],
-            "important_paths": important_paths or [],
-            "user_preferences": user_preferences or [],
-            "previous_fixes": previous_fixes or [],
-        }
-        for section, items in incoming.items():
-            base = [] if replace else current[section]
-            current[section] = _clean_items([*base, *items])
-        current["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        audit_action(
-            "memory_update", target=path, details={"replace": replace, "item_counts": {key: len(value) for key, value in incoming.items()}}
-        )
-        _atomic_save(path, current)
-        return {
-            "ok": True,
-            "project": project_name,
-            "path": str(path),
-            "updated_at": current["updated_at"],
-            "counts": {section: len(current[section]) for section in SECTIONS},
-            "bytes": path.stat().st_size,
-        }
+        with RESOURCE_LOCKS.sync(_path(project_name)):
+            path = _path(project_name)
+            current = _empty(project_name) if replace else _load(project_name)
+            incoming = {
+                "architecture_decisions": architecture_decisions or [],
+                "important_paths": important_paths or [],
+                "user_preferences": user_preferences or [],
+                "previous_fixes": previous_fixes or [],
+            }
+            for section, items in incoming.items():
+                base = [] if replace else current[section]
+                current[section] = _clean_items([*base, *items])
+            current["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            audit_action(
+                "memory_update",
+                target=path,
+                details={"replace": replace, "item_counts": {key: len(value) for key, value in incoming.items()}},
+            )
+            _atomic_save(path, current)
+            return {
+                "ok": True,
+                "project": project_name,
+                "path": str(path),
+                "updated_at": current["updated_at"],
+                "counts": {section: len(current[section]) for section in SECTIONS},
+                "bytes": path.stat().st_size,
+            }
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("memory_list")
