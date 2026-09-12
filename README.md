@@ -220,7 +220,7 @@ $env:MCP_TIMINGS = '1'
 .\START_MCP.bat
 ```
 
-Timing records are metadata-only JSONL entries written to `.agent_state\timings.jsonl`. They include the MCP request pipeline, tool body, process spawn/execution/drain, output delivery, and artifact snapshot phases. Command arguments, file contents, typed browser text, and other payload bodies are not recorded. `MCP_TIMINGS_FILE` can override the local output path for isolated runs.
+Timing records are metadata-only JSONL entries written to `.agent_state\timings.jsonl`. They include input validation, queue/dispatch wait, tool body, result conversion, MCP request pipeline, response serialization probe, process spawn/execution/drain, output delivery, and artifact snapshot phases. Command arguments, file contents, typed browser text, and other payload bodies are not recorded. Timing writes are coalesced through a bounded background writer so profiling I/O does not sit directly on the tool hot path. The serialization phase is an equivalent response-model serialization probe used only while profiling; it records only duration and byte count. `MCP_TIMINGS_FILE` can override the local output path for isolated runs.
 
 ### Repeatable Performance Benchmarks
 
@@ -241,7 +241,7 @@ The benchmark harness stores reports under ignored local state by default:
 .\.venv\Scripts\python.exe -m scripts.perf_benchmark --profile full --include-jobs --include-browser
 ```
 
-Use repeated runs for comparisons, for example `--runs 5`. Reports contain latency distributions, peak benchmark-process RSS samples, process I/O counters, tool catalog bytes, and case-specific details. Heavy job/browser cases require explicit opt-in so a normal benchmark cannot accidentally create a large process burst.
+Use repeated runs for comparisons, for example `--runs 5`. Reports contain latency distributions, full process-tree peak RSS and I/O samples, complete wire-style tool catalog bytes, and case-specific details. Startup includes the real `scripts/bootstrap.ps1` validation path as well as cold/warm MCP server construction. Output cases preserve the current default delivery behavior instead of forcing file delivery, and project cases include both raw AST parsing and a real `find_function` tool lookup so later indexing/cache work remains measurable. Search cases enforce expected matches, and benchmark temp directories older than 24 hours are cleaned on a later run. Heavy job/browser cases require explicit opt-in so a normal benchmark cannot accidentally create a large process burst.
 
 ---
 

@@ -6,6 +6,16 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Fixed
+- Correct Phase A benchmark fidelity so startup exercises the real bootstrap validation path and large output preserves the current default inline behavior.
+- Measure peak RSS and I/O across the benchmark process tree so durable job workers and browser processes are included.
+- Serialize the complete wire-style tool catalog and enforce search correctness expectations.
+- Add a real `find_function` project lookup benchmark alongside raw AST parsing and age-bounded cleanup for stale benchmark temp directories.
+
+### Changed
+- Split opt-in tool profiling into validation, queue/dispatch wait, tool body, result conversion, request pipeline, and serialization phases.
+- Coalesce timing JSONL writes through a bounded background writer to reduce observer I/O on the tool hot path.
+
 ## [0.0.12] - 2026-09-12
 
 ### Added

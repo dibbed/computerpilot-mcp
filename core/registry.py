@@ -13,7 +13,7 @@ from pydantic import ConfigDict
 
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.heartbeat import lifespan
-from core.timings import ToolRequestTimingMiddleware
+from core.timings import ToolRequestTimingMiddleware, install_sdk_timing_hooks
 from core.tooling import READ_ONLY, compact_errors
 from tools.browser import register as register_browser
 from tools.desktop import register as register_desktop
@@ -43,6 +43,7 @@ REGISTRARS = (
 
 
 def create_server() -> MCPServer:
+    install_sdk_timing_hooks()
     ArgModelBase.model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
     ArgModelBase.model_rebuild(force=True)
     ensure_runtime_dirs()

@@ -19,7 +19,7 @@ from core.executor import (
     terminate_process_tree,
 )
 from core.response import bounded_text, failure
-from core.timings import timing_span, tool_timing
+from core.timings import flush_timings, timing_span, tool_timing
 from tools.browser.registry import _url_result
 from tools.desktop.native import virtual_key
 from tools.filesystem.registry import RefactorEdit
@@ -53,6 +53,7 @@ def test_timing_records_tool_context_phase_and_failures(monkeypatch: pytest.Monk
     with pytest.raises(RuntimeError):
         with tool_timing("failed_probe"):
             raise RuntimeError("expected")
+    flush_timings()
     records = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()]
     assert any(record["phase"] == "inner" and record["tool"] == "probe" and record["items"] == 2 for record in records)
     assert any(record["phase"] == "tool_body" and record["tool"] == "probe" and record["ok"] is True for record in records)

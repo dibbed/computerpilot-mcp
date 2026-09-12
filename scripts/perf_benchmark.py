@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
@@ -47,6 +48,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
 }
 SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser")
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
+STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
 
 
 class BenchmarkSkip(RuntimeError):
@@ -58,32 +60,58 @@ class SampleResources:
     peak_rss_bytes: int
     read_bytes: int
     write_bytes: int
+    peak_processes: int
 
 
 class PeakRSSSampler:
-    """Sample this benchmark process RSS while one case is running."""
+    """Sample RSS and I/O for the benchmark process plus live descendants."""
 
     def __init__(self, interval_sec: float = 0.01) -> None:
         self._process = psutil.Process()
         self._interval_sec = interval_sec
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._peak = self._process.memory_info().rss
-        self._io_before = self._io_bytes()
+        self._peak = 0
+        self._peak_processes = 0
+        self._io_first: dict[tuple[int, float], tuple[int, int]] = {}
+        self._io_last: dict[tuple[int, float], tuple[int, int]] = {}
+        self._snapshot()
 
-    def _io_bytes(self) -> tuple[int, int]:
+    def _tree(self) -> list[psutil.Process]:
         try:
-            counters = self._process.io_counters()
-            return int(counters.read_bytes), int(counters.write_bytes)
-        except (AttributeError, psutil.Error):
-            return 0, 0
+            return [self._process, *self._process.children(recursive=True)]
+        except psutil.Error:
+            return [self._process]
+
+    @staticmethod
+    def _identity(process: psutil.Process) -> tuple[int, float] | None:
+        try:
+            return process.pid, process.create_time()
+        except psutil.Error:
+            return None
+
+    def _snapshot(self) -> None:
+        rss = 0
+        count = 0
+        for process in self._tree():
+            identity = self._identity(process)
+            if identity is None:
+                continue
+            try:
+                rss += process.memory_info().rss
+                count += 1
+                counters = process.io_counters()
+                current = (int(counters.read_bytes), int(counters.write_bytes))
+                self._io_first.setdefault(identity, current)
+                self._io_last[identity] = current
+            except (AttributeError, psutil.Error):
+                continue
+        self._peak = max(self._peak, rss)
+        self._peak_processes = max(self._peak_processes, count)
 
     def _sample(self) -> None:
         while not self._stop.wait(self._interval_sec):
-            try:
-                self._peak = max(self._peak, self._process.memory_info().rss)
-            except psutil.Error:
-                return
+            self._snapshot()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._sample, name="perf-rss-sampler", daemon=True)
@@ -93,16 +121,18 @@ class PeakRSSSampler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
-        try:
-            self._peak = max(self._peak, self._process.memory_info().rss)
-        except psutil.Error:
-            pass
-        read_after, write_after = self._io_bytes()
-        read_before, write_before = self._io_before
+        self._snapshot()
+        read_bytes = 0
+        write_bytes = 0
+        for identity, latest in self._io_last.items():
+            first = self._io_first.get(identity, latest)
+            read_bytes += max(latest[0] - first[0], 0)
+            write_bytes += max(latest[1] - first[1], 0)
         return SampleResources(
             peak_rss_bytes=self._peak,
-            read_bytes=max(read_after - read_before, 0),
-            write_bytes=max(write_after - write_before, 0),
+            read_bytes=read_bytes,
+            write_bytes=write_bytes,
+            peak_processes=self._peak_processes,
         )
 
 
@@ -125,6 +155,7 @@ def measure(name: str, fn: Callable[[], dict[str, Any] | None], runs: int) -> di
     peaks: list[int] = []
     reads: list[int] = []
     writes: list[int] = []
+    process_counts: list[int] = []
     details: dict[str, Any] = {}
     for _ in range(runs):
         sampler = PeakRSSSampler()
@@ -149,6 +180,7 @@ def measure(name: str, fn: Callable[[], dict[str, Any] | None], runs: int) -> di
         peaks.append(resources.peak_rss_bytes)
         reads.append(resources.read_bytes)
         writes.append(resources.write_bytes)
+        process_counts.append(resources.peak_processes)
         details = sample_details
     return {
         "name": name,
@@ -157,6 +189,8 @@ def measure(name: str, fn: Callable[[], dict[str, Any] | None], runs: int) -> di
         "samples_ms": [round(value, 3) for value in samples],
         "stats": _stats(samples),
         "peak_rss_mb": round(max(peaks, default=0) / MiB, 3),
+        "rss_scope": "process_tree",
+        "peak_processes": max(process_counts, default=0),
         "read_bytes": max(reads, default=0),
         "write_bytes": max(writes, default=0),
         "details": details,
@@ -184,15 +218,7 @@ def _catalog_once() -> dict[str, Any]:
         return list(await create_server().list_tools())
 
     tools = asyncio.run(collect())
-    catalog = [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.input_schema,
-            "output_schema": tool.output_schema,
-        }
-        for tool in tools
-    ]
+    catalog = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
     started = time.perf_counter()
     payload = json.dumps(catalog, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     serialization_ms = (time.perf_counter() - started) * 1_000
@@ -203,7 +229,27 @@ def _catalog_once() -> dict[str, Any]:
     }
 
 
-def _cold_start_once() -> dict[str, Any]:
+def _launcher_validation_once() -> dict[str, Any]:
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(PROJECT_ROOT / "scripts" / "bootstrap.ps1"),
+        ],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout).decode(errors="replace")[-1000:]
+        raise RuntimeError(message)
+    return {"exit_code": result.returncode}
+
+
+def _server_cold_start_once() -> dict[str, Any]:
     code = "from core.registry import create_server; create_server()"
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -216,7 +262,7 @@ def _cold_start_once() -> dict[str, Any]:
     return {"exit_code": result.returncode}
 
 
-def _warm_start_once() -> dict[str, Any]:
+def _server_warm_start_once() -> dict[str, Any]:
     server = create_server()
     tools = asyncio.run(server.list_tools())
     return {"tool_count": len(tools)}
@@ -231,7 +277,7 @@ def _cleanup_artifact(result: dict[str, Any]) -> None:
 
 
 def _output_once(size: int) -> dict[str, Any]:
-    delivery: Literal["inline", "file"] = "file" if size > MiB else "inline"
+    delivery: Literal["inline"] = "inline"
     result = run_bounded(
         [sys.executable, "-c", f"import sys;sys.stdout.buffer.write(b'x'*{size})"],
         cwd=PROJECT_ROOT,
@@ -276,14 +322,40 @@ def _parse_fixture(paths: list[Path], count: int) -> dict[str, Any]:
     return {"files": count}
 
 
+def _project_lookup_once(root: Path, count: int) -> dict[str, Any]:
+    async def invoke() -> dict[str, Any]:
+        result = await create_server().call_tool(
+            "find_function",
+            {
+                "path": str(root),
+                "function_name": "value_0",
+                "match": "exact",
+                "max_results": 20,
+                "max_files": count,
+            },
+        )
+        structured = getattr(result, "structured_content", None)
+        if not isinstance(structured, dict):
+            raise RuntimeError("find_function benchmark returned no structured content.")
+        return structured
+
+    structured = asyncio.run(invoke())
+    if structured.get("total_count") != 1:
+        raise RuntimeError(f"find_function correctness mismatch: {structured.get('total_count')!r}")
+    return {
+        "files": count,
+        "total_count": structured["total_count"],
+        "scan_truncated": bool(structured.get("scan_truncated")),
+    }
+
 def _prepare_search_fixture(root: Path, count: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
     for index in range(count):
         directory = root / f"d{index // 1_000:04d}"
         directory.mkdir(exist_ok=True)
         name = f"file_{index:06d}.txt"
-        if index == count - 1:
-            name = f"needle_{index:06d}.txt"
+        if index == 0:
+            name = "needle_000000.txt"
         (directory / name).touch()
 
 
@@ -298,7 +370,10 @@ def _search_fixture(root: Path, count: int) -> dict[str, Any]:
         max_scan_files=count,
         exclude_common=True,
     )
-    return {"files": count, "matches": len(matches), "scan_truncated": truncated}
+    expected_matches = 1
+    if len(matches) != expected_matches:
+        raise RuntimeError(f"Search correctness mismatch: expected {expected_matches}, got {len(matches)}.")
+    return {"files": count, "matches": len(matches), "expected_matches": expected_matches, "scan_truncated": truncated}
 
 
 def _job_batch_once(store: JobStore, count: int, run_key: int) -> dict[str, Any]:
@@ -371,6 +446,33 @@ def _browser_batch_once(count: int) -> dict[str, Any]:
     return asyncio.run(scenario())
 
 
+def _cleanup_stale_temp_roots(
+    parent: Path | None = None,
+    *,
+    now: float | None = None,
+    max_age_sec: float = STALE_TEMP_MAX_AGE_SEC,
+) -> int:
+    root = parent or SETTINGS.state_dir / "benchmarks" / "tmp"
+    if not root.is_dir():
+        return 0
+    current = time.time() if now is None else now
+    removed = 0
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            age = current - child.stat().st_mtime
+        except OSError:
+            continue
+        if age < max_age_sec:
+            continue
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            continue
+        removed += 1
+    return removed
+
 def _temporary_root(name: str) -> tempfile.TemporaryDirectory[str]:
     parent = SETTINGS.state_dir / "benchmarks" / "tmp"
     parent.mkdir(parents=True, exist_ok=True)
@@ -393,13 +495,15 @@ def run_benchmarks(
     if unknown:
         raise ValueError(f"Unknown suites: {sorted(unknown)}")
     limits = PROFILE_LIMITS[profile]
+    stale_temp_dirs_removed = _cleanup_stale_temp_roots()
     results: list[dict[str, Any]] = []
 
     if "catalog" in suites:
         results.append(measure("tool_catalog", _catalog_once, runs))
     if "startup" in suites:
-        results.append(measure("startup_cold", _cold_start_once, runs))
-        results.append(measure("startup_warm", _warm_start_once, runs))
+        results.append(measure("startup_launcher_validation", _launcher_validation_once, runs))
+        results.append(measure("startup_server_cold", _server_cold_start_once, runs))
+        results.append(measure("startup_server_warm", _server_warm_start_once, runs))
     if "output" in suites:
         for size in limits["output_sizes"]:
             results.append(measure(f"output_{size}_bytes", partial(_output_once, size), runs))
@@ -408,8 +512,10 @@ def run_benchmarks(
         max_count = max(limits["ast_files"])
         with _temporary_root("ast") as temporary:
             paths = _prepare_python_fixture(Path(temporary), max_count)
+            root = Path(temporary)
             for count in limits["ast_files"]:
                 results.append(measure(f"ast_parse_{count}_files", partial(_parse_fixture, paths, count), runs))
+                results.append(measure(f"find_function_{count}_files", partial(_project_lookup_once, root, count), runs))
 
     if "search" in suites:
         max_count = max(limits["search_files"])
@@ -448,6 +554,7 @@ def run_benchmarks(
         "profile": profile,
         "runs": runs,
         "git_commit": _git_commit(),
+        "stale_temp_dirs_removed": stale_temp_dirs_removed,
         "host": {
             "platform": platform.platform(),
             "python": platform.python_version(),
