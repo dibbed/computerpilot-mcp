@@ -14,6 +14,13 @@ from core import artifacts
 @pytest.fixture(autouse=True)
 def artifact_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(artifacts, "SETTINGS", replace(artifacts.SETTINGS, state_dir=tmp_path))
+    for name in (
+        "MCP_OUTPUT_DEFAULT",
+        "MCP_INLINE_SOFT_LIMIT_BYTES",
+        "MCP_INLINE_HARD_LIMIT_BYTES",
+        "MCP_PREVIEW_BYTES",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_finalized_100_mib_snapshot_is_reused_in_parallel(tmp_path: Path) -> None:

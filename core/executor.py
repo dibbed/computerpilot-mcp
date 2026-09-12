@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import copy
 import io
 import locale
 import os
@@ -87,10 +88,13 @@ class OutputCapture:
                     encoding,
                     delivery,
                     final,
+                    os.getenv("MCP_INLINE_SOFT_LIMIT_BYTES"),
+                    os.getenv("MCP_INLINE_HARD_LIMIT_BYTES"),
+                    os.getenv("MCP_PREVIEW_BYTES"),
                 )
                 cached = self._deliveries.get(key)
                 if cached is not None and Path(cached["path"]).is_file():
-                    return {**cached, **({"preview": dict(cached["preview"])} if "preview" in cached else {})}
+                    return copy.deepcopy(cached)
                 try:
                     result = deliver_stream(
                         cast(BinaryIO, self._spool),
@@ -104,7 +108,7 @@ class OutputCapture:
                         if len(self._deliveries) >= 8:
                             self._deliveries.pop(next(iter(self._deliveries)))
                         self._deliveries[key] = result
-                    return {**result, **({"preview": dict(result["preview"])} if "preview" in result else {})}
+                    return copy.deepcopy(result)
                 finally:
                     self._spool.seek(0, os.SEEK_END)
             elif since_byte is not None:

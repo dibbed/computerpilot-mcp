@@ -10,6 +10,7 @@ import psutil
 from mcp.server import MCPServer
 from pydantic import Field
 
+from core.artifacts import default_delivery
 from core.audit import audit_action
 from core.config import PROJECT_ROOT, resolve_path
 from core.executor import background_output, start_background, terminate_process_tree
@@ -33,6 +34,8 @@ def _process_row(process: psutil.Process) -> dict[str, Any] | None:
 
 
 def register(mcp: MCPServer) -> None:
+    output_default = default_delivery()
+
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("list_processes")
     def list_processes(
@@ -143,7 +146,7 @@ def register(mcp: MCPServer) -> None:
         pid: Annotated[int, Field(gt=0)],
         since_byte: Annotated[int | None, Field(ge=0)] = None,
         stderr_since_byte: Annotated[int | None, Field(ge=0)] = None,
-        delivery: Literal["inline", "file", "auto"] = "inline",
+        delivery: Literal["inline", "file", "auto"] = output_default,
     ) -> dict[str, Any]:
         """Read captured output for a process started by run_background in this server session."""
 

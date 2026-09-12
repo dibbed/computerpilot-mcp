@@ -114,6 +114,26 @@ $env:MCP_TUNNEL_PROFILE = "<your-profile>"
 .\START_MCP.bat
 ```
 
+### Bounded Output Delivery
+
+Command tools preserve the legacy full-inline default unless the controlled migration flag is enabled. To make large command responses bounded by default:
+
+```powershell
+$env:MCP_OUTPUT_DEFAULT = 'auto'
+```
+
+`delivery="inline"` remains an explicit full-inline request. `delivery="auto"` keeps small output inline, returns a bounded preview plus cursor/full-source metadata for medium output, and returns an artifact descriptor plus bounded preview for large output. Full bytes are retained; auto delivery does not discard command output.
+
+Optional policy controls:
+
+```text
+MCP_INLINE_SOFT_LIMIT_BYTES   # default: 131072 (128 KiB)
+MCP_INLINE_HARD_LIMIT_BYTES   # unset by default; safety ceiling for explicit inline
+MCP_PREVIEW_BYTES             # default: 262144 (256 KiB), internally capped at 1 MiB
+```
+
+The artifact descriptor includes a stable path/SHA-256 for finalized snapshots, and repeated final file delivery reuses the existing descriptor instead of copying and hashing the same output again.
+
 ---
 
 ## Bundled Tunnel Runtime

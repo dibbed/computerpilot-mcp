@@ -69,7 +69,9 @@ def test_file_auto_delivery_exact_bytes_and_hash(tmp_path: Path, monkeypatch: py
     assert "text" not in result
     assert Path(result["path"]).read_bytes() == payload[8:]
     assert result["sha256"] == hashlib.sha256(payload[8:]).hexdigest()
-    assert result["next_byte"] == len(payload)
+    assert 8 < result["next_byte"] < len(payload)
+    assert result["cursor"]["next_byte"] == result["next_byte"]
+    assert result["artifact"]["bytes"] == len(payload) - 8
     assert result["truncated"] is False
     assert deliver_file(source, offset=len(payload), delivery="auto")["text"] == ""
 
