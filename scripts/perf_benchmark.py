@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
@@ -47,6 +48,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
 }
 SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser")
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
+STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
 
 
 class BenchmarkSkip(RuntimeError):
@@ -320,6 +322,32 @@ def _parse_fixture(paths: list[Path], count: int) -> dict[str, Any]:
     return {"files": count}
 
 
+def _project_lookup_once(root: Path, count: int) -> dict[str, Any]:
+    async def invoke() -> dict[str, Any]:
+        result = await create_server().call_tool(
+            "find_function",
+            {
+                "path": str(root),
+                "function_name": "value_0",
+                "match": "exact",
+                "max_results": 20,
+                "max_files": count,
+            },
+        )
+        structured = getattr(result, "structured_content", None)
+        if not isinstance(structured, dict):
+            raise RuntimeError("find_function benchmark returned no structured content.")
+        return structured
+
+    structured = asyncio.run(invoke())
+    if structured.get("total_count") != 1:
+        raise RuntimeError(f"find_function correctness mismatch: {structured.get('total_count')!r}")
+    return {
+        "files": count,
+        "total_count": structured["total_count"],
+        "scan_truncated": bool(structured.get("scan_truncated")),
+    }
+
 def _prepare_search_fixture(root: Path, count: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
     for index in range(count):
@@ -418,6 +446,33 @@ def _browser_batch_once(count: int) -> dict[str, Any]:
     return asyncio.run(scenario())
 
 
+def _cleanup_stale_temp_roots(
+    parent: Path | None = None,
+    *,
+    now: float | None = None,
+    max_age_sec: float = STALE_TEMP_MAX_AGE_SEC,
+) -> int:
+    root = parent or SETTINGS.state_dir / "benchmarks" / "tmp"
+    if not root.is_dir():
+        return 0
+    current = time.time() if now is None else now
+    removed = 0
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            age = current - child.stat().st_mtime
+        except OSError:
+            continue
+        if age < max_age_sec:
+            continue
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            continue
+        removed += 1
+    return removed
+
 def _temporary_root(name: str) -> tempfile.TemporaryDirectory[str]:
     parent = SETTINGS.state_dir / "benchmarks" / "tmp"
     parent.mkdir(parents=True, exist_ok=True)
@@ -440,6 +495,7 @@ def run_benchmarks(
     if unknown:
         raise ValueError(f"Unknown suites: {sorted(unknown)}")
     limits = PROFILE_LIMITS[profile]
+    stale_temp_dirs_removed = _cleanup_stale_temp_roots()
     results: list[dict[str, Any]] = []
 
     if "catalog" in suites:
@@ -456,8 +512,10 @@ def run_benchmarks(
         max_count = max(limits["ast_files"])
         with _temporary_root("ast") as temporary:
             paths = _prepare_python_fixture(Path(temporary), max_count)
+            root = Path(temporary)
             for count in limits["ast_files"]:
                 results.append(measure(f"ast_parse_{count}_files", partial(_parse_fixture, paths, count), runs))
+                results.append(measure(f"find_function_{count}_files", partial(_project_lookup_once, root, count), runs))
 
     if "search" in suites:
         max_count = max(limits["search_files"])
@@ -496,6 +554,7 @@ def run_benchmarks(
         "profile": profile,
         "runs": runs,
         "git_commit": _git_commit(),
+        "stale_temp_dirs_removed": stale_temp_dirs_removed,
         "host": {
             "platform": platform.platform(),
             "python": platform.python_version(),

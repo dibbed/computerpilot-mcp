@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -12,8 +14,11 @@ from scripts.perf_benchmark import (
     PROFILE_LIMITS,
     BenchmarkSkip,
     MiB,
+    _cleanup_stale_temp_roots,
     _launcher_validation_once,
     _output_once,
+    _prepare_python_fixture,
+    _project_lookup_once,
     _stats,
     measure,
     run_benchmarks,
@@ -129,3 +134,23 @@ def test_launcher_benchmark_executes_real_bootstrap(monkeypatch: pytest.MonkeyPa
     assert _launcher_validation_once() == {"exit_code": 0}
     assert captured[0].casefold() == "powershell.exe"
     assert any(part.endswith("bootstrap.ps1") for part in captured)
+
+
+def test_project_lookup_benchmark_exercises_real_tool(tmp_path: Path) -> None:
+    _prepare_python_fixture(tmp_path, 5)
+    result = _project_lookup_once(tmp_path, 5)
+    assert result["files"] == 5
+    assert result["total_count"] == 1
+
+
+def test_stale_benchmark_temp_cleanup_is_age_bounded(tmp_path: Path) -> None:
+    stale = tmp_path / "stale"
+    recent = tmp_path / "recent"
+    stale.mkdir()
+    recent.mkdir()
+    os.utime(stale, (1, 1))
+    os.utime(recent, (950, 950))
+    removed = _cleanup_stale_temp_roots(tmp_path, now=1_000, max_age_sec=100)
+    assert removed == 1
+    assert stale.exists() is False
+    assert recent.is_dir()
