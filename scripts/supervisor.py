@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import logging.handlers
@@ -15,6 +16,7 @@ import time
 import urllib.request
 import uuid
 from collections import deque
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -25,10 +27,51 @@ from core.audit import audit_action
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import _creation_flags
 from core.jobs import JobStore
+from core.singleflight import SingleFlight
 
 
 def restart_delay(failures: int) -> int:
     return (5, 10, 30, 60)[min(max(failures - 1, 0), 3)]
+
+
+PANEL_PROCESS_TTL_SEC = 2.0
+PANEL_JOBS_TTL_SEC = 2.0
+PANEL_STORAGE_TTL_SEC = 20.0
+
+
+class PanelStatusCache:
+    """Small per-component TTL cache with single-flight refreshes."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._entries: dict[str, tuple[float, Any]] = {}
+        self._refreshes: SingleFlight[str, Any] = SingleFlight()
+
+    def get(self, key: str, ttl: float, loader: Callable[[], Any]) -> Any:
+        if ttl <= 0:
+            raise ValueError("Panel cache TTL must be positive.")
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry[0] > now:
+                return copy.deepcopy(entry[1])
+
+        def refresh() -> Any:
+            # Another caller may have refreshed between our initial miss and
+            # acquiring the single-flight ownership. Recheck before I/O.
+            current = self._clock()
+            with self._lock:
+                cached = self._entries.get(key)
+                if cached is not None and cached[0] > current:
+                    return copy.deepcopy(cached[1])
+            value = loader()
+            stored = copy.deepcopy(value)
+            with self._lock:
+                self._entries[key] = (self._clock() + ttl, stored)
+            return copy.deepcopy(stored)
+
+        return self._refreshes.run(key, refresh)
 
 
 class Supervisor:
@@ -81,13 +124,17 @@ class Supervisor:
             if is_error:
                 self.state["last_error"] = display
 
-    def snapshot(self) -> dict[str, Any]:
+    def state_snapshot(self) -> dict[str, Any]:
         with self.lock:
-            result = {**self.state, "logs": list(self.logs)}
+            return {**self.state, "logs": list(self.logs)}
+
+    def process_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            pid = self.state["pid"]
         processes = []
-        if result["pid"]:
+        if pid:
             try:
-                parent = psutil.Process(result["pid"])
+                parent = psutil.Process(pid)
                 for process in [parent, *parent.children(recursive=True)]:
                     try:
                         processes.append({"pid": process.pid, "name": process.name(), "status": process.status()})
@@ -95,8 +142,11 @@ class Supervisor:
                         pass
             except psutil.NoSuchProcess:
                 pass
-        result["active_processes"] = processes[:20]
-        result["process_count"] = len(processes)
+        return {"active_processes": processes[:20], "process_count": len(processes)}
+
+    def snapshot(self) -> dict[str, Any]:
+        result = self.state_snapshot()
+        result.update(self.process_snapshot())
         return result
 
     def set_state(self, **values: Any) -> None:
@@ -260,6 +310,21 @@ class Supervisor:
 
 def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
     token = secrets.token_urlsafe(32)
+    store = JobStore(supervisor.state_dir / "jobs.sqlite3")
+    cache = PanelStatusCache()
+
+    def storage_bytes() -> dict[str, int]:
+        storage: dict[str, int] = {}
+        for name in ("jobs", "artifacts"):
+            total = 0
+            for path in (supervisor.state_dir / name).rglob("*"):
+                try:
+                    if path.is_file():
+                        total += path.stat().st_size
+                except (FileNotFoundError, PermissionError):
+                    continue  # Concurrent finalization or cleanup may remove a path.
+            storage[name] = total
+        return storage
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -288,12 +353,10 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
             elif self.path == "/favicon.ico":
                 self.send(b"", "image/x-icon", 204)
             elif self.path == "/api/status":
-                snapshot = supervisor.snapshot()
-                snapshot["jobs"] = JobStore().list(0, 20)
-                snapshot["storage_bytes"] = {
-                    name: sum(p.stat().st_size for p in (supervisor.state_dir / name).rglob("*") if p.is_file())
-                    for name in ("jobs", "artifacts")
-                }
+                snapshot = supervisor.state_snapshot()
+                snapshot.update(cache.get("processes", PANEL_PROCESS_TTL_SEC, supervisor.process_snapshot))
+                snapshot["jobs"] = cache.get("jobs", PANEL_JOBS_TTL_SEC, lambda: store.list(0, 20))
+                snapshot["storage_bytes"] = cache.get("storage", PANEL_STORAGE_TTL_SEC, storage_bytes)
                 self.send(json.dumps(snapshot).encode())
             else:
                 self.send(b'{}', status=404)
