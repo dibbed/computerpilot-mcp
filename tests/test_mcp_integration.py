@@ -13,6 +13,7 @@ from mcp import Client
 
 from core.config import SETTINGS
 from core.registry import create_server
+from core.timings import flush_timings
 
 REQUIRED_TOOLS = {
     "read_file",
@@ -85,10 +86,15 @@ def test_mcp_tool_timing_records_request_and_tool_body(monkeypatch: pytest.Monke
             assert health["ok"] is True
 
     asyncio.run(scenario())
+    flush_timings()
     records = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()]
     phases = {(record["phase"], record.get("tool")) for record in records}
+    assert ("validation", "server_health") in phases
+    assert ("queue_wait", "server_health") in phases
     assert ("tool_body", "server_health") in phases
+    assert ("result_conversion", "server_health") in phases
     assert ("request_pipeline", "server_health") in phases
+    assert ("serialization", "server_health") in phases
 
 
 def test_registration_is_unique_strict_and_compact() -> None:
