@@ -87,15 +87,15 @@ def register(mcp: MCPServer) -> None:
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
     ) -> dict[str, Any]:
         """Click the first matching Playwright locator with actionability checks."""
-
-        page = MANAGER.page(session_id)
-        audit_action(
-            "browser_click",
-            target=_safe_url_target(page.url),
-            details={"session_id": session_id, "button": button, **_selector_audit(selector)},
-        )
-        await page.locator(selector).first.click(button=button, click_count=click_count, timeout=timeout_sec * 1_000)
-        return {"ok": True, "session_id": session_id, "clicked": True, "selector_chars": len(selector), **_url_result(page.url)}
+        async with MANAGER.session(session_id):
+            page = MANAGER.page(session_id)
+            audit_action(
+                "browser_click",
+                target=_safe_url_target(page.url),
+                details={"session_id": session_id, "button": button, **_selector_audit(selector)},
+            )
+            await page.locator(selector).first.click(button=button, click_count=click_count, timeout=timeout_sec * 1_000)
+            return {"ok": True, "session_id": session_id, "clicked": True, "selector_chars": len(selector), **_url_result(page.url)}
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("browser_fill")
@@ -106,22 +106,22 @@ def register(mcp: MCPServer) -> None:
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
     ) -> dict[str, Any]:
         """Fill the first matching editable locator without returning the supplied text."""
-
-        page = MANAGER.page(session_id)
-        audit_action(
-            "browser_fill",
-            target=_safe_url_target(page.url),
-            details={"session_id": session_id, "text_chars": len(text), **_selector_audit(selector)},
-        )
-        await page.locator(selector).first.fill(text, timeout=timeout_sec * 1_000)
-        return {
-            "ok": True,
-            "session_id": session_id,
-            "filled": True,
-            "selector_chars": len(selector),
-            "text_chars": len(text),
-            **_url_result(page.url),
-        }
+        async with MANAGER.session(session_id):
+            page = MANAGER.page(session_id)
+            audit_action(
+                "browser_fill",
+                target=_safe_url_target(page.url),
+                details={"session_id": session_id, "text_chars": len(text), **_selector_audit(selector)},
+            )
+            await page.locator(selector).first.fill(text, timeout=timeout_sec * 1_000)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "filled": True,
+                "selector_chars": len(selector),
+                "text_chars": len(text),
+                **_url_result(page.url),
+            }
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("browser_screenshot")
@@ -135,25 +135,25 @@ def register(mcp: MCPServer) -> None:
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
     ) -> dict[str, Any]:
         """Save one page or element screenshot and return its path and byte size."""
-
-        ensure_runtime_dirs()
-        page = MANAGER.page(session_id)
-        if path:
-            output = resolve_path(path)
-        else:
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            output = SETTINGS.screenshot_dir / f"browser_{session_id}_{stamp}.{image_type}"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        kwargs: dict[str, Any] = {"path": output, "type": image_type, "timeout": timeout_sec * 1_000, "animations": "disabled"}
-        if image_type in {"jpeg", "webp"} and quality is not None:
-            kwargs["quality"] = quality
-        if selector:
-            await page.locator(selector).first.screenshot(**kwargs)
-        else:
-            kwargs["full_page"] = full_page
-            await page.screenshot(**kwargs)
-        audit_action("browser_screenshot", target=output, details={"session_id": session_id, "selector": bool(selector)})
-        return {"ok": True, "session_id": session_id, "path": str(output), "bytes": output.stat().st_size, **_url_result(page.url)}
+        async with MANAGER.session(session_id):
+            ensure_runtime_dirs()
+            page = MANAGER.page(session_id)
+            if path:
+                output = resolve_path(path)
+            else:
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                output = SETTINGS.screenshot_dir / f"browser_{session_id}_{stamp}.{image_type}"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            kwargs: dict[str, Any] = {"path": output, "type": image_type, "timeout": timeout_sec * 1_000, "animations": "disabled"}
+            if image_type in {"jpeg", "webp"} and quality is not None:
+                kwargs["quality"] = quality
+            if selector:
+                await page.locator(selector).first.screenshot(**kwargs)
+            else:
+                kwargs["full_page"] = full_page
+                await page.screenshot(**kwargs)
+            audit_action("browser_screenshot", target=output, details={"session_id": session_id, "selector": bool(selector)})
+            return {"ok": True, "session_id": session_id, "path": str(output), "bytes": output.stat().st_size, **_url_result(page.url)}
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("browser_close")
