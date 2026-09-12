@@ -1,6 +1,23 @@
 from __future__ import annotations
 
-from scripts.perf_benchmark import PROFILE_LIMITS, BenchmarkSkip, _stats, measure, run_benchmarks
+import asyncio
+import json
+import subprocess
+import sys
+
+import pytest
+
+from core.registry import create_server
+from scripts.perf_benchmark import (
+    PROFILE_LIMITS,
+    BenchmarkSkip,
+    MiB,
+    _launcher_validation_once,
+    _output_once,
+    _stats,
+    measure,
+    run_benchmarks,
+)
 
 
 def test_benchmark_profiles_cover_planned_scale_points() -> None:
@@ -64,3 +81,51 @@ def test_catalog_benchmark_smoke() -> None:
     assert result["status"] == "ok"
     assert result["details"]["tool_count"] == 59
     assert result["details"]["catalog_json_bytes"] > 10_000
+
+
+def test_catalog_benchmark_uses_complete_wire_tool_models() -> None:
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"catalog"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    result = report["results"][0]
+    tools = asyncio.run(create_server().list_tools())
+    wire_catalog = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
+    expected = len(json.dumps(wire_catalog, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    assert result["details"]["catalog_json_bytes"] == expected
+
+
+def test_output_benchmark_measures_current_default_inline_behavior() -> None:
+    result = _output_once(2 * MiB)
+    assert result["delivery"] == "inline"
+    assert result["response_json_bytes"] > 2 * MiB
+
+
+def test_sampler_includes_descendant_processes() -> None:
+    def child_case() -> dict[str, int]:
+        completed = subprocess.run(
+            [sys.executable, "-c", "import time; payload=bytearray(20_000_000); time.sleep(0.2)"],
+            check=False,
+        )
+        return {"exit_code": completed.returncode}
+
+    result = measure("child-tree", child_case, 1)
+    assert result["status"] == "ok"
+    assert result["rss_scope"] == "process_tree"
+    assert result["peak_processes"] >= 2
+
+
+def test_launcher_benchmark_executes_real_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[str] = []
+
+    def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[bytes]:
+        captured.extend(command)
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _launcher_validation_once() == {"exit_code": 0}
+    assert captured[0].casefold() == "powershell.exe"
+    assert any(part.endswith("bootstrap.ps1") for part in captured)
