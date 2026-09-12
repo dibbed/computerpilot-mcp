@@ -11,6 +11,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from core.response import failure
+from core.timings import tool_timing
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 MUTATING = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
@@ -37,7 +38,8 @@ def compact_errors(operation: str) -> Callable[[F], F]:
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 try:
-                    return await fn(*args, **kwargs)
+                    with tool_timing(operation):
+                        return await fn(*args, **kwargs)
                 except Exception as exc:  # boundary: errors become MCP data
                     return failure(operation, exc)
 
@@ -46,7 +48,8 @@ def compact_errors(operation: str) -> Callable[[F], F]:
         @functools.wraps(fn)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
-                return fn(*args, **kwargs)
+                with tool_timing(operation):
+                    return fn(*args, **kwargs)
             except Exception as exc:  # boundary: errors become MCP data
                 return failure(operation, exc)
 

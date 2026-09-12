@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
 from core.config import SETTINGS
+from core.timings import timing_span
 
 Delivery = Literal["inline", "file", "auto"]
 AUTO_FILE_BYTES = 1_048_576
@@ -43,15 +44,16 @@ def deliver_stream(
     target = directory / f"{uuid.uuid4().hex}.bin"
     digest = hashlib.sha256()
     try:
-        with target.open("xb") as output:
-            remaining = size
-            while remaining:
-                chunk = source.read(min(remaining, 1_048_576))
-                if not chunk:
-                    raise OSError("Output changed while taking its snapshot.")
-                output.write(chunk)
-                digest.update(chunk)
-                remaining -= len(chunk)
+        with timing_span("artifact_snapshot", metadata={"bytes": size}):
+            with target.open("xb") as output:
+                remaining = size
+                while remaining:
+                    chunk = source.read(min(remaining, 1_048_576))
+                    if not chunk:
+                        raise OSError("Output changed while taking its snapshot.")
+                    output.write(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
         result.update(path=str(target), sha256=digest.hexdigest())
         return result
     except BaseException:
