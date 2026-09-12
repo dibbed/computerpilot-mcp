@@ -13,6 +13,7 @@ from pydantic import ConfigDict
 
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.heartbeat import lifespan
+from core.timings import ToolRequestTimingMiddleware
 from core.tooling import READ_ONLY, compact_errors
 from tools.browser import register as register_browser
 from tools.desktop import register as register_desktop
@@ -57,6 +58,7 @@ def create_server() -> MCPServer:
         version=SETTINGS.version,
         log_level="WARNING",
         lifespan=lifespan,
+        middleware=[ToolRequestTimingMiddleware()],
     )
     for registrar in REGISTRARS:
         registrar(server)

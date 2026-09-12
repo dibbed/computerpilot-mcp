@@ -20,6 +20,7 @@ import psutil
 
 from core.artifacts import Delivery, deliver_stream
 from core.errors import ToolError
+from core.timings import timing_span
 
 OutputMode = Literal["head", "tail", "both"]
 SPOOL_MEMORY_BYTES = 1_048_576
@@ -209,15 +210,16 @@ def run_bounded(
     stderr = OutputCapture(stderr_limit, output_mode)
     try:
         started = time.perf_counter()
-        process = subprocess.Popen(
-            list(command),
-            cwd=str(cwd),
-            env=_process_env(env),
-            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=_creation_flags(),
-        )
+        with timing_span("process_spawn"):
+            process = subprocess.Popen(
+                list(command),
+                cwd=str(cwd),
+                env=_process_env(env),
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=_creation_flags(),
+            )
         stdout_thread = threading.Thread(target=_read_pipe, args=(process.stdout, stdout), daemon=True)
         stderr_thread = threading.Thread(target=_read_pipe, args=(process.stderr, stderr), daemon=True)
         stdout_thread.start()
@@ -229,22 +231,27 @@ def run_bounded(
             except BrokenPipeError:
                 pass
         timed_out = False
-        try:
-            exit_code = process.wait(timeout=timeout_sec)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            terminate_process_tree(process.pid, force=True)
-            exit_code = process.wait(timeout=5.0)
-        stdout_thread.join(timeout=2.0)
-        stderr_thread.join(timeout=2.0)
+        with timing_span("process_execution"):
+            try:
+                exit_code = process.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                terminate_process_tree(process.pid, force=True)
+                exit_code = process.wait(timeout=5.0)
+        with timing_span("process_drain"):
+            stdout_thread.join(timeout=2.0)
+            stderr_thread.join(timeout=2.0)
+        with timing_span("output_delivery"):
+            stdout_result = stdout.result(chosen_encoding, delivery=delivery)
+            stderr_result = stderr.result(chosen_encoding, delivery=delivery)
         return {
             "ok": exit_code == 0 and not timed_out,
             "pid": process.pid,
             "exit_code": exit_code,
             "timed_out": timed_out,
             "duration_ms": round((time.perf_counter() - started) * 1_000, 1),
-            "stdout": stdout.result(chosen_encoding, delivery=delivery),
-            "stderr": stderr.result(chosen_encoding, delivery=delivery),
+            "stdout": stdout_result,
+            "stderr": stderr_result,
         }
     finally:
         stdout.close()
@@ -287,15 +294,16 @@ def start_background(
     stdout = OutputCapture(capture_limit, output_mode)
     stderr = OutputCapture(capture_limit, output_mode)
     try:
-        process = subprocess.Popen(
-            list(command),
-            cwd=str(cwd),
-            env=_process_env(env),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=_creation_flags(),
-        )
+        with timing_span("process_spawn"):
+            process = subprocess.Popen(
+                list(command),
+                cwd=str(cwd),
+                env=_process_env(env),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=_creation_flags(),
+            )
     except Exception:
         stdout.close()
         stderr.close()
@@ -347,16 +355,27 @@ def background_output(pid: int, *, since_byte: int | None = None,
     if exit_code is not None:
         record.stdout_thread.join(timeout=0.5)
         record.stderr_thread.join(timeout=0.5)
+    with timing_span("output_delivery"):
+        stdout_result = record.stdout.result(
+            record.encoding,
+            since_byte=since_byte,
+            delivery=delivery,
+            final=not record.stdout_thread.is_alive(),
+        )
+        stderr_result = record.stderr.result(
+            record.encoding,
+            since_byte=stderr_since_byte,
+            delivery=delivery,
+            final=not record.stderr_thread.is_alive(),
+        )
     return {
         "ok": True,
         "pid": pid,
         "running": exit_code is None,
         "exit_code": exit_code,
         "started_at": record.started_at,
-        "stdout": record.stdout.result(record.encoding, since_byte=since_byte, delivery=delivery,
-                                       final=not record.stdout_thread.is_alive()),
-        "stderr": record.stderr.result(record.encoding, since_byte=stderr_since_byte, delivery=delivery,
-                                       final=not record.stderr_thread.is_alive()),
+        "stdout": stdout_result,
+        "stderr": stderr_result,
     }
 
 

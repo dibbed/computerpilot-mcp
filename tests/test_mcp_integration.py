@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
 from mcp import Client
 
 from core.config import SETTINGS
@@ -70,6 +72,23 @@ def _structured(result: Any) -> dict[str, Any]:
     assert result.is_error is not True
     assert isinstance(result.structured_content, dict)
     return result.structured_content
+
+
+def test_mcp_tool_timing_records_request_and_tool_body(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    target = tmp_path / "timings.jsonl"
+    monkeypatch.setenv("MCP_TIMINGS", "1")
+    monkeypatch.setenv("MCP_TIMINGS_FILE", str(target))
+
+    async def scenario() -> None:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            health = _structured(await client.call_tool("server_health", {}))
+            assert health["ok"] is True
+
+    asyncio.run(scenario())
+    records = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()]
+    phases = {(record["phase"], record.get("tool")) for record in records}
+    assert ("tool_body", "server_health") in phases
+    assert ("request_pipeline", "server_health") in phases
 
 
 def test_registration_is_unique_strict_and_compact() -> None:

@@ -211,6 +211,38 @@ The project includes an automated test suite, static type checking, and linter v
 .\.venv\Scripts\python.exe -m scripts.health_check --json
 ```
 
+### Performance Timing
+
+Structured tool timing is opt-in and never changes MCP tool response payloads. Enable it only while profiling:
+
+```powershell
+$env:MCP_TIMINGS = '1'
+.\START_MCP.bat
+```
+
+Timing records are metadata-only JSONL entries written to `.agent_state\timings.jsonl`. They include the MCP request pipeline, tool body, process spawn/execution/drain, output delivery, and artifact snapshot phases. Command arguments, file contents, typed browser text, and other payload bodies are not recorded. `MCP_TIMINGS_FILE` can override the local output path for isolated runs.
+
+### Repeatable Performance Benchmarks
+
+The benchmark harness stores reports under ignored local state by default:
+
+```powershell
+# Fast representative suite; real jobs and browsers remain opt-in
+.\.venv\Scripts\python.exe -m scripts.perf_benchmark --profile quick
+
+# Include real durable worker launches
+.\.venv\Scripts\python.exe -m scripts.perf_benchmark --profile quick --include-jobs
+
+# Include the optional Playwright runtime
+.\.venv\Scripts\python.exe -m scripts.perf_benchmark --profile quick --include-browser
+
+# Full scale points: 100 MiB output, 10K AST files, 100K search files,
+# and up to 50 jobs / 20 browser sessions when those suites are enabled.
+.\.venv\Scripts\python.exe -m scripts.perf_benchmark --profile full --include-jobs --include-browser
+```
+
+Use repeated runs for comparisons, for example `--runs 5`. Reports contain latency distributions, peak benchmark-process RSS samples, process I/O counters, tool catalog bytes, and case-specific details. Heavy job/browser cases require explicit opt-in so a normal benchmark cannot accidentally create a large process burst.
+
 ---
 
 ## Security Notes

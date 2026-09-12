@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ from core.executor import (
     terminate_process_tree,
 )
 from core.response import bounded_text, failure
+from core.timings import timing_span, tool_timing
 from tools.browser.registry import _url_result
 from tools.desktop.native import virtual_key
 from tools.filesystem.registry import RefactorEdit
@@ -29,6 +31,33 @@ from tools.filesystem.service import (
     replace_symbol_body,
 )
 from tools.testing.registry import _junit_summary, _pytest_counts
+
+
+def test_timing_is_opt_in_and_does_not_create_a_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    target = tmp_path / "timings.jsonl"
+    monkeypatch.delenv("MCP_TIMINGS", raising=False)
+    monkeypatch.setenv("MCP_TIMINGS_FILE", str(target))
+    with tool_timing("probe"):
+        with timing_span("inner"):
+            pass
+    assert target.exists() is False
+
+
+def test_timing_records_tool_context_phase_and_failures(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    target = tmp_path / "timings.jsonl"
+    monkeypatch.setenv("MCP_TIMINGS", "1")
+    monkeypatch.setenv("MCP_TIMINGS_FILE", str(target))
+    with tool_timing("probe"):
+        with timing_span("inner", metadata={"items": 2}):
+            pass
+    with pytest.raises(RuntimeError):
+        with tool_timing("failed_probe"):
+            raise RuntimeError("expected")
+    records = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()]
+    assert any(record["phase"] == "inner" and record["tool"] == "probe" and record["items"] == 2 for record in records)
+    assert any(record["phase"] == "tool_body" and record["tool"] == "probe" and record["ok"] is True for record in records)
+    assert any(record["phase"] == "tool_body" and record["tool"] == "failed_probe" and record["ok"] is False for record in records)
+    assert all(record["duration_ms"] >= 0 for record in records)
 
 
 def test_limited_capture_both_mode_preserves_small_output() -> None:
