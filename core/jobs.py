@@ -106,28 +106,47 @@ class JobStore:
             raise ToolError("job_not_found", "Unknown job_id.")
         return dict(row)
 
-    def get(self, job_id: str) -> dict[str, Any]:
-        row = self.raw(job_id)
-        if row["status"] == "running" and not same_process(row["worker_pid"], row["worker_created"]):
-            status = "orphaned" if same_process(row["pid"], row["pid_created"]) else "interrupted"
-            # Do not overwrite a final result committed while this process checked liveness.
+    def _reconcile(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Check active processes outside the DB lock, then reconcile in one transaction."""
+        now = time.time()
+        changes = []
+        for row in rows:
+            if row["status"] == "running" and not same_process(row["worker_pid"], row["worker_created"]):
+                status = "orphaned" if same_process(row["pid"], row["pid_created"]) else "interrupted"
+                changes.append((status, now, row["id"], "running"))
+            elif row["status"] == "queued" and now - row["created"] > 60:
+                changes.append(("interrupted", now, row["id"], "queued"))
+        if changes:
             with closing(self.connect()) as db, db:
-                db.execute("UPDATE jobs SET status=?,updated=? WHERE id=? AND status='running'",
-                           (status, time.time(), job_id))
-            row = self.raw(job_id)
-        if row["status"] == "queued" and time.time() - row["created"] > 60:
-            with closing(self.connect()) as db, db:
-                db.execute("UPDATE jobs SET status='interrupted',updated=? WHERE id=? AND status='queued'",
-                           (time.time(), job_id))
-            row = self.raw(job_id)
+                # The worker may have committed a terminal result during the process checks.
+                db.executemany("UPDATE jobs SET status=?,updated=? WHERE id=? AND status=?", changes)
+                ids = [change[2] for change in changes]
+                refreshed = {}
+                # Bound variables even for direct callers requesting unusually large pages.
+                for start in range(0, len(ids), 500):
+                    batch = ids[start:start + 500]
+                    placeholders = ",".join("?" for _ in batch)
+                    refreshed.update({row["id"]: dict(row) for row in db.execute(
+                        f"SELECT * FROM jobs WHERE id IN ({placeholders})", batch,
+                    )})
+            return [refreshed.get(row["id"], row) for row in rows]
+        return rows
+
+    @staticmethod
+    def _public(row: dict[str, Any]) -> dict[str, Any]:
         return {"job_id": row["id"], **{key: row[key] for key in
                 ("status", "created", "updated", "pid", "exit_code", "cancel_requested", "error")}}
+
+    def get(self, job_id: str) -> dict[str, Any]:
+        return self._public(self._reconcile([self.raw(job_id)])[0])
 
     def list(self, offset: int, limit: int) -> dict[str, Any]:
         with closing(self.connect()) as db:
             total = db.execute("SELECT count(*) FROM jobs").fetchone()[0]
-            rows = db.execute("SELECT id FROM jobs ORDER BY created DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
-        return {"ok": True, "items": [self.get(row["id"]) for row in rows], "total_count": total,
+            rows = [dict(row) for row in db.execute(
+                "SELECT * FROM jobs ORDER BY created DESC, id DESC LIMIT ? OFFSET ?", (limit, offset),
+            )]
+        return {"ok": True, "items": [self._public(row) for row in self._reconcile(rows)], "total_count": total,
                 "offset": offset, "truncated": offset + len(rows) < total}
 
     def cancel(self, job_id: str) -> dict[str, Any]:
@@ -144,9 +163,10 @@ class JobStore:
 
     def output(self, job_id: str, since_byte: int = 0, stderr_since_byte: int = 0,
                delivery: Delivery = "inline") -> dict[str, Any]:
-        row = self.get(job_id)
+        raw = self._reconcile([self.raw(job_id)])[0]
+        row = self._public(raw)
         directory = self.output_dir / row["job_id"]
-        encoding = json.loads(self.raw(job_id)["spec"])["encoding"]
+        encoding = json.loads(raw["spec"])["encoding"]
         final = row["status"] not in {"queued", "running", "orphaned"}
         return {"ok": True, **row,
                 "stdout": deliver_file(directory / "stdout.bin", encoding=encoding,
