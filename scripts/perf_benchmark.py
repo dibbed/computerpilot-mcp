@@ -26,7 +26,7 @@ from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
 from core.jobs import JobStore, same_process
 from core.registry import create_server
-from tools.filesystem.service import search_by_name
+from tools.filesystem.service import search_by_name, search_by_name_streaming
 from tools.project.service import parse_python
 
 MiB = 1_048_576
@@ -353,16 +353,13 @@ def _prepare_search_fixture(root: Path, count: int) -> None:
     for index in range(count):
         directory = root / f"d{index // 1_000:04d}"
         directory.mkdir(exist_ok=True)
-        name = f"file_{index:06d}.txt"
-        if index == 0:
-            name = "needle_000000.txt"
-        (directory / name).touch()
+        (directory / f"fastneedle_{index:06d}.txt").touch()
 
 
 def _search_fixture(root: Path, count: int) -> dict[str, Any]:
     matches, truncated = search_by_name(
         root,
-        "needle",
+        "needle_000000",
         regex=False,
         case_sensitive=False,
         glob=None,
@@ -374,6 +371,34 @@ def _search_fixture(root: Path, count: int) -> dict[str, Any]:
     if len(matches) != expected_matches:
         raise RuntimeError(f"Search correctness mismatch: expected {expected_matches}, got {len(matches)}.")
     return {"files": count, "matches": len(matches), "expected_matches": expected_matches, "scan_truncated": truncated}
+
+
+def _search_streaming_fixture(root: Path, count: int, page_size: int = 50) -> dict[str, Any]:
+    result = search_by_name_streaming(
+        root,
+        "fastneedle_",
+        regex=False,
+        case_sensitive=False,
+        glob=None,
+        include_hidden=False,
+        max_scan_files=count,
+        exclude_common=True,
+        offset=0,
+        limit=page_size,
+    )
+    if len(result.items) != page_size or not result.has_more:
+        raise RuntimeError(
+            f"Streaming search correctness mismatch: expected {page_size} items plus continuation, "
+            f"got {len(result.items)} items and has_more={result.has_more}."
+        )
+    return {
+        "files": count,
+        "page_size": page_size,
+        "matches_returned": len(result.items),
+        "scanned_files": result.scanned_files,
+        "scan_truncated": result.scan_truncated,
+        "has_more": result.has_more,
+    }
 
 
 def _job_batch_once(store: JobStore, count: int, run_key: int) -> dict[str, Any]:
@@ -524,6 +549,13 @@ def run_benchmarks(
             _prepare_search_fixture(root, max_count)
             for count in limits["search_files"]:
                 results.append(measure(f"name_search_{count}_files", partial(_search_fixture, root, count), runs))
+                results.append(
+                    measure(
+                        f"name_search_streaming_first_page_{count}_files",
+                        partial(_search_streaming_fixture, root, count),
+                        runs,
+                    )
+                )
 
     if "jobs" in suites:
         if not include_jobs:

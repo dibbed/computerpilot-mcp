@@ -271,16 +271,53 @@ def register(mcp: MCPServer) -> None:
         glob: Annotated[str | None, Field(max_length=500)] = None,
         include_hidden: bool = False,
         exclude_common: bool = True,
+        count_mode: Literal["exact", "none"] = "exact",
         offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0,
         max_results: Annotated[int, Field(ge=1, le=500)] = 50,
         max_scan_files: Annotated[int, Field(ge=100, le=500_000)] = 100_000,
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
     ) -> dict[str, Any]:
-        """Search file names or contents with compact pagination and ripgrep acceleration."""
+        """Search files; count_mode=none streams name results in traversal order without an exact total."""
 
         root = resolve_path(path)
         if not root.is_dir():
             raise NotADirectoryError(f"Directory not found: {root}")
+        if count_mode == "none":
+            if search_type != "name":
+                raise ToolError(
+                    "streaming_name_search_only",
+                    "count_mode='none' is currently supported only for search_type='name'.",
+                    hint="Use count_mode='exact' for content/both search, or search_type='name' for streaming first-page results.",
+                )
+            streamed = service.search_by_name_streaming(
+                root,
+                query,
+                regex=regex,
+                case_sensitive=case_sensitive,
+                glob=glob,
+                include_hidden=include_hidden,
+                max_scan_files=max_scan_files,
+                exclude_common=exclude_common,
+                offset=offset,
+                limit=max_results,
+            )
+            items = [{"path": str(item), "matched_in": ["name"]} for item in streamed.items]
+            next_offset = offset + len(items) if streamed.continuation_available else None
+            return {
+                "ok": True,
+                "root": str(root),
+                "scan_truncated": streamed.scan_truncated,
+                "scanned_files": streamed.scanned_files,
+                "count_mode": "none",
+                "result_order": "traversal",
+                "items": items,
+                "count": len(items),
+                "total_count": None,
+                "offset": offset,
+                "has_more": streamed.has_more,
+                "next_offset": next_offset,
+                "truncated": streamed.has_more,
+            }
         matches: dict[str, set[str]] = {}
         truncated = False
         if search_type in {"name", "both"}:
@@ -318,7 +355,14 @@ def register(mcp: MCPServer) -> None:
         total = len(ordered)
         result = page(ordered[offset : offset + max_results], total=total, offset=offset, limit=max_results)
         result["truncated"] = bool(result["truncated"] or truncated)
-        return {"ok": True, "root": str(root), "scan_truncated": truncated, **result}
+        return {
+            "ok": True,
+            "root": str(root),
+            "scan_truncated": truncated,
+            "count_mode": "exact",
+            "result_order": "path",
+            **result,
+        }
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("list_directory")

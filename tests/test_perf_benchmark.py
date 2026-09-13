@@ -143,6 +143,26 @@ def test_project_lookup_benchmark_exercises_real_tool(tmp_path: Path) -> None:
     assert result["total_count"] == 1
 
 
+def test_search_benchmark_reports_exact_and_streaming_first_page() -> None:
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"search"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    results = {item["name"]: item for item in report["results"]}
+    exact = results["name_search_1000_files"]
+    streaming = results["name_search_streaming_first_page_1000_files"]
+
+    assert exact["status"] == "ok"
+    assert exact["details"]["matches"] == 1
+    assert streaming["status"] == "ok"
+    assert streaming["details"]["matches_returned"] == 50
+    assert streaming["details"]["has_more"] is True
+    assert streaming["details"]["scanned_files"] == 51
+
+
 def test_stale_benchmark_temp_cleanup_is_age_bounded(tmp_path: Path) -> None:
     stale = tmp_path / "stale"
     recent = tmp_path / "recent"
