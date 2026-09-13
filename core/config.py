@@ -31,6 +31,9 @@ class Settings:
     max_file_write_chars: int = _env_int("MCP_MAX_FILE_WRITE_CHARS", 2_000_000, 1_024, 20_000_000)
     ast_cache_max_files: int = _env_int("MCP_AST_CACHE_MAX_FILES", 1_024, 1, 50_000)
     ast_cache_max_bytes: int = _env_int("MCP_AST_CACHE_MAX_BYTES", 64 * 1_024 * 1_024, 1_024, 2 * 1_024 * 1_024 * 1_024)
+    search_snapshot_ttl_sec: int = _env_int("MCP_SEARCH_SNAPSHOT_TTL_SEC", 180, 30, 3_600)
+    search_snapshot_max_bytes: int = _env_int("MCP_SEARCH_SNAPSHOT_MAX_BYTES", 128 * 1_024 * 1_024, 1_024, 2 * 1_024 * 1_024 * 1_024)
+    search_snapshot_max_count: int = _env_int("MCP_SEARCH_SNAPSHOT_MAX_COUNT", 32, 1, 1_024)
     state_dir: Path = PROJECT_ROOT / ".agent_state"
     memory_dir: Path = PROJECT_ROOT / "memory"
 
@@ -46,6 +49,10 @@ class Settings:
     def screenshot_dir(self) -> Path:
         return self.state_dir / "screenshots"
 
+    @property
+    def search_snapshot_dir(self) -> Path:
+        return self.state_dir / "search_snapshots"
+
 
 SETTINGS = Settings()
 
@@ -57,6 +64,7 @@ def ensure_runtime_dirs() -> None:
         SETTINGS.state_dir,
         SETTINGS.backup_dir,
         SETTINGS.screenshot_dir,
+        SETTINGS.search_snapshot_dir,
         SETTINGS.memory_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)

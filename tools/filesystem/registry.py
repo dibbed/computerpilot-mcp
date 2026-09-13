@@ -20,6 +20,7 @@ from core.resource_locks import RESOURCE_LOCKS
 from core.response import ok, page
 from core.tooling import DESTRUCTIVE, MUTATING, READ_ONLY, PathArg, compact_errors
 from tools.filesystem import service
+from tools.filesystem.search_snapshots import SEARCH_SNAPSHOTS, search_fingerprint
 from tools.project.index import PYTHON_METADATA_CACHE
 
 EncodingArg = Annotated[str, Field(min_length=1, max_length=40)]
@@ -272,16 +273,49 @@ def register(mcp: MCPServer) -> None:
         include_hidden: bool = False,
         exclude_common: bool = True,
         count_mode: Literal["exact", "none"] = "exact",
+        snapshot: bool = False,
+        cursor: Annotated[str | None, Field(max_length=64)] = None,
         offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0,
         max_results: Annotated[int, Field(ge=1, le=500)] = 50,
         max_scan_files: Annotated[int, Field(ge=100, le=500_000)] = 100_000,
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
     ) -> dict[str, Any]:
-        """Search files; count_mode=none streams name results in traversal order without an exact total."""
+        """Search files with optional fast first-page mode or immutable snapshot cursors."""
 
         root = resolve_path(path)
+        fingerprint = search_fingerprint(
+            root,
+            {
+                "query": query,
+                "search_type": search_type,
+                "regex": regex,
+                "case_sensitive": case_sensitive,
+                "glob": glob,
+                "include_hidden": include_hidden,
+                "exclude_common": exclude_common,
+                "count_mode": count_mode,
+                "max_scan_files": max_scan_files,
+                "timeout_sec": float(timeout_sec),
+            },
+        )
+        if cursor is not None:
+            if snapshot:
+                raise ToolError("ambiguous_search_pagination", "snapshot=true cannot be combined with cursor.")
+            if offset != 0:
+                raise ToolError("ambiguous_search_pagination", "offset must remain 0 when continuing with cursor.")
+            snapshot_page = SEARCH_SNAPSHOTS.read_page(cursor, fingerprint=fingerprint, limit=max_results)
+            return {
+                "ok": True,
+                "root": str(root),
+                "scanned_files": 0,
+                **SEARCH_SNAPSHOTS.public_page(snapshot_page),
+            }
+
         if not root.is_dir():
             raise NotADirectoryError(f"Directory not found: {root}")
+        if snapshot and offset != 0:
+            raise ToolError("snapshot_requires_first_page", "snapshot=true requires offset=0.")
+
         if count_mode == "none":
             if search_type != "name":
                 raise ToolError(
@@ -289,6 +323,34 @@ def register(mcp: MCPServer) -> None:
                     "count_mode='none' is currently supported only for search_type='name'.",
                     hint="Use count_mode='exact' for content/both search, or search_type='name' for streaming first-page results.",
                 )
+            if snapshot:
+                named, scan_truncated = service.search_by_name(
+                    root,
+                    query,
+                    regex=regex,
+                    case_sensitive=case_sensitive,
+                    glob=glob,
+                    include_hidden=include_hidden,
+                    max_scan_files=max_scan_files,
+                    exclude_common=exclude_common,
+                )
+                snapshot_items = [{"path": str(item), "matched_in": ["name"]} for item in named]
+                handle = SEARCH_SNAPSHOTS.create(
+                    snapshot_items,
+                    fingerprint=fingerprint,
+                    count_mode="none",
+                    result_order="traversal",
+                    scan_truncated=scan_truncated,
+                    total_count=None,
+                )
+                snapshot_page = SEARCH_SNAPSHOTS.first_page(handle, fingerprint=fingerprint, limit=max_results)
+                return {
+                    "ok": True,
+                    "root": str(root),
+                    "snapshot_created": True,
+                    **SEARCH_SNAPSHOTS.public_page(snapshot_page),
+                }
+
             streamed = service.search_by_name_streaming(
                 root,
                 query,
@@ -316,8 +378,10 @@ def register(mcp: MCPServer) -> None:
                 "offset": offset,
                 "has_more": streamed.has_more,
                 "next_offset": next_offset,
+                "cursor": None,
                 "truncated": streamed.has_more,
             }
+
         matches: dict[str, set[str]] = {}
         truncated = False
         if search_type in {"name", "both"}:
@@ -353,6 +417,24 @@ def register(mcp: MCPServer) -> None:
             {"path": key, "matched_in": sorted(value)} for key, value in sorted(matches.items(), key=lambda pair: pair[0].casefold())
         ]
         total = len(ordered)
+        if snapshot:
+            handle = SEARCH_SNAPSHOTS.create(
+                ordered,
+                fingerprint=fingerprint,
+                count_mode="exact",
+                result_order="path",
+                scan_truncated=truncated,
+                total_count=total,
+            )
+            snapshot_page = SEARCH_SNAPSHOTS.first_page(handle, fingerprint=fingerprint, limit=max_results)
+            return {
+                "ok": True,
+                "root": str(root),
+                "snapshot_created": True,
+                **SEARCH_SNAPSHOTS.public_page(snapshot_page),
+            }
+
+        total = len(ordered)
         result = page(ordered[offset : offset + max_results], total=total, offset=offset, limit=max_results)
         result["truncated"] = bool(result["truncated"] or truncated)
         return {
@@ -361,6 +443,7 @@ def register(mcp: MCPServer) -> None:
             "scan_truncated": truncated,
             "count_mode": "exact",
             "result_order": "path",
+            "cursor": None,
             **result,
         }
 
