@@ -29,7 +29,7 @@ class Settings:
     default_list_limit: int = _env_int("MCP_DEFAULT_LIST_LIMIT", 50, 1, 500)
     max_list_limit: int = _env_int("MCP_MAX_LIST_LIMIT", 500, 10, 5_000)
     max_file_write_chars: int = _env_int("MCP_MAX_FILE_WRITE_CHARS", 2_000_000, 1_024, 20_000_000)
-    ast_cache_max_files: int = _env_int("MCP_AST_CACHE_MAX_FILES", 1_024, 1, 50_000)
+    ast_cache_max_files: int = _env_int("MCP_AST_CACHE_MAX_FILES", 10_000, 1, 50_000)
     ast_cache_max_bytes: int = _env_int("MCP_AST_CACHE_MAX_BYTES", 64 * 1_024 * 1_024, 1_024, 2 * 1_024 * 1_024 * 1_024)
     search_snapshot_ttl_sec: int = _env_int("MCP_SEARCH_SNAPSHOT_TTL_SEC", 180, 30, 3_600)
     search_snapshot_max_bytes: int = _env_int("MCP_SEARCH_SNAPSHOT_MAX_BYTES", 128 * 1_024 * 1_024, 1_024, 2 * 1_024 * 1_024 * 1_024)
