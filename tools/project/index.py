@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import sys
 import threading
 import tokenize
@@ -15,8 +16,10 @@ from typing import Any
 from core.config import SETTINGS
 from core.errors import ToolError
 from core.resource_locks import canonical_path
+from core.singleflight import SingleFlight
 
 CACHE_ENTRY_OVERHEAD_BYTES = 256
+MAX_PARSE_VERSION_RETRIES = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,10 +178,13 @@ def _deep_size(value: Any, seen: set[int] | None = None) -> int:
 
 
 class PythonMetadataCache:
-    """LRU cache keyed by canonical path and validated by mtime_ns + size.
+    """Bounded LRU metadata cache with per-file-version single-flight parsing.
 
-    Cache bookkeeping is thread-safe. C1 intentionally does not single-flight
-    concurrent cache misses; duplicate in-flight parses are addressed in C2.
+    Cache hits are validated by canonical path, mtime_ns, and size. Concurrent
+    callers requesting the same unchanged file version share one parse, while
+    unrelated files stay concurrent. Explicit MCP mutations can invalidate one
+    file or a whole directory subtree immediately; external edits still fall
+    back to version validation on the next read.
     """
 
     def __init__(
@@ -196,59 +202,121 @@ class PythonMetadataCache:
         self._lock = threading.RLock()
         self._entries: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._bytes = 0
+        self._path_generations: dict[str, int] = {}
+        self._active_loads: dict[str, int] = {}
+        self._flights: SingleFlight[tuple[str, FileVersion], PythonFileMetadata] = SingleFlight()
 
     @staticmethod
     def _version(path: Path) -> FileVersion:
         stat = path.stat()
         return FileVersion(mtime_ns=stat.st_mtime_ns, size=stat.st_size)
 
+    def _cached_locked(self, key: str, version: FileVersion) -> PythonFileMetadata | None:
+        cached = self._entries.get(key)
+        if cached is None:
+            return None
+        if cached.version != version:
+            self._entries.pop(key)
+            self._bytes -= cached.estimated_bytes
+            return None
+        self._entries.move_to_end(key)
+        return cached.metadata
+
     def get(self, path: Path) -> PythonFileMetadata:
         target = path.resolve(strict=False)
-        version = self._version(target)
         key = canonical_path(target)
+        version = self._version(target)
         with self._lock:
-            cached = self._entries.get(key)
-            if cached is not None and cached.version == version:
-                self._entries.move_to_end(key)
-                return cached.metadata
+            cached = self._cached_locked(key, version)
             if cached is not None:
-                self._entries.pop(key)
-                self._bytes -= cached.estimated_bytes
+                return cached
 
-        metadata: PythonFileMetadata | None = None
-        for _attempt in range(3):
+        return self._flights.run(
+            (key, version),
+            lambda: self._load_for_version(target, key, version, attempts_left=MAX_PARSE_VERSION_RETRIES),
+        )
+
+    def _load_for_version(
+        self,
+        target: Path,
+        key: str,
+        version: FileVersion,
+        *,
+        attempts_left: int,
+    ) -> PythonFileMetadata:
+        with self._lock:
+            cached = self._cached_locked(key, version)
+            if cached is not None:
+                return cached
+            generation = self._path_generations.get(key, 0)
+            self._active_loads[key] = self._active_loads.get(key, 0) + 1
+
+        try:
             metadata = self._loader(target)
             after = self._version(target)
-            if after == version:
-                break
-            version = after
-        else:
-            raise ToolError(
-                "project_file_changed_during_parse",
-                f"Python source changed repeatedly while being indexed: {target}",
-            )
-        assert metadata is not None
+            if after != version:
+                if attempts_left <= 1:
+                    raise ToolError(
+                        "project_file_changed_during_parse",
+                        f"Python source changed repeatedly while being indexed: {target}",
+                    )
+                return self._flights.run(
+                    (key, after),
+                    lambda: self._load_for_version(target, key, after, attempts_left=attempts_left - 1),
+                )
 
-        estimated = _deep_size(metadata) + _deep_size(version) + sys.getsizeof(key) + CACHE_ENTRY_OVERHEAD_BYTES
-        if estimated > self.max_bytes:
+            estimated = _deep_size(metadata) + _deep_size(version) + sys.getsizeof(key) + CACHE_ENTRY_OVERHEAD_BYTES
+            if estimated > self.max_bytes:
+                return metadata
+
+            with self._lock:
+                if self._path_generations.get(key, 0) != generation:
+                    return metadata
+                existing = self._entries.pop(key, None)
+                if existing is not None:
+                    self._bytes -= existing.estimated_bytes
+                self._entries[key] = _CacheEntry(version=version, metadata=metadata, estimated_bytes=estimated)
+                self._bytes += estimated
+                self._evict_locked()
             return metadata
-
-        with self._lock:
-            existing = self._entries.pop(key, None)
-            if existing is not None:
-                self._bytes -= existing.estimated_bytes
-            self._entries[key] = _CacheEntry(version=version, metadata=metadata, estimated_bytes=estimated)
-            self._bytes += estimated
-            self._evict_locked()
-        return metadata
+        finally:
+            with self._lock:
+                remaining = self._active_loads.get(key, 1) - 1
+                if remaining > 0:
+                    self._active_loads[key] = remaining
+                else:
+                    self._active_loads.pop(key, None)
+                    self._path_generations.pop(key, None)
 
     def _evict_locked(self) -> None:
         while self._entries and (len(self._entries) > self.max_files or self._bytes > self.max_bytes):
             _, entry = self._entries.popitem(last=False)
             self._bytes -= entry.estimated_bytes
 
+    def invalidate(self, path: str | Path, *, recursive: bool = False) -> int:
+        key = canonical_path(path)
+        prefix = key.rstrip("\\/") + os.sep
+        removed = 0
+        with self._lock:
+            candidates = set(self._entries) | set(self._active_loads)
+            if recursive:
+                affected = [candidate for candidate in candidates if candidate == key or candidate.startswith(prefix)]
+            else:
+                affected = [key] if key in candidates else []
+            for affected_key in affected:
+                self._path_generations[affected_key] = self._path_generations.get(affected_key, 0) + 1
+                entry = self._entries.pop(affected_key, None)
+                if entry is not None:
+                    self._bytes -= entry.estimated_bytes
+                    removed += 1
+                if affected_key not in self._active_loads:
+                    self._path_generations.pop(affected_key, None)
+        return removed
+
     def clear(self) -> None:
         with self._lock:
+            for key in self._active_loads:
+                self._path_generations[key] = self._path_generations.get(key, 0) + 1
             self._entries.clear()
             self._bytes = 0
 

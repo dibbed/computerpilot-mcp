@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections import Counter
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -177,3 +179,110 @@ def test_project_tool_turns_disappearing_file_into_parse_error(
     assert result["total_count"] == 0
     assert len(result["parse_errors"]) == 1
     assert "gone.py" in result["parse_errors"][0]["file"]
+
+
+def test_concurrent_same_version_uses_one_parse(tmp_path: Path) -> None:
+    target = tmp_path / "shared.py"
+    target.write_text("def shared():\n    return 1\n", encoding="utf-8")
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def slow_loader(path: Path) -> PythonFileMetadata:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        started.set()
+        assert release.wait(5)
+        return build_python_metadata(path)
+
+    cache = PythonMetadataCache(max_files=8, max_bytes=1024 * 1024, loader=slow_loader)
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [pool.submit(cache.get, target) for _ in range(12)]
+        assert started.wait(5)
+        release.set()
+        results = [future.result(timeout=5) for future in futures]
+
+    assert calls == 1
+    assert all(result is results[0] for result in results)
+    assert cache.stats()["entries"] == 1
+
+
+def test_unrelated_files_parse_concurrently(tmp_path: Path) -> None:
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("def first():\n    pass\n", encoding="utf-8")
+    second.write_text("def second():\n    pass\n", encoding="utf-8")
+    barrier = threading.Barrier(2)
+
+    def loader(path: Path) -> PythonFileMetadata:
+        barrier.wait(timeout=5)
+        return build_python_metadata(path)
+
+    cache = PythonMetadataCache(max_files=8, max_bytes=1024 * 1024, loader=loader)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        one = pool.submit(cache.get, first)
+        two = pool.submit(cache.get, second)
+        assert one.result(timeout=5).functions[0].qualified_name == "first"
+        assert two.result(timeout=5).functions[0].qualified_name == "second"
+
+
+def test_invalidate_forces_reparse_even_when_stat_version_is_restored(tmp_path: Path) -> None:
+    target = tmp_path / "stable.py"
+    target.write_text("def old():\n    return 1\n", encoding="utf-8")
+    cache, calls = counting_cache()
+    original = target.stat()
+    assert cache.get(target).functions[0].qualified_name == "old"
+
+    target.write_text("def new():\n    return 2\n", encoding="utf-8")
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+    assert target.stat().st_size == original.st_size
+    assert target.stat().st_mtime_ns == original.st_mtime_ns
+
+    assert cache.invalidate(target) == 1
+    assert cache.get(target).functions[0].qualified_name == "new"
+    assert calls["stable.py"] == 2
+
+
+def test_recursive_invalidation_removes_only_subtree(tmp_path: Path) -> None:
+    inside = tmp_path / "pkg" / "inside.py"
+    nested = tmp_path / "pkg" / "nested" / "other.py"
+    outside = tmp_path / "outside.py"
+    for path in (inside, nested, outside):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"def {path.stem}():\n    pass\n", encoding="utf-8")
+    cache, calls = counting_cache()
+    for path in (inside, nested, outside):
+        cache.get(path)
+
+    assert cache.invalidate(tmp_path / "pkg", recursive=True) == 2
+    assert cache.stats()["entries"] == 1
+    cache.get(outside)
+    cache.get(inside)
+    cache.get(nested)
+    assert calls["outside.py"] == 1
+    assert calls["inside.py"] == 2
+    assert calls["other.py"] == 2
+
+
+def test_invalidation_during_parse_cannot_resurrect_cache_entry(tmp_path: Path) -> None:
+    target = tmp_path / "race.py"
+    target.write_text("def race():\n    return 1\n", encoding="utf-8")
+    started = threading.Event()
+    release = threading.Event()
+
+    def loader(path: Path) -> PythonFileMetadata:
+        started.set()
+        assert release.wait(5)
+        return build_python_metadata(path)
+
+    cache = PythonMetadataCache(max_files=8, max_bytes=1024 * 1024, loader=loader)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(cache.get, target)
+        assert started.wait(5)
+        cache.invalidate(target)
+        release.set()
+        assert future.result(timeout=5).functions[0].qualified_name == "race"
+
+    assert cache.stats()["entries"] == 0
