@@ -8,12 +8,12 @@ import os
 import re
 import tokenize
 from collections import Counter
-from collections.abc import Iterator
 from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from core.errors import ToolError
+from tools.project.index import PYTHON_METADATA_CACHE, PythonFileMetadata
 
 EXCLUDED_DIRS = {
     ".git",
@@ -104,26 +104,20 @@ def iter_python_files(root: Path, max_files: int) -> tuple[list[Path], bool]:
     return python_files, truncated
 
 
+def python_metadata(path: Path) -> PythonFileMetadata:
+    """Return compact version-aware Python metadata from the bounded cache."""
+
+    return PYTHON_METADATA_CACHE.get(path)
+
+
 def parse_python(path: Path) -> ast.Module:
+    """Parse one Python file without caching for raw parser benchmarks."""
+
     try:
         with tokenize.open(path) as handle:
             return ast.parse(handle.read(), filename=str(path))
     except (SyntaxError, UnicodeError, OSError) as exc:
         raise ToolError("python_parse_error", f"Cannot parse {path}: {exc}") from exc
-
-
-SymbolNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
-
-
-def walk_qualified(tree: ast.Module) -> Iterator[tuple[str, SymbolNode]]:
-    def visit(body: list[ast.stmt], prefix: str = "") -> Iterator[tuple[str, SymbolNode]]:
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                qualified = f"{prefix}.{node.name}" if prefix else node.name
-                yield qualified, node
-                yield from visit(node.body, qualified)
-
-    yield from visit(tree.body)
 
 
 def _dependency_name(value: str) -> str:
