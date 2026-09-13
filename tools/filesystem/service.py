@@ -14,6 +14,8 @@ import shutil
 import stat
 import tempfile
 import textwrap
+from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -518,9 +520,30 @@ def directory_listing(
     return {"ok": True, "path": str(path), "scan_truncated": scan_truncated, **result}
 
 
-def _walk_files(root: Path, include_hidden: bool, max_scan_files: int, exclude_common: bool) -> tuple[list[Path], bool]:
-    found: list[Path] = []
-    truncated = False
+@dataclass(slots=True)
+class _WalkProgress:
+    scanned_files: int = 0
+    truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingNameSearchPage:
+    items: tuple[Path, ...]
+    has_more: bool
+    continuation_available: bool
+    scan_truncated: bool
+    scanned_files: int
+
+
+def _iter_files(
+    root: Path,
+    include_hidden: bool,
+    max_scan_files: int,
+    exclude_common: bool,
+    progress: _WalkProgress,
+) -> Iterator[Path]:
+    """Yield files incrementally while preserving the existing scan-limit semantics."""
+
     for current, directories, files in os.walk(root):
         directories[:] = [
             name
@@ -530,11 +553,39 @@ def _walk_files(root: Path, include_hidden: bool, max_scan_files: int, exclude_c
         for name in files:
             if not include_hidden and name.startswith("."):
                 continue
-            found.append(Path(current) / name)
-            if len(found) >= max_scan_files:
-                truncated = True
-                return found, truncated
-    return found, truncated
+            progress.scanned_files += 1
+            if progress.scanned_files >= max_scan_files:
+                progress.truncated = True
+            yield Path(current) / name
+            if progress.truncated:
+                return
+
+
+def _walk_files(root: Path, include_hidden: bool, max_scan_files: int, exclude_common: bool) -> tuple[list[Path], bool]:
+    progress = _WalkProgress()
+    found = list(_iter_files(root, include_hidden, max_scan_files, exclude_common, progress))
+    return found, progress.truncated
+
+
+def _name_matcher(query: str, *, regex: bool, case_sensitive: bool) -> tuple[re.Pattern[str] | None, str]:
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return (re.compile(query, flags) if regex else None, query if case_sensitive else query.casefold())
+
+
+def _name_matches(
+    path: Path,
+    root: Path,
+    *,
+    compiled: re.Pattern[str] | None,
+    needle: str,
+    case_sensitive: bool,
+    glob: str | None,
+) -> bool:
+    relative = str(path.relative_to(root))
+    if glob and not fnmatch.fnmatch(relative, glob):
+        return False
+    candidate = relative if case_sensitive else relative.casefold()
+    return bool(compiled.search(relative)) if compiled else needle in candidate
 
 
 def search_by_name(
@@ -548,19 +599,70 @@ def search_by_name(
     max_scan_files: int,
     exclude_common: bool,
 ) -> tuple[list[Path], bool]:
-    files, scan_truncated = _walk_files(root, include_hidden, max_scan_files, exclude_common)
-    flags = 0 if case_sensitive else re.IGNORECASE
-    compiled = re.compile(query, flags) if regex else None
-    needle = query if case_sensitive else query.casefold()
-    matches = []
-    for path in files:
-        relative = str(path.relative_to(root))
-        if glob and not fnmatch.fnmatch(relative, glob):
-            continue
-        candidate = relative if case_sensitive else relative.casefold()
-        if compiled.search(relative) if compiled else needle in candidate:
+    """Run an exact-count name search without materializing every scanned path."""
+
+    progress = _WalkProgress()
+    compiled, needle = _name_matcher(query, regex=regex, case_sensitive=case_sensitive)
+    matches: list[Path] = []
+    for path in _iter_files(root, include_hidden, max_scan_files, exclude_common, progress):
+        if _name_matches(
+            path,
+            root,
+            compiled=compiled,
+            needle=needle,
+            case_sensitive=case_sensitive,
+            glob=glob,
+        ):
             matches.append(path)
-    return matches, scan_truncated
+    return matches, progress.truncated
+
+
+def search_by_name_streaming(
+    root: Path,
+    query: str,
+    *,
+    regex: bool,
+    case_sensitive: bool,
+    glob: str | None,
+    include_hidden: bool,
+    max_scan_files: int,
+    exclude_common: bool,
+    offset: int,
+    limit: int,
+) -> StreamingNameSearchPage:
+    """Return one traversal-order page and stop after finding one extra match."""
+
+    progress = _WalkProgress()
+    compiled, needle = _name_matcher(query, regex=regex, case_sensitive=case_sensitive)
+    skipped = 0
+    items: list[Path] = []
+    found_extra = False
+    for path in _iter_files(root, include_hidden, max_scan_files, exclude_common, progress):
+        if not _name_matches(
+            path,
+            root,
+            compiled=compiled,
+            needle=needle,
+            case_sensitive=case_sensitive,
+            glob=glob,
+        ):
+            continue
+        if skipped < offset:
+            skipped += 1
+            continue
+        if len(items) < limit:
+            items.append(path)
+            continue
+        found_extra = True
+        break
+    has_more = found_extra or progress.truncated
+    return StreamingNameSearchPage(
+        items=tuple(items),
+        has_more=has_more,
+        continuation_available=found_extra,
+        scan_truncated=progress.truncated,
+        scanned_files=progress.scanned_files,
+    )
 
 
 def search_by_content(
