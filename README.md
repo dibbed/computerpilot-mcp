@@ -8,8 +8,9 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 - **Robust Filesystem Tools**: Atomic file creation, writing, copying, moving, and deletion; paginated listing and regex file search; complete reads with streaming byte cursors.
 - **Precision Code Editing**: Exact match, anchored replacements, and AST function/class body substitutions with syntax validation and rollback on syntax error.
-- **Process & Command Execution**: Synchronous and background execution for PowerShell, CMD, and native Windows executables with streaming spooling (1 MiB RAM limit rolling over to temp disk).
-- **Durable Job Store**: SQLite-backed background job queue (`.agent_state/jobs.sqlite3`) with idempotency keys, progress tracking, and survivor workers surviving supervisor restarts.
+- **Process & Command Execution**: Synchronous and background execution for PowerShell, CMD, and native Windows executables with streaming spooling (1 MiB RAM limit rolling over to temp disk), bounded auto-delivery, byte cursors, and reusable finalized artifacts.
+- **Durable Job Store**: SQLite-backed background job queue (`.agent_state/jobs.sqlite3`) with idempotency keys, progress tracking, survivor workers across supervisor restarts, constant-query list/status paths, and one persistent SQLite connection per running worker.
+- **Concurrency Hardening**: Keyed resource locks protect filesystem read-modify-write operations and project-memory updates; browser navigation is serialized only within the same session rather than across unrelated sessions.
 - **System Diagnostics**: Live inspection of CPU, memory, disks, environment variables, installed applications, and Windows services.
 - **Codebase Intelligence**: Fast Python AST parsing for classes, functions, imports, and project summaries.
 - **Validation Suite**: Compact summaries from integrated `pytest`, `Ruff`, and `mypy` tools.
@@ -116,7 +117,7 @@ $env:MCP_TUNNEL_PROFILE = "<your-profile>"
 
 ### Bounded Output Delivery
 
-Command tools preserve the legacy full-inline default unless the controlled migration flag is enabled. To make large command responses bounded by default:
+Command and captured-output tools preserve the legacy full-inline default unless the controlled migration flag is enabled. The flag applies to `run_process`, `run_powershell`, `run_cmd`, `process_output`, and `job_output`. To make large responses bounded by default:
 
 ```powershell
 $env:MCP_OUTPUT_DEFAULT = 'auto'
@@ -132,7 +133,22 @@ MCP_INLINE_HARD_LIMIT_BYTES   # unset by default; safety ceiling for explicit in
 MCP_PREVIEW_BYTES             # default: 262144 (256 KiB), internally capped at 1 MiB
 ```
 
-The artifact descriptor includes a stable path/SHA-256 for finalized snapshots, and repeated final file delivery reuses the existing descriptor instead of copying and hashing the same output again.
+The artifact descriptor includes a stable path/SHA-256 for finalized snapshots, and repeated final file delivery reuses the existing descriptor instead of copying and hashing the same output again. Finalized artifact cache keys use canonical Windows path identity so case/path aliases do not create duplicate snapshots.
+
+### Core Performance and Concurrency Hardening
+
+The `0.0.13` release established the Core Performance baseline. The current development head keeps that design and adds the hardening below:
+
+- Filesystem read-modify-write tools hold keyed, canonical-path resource locks for the full mutation transaction. Multi-path operations acquire keys in stable order to avoid lock-order deadlocks while unrelated files remain concurrent.
+- Project-memory updates use the same process-local keyed locking model, preventing same-runtime lost updates while preserving atomic file replacement.
+- Browser operations use per-session locks. A slow navigation in one session does not serialize unrelated browser sessions.
+- Durable job tools reuse one `JobStore` for the MCP server lifetime. Status/list queries fetch only the columns they need, avoid N+1 reads, and do not materialize private command specs or fingerprints.
+- Each durable worker skips redundant schema initialization and owns one SQLite connection for its runtime polling/update loop.
+- Control-panel process/job/storage aggregation uses short TTLs plus single-flight refreshes so concurrent `/api/status` requests do not repeat the same expensive work.
+- Normal startup uses a successful-validation fingerprint and keeps the full Doctor separate; unchanged startup avoids repeated dependency/MCP smoke validation.
+- Pytest temporary/cache state is kept under ignored `.agent_state/`, avoiding Windows `%TEMP%` symlink cleanup failures and repository-root cache permission noise.
+
+These locks and caches are process-local coordination mechanisms. External editors/processes remain outside that locking boundary, so stale-write-sensitive file replacement should still use `expected_sha256` where appropriate.
 
 ---
 
