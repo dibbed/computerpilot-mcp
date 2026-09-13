@@ -70,6 +70,19 @@ def test_deleted_cached_artifact_is_recreated(tmp_path: Path) -> None:
     assert Path(second["path"]).read_bytes() == b"payload"
 
 
+def test_finalized_cache_uses_canonical_source_identity(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    first = artifacts.deliver_file(source, delivery="file", final=True)
+    alias = source.parent / "." / source.name
+    second = artifacts.deliver_file(alias, delivery="file", final=True)
+    assert second["path"] == first["path"]
+    if artifacts.os.name == "nt":
+        case_alias = Path(str(source).upper())
+        third = artifacts.deliver_file(case_alias, delivery="file", final=True)
+        assert third["path"] == first["path"]
+
+
 def test_short_source_cleans_failed_artifact(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         artifacts.deliver_stream(io.BytesIO(b"a"), encoding="utf-8", total=10, delivery="file")

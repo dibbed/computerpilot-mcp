@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
 from core.config import SETTINGS
-from core.resource_locks import RESOURCE_LOCKS
+from core.resource_locks import RESOURCE_LOCKS, canonical_path
 from core.timings import timing_span
 
 Delivery = Literal["inline", "file", "auto"]
@@ -246,7 +246,7 @@ def deliver_file(
         with path.open("rb") as source:
             stat = os.fstat(source.fileno())
             key = (
-                str(path.resolve()),
+                canonical_path(path),
                 stat.st_size,
                 stat.st_mtime_ns,
                 stat.st_ctime_ns,
