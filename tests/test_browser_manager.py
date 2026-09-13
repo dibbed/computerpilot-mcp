@@ -34,11 +34,12 @@ def test_sessions_overlap_and_same_session_waits() -> None:
     asyncio.run(run())
 
 
-def test_open_independent_navigation_and_partial_failure_cleanup() -> None:
+def test_same_config_shares_browser_with_isolated_contexts() -> None:
     async def run() -> None:
         manager = BrowserManager()
         count = 0
         both = asyncio.Event()
+        contexts: list[SimpleNamespace] = []
 
         async def goto(*args: object, **kwargs: object) -> None:
             nonlocal count
@@ -47,31 +48,99 @@ def test_open_independent_navigation_and_partial_failure_cleanup() -> None:
                 both.set()
             await asyncio.wait_for(both.wait(), 2)
 
-        def browser() -> SimpleNamespace:
-            page = SimpleNamespace(set_default_timeout=lambda n: None, goto=goto, title=AsyncMock(return_value="title"), url="about:blank")
-            context = SimpleNamespace(new_page=AsyncMock(return_value=page))
-            return SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+        def make_context() -> SimpleNamespace:
+            page = SimpleNamespace(
+                set_default_timeout=lambda n: None,
+                goto=goto,
+                title=AsyncMock(return_value="title"),
+                url="about:blank",
+            )
+            context = SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock())
+            contexts.append(context)
+            return context
 
-        runtime = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(side_effect=lambda **k: browser())))
-        manager._playwright = runtime
+        browser = SimpleNamespace(new_context=AsyncMock(side_effect=make_context), close=AsyncMock())
+        launch = AsyncMock(return_value=browser)
+        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+
         result = await asyncio.gather(
             manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load"),
             manager.open("b", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load"),
         )
+
         assert len(result) == 2
-        failed = SimpleNamespace(new_context=AsyncMock(side_effect=RuntimeError("context failed")), close=AsyncMock())
-        runtime.chromium.launch = AsyncMock(return_value=failed)
-        with pytest.raises(RuntimeError, match="context failed"):
-            await manager.open(
-                "failed",
-                "about:blank",
-                browser_name="chromium",
-                headless=True,
-                timeout_ms=1000,
-                wait_until="load",
+        launch.assert_awaited_once_with(headless=True)
+        assert browser.new_context.await_count == 2
+        assert len(contexts) == 2
+        assert manager._sessions["a"].context is not manager._sessions["b"].context
+        assert len(manager._pools) == 1
+        pool = next(iter(manager._pools.values()))
+        assert pool.browser is browser
+        assert pool.active_contexts == 2
+
+        assert (await manager.close("a"))["closed"] is True
+        contexts[0].close.assert_awaited_once()
+        browser.close.assert_not_awaited()
+        assert pool.active_contexts == 1
+        assert "b" in manager._sessions
+
+    asyncio.run(run())
+
+
+def test_different_launch_configs_use_separate_pools() -> None:
+    async def run() -> None:
+        manager = BrowserManager()
+
+        def make_browser() -> SimpleNamespace:
+            page = SimpleNamespace(
+                set_default_timeout=lambda n: None,
+                goto=AsyncMock(return_value=None),
+                title=AsyncMock(return_value="title"),
+                url="about:blank",
             )
-        failed.close.assert_awaited_once()
+            context = SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock())
+            return SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+
+        browsers = [make_browser(), make_browser()]
+        launch = AsyncMock(side_effect=browsers)
+        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+
+        await manager.open("headless", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        await manager.open("headed", "about:blank", browser_name="chromium", headless=False, timeout_ms=1000, wait_until="load")
+
+        assert launch.await_count == 2
+        assert len(manager._pools) == 2
+        assert {key.headless for key in manager._pools} == {True, False}
+
+    asyncio.run(run())
+
+
+def test_context_creation_failure_does_not_kill_shared_pool() -> None:
+    async def run() -> None:
+        manager = BrowserManager()
+        page = SimpleNamespace(
+            set_default_timeout=lambda n: None,
+            goto=AsyncMock(return_value=None),
+            title=AsyncMock(return_value="title"),
+            url="about:blank",
+        )
+        first_context = SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock())
+        browser = SimpleNamespace(
+            new_context=AsyncMock(side_effect=[first_context, RuntimeError("context failed")]),
+            close=AsyncMock(),
+        )
+        launch = AsyncMock(return_value=browser)
+        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+
+        await manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        with pytest.raises(RuntimeError, match="context failed"):
+            await manager.open("failed", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+
+        launch.assert_awaited_once()
+        browser.close.assert_not_awaited()
+        assert "a" in manager._sessions
         assert "failed" not in manager._sessions
+        assert next(iter(manager._pools.values())).active_contexts == 1
         assert not manager._session_locks
 
     asyncio.run(run())
@@ -97,17 +166,22 @@ def test_runtime_initialization_singleflight(monkeypatch: pytest.MonkeyPatch) ->
     asyncio.run(run())
 
 
-def test_new_session_navigation_failure_closes_browser() -> None:
+def test_new_session_navigation_failure_closes_context_not_pool() -> None:
     async def run() -> None:
         manager = BrowserManager()
         page = SimpleNamespace(set_default_timeout=lambda n: None, goto=AsyncMock(side_effect=RuntimeError("navigation failed")))
-        context = SimpleNamespace(new_page=AsyncMock(return_value=page))
+        context = SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock())
         browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
         manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)))
+
         with pytest.raises(RuntimeError, match="navigation failed"):
             await manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
-        browser.close.assert_awaited_once()
+
+        context.close.assert_awaited_once()
+        browser.close.assert_not_awaited()
         assert not manager._sessions
+        assert len(manager._pools) == 1
+        assert next(iter(manager._pools.values())).active_contexts == 0
         assert not manager._session_locks
 
     asyncio.run(run())
