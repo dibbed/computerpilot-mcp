@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -13,10 +12,13 @@ from core.config import resolve_path
 from core.response import page
 from core.tooling import READ_ONLY, PathArg, compact_errors
 from tools.project import service
+from tools.project.index import ClassMetadata, FunctionMetadata
 
 
 def _matches(candidate: str, query: str, mode: Literal["exact", "contains"]) -> bool:
-    return candidate == query or candidate.rsplit(".", 1)[-1] == query if mode == "exact" else query.casefold() in candidate.casefold()
+    if mode == "exact":
+        return candidate == query or candidate.rsplit(".", 1)[-1] == query
+    return query.casefold() in candidate.casefold()
 
 
 def _scan_symbols(
@@ -37,35 +39,33 @@ def _scan_symbols(
     base = root if root.is_dir() else root.parent
     for path in files:
         try:
-            tree = service.parse_python(path)
+            metadata = service.python_metadata(path)
         except Exception as exc:
             if len(errors) < 10:
                 errors.append({"file": str(path), "error": str(exc)})
             continue
-        for qualified, node in service.walk_qualified(tree):
-            if kind == "class" and not isinstance(node, ast.ClassDef):
-                continue
-            if kind == "function" and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if not _matches(qualified, name, match):
+        if metadata.parse_error is not None:
+            if len(errors) < 10:
+                errors.append({"file": str(path), "error": metadata.parse_error})
+            continue
+        symbols = metadata.classes if kind == "class" else metadata.functions
+        for symbol in symbols:
+            if not _matches(symbol.qualified_name, name, match):
                 continue
             if offset <= total < offset + limit:
                 relative = path.relative_to(base).as_posix() if path.is_relative_to(base) else str(path)
                 row: dict[str, Any] = {
                     "file": relative,
-                    "qualified_name": qualified,
-                    "line": node.lineno,
-                    "end_line": node.end_lineno,
+                    "qualified_name": symbol.qualified_name,
+                    "line": symbol.line,
+                    "end_line": symbol.end_line,
                 }
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    row["async"] = isinstance(node, ast.AsyncFunctionDef)
-                    try:
-                        row["signature"] = f"({ast.unparse(node.args)})"
-                    except Exception:
-                        row["signature"] = None
-                elif isinstance(node, ast.ClassDef):
-                    row["bases"] = [ast.unparse(base_node) for base_node in node.bases[:10]]
-                    row["method_count"] = sum(isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) for child in node.body)
+                if isinstance(symbol, FunctionMetadata):
+                    row["async"] = symbol.is_async
+                    row["signature"] = symbol.signature
+                elif isinstance(symbol, ClassMetadata):
+                    row["bases"] = list(symbol.bases)
+                    row["method_count"] = symbol.method_count
                 results.append(row)
             total += 1
     return results, total, errors, truncated
@@ -155,29 +155,30 @@ def register(mcp: MCPServer) -> None:
         total = 0
         for file_path in files:
             try:
-                tree = service.parse_python(file_path)
+                metadata = service.python_metadata(file_path)
             except Exception as exc:
                 if len(errors) < 10:
                     errors.append({"file": str(file_path), "error": str(exc)})
                 continue
+            if metadata.parse_error is not None:
+                if len(errors) < 10:
+                    errors.append({"file": str(file_path), "error": metadata.parse_error})
+                continue
             relative = file_path.relative_to(base).as_posix() if file_path.is_relative_to(base) else str(file_path)
-            import_nodes = [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
-            for node in sorted(import_nodes, key=lambda item: item.lineno):
-                if isinstance(node, ast.Import):
-                    modules = [alias.name for alias in node.names]
-                    source = None
-                    level = 0
-                elif isinstance(node, ast.ImportFrom):
-                    source = node.module
-                    modules = [alias.name for alias in node.names]
-                    level = node.level
-                else:
-                    continue
-                searchable = f"{source or ''} {' '.join(modules)}".casefold()
+            for item in metadata.imports:
+                searchable = f"{item.source or ''} {' '.join(item.names)}".casefold()
                 if needle and needle not in searchable:
                     continue
                 if offset <= total < offset + max_results:
-                    rows.append({"file": relative, "line": node.lineno, "from": source, "names": modules, "level": level})
+                    rows.append(
+                        {
+                            "file": relative,
+                            "line": item.line,
+                            "from": item.source,
+                            "names": list(item.names),
+                            "level": item.level,
+                        }
+                    )
                 total += 1
         result = page(rows, total=total, offset=offset, limit=max_results)
         result["truncated"] = bool(result["truncated"] or truncated)
@@ -205,25 +206,28 @@ def register(mcp: MCPServer) -> None:
         parse_errors: list[dict[str, Any]] = []
         for source, file_path in modules.items():
             try:
-                tree = service.parse_python(file_path)
+                metadata = service.python_metadata(file_path)
             except Exception as exc:
                 if len(parse_errors) < 10:
                     parse_errors.append({"file": str(file_path), "error": str(exc)})
                 continue
-            for node in ast.walk(tree):
+            if metadata.parse_error is not None:
+                if len(parse_errors) < 10:
+                    parse_errors.append({"file": str(file_path), "error": metadata.parse_error})
+                continue
+            for item in metadata.imports:
                 targets: list[str] = []
-                if isinstance(node, ast.Import):
-                    targets = [alias.name for alias in node.names]
-                elif isinstance(node, ast.ImportFrom):
+                if item.source is None:
+                    targets = list(item.names)
+                elif item.level:
                     base_parts = source.split(".")[:-1]
-                    if node.level:
-                        keep = max(len(base_parts) - node.level + 1, 0)
-                        prefix = base_parts[:keep]
-                        if node.module:
-                            prefix.extend(node.module.split("."))
-                        targets = [".".join(prefix)] if prefix else []
-                    elif node.module:
-                        targets = [node.module]
+                    keep = max(len(base_parts) - item.level + 1, 0)
+                    prefix = base_parts[:keep]
+                    if item.source:
+                        prefix.extend(item.source.split("."))
+                    targets = [".".join(prefix)] if prefix else []
+                elif item.source:
+                    targets = [item.source]
                 for target in targets:
                     internal_target = next(
                         (
