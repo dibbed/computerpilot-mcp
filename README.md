@@ -137,7 +137,7 @@ The artifact descriptor includes a stable path/SHA-256 for finalized snapshots, 
 
 ### Core Performance and Concurrency Hardening
 
-The `0.0.13` release established the Core Performance baseline. The current development head keeps that design and adds the hardening below:
+The `0.0.13` release established the Core Performance baseline. Version `0.0.14` keeps that design and includes the hardening below:
 
 - Filesystem read-modify-write tools hold keyed, canonical-path resource locks for the full mutation transaction. Multi-path operations acquire keys in stable order to avoid lock-order deadlocks while unrelated files remain concurrent.
 - Project-memory updates use the same process-local keyed locking model, preventing same-runtime lost updates while preserving atomic file replacement.
@@ -149,6 +149,28 @@ The `0.0.13` release established the Core Performance baseline. The current deve
 - Pytest temporary/cache state is kept under ignored `.agent_state/`, avoiding Windows `%TEMP%` symlink cleanup failures and repository-root cache permission noise.
 
 These locks and caches are process-local coordination mechanisms. External editors/processes remain outside that locking boundary, so stale-write-sensitive file replacement should still use `expected_sha256` where appropriate.
+
+### Project Intelligence and Search Pagination
+
+Version `0.0.14` adds bounded reusable project intelligence and an explicit fast/consistent search model:
+
+- Python project tools cache compact per-file metadata instead of retaining full ASTs. Cache identity is the canonical path plus `mtime_ns` and file size, with LRU limits from `MCP_AST_CACHE_MAX_FILES` (default `10000`) and `MCP_AST_CACHE_MAX_BYTES` (default `67108864`).
+- Concurrent requests for the same Python source share one per-path parse. Successful MCP filesystem mutations invalidate affected files/subtrees immediately, while edits made by external programs are still detected through the file-version check on the next read.
+- `find_function`, `find_class`, `find_imports`, and `dependency_graph` reuse this metadata cache. A changed file is reparsed without forcing unrelated cached files to be reparsed.
+- `search_files` keeps `count_mode="exact"` as the backward-compatible default: it performs the bounded full scan, returns a globally path-sorted page, and reports `total_count`.
+- `count_mode="none"` is the fast name-search mode. It returns traversal-order results, leaves `total_count` as `null`, and stops once it has enough matches to answer the requested page plus `has_more`. Content/both searches continue to require exact mode.
+- `snapshot=true` is opt-in consistent pagination. It intentionally completes the bounded search first, writes an immutable JSONL snapshot under ignored `.agent_state\search_snapshots\`, and returns an opaque `cursor`. Cursor pages are read from that fixed snapshot and do not rescan the filesystem, so later file changes do not reorder or replace already-snapshotted results.
+- Cursors are bound to the canonical root and all result-shaping search parameters. They expire instead of silently switching to a fresh search. Snapshot publication is atomic, IDs are random rather than user-supplied paths, and expired/old snapshots are removed under TTL/count/byte quotas.
+
+Snapshot policy controls:
+
+```text
+MCP_SEARCH_SNAPSHOT_TTL_SEC     # default: 180 seconds
+MCP_SEARCH_SNAPSHOT_MAX_BYTES   # default: 134217728 (128 MiB total budget)
+MCP_SEARCH_SNAPSHOT_MAX_COUNT   # default: 32 snapshots
+```
+
+Use streaming mode when lowest first-page latency matters. Use `snapshot=true` when stable multi-page traversal matters more than first-page latency. If a bounded scan itself is truncated, the response reports `scan_truncated=true`; it never invents a cursor beyond results that were actually captured.
 
 ---
 
@@ -289,7 +311,7 @@ The benchmark harness stores reports under ignored local state by default:
 .\.venv\Scripts\python.exe -m scripts.perf_benchmark --profile full --include-jobs --include-browser
 ```
 
-Use repeated runs for comparisons, for example `--runs 5`. Reports contain latency distributions, full process-tree peak RSS and I/O samples, complete wire-style tool catalog bytes, and case-specific details. Startup includes the real `scripts/bootstrap.ps1` validation path as well as cold/warm MCP server construction. Output cases preserve the current default delivery behavior instead of forcing file delivery, and project cases include both raw AST parsing and a real `find_function` tool lookup so later indexing/cache work remains measurable. Search cases enforce expected matches, and benchmark temp directories older than 24 hours are cleaned on a later run. Heavy job/browser cases require explicit opt-in so a normal benchmark cannot accidentally create a large process burst.
+Use repeated runs for comparisons, for example `--runs 5`. Reports contain latency distributions, full process-tree peak RSS and I/O samples, complete wire-style tool catalog bytes, and case-specific details. Startup includes the real `scripts/bootstrap.ps1` validation path as well as cold/warm MCP server construction. Output cases preserve the current default delivery behavior instead of forcing file delivery, and project cases include both raw AST parsing and a real `find_function` tool lookup so metadata-cache work remains measurable. Search cases separately measure exact scans, streaming first-page latency, snapshot creation, and snapshot page-two reads with zero filesystem rescan. Benchmark temp directories older than 24 hours are cleaned on a later run. Heavy job/browser cases require explicit opt-in so a normal benchmark cannot accidentally create a large process burst.
 
 ---
 

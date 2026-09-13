@@ -6,21 +6,33 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+## [0.0.14] - 2026-09-13
+
+### Added
+- Add a bounded, version-aware Python metadata cache keyed by canonical path, `mtime_ns`, and file size, with configurable LRU file/byte budgets.
+- Add per-path parse single-flight so concurrent project-intelligence requests share one stable parse while unrelated files remain concurrent.
+- Invalidate Python metadata after successful MCP file mutations, including recursive move/delete cases, while retaining stat-based detection for external edits.
+- Add `search_files` `count_mode="none"` for traversal-order streaming name-search pages without an exact total count; the backward-compatible default remains `count_mode="exact"`.
+- Add opt-in immutable disk-backed search snapshots with opaque cursors, query fingerprint binding, atomic publication, TTL expiry, and count/byte quotas.
+- Add search benchmark cases for streaming first-page latency, snapshot creation, and zero-rescan snapshot continuation.
+
 ### Changed
-- Tighten durable-job status/list queries so they fetch only reconciliation/public fields instead of materializing command specs and fingerprints.
-- Start durable workers without repeating JobStore schema/WAL initialization; each worker now opens only its single runtime SQLite connection.
-- Apply `MCP_OUTPUT_DEFAULT` to `job_output` as well as terminal/process output tools, while preserving legacy inline behavior when the flag is unset.
-- Canonicalize finalized artifact cache source identities so Windows case/path aliases reuse the same snapshot descriptor.
+- Exact name search now matches while walking instead of first materializing every scanned path, while preserving global path sorting and exact-count semantics over the bounded scan.
+- Raise the default Python metadata file-count budget from 1,024 to 10,000 after large-project benchmarking; the 64 MiB byte cap remains the primary memory safety bound.
+- Durable-job status/list queries fetch only reconciliation/public fields; workers skip redundant store initialization and reuse one runtime SQLite connection.
+- `job_output` follows `MCP_OUTPUT_DEFAULT`, and finalized artifact descriptors use canonical Windows source identities for cache reuse.
 
 ### Fixed
-- Keep pytest temporary and cache state under ignored `.agent_state/` to avoid Windows temp symlink cleanup failures and repository cache permission warnings.
+- Prevent an in-flight Python parse invalidated by a concurrent mutation from returning or republishing stale metadata; retries now coalesce per canonical path until a stable version is observed.
+- Move project-cache invalidation immediately after successful filesystem mutation and invalidate failed `safe_refactor` rollback paths so transient content cannot survive in metadata caches.
+- Keep pytest temporary/cache state under ignored `.agent_state/` to avoid Windows temporary-directory cleanup failures and repository cache permission warnings.
 
 ### Validation
-- 136 pytest tests passed with a clean exit on Windows.
-- Ruff passed with zero violations; mypy passed across 69 source files; compileall passed.
-- The 59-tool MCP health check passed.
-- Full Doctor passed in `local-http` mode and the subsequent fingerprint-only check completed successfully.
-- Quick benchmark suites completed successfully, including durable jobs and the optional Playwright browser run.
+- 178 pytest tests passed on Windows; Ruff passed with zero violations; mypy passed across 74 source files; compileall passed.
+- The 59-tool MCP health check passed; full Doctor passed in `local-http` mode and the subsequent fingerprint-only check succeeded.
+- With the final 10,000-file metadata-cache default, the 10,000-file `find_function` benchmark median was 6,299.379 ms versus 9,196.297 ms with the earlier 1,024-entry budget; 10,000 cached metadata entries occupied about 11.5 MB under the 64 MiB byte cap.
+- At 10,000 search files, median exact name search was 786.797 ms, streaming first-page search was 7.123 ms, snapshot creation was 915.792 ms, and snapshot page two was 0.627 ms with zero filesystem rescan.
+- At 100,000 search files, median exact name search was 7,473.454 ms, streaming first-page search was 9.191 ms, snapshot creation was 8,323.974 ms, and snapshot page two was 0.642 ms with zero filesystem rescan; the snapshot was 17,900,337 bytes under the 128 MiB total snapshot budget.
 
 ## [0.0.13] - 2026-09-12
 

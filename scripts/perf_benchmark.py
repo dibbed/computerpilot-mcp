@@ -26,6 +26,7 @@ from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
 from core.jobs import JobStore, same_process
 from core.registry import create_server
+from tools.filesystem.search_snapshots import SearchSnapshotStore, search_fingerprint
 from tools.filesystem.service import search_by_name, search_by_name_streaming
 from tools.project.service import parse_python
 
@@ -401,6 +402,92 @@ def _search_streaming_fixture(root: Path, count: int, page_size: int = 50) -> di
     }
 
 
+def _search_snapshot_fingerprint(root: Path, count: int) -> str:
+    return search_fingerprint(
+        root,
+        {
+            "query": "fastneedle_",
+            "search_type": "name",
+            "regex": False,
+            "case_sensitive": False,
+            "glob": None,
+            "include_hidden": False,
+            "exclude_common": True,
+            "count_mode": "none",
+            "max_scan_files": count,
+            "timeout_sec": 30.0,
+        },
+    )
+
+
+def _create_search_snapshot(
+    root: Path,
+    count: int,
+    *,
+    page_size: int = 50,
+    namespace: str = "build",
+) -> tuple[SearchSnapshotStore, str, str, int]:
+    matches, truncated = search_by_name(
+        root,
+        "fastneedle_",
+        regex=False,
+        case_sensitive=False,
+        glob=None,
+        include_hidden=False,
+        max_scan_files=count,
+        exclude_common=True,
+    )
+    fingerprint = _search_snapshot_fingerprint(root, count)
+    store = SearchSnapshotStore(
+        root / ".agent_state" / f"benchmark_snapshots_{namespace}",
+        ttl_sec=3_600,
+        max_bytes=SETTINGS.search_snapshot_max_bytes,
+        max_count=max(SETTINGS.search_snapshot_max_count, 16),
+    )
+    items = [{"path": str(path), "matched_in": ["name"]} for path in matches]
+    handle = store.create(
+        items,
+        fingerprint=fingerprint,
+        count_mode="none",
+        result_order="traversal",
+        scan_truncated=truncated,
+        total_count=None,
+    )
+    first = store.first_page(handle, fingerprint=fingerprint, limit=page_size)
+    if len(first.items) != page_size or first.cursor is None:
+        raise RuntimeError("Snapshot benchmark did not produce a continuable first page.")
+    return store, first.cursor, fingerprint, handle.bytes
+
+
+def _search_snapshot_build_fixture(root: Path, count: int, page_size: int = 50) -> dict[str, Any]:
+    store, cursor, fingerprint, snapshot_bytes = _create_search_snapshot(root, count, page_size=page_size, namespace="build")
+    page = store.read_page(cursor, fingerprint=fingerprint, limit=page_size)
+    return {
+        "files": count,
+        "page_size": page_size,
+        "snapshot_bytes": snapshot_bytes,
+        "page_two_items": len(page.items),
+        "scanned_files_page_two": 0,
+    }
+
+
+def _search_snapshot_page_fixture(
+    store: SearchSnapshotStore,
+    cursor: str,
+    fingerprint: str,
+    page_size: int = 50,
+) -> dict[str, Any]:
+    page = store.read_page(cursor, fingerprint=fingerprint, limit=page_size)
+    if len(page.items) != page_size:
+        raise RuntimeError(f"Snapshot continuation expected {page_size} items, got {len(page.items)}.")
+    return {
+        "page_size": page_size,
+        "matches_returned": len(page.items),
+        "scanned_files": 0,
+        "has_more": page.has_more,
+    }
+
+
 def _job_batch_once(store: JobStore, count: int, run_key: int) -> dict[str, Any]:
     job_ids: list[str] = []
     for index in range(count):
@@ -553,6 +640,25 @@ def run_benchmarks(
                     measure(
                         f"name_search_streaming_first_page_{count}_files",
                         partial(_search_streaming_fixture, root, count),
+                        runs,
+                    )
+                )
+                results.append(
+                    measure(
+                        f"name_search_snapshot_build_{count}_files",
+                        partial(_search_snapshot_build_fixture, root, count),
+                        runs,
+                    )
+                )
+                snapshot_store, snapshot_cursor, snapshot_fingerprint, _ = _create_search_snapshot(
+                    root,
+                    count,
+                    namespace=f"page2-{count}",
+                )
+                results.append(
+                    measure(
+                        f"name_search_snapshot_page2_{count}_files",
+                        partial(_search_snapshot_page_fixture, snapshot_store, snapshot_cursor, snapshot_fingerprint),
                         runs,
                     )
                 )
