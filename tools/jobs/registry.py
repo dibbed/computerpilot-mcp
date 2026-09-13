@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 from mcp.server import MCPServer
 from pydantic import Field
 
+from core.artifacts import default_delivery
 from core.audit import audit_action
 from core.config import resolve_path
 from core.jobs import JobStore
@@ -17,6 +18,7 @@ JobId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
 
 def register(mcp: MCPServer) -> None:
     store = JobStore()
+    output_default = default_delivery()
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("submit_job")
@@ -52,7 +54,7 @@ def register(mcp: MCPServer) -> None:
     @compact_errors("job_output")
     def job_output(job_id: JobId, since_byte: Annotated[int, Field(ge=0)] = 0,
                    stderr_since_byte: Annotated[int, Field(ge=0)] = 0,
-                   delivery: Literal["inline", "file", "auto"] = "inline") -> dict[str, Any]:
+                   delivery: Literal["inline", "file", "auto"] = output_default) -> dict[str, Any]:
         """Read full or incremental durable output; file/auto returns a snapshot path and SHA-256."""
         return store.output(job_id, since_byte, stderr_since_byte, delivery)
 
