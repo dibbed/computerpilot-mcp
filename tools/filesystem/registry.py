@@ -134,8 +134,8 @@ def register(mcp: MCPServer) -> None:
                 backup=backup,
                 validate_python=validate_python,
             )
-            audit_action("write_file", target=target, outcome="succeeded", details={"changed": result["changed"]})
             _invalidate_if_changed(target, result)
+            audit_action("write_file", target=target, outcome="succeeded", details={"changed": result["changed"]})
             return result
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
@@ -162,8 +162,8 @@ def register(mcp: MCPServer) -> None:
                 validate_python=validate_python,
                 exclusive_create=True,
             )
-            audit_action("create_file", target=target, outcome="succeeded")
             _invalidate_if_changed(target, result)
+            audit_action("create_file", target=target, outcome="succeeded")
             return result
 
     @mcp.tool(annotations=DESTRUCTIVE, structured_output=True)
@@ -190,8 +190,8 @@ def register(mcp: MCPServer) -> None:
                     shutil.rmtree(target)
             else:
                 target.unlink()
-            audit_action("delete_file", target=target, outcome="succeeded", details={"type": target_type})
             PYTHON_METADATA_CACHE.invalidate(target, recursive=target_type == "directory")
+            audit_action("delete_file", target=target, outcome="succeeded", details={"type": target_type})
             return ok(path=str(target), deleted=True, type=target_type, bytes_removed=size, recoverable=False)
 
     @mcp.tool(annotations=DESTRUCTIVE, structured_output=True)
@@ -225,10 +225,10 @@ def register(mcp: MCPServer) -> None:
                 raise FileNotFoundError(f"Destination parent not found: {dst.parent}")
             audit_action("move_file", target=src, details={"destination": str(dst), "overwrite": overwrite})
             shutil.move(str(src), str(dst))
-            audit_action("move_file", target=src, outcome="succeeded", details={"destination": str(dst)})
             recursive_invalidation = src_is_dir or dst_was_dir
             PYTHON_METADATA_CACHE.invalidate(src, recursive=recursive_invalidation)
             PYTHON_METADATA_CACHE.invalidate(dst, recursive=recursive_invalidation)
+            audit_action("move_file", target=src, outcome="succeeded", details={"destination": str(dst)})
             return ok(source=str(src), destination=str(dst), moved=True)
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
@@ -256,8 +256,8 @@ def register(mcp: MCPServer) -> None:
                 raise FileNotFoundError(f"Destination parent not found: {dst.parent}")
             audit_action("copy_file", target=src, details={"destination": str(dst), "overwrite": overwrite})
             (shutil.copy2 if preserve_metadata else shutil.copyfile)(src, dst)
-            audit_action("copy_file", target=src, outcome="succeeded", details={"destination": str(dst)})
             PYTHON_METADATA_CACHE.invalidate(dst)
+            audit_action("copy_file", target=src, outcome="succeeded", details={"destination": str(dst)})
             return ok(source=str(src), destination=str(dst), copied=True, bytes=dst.stat().st_size, sha256=_hash_file(dst))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
@@ -396,9 +396,9 @@ def register(mcp: MCPServer) -> None:
             after, count = service.exact_replace(before, old, new, expected_count)
             audit_action("replace_exact", target=target, details={"expected_count": expected_count})
             result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=validate_python)
+            _invalidate_if_changed(target, result)
             result["replacements"] = count
             audit_action("replace_exact", target=target, outcome="succeeded", details={"replacements": count})
-            _invalidate_if_changed(target, result)
             return result
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
@@ -419,8 +419,8 @@ def register(mcp: MCPServer) -> None:
             after = service.anchor_replace(before, start_marker, end_marker, replacement, include_markers)
             audit_action("replace_between_anchors", target=target, details={"include_markers": include_markers})
             result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=validate_python)
-            audit_action("replace_between_anchors", target=target, outcome="succeeded")
             _invalidate_if_changed(target, result)
+            audit_action("replace_between_anchors", target=target, outcome="succeeded")
             return result
 
     def replace_python_body(
@@ -437,9 +437,9 @@ def register(mcp: MCPServer) -> None:
             after = service.replace_symbol_body(before, qualified_name, new_body, kind)
             audit_action(f"replace_{kind}", target=target, details={"symbol": qualified_name})
             result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=True)
+            _invalidate_if_changed(target, result)
             result["symbol"] = qualified_name
             audit_action(f"replace_{kind}", target=target, outcome="succeeded", details={"symbol": qualified_name})
-            _invalidate_if_changed(target, result)
             return result
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
@@ -491,14 +491,21 @@ def register(mcp: MCPServer) -> None:
                     }
                 )
             audit_action("safe_refactor", target=target, details=details)
-            result = service.apply_safe_refactor(
-                path,
-                edits,
-                encoding=encoding,
-                validation_command=validation_command,
-                validation_cwd=validation_cwd,
-                timeout_sec=timeout_sec,
-            )
-            audit_action("safe_refactor", target=target, outcome="succeeded", details={"edit_count": len(edits)})
+            try:
+                result = service.apply_safe_refactor(
+                    path,
+                    edits,
+                    encoding=encoding,
+                    validation_command=validation_command,
+                    validation_cwd=validation_cwd,
+                    timeout_sec=timeout_sec,
+                )
+            except Exception:
+                # Validation failure can write and then roll back before raising.
+                # Invalidate even on failure so no concurrent parse of the transient
+                # content survives after the rollback.
+                PYTHON_METADATA_CACHE.invalidate(target)
+                raise
             _invalidate_if_changed(target, result)
+            audit_action("safe_refactor", target=target, outcome="succeeded", details={"edit_count": len(edits)})
             return result

@@ -1,3 +1,4 @@
+import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -145,3 +146,29 @@ def test_directory_move_and_delete_use_recursive_invalidation(
     capture.clear()
     server.functions["delete_file"](str(destination), recursive=True)
     assert capture.calls == [(destination, True)]
+
+
+def test_failed_safe_refactor_invalidates_after_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = InvalidationCapture()
+    monkeypatch.setattr(registry, "PYTHON_METADATA_CACHE", capture)
+    monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+    server = ToolCapture()
+    registry.register(cast(Any, server))
+    target = tmp_path / "module.py"
+    original = "VALUE = 1\n"
+    target.write_text(original, encoding="utf-8")
+
+    result = server.functions["safe_refactor"](
+        str(target),
+        [registry.RefactorEdit(mode="exact", old="1", new="2")],
+        validation_command=[sys.executable, "-c", "raise SystemExit(7)"],
+        validation_cwd=str(tmp_path),
+        timeout_sec=10,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "validation_failed_rolled_back"
+    assert target.read_text(encoding="utf-8") == original
+    assert capture.calls == [(target, False)]
