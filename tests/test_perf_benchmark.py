@@ -143,7 +143,7 @@ def test_project_lookup_benchmark_exercises_real_tool(tmp_path: Path) -> None:
     assert result["total_count"] == 1
 
 
-def test_search_benchmark_reports_exact_and_streaming_first_page() -> None:
+def test_search_benchmark_reports_exact_streaming_and_snapshot_pagination() -> None:
     report = run_benchmarks(
         profile="quick",
         runs=1,
@@ -154,6 +154,8 @@ def test_search_benchmark_reports_exact_and_streaming_first_page() -> None:
     results = {item["name"]: item for item in report["results"]}
     exact = results["name_search_1000_files"]
     streaming = results["name_search_streaming_first_page_1000_files"]
+    snapshot_build = results["name_search_snapshot_build_1000_files"]
+    snapshot_page2 = results["name_search_snapshot_page2_1000_files"]
 
     assert exact["status"] == "ok"
     assert exact["details"]["matches"] == 1
@@ -161,6 +163,12 @@ def test_search_benchmark_reports_exact_and_streaming_first_page() -> None:
     assert streaming["details"]["matches_returned"] == 50
     assert streaming["details"]["has_more"] is True
     assert streaming["details"]["scanned_files"] == 51
+    assert snapshot_build["status"] == "ok"
+    assert snapshot_build["details"]["page_two_items"] == 50
+    assert snapshot_build["details"]["snapshot_bytes"] > 0
+    assert snapshot_page2["status"] == "ok"
+    assert snapshot_page2["details"]["matches_returned"] == 50
+    assert snapshot_page2["details"]["scanned_files"] == 0
 
 
 def test_stale_benchmark_temp_cleanup_is_age_bounded(tmp_path: Path) -> None:
