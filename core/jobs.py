@@ -21,6 +21,11 @@ from core.artifacts import Delivery, deliver_file
 from core.config import PROJECT_ROOT, SETTINGS
 from core.errors import ToolError
 
+JOB_STATUS_COLUMNS = (
+    "id,status,created,updated,worker_pid,worker_created,pid,pid_created,"
+    "exit_code,cancel_requested,error"
+)
+
 
 def same_process(pid: int | None, created: float | None) -> bool:
     if not pid or created is None:
@@ -33,19 +38,20 @@ def same_process(pid: int | None, created: float | None) -> bool:
 
 
 class JobStore:
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, *, initialize: bool = True) -> None:
         self.path = path or SETTINGS.state_dir / "jobs.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.output_dir = self.path.parent / "jobs"
         self.output_dir.mkdir(exist_ok=True)
-        with closing(self.connect()) as db, db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("""CREATE TABLE IF NOT EXISTS jobs (
-                id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL, fingerprint TEXT NOT NULL,
-                spec TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
-                worker_pid INTEGER, worker_created REAL, pid INTEGER, pid_created REAL,
-                exit_code INTEGER, cancel_requested INTEGER NOT NULL DEFAULT 0, error TEXT
-            )""")
+        if initialize:
+            with closing(self.connect()) as db, db:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("""CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL, fingerprint TEXT NOT NULL,
+                    spec TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+                    worker_pid INTEGER, worker_created REAL, pid INTEGER, pid_created REAL,
+                    exit_code INTEGER, cancel_requested INTEGER NOT NULL DEFAULT 0, error TEXT
+                )""")
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10)
@@ -106,6 +112,13 @@ class JobStore:
             raise ToolError("job_not_found", "Unknown job_id.")
         return dict(row)
 
+    def _status_raw(self, job_id: str) -> dict[str, Any]:
+        with closing(self.connect()) as db:
+            row = db.execute(f"SELECT {JOB_STATUS_COLUMNS} FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise ToolError("job_not_found", "Unknown job_id.")
+        return dict(row)
+
     def _reconcile(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Check active processes outside the DB lock, then reconcile in one transaction."""
         now = time.time()
@@ -127,7 +140,7 @@ class JobStore:
                     batch = ids[start:start + 500]
                     placeholders = ",".join("?" for _ in batch)
                     refreshed.update({row["id"]: dict(row) for row in db.execute(
-                        f"SELECT * FROM jobs WHERE id IN ({placeholders})", batch,
+                        f"SELECT {JOB_STATUS_COLUMNS} FROM jobs WHERE id IN ({placeholders})", batch,
                     )})
             return [refreshed.get(row["id"], row) for row in rows]
         return rows
@@ -138,13 +151,13 @@ class JobStore:
                 ("status", "created", "updated", "pid", "exit_code", "cancel_requested", "error")}}
 
     def get(self, job_id: str) -> dict[str, Any]:
-        return self._public(self._reconcile([self.raw(job_id)])[0])
+        return self._public(self._reconcile([self._status_raw(job_id)])[0])
 
     def list(self, offset: int, limit: int) -> dict[str, Any]:
         with closing(self.connect()) as db:
             total = db.execute("SELECT count(*) FROM jobs").fetchone()[0]
             rows = [dict(row) for row in db.execute(
-                "SELECT * FROM jobs ORDER BY created DESC, id DESC LIMIT ? OFFSET ?", (limit, offset),
+                f"SELECT {JOB_STATUS_COLUMNS} FROM jobs ORDER BY created DESC, id DESC LIMIT ? OFFSET ?", (limit, offset),
             )]
         return {"ok": True, "items": [self._public(row) for row in self._reconcile(rows)], "total_count": total,
                 "offset": offset, "truncated": offset + len(rows) < total}
