@@ -106,9 +106,8 @@ class BrowserManager:
             self._pools[key] = pool
             return pool
 
-    async def _create_session(
+    async def _new_session(
         self,
-        session_id: str,
         *,
         browser_name: BrowserName,
         headless: bool,
@@ -127,15 +126,13 @@ class BrowserManager:
             raise
         async with self._pool_lock:
             pool.active_contexts += 1
-        session = Session(
+        return Session(
             pool_key=pool.key,
             context=context,
             page=page,
             browser_name=browser_name,
             headless=headless,
         )
-        self._sessions[session_id] = session
-        return session
 
     async def _close_session_context(self, session: Session) -> None:
         try:
@@ -145,6 +142,24 @@ class BrowserManager:
                 pool = self._pools.get(session.pool_key)
                 if pool is not None and pool.active_contexts > 0:
                     pool.active_contexts -= 1
+
+    @staticmethod
+    def _compatible(session: Session, *, browser_name: BrowserName, headless: bool) -> bool:
+        return session.pool_key == BrowserManager._pool_key(browser_name, headless)
+
+    @staticmethod
+    async def _navigate(session: Session, url: str, *, timeout_ms: int, wait_until: str) -> dict[str, Any]:
+        session.page.set_default_timeout(timeout_ms)
+        response = await session.page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+        return {
+            "ok": True,
+            "url": session.page.url,
+            "url_truncated": False,
+            "title": await session.page.title(),
+            "status": response.status if response else None,
+            "browser": session.browser_name,
+            "headless": session.headless,
+        }
 
     async def open(
         self,
@@ -158,35 +173,23 @@ class BrowserManager:
     ) -> dict[str, Any]:
         async with self.session(session_id):
             existing = self._sessions.get(session_id)
-            created = False
-            if existing is None or existing.browser_name != browser_name or existing.headless != headless:
-                if existing is not None:
-                    self._sessions.pop(session_id, None)
-                    await self._close_session_context(existing)
-                existing = await self._create_session(
-                    session_id,
-                    browser_name=browser_name,
-                    headless=headless,
-                )
-                created = True
+            if existing is not None and self._compatible(existing, browser_name=browser_name, headless=headless):
+                result = await self._navigate(existing, url, timeout_ms=timeout_ms, wait_until=wait_until)
+                return {"session_id": session_id, **result}
+
+            replacement = await self._new_session(browser_name=browser_name, headless=headless)
             try:
-                existing.page.set_default_timeout(timeout_ms)
-                response = await existing.page.goto(url, wait_until=wait_until, timeout=timeout_ms)
-                return {
-                    "ok": True,
-                    "session_id": session_id,
-                    "url": existing.page.url,
-                    "url_truncated": False,
-                    "title": await existing.page.title(),
-                    "status": response.status if response else None,
-                    "browser": browser_name,
-                    "headless": headless,
-                }
+                result = await self._navigate(replacement, url, timeout_ms=timeout_ms, wait_until=wait_until)
             except BaseException:
-                if created:
-                    self._sessions.pop(session_id, None)
-                    await self._close_session_context(existing)
+                await self._close_session_context(replacement)
                 raise
+
+            # Publish only after the replacement has navigated successfully. This keeps
+            # the existing session usable if launch/context/navigation fails.
+            self._sessions[session_id] = replacement
+            if existing is not None:
+                await self._close_session_context(existing)
+            return {"session_id": session_id, **result}
 
     def page(self, session_id: str) -> Any:
         session = self._sessions.get(session_id)
