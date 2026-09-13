@@ -82,7 +82,7 @@ def test_preview_budget_rejects_unsafe_tiny_values(monkeypatch: pytest.MonkeyPat
 def _tool_delivery_defaults() -> dict[str, str | None]:
     async def scenario() -> dict[str, str | None]:
         tools = await create_server().list_tools()
-        wanted = {"run_process", "run_powershell", "run_cmd", "process_output"}
+        wanted = {"run_process", "run_powershell", "run_cmd", "process_output", "job_output"}
         return {
             tool.name: tool.input_schema["properties"]["delivery"].get("default")
             for tool in tools

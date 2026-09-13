@@ -43,7 +43,7 @@ def _update(db: sqlite3.Connection, job_id: str, **values: Any) -> None:
 
 
 def run(path: Path, job_id: str) -> None:
-    store = JobStore(path)
+    store = JobStore(path, initialize=False)
     process: subprocess.Popen[bytes] | None = None
     # The worker owns one SQLite connection for its lifetime. Short transactions
     # keep WAL readers/writers independent while avoiding a connection per poll.

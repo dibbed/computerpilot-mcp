@@ -72,8 +72,8 @@ def test_worker_reuses_one_runtime_connection(tmp_path: Path, monkeypatch: pytes
 
     job_worker.run(path, job_id)
 
-    # One connection initializes JobStore and one remains open for the worker run.
-    assert opened == 2
+    # Submit already initialized the database; the worker keeps exactly one runtime connection.
+    assert opened == 1
     assert process.wait_calls == 3
     assert seed_store.raw(job_id)["status"] == "succeeded"
 

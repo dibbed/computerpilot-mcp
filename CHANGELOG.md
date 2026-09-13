@@ -6,6 +6,22 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Changed
+- Tighten durable-job status/list queries so they fetch only reconciliation/public fields instead of materializing command specs and fingerprints.
+- Start durable workers without repeating JobStore schema/WAL initialization; each worker now opens only its single runtime SQLite connection.
+- Apply `MCP_OUTPUT_DEFAULT` to `job_output` as well as terminal/process output tools, while preserving legacy inline behavior when the flag is unset.
+- Canonicalize finalized artifact cache source identities so Windows case/path aliases reuse the same snapshot descriptor.
+
+### Fixed
+- Keep pytest temporary and cache state under ignored `.agent_state/` to avoid Windows temp symlink cleanup failures and repository cache permission warnings.
+
+### Validation
+- 136 pytest tests passed with a clean exit on Windows.
+- Ruff passed with zero violations; mypy passed across 69 source files; compileall passed.
+- The 59-tool MCP health check passed.
+- Full Doctor passed in `local-http` mode and the subsequent fingerprint-only check completed successfully.
+- Quick benchmark suites completed successfully, including durable jobs and the optional Playwright browser run.
+
 ## [0.0.13] - 2026-09-12
 
 ### Added

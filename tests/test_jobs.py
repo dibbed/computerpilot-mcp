@@ -41,6 +41,8 @@ def test_listing_fifty_rows_has_constant_select_count(
     result = store.list(0, 50)
     assert result["total_count"] == len(result["items"]) == 50
     assert sum(statement.startswith("SELECT") for statement in statements) == selects
+    assert not any("SELECT * FROM jobs" in statement for statement in statements)
+    assert not any("spec" in statement.casefold() for statement in statements if statement.startswith("SELECT"))
     assert all(row["status"] == ("succeeded" if status == "succeeded" else "interrupted") for row in result["items"])
     assert all("spec" not in row and "fingerprint" not in row for row in result["items"])
 
@@ -68,6 +70,26 @@ def test_store_instance_is_safe_for_independent_thread_connections(tmp_path: Pat
     assert len(results[0]["items"]) == 20
     assert results[0]["truncated"] is True
     assert store.list(60, 20)["items"] == []
+
+
+def test_status_lookup_does_not_load_private_command_spec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    seed(store, 1)
+    statements: list[str] = []
+    connect = store.connect
+
+    def traced() -> Any:
+        db = connect()
+        db.set_trace_callback(statements.append)
+        return db
+
+    monkeypatch.setattr(store, "connect", traced)
+    assert store.get("0" * 32)["status"] == "succeeded"
+    selects = [statement for statement in statements if statement.startswith("SELECT")]
+    assert len(selects) == 1
+    assert "SELECT * FROM jobs" not in selects[0]
+    assert "spec" not in selects[0].casefold()
+    assert "fingerprint" not in selects[0].casefold()
 
 
 def test_output_reads_metadata_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
