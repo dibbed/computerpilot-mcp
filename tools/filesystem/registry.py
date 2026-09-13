@@ -20,6 +20,7 @@ from core.resource_locks import RESOURCE_LOCKS
 from core.response import ok, page
 from core.tooling import DESTRUCTIVE, MUTATING, READ_ONLY, PathArg, compact_errors
 from tools.filesystem import service
+from tools.project.index import PYTHON_METADATA_CACHE
 
 EncodingArg = Annotated[str, Field(min_length=1, max_length=40)]
 MaxCharsArg = Annotated[int | None, Field(ge=1)]
@@ -69,6 +70,11 @@ def _edit_result(
     )
     result["diff"] = summary
     return result
+
+
+def _invalidate_if_changed(path: Path, result: dict[str, Any]) -> None:
+    if bool(result.get("changed")):
+        PYTHON_METADATA_CACHE.invalidate(path)
 
 
 def register(mcp: MCPServer) -> None:
@@ -129,6 +135,7 @@ def register(mcp: MCPServer) -> None:
                 validate_python=validate_python,
             )
             audit_action("write_file", target=target, outcome="succeeded", details={"changed": result["changed"]})
+            _invalidate_if_changed(target, result)
             return result
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
@@ -156,6 +163,7 @@ def register(mcp: MCPServer) -> None:
                 exclusive_create=True,
             )
             audit_action("create_file", target=target, outcome="succeeded")
+            _invalidate_if_changed(target, result)
             return result
 
     @mcp.tool(annotations=DESTRUCTIVE, structured_output=True)
@@ -183,6 +191,7 @@ def register(mcp: MCPServer) -> None:
             else:
                 target.unlink()
             audit_action("delete_file", target=target, outcome="succeeded", details={"type": target_type})
+            PYTHON_METADATA_CACHE.invalidate(target, recursive=target_type == "directory")
             return ok(path=str(target), deleted=True, type=target_type, bytes_removed=size, recoverable=False)
 
     @mcp.tool(annotations=DESTRUCTIVE, structured_output=True)
@@ -201,7 +210,9 @@ def register(mcp: MCPServer) -> None:
                 raise FileNotFoundError(f"Source not found: {src}")
             if src == dst:
                 raise ToolError("same_path", "Source and destination resolve to the same path.")
-            if src.is_dir() and dst.is_relative_to(src):
+            src_is_dir = src.is_dir() and not src.is_symlink()
+            dst_was_dir = dst.is_dir() and not dst.is_symlink()
+            if src_is_dir and dst.is_relative_to(src):
                 raise ToolError("destination_inside_source", "A directory cannot be moved inside itself.")
             if dst.exists() or dst.is_symlink():
                 if not overwrite:
@@ -215,6 +226,9 @@ def register(mcp: MCPServer) -> None:
             audit_action("move_file", target=src, details={"destination": str(dst), "overwrite": overwrite})
             shutil.move(str(src), str(dst))
             audit_action("move_file", target=src, outcome="succeeded", details={"destination": str(dst)})
+            recursive_invalidation = src_is_dir or dst_was_dir
+            PYTHON_METADATA_CACHE.invalidate(src, recursive=recursive_invalidation)
+            PYTHON_METADATA_CACHE.invalidate(dst, recursive=recursive_invalidation)
             return ok(source=str(src), destination=str(dst), moved=True)
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
@@ -243,6 +257,7 @@ def register(mcp: MCPServer) -> None:
             audit_action("copy_file", target=src, details={"destination": str(dst), "overwrite": overwrite})
             (shutil.copy2 if preserve_metadata else shutil.copyfile)(src, dst)
             audit_action("copy_file", target=src, outcome="succeeded", details={"destination": str(dst)})
+            PYTHON_METADATA_CACHE.invalidate(dst)
             return ok(source=str(src), destination=str(dst), copied=True, bytes=dst.stat().st_size, sha256=_hash_file(dst))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
@@ -383,6 +398,7 @@ def register(mcp: MCPServer) -> None:
             result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=validate_python)
             result["replacements"] = count
             audit_action("replace_exact", target=target, outcome="succeeded", details={"replacements": count})
+            _invalidate_if_changed(target, result)
             return result
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
@@ -404,6 +420,7 @@ def register(mcp: MCPServer) -> None:
             audit_action("replace_between_anchors", target=target, details={"include_markers": include_markers})
             result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=validate_python)
             audit_action("replace_between_anchors", target=target, outcome="succeeded")
+            _invalidate_if_changed(target, result)
             return result
 
     def replace_python_body(
@@ -422,6 +439,7 @@ def register(mcp: MCPServer) -> None:
             result = _edit_result(target, before, after, used_encoding, backup=backup, validate_python=True)
             result["symbol"] = qualified_name
             audit_action(f"replace_{kind}", target=target, outcome="succeeded", details={"symbol": qualified_name})
+            _invalidate_if_changed(target, result)
             return result
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
@@ -482,4 +500,5 @@ def register(mcp: MCPServer) -> None:
                 timeout_sec=timeout_sec,
             )
             audit_action("safe_refactor", target=target, outcome="succeeded", details={"edit_count": len(edits)})
+            _invalidate_if_changed(target, result)
             return result
