@@ -268,21 +268,72 @@ def test_recursive_invalidation_removes_only_subtree(tmp_path: Path) -> None:
 
 def test_invalidation_during_parse_cannot_resurrect_cache_entry(tmp_path: Path) -> None:
     target = tmp_path / "race.py"
-    target.write_text("def race():\n    return 1\n", encoding="utf-8")
+    target.write_text("def old():\n    return 1\n", encoding="utf-8")
+    original = target.stat()
     started = threading.Event()
     release = threading.Event()
+    calls = 0
+
 
     def loader(path: Path) -> PythonFileMetadata:
-        started.set()
-        assert release.wait(5)
-        return build_python_metadata(path)
+        nonlocal calls
+        calls += 1
+        metadata = build_python_metadata(path)
+        if calls == 1:
+            started.set()
+            assert release.wait(5)
+        return metadata
+
 
     cache = PythonMetadataCache(max_files=8, max_bytes=1024 * 1024, loader=loader)
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(cache.get, target)
         assert started.wait(5)
+        target.write_text("def new():\n    return 2\n", encoding="utf-8")
+        os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+        assert target.stat().st_size == original.st_size
+        assert target.stat().st_mtime_ns == original.st_mtime_ns
         cache.invalidate(target)
         release.set()
-        assert future.result(timeout=5).functions[0].qualified_name == "race"
+        result = future.result(timeout=5)
 
-    assert cache.stats()["entries"] == 0
+    assert result.functions[0].qualified_name == "new"
+    assert calls == 2
+    assert cache.stats()["entries"] == 1
+    assert cache.get(target) is result
+
+
+def test_concurrent_waiters_retry_after_invalidation(tmp_path: Path) -> None:
+    target = tmp_path / "shared_race.py"
+    target.write_text("def old():\n    return 1\n", encoding="utf-8")
+    original = target.stat()
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def loader(path: Path) -> PythonFileMetadata:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        metadata = build_python_metadata(path)
+        if call_number == 1:
+            started.set()
+            assert release.wait(5)
+        return metadata
+
+    cache = PythonMetadataCache(max_files=8, max_bytes=1024 * 1024, loader=loader)
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [pool.submit(cache.get, target) for _ in range(12)]
+        assert started.wait(5)
+        target.write_text("def new():\n    return 2\n", encoding="utf-8")
+        os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+        cache.invalidate(target)
+        release.set()
+        results = [future.result(timeout=5) for future in futures]
+
+    assert calls == 2
+    assert all(result.functions[0].qualified_name == "new" for result in results)
+    assert all(result is results[0] for result in results)
+    assert cache.stats()["entries"] == 1
