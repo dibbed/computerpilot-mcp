@@ -22,6 +22,8 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Prevent max-running slot leaks by reconciling dead running workers and finished orphaned commands before new admission decisions; capacity is derived from authoritative row state rather than a separate counter.
 - Make queued cancellation atomic with admission so a cancel/claim race cannot produce an uncancelled running command.
 - Preserve submitter-exit durability under bounded launching by synchronously launching available workers before `submit()` returns and having terminal workers kick queued successors before exit.
+- Make durable-job output-directory setup idempotent so a concurrent deduplicated submit can kick the scheduler and pre-create the job directory without causing the original inserter to fail or truncate already-created output files.
+- Reuse one process-local scheduler coordinator under concurrent scheduler kicks, and remove failed-to-start coordinators from the registry so thread-start failure cannot poison later recovery attempts.
 
 ### Changed
 - Browser benchmarks now report open latency, parallel-navigation latency, and cleanup latency for the 1/5/20-session cases, plus a dedicated background idle-eviction case with separate session and empty-pool reclamation timings.
@@ -36,6 +38,7 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Phase E1 validation completed with 214 passing pytest tests, Ruff with zero violations, mypy with zero issues across 80 source files, successful compileall, and a passing 59-tool health check. The jobs migration was also validated against a transactionally copied real local database with all 4 existing rows/request keys preserved across schema 0 -> 2.
 - Phase E2's initial worker-waiting design correctly capped 50 submitted jobs at 4 active jobs but still peaked at 3280.344 MiB / 155 processes, triggering the roadmap's lightweight-launcher gate. The final committed scheduler benchmark (`e9fc0b9`) kept the same 4-active-job cap and completed the 50-job case in 20817.842 ms at 491.629 MiB / 25 processes; a calibration run with cap 8 completed in 17955.369 ms at 748.305 MiB / 37 processes.
 - Phase E2 final validation completed with 225 passing pytest tests, Ruff with zero violations, mypy with zero issues across 81 source files, successful compileall, a passing 59-tool health check, and Full Doctor including a real disposable Chromium launch.
+- A post-E1/E2 hardening audit completed with 229 passing pytest tests, Ruff with zero violations, mypy with zero issues across 83 source files, successful compileall, a passing 59-tool health check, and Full Doctor. Additional live stress checks covered 48 concurrent duplicate submissions resolving to one job, 20 jobs submitted from 4 independent processes with an actual command peak exactly equal to cap 3, and a forced worker crash where the live orphaned child retained capacity until exit before the successor job started. A dedicated migration regression also verifies schema 2 -> 3 preserves existing version/queue-deadline state.
 
 ## [0.0.15] - 2026-09-14
 
