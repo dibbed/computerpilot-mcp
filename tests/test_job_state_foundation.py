@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from core import jobs as jobs_module
+from core import job_scheduler
 from core.jobs import JOB_SCHEMA_VERSION, QUEUE_TIMEOUT_ERROR, JobStore
 from scripts import job_worker
 
@@ -74,7 +74,7 @@ def test_old_database_migrates_in_place_and_preserves_default_idempotency(tmp_pa
         columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
         schema_version = int(db.execute("PRAGMA user_version").fetchone()[0])
     assert schema_version == JOB_SCHEMA_VERSION
-    assert {"version", "queue_deadline"} <= columns
+    assert {"version", "queue_deadline", "launch_token", "launch_started"} <= columns
     row = store.raw("0" * 32)
     assert row["version"] == 1
     assert row["queue_deadline"] is None
@@ -92,6 +92,8 @@ def test_schema_migration_is_idempotent(tmp_path: Path) -> None:
         columns = [row[1] for row in db.execute("PRAGMA table_info(jobs)")]
     assert columns.count("version") == 1
     assert columns.count("queue_deadline") == 1
+    assert columns.count("launch_token") == 1
+    assert columns.count("launch_started") == 1
 
 
 def test_concurrent_old_schema_migration_is_serialized(tmp_path: Path) -> None:
@@ -105,6 +107,8 @@ def test_concurrent_old_schema_migration_is_serialized(tmp_path: Path) -> None:
         columns = [row[1] for row in db.execute("PRAGMA table_info(jobs)")]
     assert columns.count("version") == 1
     assert columns.count("queue_deadline") == 1
+    assert columns.count("launch_token") == 1
+    assert columns.count("launch_started") == 1
 
 
 def test_newer_job_schema_is_rejected(tmp_path: Path) -> None:
@@ -119,7 +123,7 @@ def test_submit_queue_timeout_is_optional_and_part_of_new_request_semantics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
-    monkeypatch.setattr(jobs_module.subprocess, "Popen", lambda *args, **kwargs: object())
+    monkeypatch.setattr(job_scheduler, "ensure_job_scheduler", lambda store: None)
     before = time.time()
     result = store.submit(["fake"], tmp_path, 60, "queue-key", queue_timeout_sec=5)
     after = time.time()

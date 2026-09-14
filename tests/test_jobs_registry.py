@@ -36,6 +36,7 @@ def test_submit_job_forwards_optional_queue_timeout(tmp_path: Path, monkeypatch:
             return {"ok": True, "job_id": "0" * 32, "status": "queued", "version": 1}
 
     monkeypatch.setattr(registry, "JobStore", FakeStore)
+    monkeypatch.setattr(registry, "ensure_job_scheduler", lambda store: None)
     async def scenario() -> None:
         server = MCPServer("jobs")
         registry.register(server)

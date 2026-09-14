@@ -10,6 +10,7 @@ from pydantic import Field
 from core.artifacts import default_delivery
 from core.audit import audit_action
 from core.config import resolve_path
+from core.job_scheduler import ensure_job_scheduler
 from core.jobs import JobStore
 from core.tooling import DESTRUCTIVE, OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 
@@ -18,6 +19,7 @@ JobId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
 
 def register(mcp: MCPServer) -> None:
     store = JobStore()
+    ensure_job_scheduler(store)
     output_default = default_delivery()
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)

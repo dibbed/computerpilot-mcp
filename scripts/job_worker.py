@@ -15,8 +15,9 @@ from typing import Any
 import psutil
 
 from core.audit import audit_action
+from core.config import SETTINGS
 from core.executor import _creation_flags, terminate_process_tree
-from core.jobs import QUEUE_TIMEOUT_ERROR, JobStore
+from core.jobs import JobStore
 
 
 def _poll_interval(elapsed: float) -> float:
@@ -26,6 +27,20 @@ def _poll_interval(elapsed: float) -> float:
     if elapsed < 30.0:
         return 0.5
     return 1.0
+
+
+def _admission_poll_interval(attempt: int) -> float:
+    """Back off queued workers cheaply while keeping slot handoff responsive."""
+    return min(0.1 * (2 ** min(attempt, 3)), 1.0)
+
+
+def _kick_successor(store: JobStore) -> None:
+    try:
+        from core.job_scheduler import ensure_job_scheduler
+        from core.jobs import JobStore as SchedulerStore
+        ensure_job_scheduler(SchedulerStore(store.path, initialize=False))
+    except Exception:
+        pass
 
 
 def _row(db: sqlite3.Connection, job_id: str) -> dict[str, Any]:
@@ -45,31 +60,35 @@ def _update(db: sqlite3.Connection, job_id: str, **values: Any) -> None:
         )
 
 
-def run(path: Path, job_id: str) -> None:
+def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
     store = JobStore(path, initialize=False)
     process: subprocess.Popen[bytes] | None = None
     # The worker owns one SQLite connection for its lifetime. Short transactions
     # keep WAL readers/writers independent while avoiding a connection per poll.
     with closing(store.connect()) as db:
-        claim_time = time.time()
-        with db:
-            claimed = db.execute(
-                "UPDATE jobs SET status='running',worker_pid=?,worker_created=?,updated=?,version=version+1 "
-                "WHERE id=? AND status='queued' AND (queue_deadline IS NULL OR queue_deadline>?)",
-                (os.getpid(), psutil.Process().create_time(), claim_time, job_id, claim_time),
-            ).rowcount
-            if not claimed:
-                db.execute(
-                    "UPDATE jobs SET status='timed_out',error=?,updated=?,version=version+1 "
-                    "WHERE id=? AND status='queued' AND queue_deadline IS NOT NULL AND queue_deadline<=?",
-                    (QUEUE_TIMEOUT_ERROR, claim_time, job_id, claim_time),
-                )
-        if not claimed:
-            return
+        worker_created = psutil.Process().create_time()
+        admission_attempt = 0
+        while True:
+            claim = store.claim_for_execution(
+                job_id,
+                worker_pid=os.getpid(),
+                worker_created=worker_created,
+                max_running=SETTINGS.max_running_jobs,
+                launch_token=launch_token,
+                db=db,
+            )
+            if claim == "claimed":
+                break
+            if claim == "terminal":
+                _kick_successor(store)
+                return
+            time.sleep(_admission_poll_interval(admission_attempt))
+            admission_attempt += 1
         try:
             row = _row(db, job_id)
             if row["cancel_requested"]:
                 _update(db, job_id, status="cancelled")
+                _kick_successor(store)
                 return
             spec = json.loads(row["spec"])
             directory = store.output_dir / job_id
@@ -132,7 +151,8 @@ def run(path: Path, job_id: str) -> None:
                 # Recovery path only: a broken worker connection must still make
                 # the terminal state visible if the database itself is reachable.
                 store.update(job_id, status="failed", error=str(exc))
+    _kick_successor(store)
 
 
 if __name__ == "__main__":
-    run(Path(sys.argv[1]), sys.argv[2])
+    run(Path(sys.argv[1]), sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)

@@ -36,6 +36,7 @@ class Settings:
     search_snapshot_max_count: int = _env_int("MCP_SEARCH_SNAPSHOT_MAX_COUNT", 32, 1, 1_024)
     browser_idle_sec: int = _env_int("MCP_BROWSER_IDLE_SEC", 900, 1, 86_400)
     browser_pool_idle_sec: int = _env_int("MCP_BROWSER_POOL_IDLE_SEC", 120, 1, 86_400)
+    max_running_jobs: int = _env_int("MCP_MAX_RUNNING_JOBS", 4, 1, 256)
     state_dir: Path = PROJECT_ROOT / ".agent_state"
     memory_dir: Path = PROJECT_ROOT / "memory"
 
