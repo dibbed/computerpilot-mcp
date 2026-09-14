@@ -27,6 +27,7 @@ from core.audit import audit_action
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import _creation_flags
 from core.jobs import JobStore
+from core.lifecycle import lifecycle_control_request
 from core.singleflight import SingleFlight
 
 
@@ -37,6 +38,10 @@ def restart_delay(failures: int) -> int:
 PANEL_PROCESS_TTL_SEC = 2.0
 PANEL_JOBS_TTL_SEC = 2.0
 PANEL_STORAGE_TTL_SEC = 20.0
+LIFECYCLE_STATUS_MAX_BYTES = 16_384
+LIFECYCLE_POLL_SEC = 0.025
+LIFECYCLE_START_GRACE_SEC = 0.25
+LIFECYCLE_STOP_ACK_SEC = 0.25
 
 
 class PanelStatusCache:
@@ -76,7 +81,8 @@ class PanelStatusCache:
 
 class Supervisor:
     def __init__(self, command: list[str], *, readiness_url: str | None,
-                 state_dir: Path | None = None, grace: float = 90, interval: float = 5) -> None:
+                 state_dir: Path | None = None, grace: float = 90, interval: float = 5,
+                 drain_timeout: float | None = None, watchdog_drain_timeout: float | None = None) -> None:
         self.command = command
         self.readiness_url = readiness_url
         self.state_dir = state_dir or SETTINGS.state_dir
@@ -84,11 +90,26 @@ class Supervisor:
         self.heartbeat = self.state_dir / f"heartbeat-{uuid.uuid4().hex}"
         self.grace = grace
         self.interval = interval
+        self.drain_timeout = float(SETTINGS.supervisor_drain_sec if drain_timeout is None else drain_timeout)
+        self.watchdog_drain_timeout = float(
+            SETTINGS.supervisor_watchdog_drain_sec if watchdog_drain_timeout is None else watchdog_drain_timeout
+        )
+        if self.drain_timeout <= 0 or self.watchdog_drain_timeout <= 0:
+            raise ValueError("Supervisor drain timeouts must be positive.")
         self.stop = threading.Event()
         self.restart = threading.Event()
         self.lock = threading.Lock()
-        self.state: dict[str, Any] = {"state": "starting", "restart_count": 0, "last_error": None,
-                                      "pid": None, "mcp_healthy": False, "tunnel_healthy": None}
+        self.state: dict[str, Any] = {
+            "state": "starting",
+            "restart_count": 0,
+            "last_error": None,
+            "pid": None,
+            "mcp_healthy": False,
+            "tunnel_healthy": None,
+            "runtime_lifecycle": None,
+            "active_mutations": 0,
+            "last_drain_result": None,
+        }
         self.logs: deque[str] = deque(maxlen=100)
         self.logger = logging.getLogger(f"mcp.supervisor.{uuid.uuid4().hex}")
         self.logger.setLevel(logging.INFO)
@@ -152,6 +173,114 @@ class Supervisor:
     def set_state(self, **values: Any) -> None:
         with self.lock:
             self.state.update(values)
+
+    def _runtime_lifecycle_paths(self) -> tuple[Path, Path]:
+        directory = self.state_dir / "runtime_lifecycle"
+        directory.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        return directory / f"control-{token}.json", directory / f"status-{token}.json"
+
+    @staticmethod
+    def _write_lifecycle_control(path: Path, command: str, request_id: str, deadline: float) -> None:
+        payload = lifecycle_control_request(cast(Any, command), request_id, deadline)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True), encoding="utf-8")
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _read_lifecycle_status(path: Path) -> dict[str, Any] | None:
+        try:
+            if path.stat().st_size > LIFECYCLE_STATUS_MAX_BYTES:
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            return None
+        return payload
+
+    def drain_runtime(
+        self,
+        process: subprocess.Popen[bytes],
+        *,
+        reason: str,
+        control_path: Path,
+        status_path: Path,
+    ) -> dict[str, Any]:
+        """Request a bounded mutation drain before terminating one runtime generation."""
+        timeout = self.watchdog_drain_timeout if reason == "watchdog_unhealthy" else self.drain_timeout
+        request_id = uuid.uuid4().hex
+        started = time.monotonic()
+        deadline_monotonic = started + timeout
+        deadline_epoch = time.time() + timeout
+        self._write_lifecycle_control(control_path, "drain", request_id, deadline_epoch)
+        acknowledged = False
+        drained = False
+        active_mutations: int | None = None
+        runtime_state: str | None = None
+        saw_status = False
+        start_grace = min(LIFECYCLE_START_GRACE_SEC, timeout)
+
+        while time.monotonic() < deadline_monotonic and process.poll() is None:
+            status = self._read_lifecycle_status(status_path)
+            if status is not None:
+                saw_status = True
+                runtime_state = str(status.get("state"))
+                try:
+                    active_mutations = int(status.get("active_mutations", 0))
+                except (TypeError, ValueError):
+                    active_mutations = None
+                if status.get("request_id") == request_id and runtime_state in {"DRAINING", "STOPPING"}:
+                    acknowledged = True
+                    self.set_state(
+                        state="draining",
+                        runtime_lifecycle=runtime_state,
+                        active_mutations=active_mutations,
+                    )
+                    if active_mutations == 0:
+                        drained = True
+                        break
+            elif time.monotonic() - started >= start_grace:
+                # No lifecycle status means the MCP lifespan never reached request-serving state.
+                break
+            time.sleep(LIFECYCLE_POLL_SEC)
+
+        if drained and process.poll() is None:
+            self._write_lifecycle_control(control_path, "stop", request_id, deadline_epoch)
+            stop_deadline = min(deadline_monotonic, time.monotonic() + LIFECYCLE_STOP_ACK_SEC)
+            while time.monotonic() < stop_deadline and process.poll() is None:
+                status = self._read_lifecycle_status(status_path)
+                if status is not None and status.get("request_id") == request_id:
+                    runtime_state = str(status.get("state"))
+                    try:
+                        active_mutations = int(status.get("active_mutations", 0))
+                    except (TypeError, ValueError):
+                        active_mutations = None
+                    if runtime_state == "STOPPING":
+                        break
+                time.sleep(LIFECYCLE_POLL_SEC)
+
+        elapsed_ms = round((time.monotonic() - started) * 1_000, 3)
+        result = {
+            "reason": reason,
+            "acknowledged": acknowledged,
+            "drained": drained,
+            "timed_out": saw_status and not drained and time.monotonic() >= deadline_monotonic,
+            "runtime_lifecycle": runtime_state,
+            "active_mutations": active_mutations,
+            "elapsed_ms": elapsed_ms,
+        }
+        self.set_state(
+            runtime_lifecycle=runtime_state,
+            active_mutations=active_mutations or 0,
+            last_drain_result=result,
+        )
+        self.event(
+            "Runtime drain "
+            f"reason={reason} acknowledged={acknowledged} drained={drained} "
+            f"active_mutations={active_mutations} elapsed_ms={elapsed_ms}"
+        )
+        return result
 
     def read_log(self, pipe: BinaryIO) -> None:
         pending = b""
@@ -232,8 +361,13 @@ class Supervisor:
             while not self.stop.is_set():
                 self.restart.clear()
                 self.heartbeat.unlink(missing_ok=True)
+                control_path, status_path = self._runtime_lifecycle_paths()
+                control_path.unlink(missing_ok=True)
+                status_path.unlink(missing_ok=True)
                 env = os.environ.copy()
                 env["MCP_HEARTBEAT_FILE"] = str(self.heartbeat)
+                env["MCP_LIFECYCLE_CONTROL_FILE"] = str(control_path)
+                env["MCP_LIFECYCLE_STATUS_FILE"] = str(status_path)
                 started = time.monotonic()
                 process = None
                 readers: list[threading.Thread] = []
@@ -242,7 +376,14 @@ class Supervisor:
                     process = subprocess.Popen(self.command, cwd=PROJECT_ROOT, env=env,
                                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                                creationflags=_creation_flags())
-                    self.set_state(state="starting", pid=process.pid, restart_count=attempts, next_retry_seconds=None)
+                    self.set_state(
+                        state="starting",
+                        pid=process.pid,
+                        restart_count=attempts,
+                        next_retry_seconds=None,
+                        runtime_lifecycle=None,
+                        active_mutations=0,
+                    )
                     self.event(f"Runtime started pid={process.pid} restart_count={attempts}")
                     for pipe in (process.stdout, process.stderr):
                         assert pipe is not None
@@ -250,24 +391,35 @@ class Supervisor:
                         thread.start()
                         readers.append(thread)
                     missed = 0
-                    while process.poll() is None and not self.stop.is_set() and not self.restart.is_set():
-                        self.remember_children(process)
-                        if self.healthy():
-                            missed = 0
-                            self.set_state(state="running")
-                        elif time.monotonic() - started > self.grace:
-                            missed += 1
-                            self.set_state(state="unhealthy", failed_probes=missed)
-                            if missed >= 3:
-                                reason = "watchdog_unhealthy"
-                                break
-                        self.stop.wait(self.interval)
+                    try:
+                        while process.poll() is None and not self.stop.is_set() and not self.restart.is_set():
+                            self.remember_children(process)
+                            if self.healthy():
+                                missed = 0
+                                self.set_state(state="running")
+                            elif time.monotonic() - started > self.grace:
+                                missed += 1
+                                self.set_state(state="unhealthy", failed_probes=missed)
+                                if missed >= 3:
+                                    reason = "watchdog_unhealthy"
+                                    break
+                            self.stop.wait(self.interval)
+                    except KeyboardInterrupt:
+                        self.stop.set()
+                        reason = "user_stop"
                     if self.stop.is_set():
                         reason = "user_stop"
                     elif self.restart.is_set():
                         reason = "user_restart"
+                    if process.poll() is None and reason in {"watchdog_unhealthy", "user_restart", "user_stop"}:
+                        self.drain_runtime(
+                            process,
+                            reason=reason,
+                            control_path=control_path,
+                            status_path=status_path,
+                        )
                     code = process.poll()
-                    self.event(f"Runtime stopped reason={reason} exit_code={code}")
+                    self.event(f"Runtime stopping reason={reason} exit_code={code}")
                     self.set_state(last_exit_code=code, last_exit_reason=reason)
                     if not reason.startswith("user_") and not self.snapshot()["last_error"]:
                         self.set_state(last_error=reason)
@@ -281,6 +433,8 @@ class Supervisor:
                         self.cleanup(process)
                         self.set_state(last_exit_code=process.returncode)
                         self.event(f"Runtime cleanup completed pid={process.pid} exit_code={process.returncode}")
+                    control_path.unlink(missing_ok=True)
+                    status_path.unlink(missing_ok=True)
                     for thread in readers:
                         thread.join(timeout=2)
                 if self.stop.is_set():

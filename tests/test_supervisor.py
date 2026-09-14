@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from core.jobs import JobStore
+from core.lifecycle import RuntimeLifecycle
 from scripts import supervisor as module
 from scripts.supervisor import Supervisor, make_panel, restart_delay
 
@@ -137,3 +138,146 @@ def test_runtime_restart_preserves_durable_job(tmp_path: Path) -> None:
         supervisor.stop.set()
         thread.join(timeout=10)
     assert not thread.is_alive()
+
+
+def test_user_restart_drains_active_mutation_before_cleanup(tmp_path: Path) -> None:
+    attempts = tmp_path / "attempts.txt"
+    target = tmp_path / "mutation.txt"
+    script = tmp_path / "runtime_probe.py"
+    script.write_text(
+        f"""
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+sys.path.insert(0, {str(module.PROJECT_ROOT)!r})
+from core.lifecycle import RUNTIME_LIFECYCLE
+
+heartbeat = Path(os.environ["MCP_HEARTBEAT_FILE"])
+attempts = Path({str(attempts)!r})
+target = Path({str(target)!r})
+RUNTIME_LIFECYCLE.configure_from_env()
+
+
+def watch() -> None:
+    while True:
+        RUNTIME_LIFECYCLE.poll_control()
+        time.sleep(0.01)
+
+
+def pulse() -> None:
+    while True:
+        heartbeat.write_text(str(os.getpid()), encoding="ascii")
+        time.sleep(0.03)
+
+
+threading.Thread(target=watch, daemon=True).start()
+threading.Thread(target=pulse, daemon=True).start()
+number = int(attempts.read_text()) + 1 if attempts.exists() else 1
+attempts.write_text(str(number))
+if number == 1:
+    with RUNTIME_LIFECYCLE.mutation("safe_refactor"):
+        target.write_text("started", encoding="utf-8")
+        time.sleep(0.45)
+        target.write_text("complete", encoding="utf-8")
+while True:
+    time.sleep(1)
+""",
+        encoding="utf-8",
+    )
+    supervisor = Supervisor(
+        [sys.executable, str(script)],
+        readiness_url=None,
+        state_dir=tmp_path,
+        grace=3,
+        interval=0.02,
+        drain_timeout=2,
+        watchdog_drain_timeout=0.2,
+    )
+    thread = threading.Thread(target=supervisor.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if target.exists() and target.read_text(encoding="utf-8") == "started":
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(supervisor.snapshot())
+
+        supervisor.restart.set()
+        while time.monotonic() < deadline:
+            state = supervisor.snapshot()
+            if state["restart_count"] >= 1 and state["state"] == "running":
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(supervisor.snapshot())
+
+        assert target.read_text(encoding="utf-8") == "complete"
+        drain = state["last_drain_result"]
+        assert drain["reason"] == "user_restart"
+        assert drain["acknowledged"] is True
+        assert drain["drained"] is True
+        assert drain["active_mutations"] == 0
+        assert drain["elapsed_ms"] >= 250
+    finally:
+        supervisor.stop.set()
+        thread.join(timeout=10)
+        close_logger(supervisor)
+    assert not thread.is_alive()
+
+
+def test_watchdog_drain_is_bounded_when_mutation_does_not_finish(tmp_path: Path) -> None:
+    control = tmp_path / "control.json"
+    status = tmp_path / "status.json"
+    lifecycle = RuntimeLifecycle()
+    lifecycle.configure(control, status)
+    entered = threading.Event()
+    release = threading.Event()
+    watcher_stop = threading.Event()
+
+    def mutate() -> None:
+        with lifecycle.mutation("run_process"):
+            entered.set()
+            release.wait(timeout=5)
+
+    def watch() -> None:
+        while not watcher_stop.is_set():
+            lifecycle.poll_control()
+            time.sleep(0.005)
+
+    mutation_thread = threading.Thread(target=mutate)
+    watcher_thread = threading.Thread(target=watch)
+    mutation_thread.start()
+    watcher_thread.start()
+    assert entered.wait(timeout=5)
+    process = module.subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    supervisor = Supervisor(
+        [],
+        readiness_url=None,
+        state_dir=tmp_path,
+        drain_timeout=1,
+        watchdog_drain_timeout=0.12,
+    )
+    try:
+        result = supervisor.drain_runtime(
+            process,
+            reason="watchdog_unhealthy",
+            control_path=control,
+            status_path=status,
+        )
+        assert result["acknowledged"] is True
+        assert result["drained"] is False
+        assert result["timed_out"] is True
+        assert result["active_mutations"] == 1
+        assert result["elapsed_ms"] < 500
+    finally:
+        release.set()
+        mutation_thread.join(timeout=5)
+        watcher_stop.set()
+        watcher_thread.join(timeout=5)
+        process.kill()
+        process.wait(timeout=5)
+        close_logger(supervisor)
