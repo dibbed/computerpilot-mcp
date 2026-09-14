@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,7 @@ from scripts.perf_benchmark import (
     PROFILE_LIMITS,
     BenchmarkSkip,
     MiB,
+    _browser_pool_details,
     _cleanup_stale_temp_roots,
     _launcher_validation_once,
     _output_once,
@@ -32,6 +34,29 @@ def test_benchmark_profiles_cover_planned_scale_points() -> None:
     assert full["search_files"] == [10_000, 100_000]
     assert full["job_counts"] == [1, 10, 50]
     assert full["browser_counts"] == [1, 5, 20]
+
+
+def test_browser_pool_details_report_instances_contexts_and_keys() -> None:
+    manager = SimpleNamespace(
+        _pools={
+            "chromium": SimpleNamespace(
+                active_contexts=5,
+                key=SimpleNamespace(browser_name="chromium", headless=True),
+            ),
+            "firefox": SimpleNamespace(
+                active_contexts=5,
+                key=SimpleNamespace(browser_name="firefox", headless=True),
+            ),
+        }
+    )
+    details = _browser_pool_details(manager, 10)
+    assert details["sessions"] == 10
+    assert details["browser_instances"] == 2
+    assert details["contexts"] == 10
+    assert details["pool_keys"] == [
+        {"browser": "chromium", "headless": True, "active_contexts": 5},
+        {"browser": "firefox", "headless": True, "active_contexts": 5},
+    ]
 
 
 def test_stats_are_stable_and_population_based() -> None:

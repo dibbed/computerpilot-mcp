@@ -520,6 +520,23 @@ def _job_batch_once(store: JobStore, count: int, run_key: int) -> dict[str, Any]
     return {"jobs": count, "states": states}
 
 
+def _browser_pool_details(manager: Any, sessions: int) -> dict[str, Any]:
+    pools = list(getattr(manager, "_pools", {}).values())
+    return {
+        "sessions": sessions,
+        "browser_instances": len(pools),
+        "contexts": sum(int(pool.active_contexts) for pool in pools),
+        "pool_keys": [
+            {
+                "browser": pool.key.browser_name,
+                "headless": pool.key.headless,
+                "active_contexts": int(pool.active_contexts),
+            }
+            for pool in pools
+        ],
+    }
+
+
 def _browser_batch_once(count: int) -> dict[str, Any]:
     try:
         from tools.browser.manager import BrowserManager
@@ -529,6 +546,7 @@ def _browser_batch_once(count: int) -> dict[str, Any]:
     async def scenario() -> dict[str, Any]:
         manager = BrowserManager()
         session_ids = [f"bench-{index}" for index in range(count)]
+        details: dict[str, Any] = {}
         try:
             await asyncio.gather(
                 *(
@@ -543,9 +561,14 @@ def _browser_batch_once(count: int) -> dict[str, Any]:
                     for session_id in session_ids
                 )
             )
+            details = _browser_pool_details(manager, count)
         except Exception as exc:
             message = str(exc)
-            if "browser_runtime_missing" in message or "Executable doesn't exist" in message or "playwright install" in message:
+            if (
+                getattr(exc, "code", None) == "browser_runtime_missing"
+                or "Executable doesn't exist" in message
+                or "playwright install" in message
+            ):
                 raise BenchmarkSkip("Chromium Playwright runtime is not installed.") from exc
             raise
         finally:
@@ -553,7 +576,54 @@ def _browser_batch_once(count: int) -> dict[str, Any]:
             runtime = getattr(manager, "_playwright", None)
             if runtime is not None:
                 await runtime.stop()
-        return {"sessions": count}
+        return details
+
+    return asyncio.run(scenario())
+
+
+def _browser_mixed_once(count_per_engine: int = 5) -> dict[str, Any]:
+    try:
+        from tools.browser.manager import BrowserManager
+    except ImportError as exc:
+        raise BenchmarkSkip("Playwright support is not installed.") from exc
+
+    async def scenario() -> dict[str, Any]:
+        manager = BrowserManager()
+        specs: list[tuple[str, Literal["chromium", "firefox", "webkit"]]] = [
+            *[(f"chromium-{index}", "chromium") for index in range(count_per_engine)],
+            *[(f"firefox-{index}", "firefox") for index in range(count_per_engine)],
+        ]
+        details: dict[str, Any] = {}
+        try:
+            await asyncio.gather(
+                *(
+                    manager.open(
+                        session_id,
+                        "data:text/html,<title>benchmark</title>",
+                        browser_name=browser_name,
+                        headless=True,
+                        timeout_ms=30_000,
+                        wait_until="load",
+                    )
+                    for session_id, browser_name in specs
+                )
+            )
+            details = _browser_pool_details(manager, len(specs))
+        except Exception as exc:
+            message = str(exc)
+            if (
+                getattr(exc, "code", None) == "browser_runtime_missing"
+                or "Executable doesn't exist" in message
+                or "playwright install" in message
+            ):
+                raise BenchmarkSkip("Chromium/Firefox Playwright runtimes are not both installed.") from exc
+            raise
+        finally:
+            await asyncio.gather(*(manager.close(session_id) for session_id, _ in specs), return_exceptions=True)
+            runtime = getattr(manager, "_playwright", None)
+            if runtime is not None:
+                await runtime.stop()
+        return details
 
     return asyncio.run(scenario())
 
@@ -684,6 +754,8 @@ def run_benchmarks(
         else:
             for count in limits["browser_counts"]:
                 results.append(measure(f"browser_{count}_sessions", partial(_browser_batch_once, count), runs))
+            if profile == "full":
+                results.append(measure("browser_5_chromium_5_firefox", _browser_mixed_once, runs))
 
     process = psutil.Process()
     return {
