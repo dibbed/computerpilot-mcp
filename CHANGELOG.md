@@ -12,10 +12,12 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ### Changed
 - Browser benchmarks now report open latency, parallel-navigation latency, and cleanup latency for the 1/5/20-session cases, plus a dedicated background idle-eviction case with separate session and empty-pool reclamation timings.
+- Refresh the README with an explicit completed-roadmap snapshot for Phases A-D (`v0.0.12` through `v0.0.15`), the benchmark-gated compact-tool decision, current post-D validation, and the next Phase E target.
 
 ### Validation
 - Real Chromium validation confirmed recovery from both externally closed Page and BrowserContext while preserving the same Browser pool.
 - After installing the optional Playwright Firefox runtime on the validation host, the mixed 5 Chromium + 5 Firefox benchmark completed with exactly 2 Browser instances and 10 isolated contexts.
+- Final post-D validation completed with 203 passing pytest tests, Ruff with zero violations, mypy with zero issues across 79 source files, successful compileall, a passing 59-tool health check, and Full Doctor.
 
 ## [0.0.15] - 2026-09-14
 

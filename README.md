@@ -4,6 +4,25 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 ---
 
+## Current Status
+
+The optimization roadmap is complete through **Phase D / v0.0.15**. The `main` branch also contains the final post-release D hardening for externally closed Playwright pages/contexts and expanded browser lifecycle benchmarks; the published `v0.0.15` tag remains immutable.
+
+| Phase | Release | Focus | Status |
+| --- | --- | --- | --- |
+| A | `v0.0.12` | Measurement & Observability | ✅ Complete |
+| B | `v0.0.13` | Core Performance | ✅ Complete |
+| C | `v0.0.14` | Project Intelligence | ✅ Complete |
+| D | `v0.0.15` | Runtime & Browser | ✅ Complete |
+
+Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
+
+The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify introducing another tool-profile mode without stronger host-level token/context evidence. The default full 59-tool surface therefore remains unchanged.
+
+Current post-D validation on Windows: **203 pytest tests**, Ruff with zero violations, mypy with zero issues across 79 source files, compileall, the 59-tool health check, Full Doctor, real Chromium recovery tests, and a real mixed Chromium/Firefox pooling benchmark all pass. The next planned roadmap phase is **Phase E / v0.0.16 — Durable Jobs & Reliability**.
+
+---
+
 ## Features
 
 - **Robust Filesystem Tools**: Atomic file creation, writing, copying, moving, and deletion; paginated listing and regex file search; complete reads with streaming byte cursors.
@@ -181,7 +200,7 @@ Version `0.0.15` changes browser ownership from one Playwright `Browser` per ses
 - Closing one session closes only that session's context. Reopening the same session with an incompatible configuration is transactional: the old context stays usable until the replacement context has opened and navigated successfully.
 - Per-session locking remains the operation boundary. Navigation or interaction in one session does not reintroduce a global browser lock.
 - Idle contexts are reclaimed after `MCP_BROWSER_IDLE_SEC` (default `900` seconds). An empty browser pool is reclaimed after `MCP_BROWSER_POOL_IDLE_SEC` (default `120` seconds). Cleanup is single-flight and will not evict a context while an operation or context attach is active.
-- Browser disconnects invalidate the dead pool and mark dependent sessions stale. Non-open operations return a specific stale-session error, while a later `browser_open_page` can recreate a healthy compatible pool. Launch/context failures do not publish half-created sessions.
+- Browser disconnects invalidate the dead pool and mark dependent sessions stale. Externally closed pages/contexts are also detected as stale without discarding a still-healthy Browser process: non-open operations return `browser_session_stale`, while `browser_open_page` recreates the session context inside the compatible pool. A page/context closed during navigation is distinguished from a Browser-process disconnect, and launch/context failures never publish half-created sessions.
 
 Browser idle controls:
 
@@ -190,7 +209,7 @@ MCP_BROWSER_IDLE_SEC       # default: 900 seconds
 MCP_BROWSER_POOL_IDLE_SEC  # default: 120 seconds
 ```
 
-The browser benchmark reports Playwright browser-instance count and active-context count separately from operating-system process-tree count. On the local Windows validation host, the 20-session Chromium case changed from 20 Browser instances in `v0.0.14` to 1 shared Browser instance plus 20 contexts in `v0.0.15`. In the same one-run comparison, peak process-tree RSS changed from 3757.762 MiB to 1506.699 MiB, peak process count from 83 to 26, and elapsed time from 2606.737 ms to 1272.600 ms. These host-specific measurements are regression evidence, not universal performance guarantees. The mixed Chromium/Firefox benchmark is also available; it is reported as skipped when both optional browser runtimes are not installed.
+The browser benchmark reports Playwright browser-instance count and active-context count separately from operating-system process-tree count. On the local Windows validation host, the original D release comparison changed the 20-session Chromium case from 20 Browser instances in `v0.0.14` to 1 shared Browser instance plus 20 contexts in `v0.0.15`; peak process-tree RSS changed from 3757.762 MiB to 1506.699 MiB, peak process count from 83 to 26, and elapsed time from 2606.737 ms to 1272.600 ms. The final post-D harness additionally records open, parallel-navigation, cleanup, and idle-reclamation timings. On the final validation run, 20 Chromium sessions still used exactly 1 Browser plus 20 contexts, and the mixed 5 Chromium + 5 Firefox case completed with exactly 2 Browser instances plus 10 isolated contexts. These host-specific measurements are regression evidence, not universal performance guarantees.
 
 ---
 
@@ -300,6 +319,8 @@ The project includes an automated test suite, static type checking, and linter v
 # Run MCP startup smoke check
 .\.venv\Scripts\python.exe -m scripts.health_check --json
 ```
+
+The final Phase-D validation snapshot on Windows is **203 passing pytest tests**, Ruff with zero violations, mypy with zero issues across 79 source files, successful `compileall`, a passing 59-tool MCP health check, and a passing Full Doctor using the project `.venv`. Real Playwright validation covers Chromium launch/recovery, externally closed page/context recreation, idle context/pool reclamation, and mixed Chromium/Firefox pool isolation.
 
 ### Performance Timing
 
