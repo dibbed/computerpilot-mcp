@@ -548,6 +548,7 @@ def _browser_batch_once(count: int) -> dict[str, Any]:
         session_ids = [f"bench-{index}" for index in range(count)]
         details: dict[str, Any] = {}
         try:
+            opened_at = time.perf_counter()
             await asyncio.gather(
                 *(
                     manager.open(
@@ -561,7 +562,25 @@ def _browser_batch_once(count: int) -> dict[str, Any]:
                     for session_id in session_ids
                 )
             )
+            open_latency_ms = (time.perf_counter() - opened_at) * 1_000
             details = _browser_pool_details(manager, count)
+            details["open_latency_ms"] = round(open_latency_ms, 3)
+
+            navigated_at = time.perf_counter()
+            await asyncio.gather(
+                *(
+                    manager.open(
+                        session_id,
+                        "data:text/html,<title>benchmark-nav</title>",
+                        browser_name="chromium",
+                        headless=True,
+                        timeout_ms=30_000,
+                        wait_until="load",
+                    )
+                    for session_id in session_ids
+                )
+            )
+            details["parallel_navigation_ms"] = round((time.perf_counter() - navigated_at) * 1_000, 3)
         except Exception as exc:
             message = str(exc)
             if (
@@ -572,7 +591,10 @@ def _browser_batch_once(count: int) -> dict[str, Any]:
                 raise BenchmarkSkip("Chromium Playwright runtime is not installed.") from exc
             raise
         finally:
+            cleanup_at = time.perf_counter()
             await asyncio.gather(*(manager.close(session_id) for session_id in session_ids), return_exceptions=True)
+            if details:
+                details["cleanup_latency_ms"] = round((time.perf_counter() - cleanup_at) * 1_000, 3)
             runtime = getattr(manager, "_playwright", None)
             if runtime is not None:
                 await runtime.stop()
@@ -624,6 +646,70 @@ def _browser_mixed_once(count_per_engine: int = 5) -> dict[str, Any]:
             if runtime is not None:
                 await runtime.stop()
         return details
+
+    return asyncio.run(scenario())
+
+
+def _browser_idle_eviction_once() -> dict[str, Any]:
+    try:
+        from tools.browser.manager import BrowserManager
+    except ImportError as exc:
+        raise BenchmarkSkip("Playwright support is not installed.") from exc
+
+    async def scenario() -> dict[str, Any]:
+        session_idle_sec = 0.05
+        pool_idle_sec = 0.05
+        manager = BrowserManager(session_idle_sec=session_idle_sec, pool_idle_sec=pool_idle_sec)
+        try:
+            await manager.open(
+                "idle-bench",
+                "data:text/html,<title>idle-benchmark</title>",
+                browser_name="chromium",
+                headless=True,
+                timeout_ms=30_000,
+                wait_until="load",
+            )
+        except Exception as exc:
+            message = str(exc)
+            if (
+                getattr(exc, "code", None) == "browser_runtime_missing"
+                or "Executable doesn't exist" in message
+                or "playwright install" in message
+            ):
+                raise BenchmarkSkip("Chromium Playwright runtime is not installed.") from exc
+            raise
+
+        started = time.perf_counter()
+        session_evicted_at: float | None = None
+        deadline = started + 5.0
+        try:
+            while time.perf_counter() < deadline:
+                now = time.perf_counter()
+                if session_evicted_at is None and not manager._sessions:
+                    session_evicted_at = now
+                if session_evicted_at is not None and not manager._pools:
+                    finished = now
+                    return {
+                        "session_idle_sec": session_idle_sec,
+                        "pool_idle_sec": pool_idle_sec,
+                        "session_eviction_ms": round((session_evicted_at - started) * 1_000, 3),
+                        "pool_eviction_ms": round((finished - session_evicted_at) * 1_000, 3),
+                        "total_idle_reclamation_ms": round((finished - started) * 1_000, 3),
+                        "remaining_sessions": 0,
+                        "remaining_browser_instances": 0,
+                    }
+                await asyncio.sleep(0.005)
+            raise RuntimeError("Timed out waiting for browser idle eviction.")
+        finally:
+            await manager.close("idle-bench")
+            for pool in list(manager._pools.values()):
+                try:
+                    await pool.browser.close()
+                except Exception:
+                    pass
+            runtime = getattr(manager, "_playwright", None)
+            if runtime is not None:
+                await runtime.stop()
 
     return asyncio.run(scenario())
 
@@ -755,6 +841,7 @@ def run_benchmarks(
             for count in limits["browser_counts"]:
                 results.append(measure(f"browser_{count}_sessions", partial(_browser_batch_once, count), runs))
             if profile == "full":
+                results.append(measure("browser_idle_eviction", _browser_idle_eviction_once, runs))
                 results.append(measure("browser_5_chromium_5_firefox", _browser_mixed_once, runs))
 
     process = psutil.Process()
