@@ -27,6 +27,8 @@ class BrowserPool:
     key: PoolKey
     browser: Any
     active_contexts: int = 0
+    pending_contexts: int = 0
+    last_used: float = 0.0
 
 
 @dataclass(slots=True)
@@ -44,6 +46,7 @@ class BrowserManager:
         self,
         *,
         session_idle_sec: float | None = None,
+        pool_idle_sec: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._playwright: Any = None
@@ -55,7 +58,8 @@ class BrowserManager:
         self._session_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
         self._session_idle_sec = float(SETTINGS.browser_idle_sec if session_idle_sec is None else session_idle_sec)
-        self._cleanup_interval_sec = max(0.01, min(30.0, self._session_idle_sec / 2))
+        self._pool_idle_sec = float(SETTINGS.browser_pool_idle_sec if pool_idle_sec is None else pool_idle_sec)
+        self._cleanup_interval_sec = max(0.01, min(30.0, self._session_idle_sec / 2, self._pool_idle_sec / 2))
         self._clock = clock
 
     def _touch_session(self, session_id: str) -> None:
@@ -130,6 +134,7 @@ class BrowserManager:
         async with self._pool_lock:
             existing = self._pools.get(key)
             if existing is not None:
+                existing.last_used = self._clock()
                 return existing
             try:
                 browser = await getattr(runtime, browser_name).launch(headless=headless)
@@ -142,7 +147,7 @@ class BrowserManager:
                         hint=f"Run .venv\\Scripts\\python.exe -m playwright install {browser_name}.",
                     ) from exc
                 raise
-            pool = BrowserPool(key=key, browser=browser)
+            pool = BrowserPool(key=key, browser=browser, last_used=self._clock())
             self._pools[key] = pool
             self._ensure_cleanup_task()
             return pool
@@ -155,6 +160,9 @@ class BrowserManager:
     ) -> Session:
         pool = await self._get_or_create_pool(browser_name, headless)
         context: Any = None
+        async with self._pool_lock:
+            pool.pending_contexts += 1
+            pool.last_used = self._clock()
         try:
             context = await pool.browser.new_context()
             page = await context.new_page()
@@ -165,8 +173,13 @@ class BrowserManager:
                 except Exception:
                     pass
             raise
+        finally:
+            async with self._pool_lock:
+                pool.pending_contexts = max(0, pool.pending_contexts - 1)
+                pool.last_used = self._clock()
         async with self._pool_lock:
             pool.active_contexts += 1
+            pool.last_used = self._clock()
         return Session(
             pool_key=pool.key,
             context=context,
@@ -182,8 +195,10 @@ class BrowserManager:
         finally:
             async with self._pool_lock:
                 pool = self._pools.get(session.pool_key)
-                if pool is not None and pool.active_contexts > 0:
-                    pool.active_contexts -= 1
+                if pool is not None:
+                    if pool.active_contexts > 0:
+                        pool.active_contexts -= 1
+                    pool.last_used = self._clock()
 
     @staticmethod
     def _compatible(session: Session, *, browser_name: BrowserName, headless: bool) -> bool:
@@ -274,10 +289,28 @@ class BrowserManager:
                     await self._close_session_context(current)
                     evicted_sessions += 1
 
+            pools_to_close: list[BrowserPool] = []
+            now = self._clock()
+            async with self._pool_lock:
+                for key, pool in list(self._pools.items()):
+                    if pool.active_contexts != 0 or pool.pending_contexts != 0:
+                        continue
+                    if now - pool.last_used < self._pool_idle_sec:
+                        continue
+                    if self._pools.get(key) is pool:
+                        self._pools.pop(key)
+                        pools_to_close.append(pool)
+
+            closed_pools = 0
+            for pool in pools_to_close:
+                await pool.browser.close()
+                closed_pools += 1
+
             return {
                 "ok": True,
                 "skipped": False,
                 "evicted_sessions": evicted_sessions,
+                "closed_pools": closed_pools,
                 "active_sessions": len(self._sessions),
                 "active_pools": len(self._pools),
             }
