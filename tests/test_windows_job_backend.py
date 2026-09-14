@@ -155,6 +155,16 @@ def test_background_root_exit_reaps_surviving_descendant_without_output_poll(
             psutil.Process(pid).kill()
 
 
+def test_job_object_backend_can_be_explicitly_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_WINDOWS_JOB_OBJECTS", "0")
+    result = run_bounded([sys.executable, "-c", "print('ok')"], cwd=tmp_path, timeout_sec=10)
+    assert result["ok"] is True
+    assert result["process_ownership"] == "psutil"
+    assert result["stdout"]["text"].strip() == "ok"
+
+
 def test_job_object_unavailable_falls_back_without_double_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
