@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
+from typing import cast
 
 import psutil
+import pytest
 
+from core import job_scheduler
+from core import jobs as jobs_module
 from core.jobs import JobStore
 
 
@@ -82,6 +87,105 @@ def test_stale_launch_reservation_is_recovered_and_replaced(tmp_path: Path) -> N
     assert reservations[0][0] == job_id
     assert reservations[0][1] != "stale"
     assert store.raw(job_id)["launch_token"] == reservations[0][1]
+
+
+def test_submit_tolerates_scheduler_precreated_output_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id = "f" * 32
+    directory = store.output_dir / job_id
+    directory.mkdir()
+    stdout = directory / "stdout.bin"
+    stderr = directory / "stderr.bin"
+    stdout.write_bytes(b"existing-output")
+    stderr.write_bytes(b"existing-error")
+    monkeypatch.setattr(jobs_module.uuid, "uuid4", lambda: type("FixedUUID", (), {"hex": job_id})())
+    monkeypatch.setattr(job_scheduler, "ensure_job_scheduler", lambda store: None)
+
+    result = store.submit(["fake"], tmp_path, 10.0, "precreated-output")
+
+    assert result["job_id"] == job_id
+    assert result["status"] == "queued"
+    assert stdout.read_bytes() == b"existing-output"
+    assert stderr.read_bytes() == b"existing-error"
+
+
+def test_concurrent_scheduler_ensure_reuses_single_coordinator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeStore:
+        path = tmp_path / "jobs.sqlite3"
+
+        @staticmethod
+        def has_queued_jobs() -> bool:
+            return True
+
+    created: list[FakeScheduler] = []
+    barrier = threading.Barrier(2)
+
+    class FakeScheduler:
+        def __init__(self, store: object) -> None:
+            self.store = store
+            self.key = str(FakeStore.path)
+            self.started = False
+            created.append(self)
+
+        @property
+        def alive(self) -> bool:
+            return self.started
+
+        def launch_once(self) -> int:
+            barrier.wait(timeout=5)
+            return 1
+
+        def start(self) -> None:
+            self.started = True
+
+        def wake(self) -> None:
+            pass
+
+    job_scheduler._SCHEDULERS.clear()
+    monkeypatch.setattr(job_scheduler, "JobScheduler", FakeScheduler)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(lambda _: job_scheduler.ensure_job_scheduler(cast(JobStore, FakeStore())), range(2))
+            )
+        assert len(created) == 1
+        assert results[0] is results[1] is created[0]
+    finally:
+        job_scheduler._SCHEDULERS.clear()
+
+
+def test_scheduler_start_failure_does_not_poison_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeStore:
+        path = tmp_path / "jobs.sqlite3"
+
+        @staticmethod
+        def has_queued_jobs() -> bool:
+            return True
+
+    class FailingScheduler:
+        def __init__(self, store: object) -> None:
+            self.store = store
+
+        def launch_once(self) -> int:
+            return 1
+
+        def start(self) -> None:
+            raise RuntimeError("cannot start thread")
+
+        def wake(self) -> None:
+            pass
+
+    job_scheduler._SCHEDULERS.clear()
+    monkeypatch.setattr(job_scheduler, "JobScheduler", FailingScheduler)
+    with pytest.raises(RuntimeError, match="cannot start thread"):
+        job_scheduler.ensure_job_scheduler(cast(JobStore, FakeStore()))
+    assert job_scheduler._SCHEDULERS == {}
 
 
 def test_reserved_worker_claim_requires_matching_launch_token(tmp_path: Path) -> None:

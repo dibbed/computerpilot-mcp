@@ -151,9 +151,11 @@ class JobStore:
                 ensure_job_scheduler(self)
             return {"ok": True, "deduplicated": True, **result}
         directory = self.output_dir / job_id
-        directory.mkdir()
-        (directory / "stdout.bin").touch()
-        (directory / "stderr.bin").touch()
+        # A concurrent idempotent submit may already have kicked the scheduler,
+        # which creates the output directory before this inserter reaches it.
+        directory.mkdir(exist_ok=True)
+        (directory / "stdout.bin").touch(exist_ok=True)
+        (directory / "stderr.bin").touch(exist_ok=True)
         from core.job_scheduler import ensure_job_scheduler
         ensure_job_scheduler(self)
         return {"ok": True, "deduplicated": False, **self.get(job_id)}

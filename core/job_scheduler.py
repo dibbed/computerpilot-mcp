@@ -107,20 +107,27 @@ class JobScheduler:
 
 
 def ensure_job_scheduler(store: JobStore) -> JobScheduler | None:
-    """Synchronously kick durable workers, then keep a recovery launcher while queue work remains."""
+    """Synchronously kick durable workers, then keep one recovery launcher per jobs DB."""
     if not store.has_queued_jobs():
         return None
     key = _scheduler_key(store.path)
     with _SCHEDULERS_LOCK:
         current = _SCHEDULERS.get(key)
-        if current is not None and current.alive:
+        if current is not None:
             scheduler = current
             start = False
         else:
             scheduler = JobScheduler(store)
             _SCHEDULERS[key] = scheduler
             start = True
-    queued = scheduler.launch_once()
+    try:
+        queued = scheduler.launch_once()
+    except BaseException:
+        if start:
+            with _SCHEDULERS_LOCK:
+                if _SCHEDULERS.get(key) is scheduler:
+                    _SCHEDULERS.pop(key, None)
+        raise
     if queued == 0 and not store.has_queued_jobs():
         if start:
             with _SCHEDULERS_LOCK:
@@ -128,7 +135,13 @@ def ensure_job_scheduler(store: JobStore) -> JobScheduler | None:
                     _SCHEDULERS.pop(key, None)
         return None
     if start:
-        scheduler.start()
+        try:
+            scheduler.start()
+        except BaseException:
+            with _SCHEDULERS_LOCK:
+                if _SCHEDULERS.get(key) is scheduler:
+                    _SCHEDULERS.pop(key, None)
+            raise
     else:
         scheduler.wake()
     return scheduler

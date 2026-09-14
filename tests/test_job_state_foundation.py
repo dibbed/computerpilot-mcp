@@ -83,6 +83,43 @@ def test_old_database_migrates_in_place_and_preserves_default_idempotency(tmp_pa
     assert deduplicated["job_id"] == "0" * 32
 
 
+def test_e1_schema_migrates_to_e2_without_resetting_job_state(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.sqlite3"
+    deadline = time.time() + 120
+    spec = json.dumps(
+        {"command": ["fake"], "cwd": str(tmp_path), "timeout_sec": 60.0, "encoding": "utf-8"},
+        sort_keys=True,
+    )
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("""CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL, fingerprint TEXT NOT NULL,
+            spec TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1, queue_deadline REAL,
+            worker_pid INTEGER, worker_created REAL, pid INTEGER, pid_created REAL,
+            exit_code INTEGER, cancel_requested INTEGER NOT NULL DEFAULT 0, error TEXT
+        )""")
+        db.execute("PRAGMA user_version=2")
+        db.execute(
+            "INSERT INTO jobs (id,request_key,fingerprint,spec,status,created,updated,version,queue_deadline) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("e" * 32, "e1-key", "e1-fingerprint", spec, "queued", 1.0, 2.0, 7, deadline),
+        )
+
+    store = JobStore(path)
+    row = store.raw("e" * 32)
+    with closing(store.connect()) as db:
+        columns = {str(item[1]) for item in db.execute("PRAGMA table_info(jobs)")}
+        schema_version = int(db.execute("PRAGMA user_version").fetchone()[0])
+
+    assert schema_version == JOB_SCHEMA_VERSION == 3
+    assert {"launch_token", "launch_started"} <= columns
+    assert row["version"] == 7
+    assert row["queue_deadline"] == deadline
+    assert row["status"] == "queued"
+    assert row["launch_token"] is None
+    assert row["launch_started"] is None
+
+
 def test_schema_migration_is_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "jobs.sqlite3"
     JobStore(path)
