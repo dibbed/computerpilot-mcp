@@ -185,6 +185,28 @@ def test_pending_context_prevents_pool_eviction() -> None:
     asyncio.run(run())
 
 
+def test_pool_acquisition_marks_pending_before_cleanup_can_evict() -> None:
+    async def run() -> None:
+        clock = Clock()
+        manager = BrowserManager(session_idle_sec=60, pool_idle_sec=1, clock=clock)
+        browser, _ = _browser()
+        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)))
+
+        pool = await manager._acquire_pool_for_context("chromium", True)
+        assert pool.pending_contexts == 1
+
+        clock.value = 2
+        result = await manager.cleanup_idle()
+        assert result["closed_pools"] == 0
+        assert manager._pools[pool.key] is pool
+        browser.close.assert_not_awaited()
+
+        async with manager._pool_lock:
+            pool.pending_contexts -= 1
+
+    asyncio.run(run())
+
+
 def test_background_cleanup_reclaims_idle_context_and_pool() -> None:
     async def run() -> None:
         context_closed = asyncio.Event()

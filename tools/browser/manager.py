@@ -128,12 +128,13 @@ class BrowserManager:
             if self._cleanup_task is current:
                 self._cleanup_task = None
 
-    async def _get_or_create_pool(self, browser_name: BrowserName, headless: bool) -> BrowserPool:
+    async def _acquire_pool_for_context(self, browser_name: BrowserName, headless: bool) -> BrowserPool:
         key = self._pool_key(browser_name, headless)
         runtime = await self._runtime()
         async with self._pool_lock:
             existing = self._pools.get(key)
             if existing is not None:
+                existing.pending_contexts += 1
                 existing.last_used = self._clock()
                 return existing
             try:
@@ -147,7 +148,12 @@ class BrowserManager:
                         hint=f"Run .venv\\Scripts\\python.exe -m playwright install {browser_name}.",
                     ) from exc
                 raise
-            pool = BrowserPool(key=key, browser=browser, last_used=self._clock())
+            pool = BrowserPool(
+                key=key,
+                browser=browser,
+                pending_contexts=1,
+                last_used=self._clock(),
+            )
             self._pools[key] = pool
             self._ensure_cleanup_task()
             return pool
@@ -158,11 +164,8 @@ class BrowserManager:
         browser_name: BrowserName,
         headless: bool,
     ) -> Session:
-        pool = await self._get_or_create_pool(browser_name, headless)
+        pool = await self._acquire_pool_for_context(browser_name, headless)
         context: Any = None
-        async with self._pool_lock:
-            pool.pending_contexts += 1
-            pool.last_used = self._clock()
         try:
             context = await pool.browser.new_context()
             page = await context.new_page()
