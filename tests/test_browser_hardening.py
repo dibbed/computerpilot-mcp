@@ -20,6 +20,23 @@ def _context() -> SimpleNamespace:
     return SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock())
 
 
+def _closable_context() -> tuple[SimpleNamespace, SimpleNamespace, dict[str, bool]]:
+    state = {"closed": False}
+    page = SimpleNamespace(
+        set_default_timeout=lambda n: None,
+        goto=AsyncMock(return_value=None),
+        title=AsyncMock(return_value="title"),
+        url="about:blank",
+        is_closed=lambda: state["closed"],
+    )
+
+    async def close() -> None:
+        state["closed"] = True
+
+    context = SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock(side_effect=close))
+    return context, page, state
+
+
 class FakeBrowser:
     def __init__(self, contexts: list[SimpleNamespace] | None = None) -> None:
         self._connected = True
@@ -49,6 +66,99 @@ class FakeBrowser:
         self._connected = False
         for callback in list(self._disconnect_handlers):
             callback(self)
+
+
+def test_closed_page_reopens_session_in_existing_pool() -> None:
+    async def run() -> None:
+        old_context, _, old_state = _closable_context()
+        new_context, new_page, _ = _closable_context()
+        browser = FakeBrowser([old_context, new_context])
+        launch = AsyncMock(return_value=browser)
+        manager = BrowserManager(session_idle_sec=60, pool_idle_sec=60)
+        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+
+        await manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        pool = next(iter(manager._pools.values()))
+        old_state["closed"] = True
+
+        result = await manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+
+        assert result["ok"] is True
+        launch.assert_awaited_once()
+        assert browser.new_context.await_count == 2
+        assert manager._sessions["a"].page is new_page
+        assert manager._sessions["a"].pool is pool
+        assert pool.active_contexts == 1
+        old_context.close.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+def test_closed_context_reopens_session_in_existing_pool() -> None:
+    async def run() -> None:
+        old_context, _, _ = _closable_context()
+        new_context, new_page, _ = _closable_context()
+        browser = FakeBrowser([old_context, new_context])
+        launch = AsyncMock(return_value=browser)
+        manager = BrowserManager(session_idle_sec=60, pool_idle_sec=60)
+        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+
+        await manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        pool = next(iter(manager._pools.values()))
+        await old_context.close()
+
+        result = await manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+
+        assert result["ok"] is True
+        launch.assert_awaited_once()
+        assert browser.new_context.await_count == 2
+        assert manager._sessions["a"].page is new_page
+        assert manager._sessions["a"].pool is pool
+        assert pool.active_contexts == 1
+        assert old_context.close.await_count == 2
+
+    asyncio.run(run())
+
+
+def test_closed_page_is_reported_stale_to_non_open_operations() -> None:
+    async def run() -> None:
+        context, _, state = _closable_context()
+        browser = FakeBrowser([context])
+        manager = BrowserManager(session_idle_sec=60, pool_idle_sec=60)
+        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)))
+
+        await manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        state["closed"] = True
+
+        with pytest.raises(ToolError) as exc_info:
+            manager.page("a")
+        assert exc_info.value.code == "browser_session_stale"
+        assert manager._sessions["a"].stale is True
+
+    asyncio.run(run())
+
+
+def test_page_closed_during_navigation_returns_stale_session_error() -> None:
+    async def run() -> None:
+        context, page, state = _closable_context()
+        browser = FakeBrowser([context])
+        manager = BrowserManager(session_idle_sec=60, pool_idle_sec=60)
+        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)))
+
+        await manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+
+        async def close_during_navigation(*args: object, **kwargs: object) -> None:
+            state["closed"] = True
+            raise RuntimeError("target closed")
+
+        page.goto = AsyncMock(side_effect=close_during_navigation)
+        with pytest.raises(ToolError) as exc_info:
+            await manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        assert exc_info.value.code == "browser_session_stale"
+        assert manager._sessions["a"].stale is True
+        assert browser.is_connected() is True
+
+    asyncio.run(run())
 
 
 def test_launch_failure_does_not_poison_future_pool_creation() -> None:
