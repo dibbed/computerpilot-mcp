@@ -183,9 +183,24 @@ class Supervisor:
     @staticmethod
     def _write_lifecycle_control(path: Path, command: str, request_id: str, deadline: float) -> None:
         payload = lifecycle_control_request(cast(Any, command), request_id, deadline)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True), encoding="utf-8")
-        os.replace(temporary, path)
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        last_error: OSError | None = None
+        for attempt in range(20):
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.{attempt}.tmp")
+            try:
+                temporary.write_text(encoded, encoding="utf-8")
+                os.replace(temporary, path)
+                return
+            except OSError as exc:
+                last_error = exc
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if attempt < 19:
+                    time.sleep(0.01)
+        assert last_error is not None
+        raise last_error
 
     @staticmethod
     def _read_lifecycle_status(path: Path) -> dict[str, Any] | None:
@@ -240,8 +255,10 @@ class Supervisor:
                     if active_mutations == 0:
                         drained = True
                         break
-            elif time.monotonic() - started >= start_grace:
-                # No lifecycle status means the MCP lifespan never reached request-serving state.
+            elif not saw_status and time.monotonic() - started >= start_grace:
+                # Only give up early when this runtime generation never published
+                # any lifecycle status. After one valid status, transient Windows
+                # sharing/read failures must not be mistaken for an unstarted MCP.
                 break
             time.sleep(LIFECYCLE_POLL_SEC)
 

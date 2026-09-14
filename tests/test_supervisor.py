@@ -230,6 +230,82 @@ while True:
     assert not thread.is_alive()
 
 
+def test_lifecycle_control_write_retries_transient_windows_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "control.json"
+    original_replace = module.os.replace
+    calls = 0
+
+    def flaky_replace(source: str | bytes | Path, destination: str | bytes | Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise OSError("transient sharing violation")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(module.os, "replace", flaky_replace)
+    Supervisor._write_lifecycle_control(path, "drain", "request-1", time.time() + 5)
+    assert calls == 3
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["command"] == "drain"
+    assert payload["request_id"] == "request-1"
+
+
+def test_drain_ignores_transient_status_read_failure_after_runtime_was_seen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = tmp_path / "control.json"
+    status = tmp_path / "status.json"
+    process = module.subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    supervisor = Supervisor(
+        [],
+        readiness_url=None,
+        state_dir=tmp_path,
+        drain_timeout=1.0,
+        watchdog_drain_timeout=0.2,
+    )
+    calls = 0
+
+    def intermittent_read(path: Path) -> dict[str, object] | None:
+        nonlocal calls
+        calls += 1
+        payload = json.loads(control.read_text(encoding="utf-8"))
+        request_id = payload["request_id"]
+        if calls <= 11:
+            return {
+                "schema_version": 1,
+                "request_id": request_id,
+                "state": "DRAINING",
+                "active_mutations": 1,
+            }
+        if calls == 12:
+            return None
+        return {
+            "schema_version": 1,
+            "request_id": request_id,
+            "state": "DRAINING",
+            "active_mutations": 0,
+        }
+
+    monkeypatch.setattr(supervisor, "_read_lifecycle_status", intermittent_read)
+    try:
+        result = supervisor.drain_runtime(
+            process,
+            reason="user_restart",
+            control_path=control,
+            status_path=status,
+        )
+        assert calls >= 13
+        assert result["acknowledged"] is True
+        assert result["drained"] is True
+        assert result["active_mutations"] == 0
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+        close_logger(supervisor)
+
+
 def test_watchdog_drain_is_bounded_when_mutation_does_not_finish(tmp_path: Path) -> None:
     control = tmp_path / "control.json"
     status = tmp_path / "status.json"
