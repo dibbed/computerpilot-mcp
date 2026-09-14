@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from core.jobs import JobStore
 from core.registry import create_server
 from scripts.perf_benchmark import (
     PROFILE_LIMITS,
@@ -19,6 +20,8 @@ from scripts.perf_benchmark import (
     _browser_batch_once,
     _browser_pool_details,
     _cleanup_stale_temp_roots,
+    _job_wait_change_once,
+    _job_wait_timeout_once,
     _launcher_validation_once,
     _output_once,
     _prepare_python_fixture,
@@ -141,7 +144,7 @@ def test_catalog_benchmark_smoke() -> None:
     result = report["results"][0]
     assert result["name"] == "tool_catalog"
     assert result["status"] == "ok"
-    assert result["details"]["tool_count"] == 59
+    assert result["details"]["tool_count"] == 60
     assert result["details"]["catalog_json_bytes"] > 10_000
 
 
@@ -226,6 +229,18 @@ def test_search_benchmark_reports_exact_streaming_and_snapshot_pagination() -> N
     assert snapshot_page2["status"] == "ok"
     assert snapshot_page2["details"]["matches_returned"] == 50
     assert snapshot_page2["details"]["scanned_files"] == 0
+
+
+def test_job_wait_benchmark_covers_change_and_timeout_paths(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    changed = _job_wait_change_once(store, waiters=4)
+    timed_out = _job_wait_timeout_once(store, timeout=0.05)
+
+    assert changed["waiters"] == 4
+    assert changed["observed_version"] == 2
+    assert changed["wake_latency_ms"] >= 0
+    assert timed_out["observed_version"] == 1
+    assert timed_out["elapsed_ms"] >= 40
 
 
 def test_stale_benchmark_temp_cleanup_is_age_bounded(tmp_path: Path) -> None:

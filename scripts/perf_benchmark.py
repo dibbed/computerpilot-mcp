@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -532,6 +533,78 @@ def _job_batch_once(store: JobStore, count: int, run_key: int) -> dict[str, Any]
     }
 
 
+def _job_wait_seed(store: JobStore) -> str:
+    """Create one synthetic live row so wait latency is measured without command startup noise."""
+    job_id = f"{time.time_ns() & ((1 << 128) - 1):032x}"
+    now = time.time()
+    process = psutil.Process()
+    spec = json.dumps({"encoding": "utf-8"}, sort_keys=True)
+    db = store.connect()
+    try:
+        with db:
+            db.execute(
+                "INSERT INTO jobs "
+                "(id,request_key,fingerprint,spec,status,created,updated,version,worker_pid,worker_created) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    f"wait-benchmark-{job_id}",
+                    f"wait-fingerprint-{job_id}",
+                    spec,
+                    "running",
+                    now,
+                    now,
+                    1,
+                    process.pid,
+                    process.create_time(),
+                ),
+            )
+    finally:
+        db.close()
+    return job_id
+
+
+def _job_wait_change_once(store: JobStore, waiters: int = 1) -> dict[str, Any]:
+    job_id = _job_wait_seed(store)
+    barrier = threading.Barrier(waiters + 1)
+
+    def wait_one() -> dict[str, Any]:
+        barrier.wait(timeout=5)
+        return store.wait(job_id, after_version=1, timeout=5)
+
+    with ThreadPoolExecutor(max_workers=waiters) as pool:
+        futures = [pool.submit(wait_one) for _ in range(waiters)]
+        barrier.wait(timeout=5)
+        time.sleep(0.1)
+        changed_at = time.perf_counter()
+        store.update(job_id, status="succeeded", exit_code=0)
+        results = [future.result(timeout=5) for future in futures]
+        wake_latency_ms = (time.perf_counter() - changed_at) * 1_000
+    if not all(result["changed"] and not result["timed_out"] for result in results):
+        raise RuntimeError("job_wait failed to observe the authoritative version change.")
+    return {
+        "waiters": waiters,
+        "update_delay_ms": 100.0,
+        "wake_latency_ms": round(wake_latency_ms, 3),
+        "observed_version": int(results[0]["version"]),
+    }
+
+
+def _job_wait_timeout_once(store: JobStore, timeout: float = 0.2) -> dict[str, Any]:
+    job_id = _job_wait_seed(store)
+    started = time.perf_counter()
+    result = store.wait(job_id, after_version=1, timeout=timeout)
+    elapsed_ms = (time.perf_counter() - started) * 1_000
+    store.update(job_id, status="succeeded", exit_code=0)
+    if result["changed"] or not result["timed_out"]:
+        raise RuntimeError("job_wait timeout benchmark unexpectedly observed a version change.")
+    return {
+        "timeout_ms": round(timeout * 1_000, 3),
+        "elapsed_ms": round(elapsed_ms, 3),
+        "observed_version": int(result["version"]),
+    }
+
+
 def _browser_pool_details(manager: Any, sessions: int) -> dict[str, Any]:
     pools = list(getattr(manager, "_pools", {}).values())
     return {
@@ -845,6 +918,10 @@ def run_benchmarks(
                         return _job_batch_once(store, count, sequence)
 
                     results.append(measure(f"jobs_{count}_concurrent", job_case, runs))
+                results.append(measure("job_wait_change", partial(_job_wait_change_once, store, 1), runs))
+                results.append(measure("job_wait_timeout", partial(_job_wait_timeout_once, store), runs))
+                if profile == "full":
+                    results.append(measure("job_wait_50_waiters", partial(_job_wait_change_once, store, 50), runs))
 
     if "browser" in suites:
         if not include_browser:
