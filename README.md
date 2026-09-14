@@ -14,13 +14,13 @@ The optimization roadmap is complete through **Phase D / v0.0.15**. The `main` b
 | B | `v0.0.13` | Core Performance | ✅ Complete |
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
-| E | `v0.0.16` | Durable Jobs & Reliability | 🚧 In progress — E1 complete |
+| E | `v0.0.16` | Durable Jobs & Reliability | 🚧 In progress — E1/E2 complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
 The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify introducing another tool-profile mode without stronger host-level token/context evidence. The default full 59-tool surface therefore remains unchanged.
 
-Current post-D validation on Windows: **203 pytest tests**, Ruff with zero violations, mypy with zero issues across 79 source files, compileall, the 59-tool health check, Full Doctor, real Chromium recovery tests, and a real mixed Chromium/Firefox pooling benchmark all pass. **Phase E / v0.0.16 — Durable Jobs & Reliability** is now in progress; E1 establishes the versioned job-state and queue/execution-timeout foundation, while admission control and `job_wait` remain later E subphases.
+Current post-D validation on Windows: **203 pytest tests**, Ruff with zero violations, mypy with zero issues across 79 source files, compileall, the 59-tool health check, Full Doctor, real Chromium recovery tests, and a real mixed Chromium/Firefox pooling benchmark all pass. **Phase E / v0.0.16 — Durable Jobs & Reliability** is now in progress; E1 establishes versioned job state and queue/execution-timeout separation, and E2 adds bounded durable-job admission plus lightweight worker launching. Version-aware `job_wait` remains the next E subphase.
 
 ---
 
@@ -29,7 +29,7 @@ Current post-D validation on Windows: **203 pytest tests**, Ruff with zero viola
 - **Robust Filesystem Tools**: Atomic file creation, writing, copying, moving, and deletion; paginated listing and regex file search; complete reads with streaming byte cursors.
 - **Precision Code Editing**: Exact match, anchored replacements, and AST function/class body substitutions with syntax validation and rollback on syntax error.
 - **Process & Command Execution**: Synchronous and background execution for PowerShell, CMD, and native Windows executables with streaming spooling (1 MiB RAM limit rolling over to temp disk), bounded auto-delivery, byte cursors, and reusable finalized artifacts.
-- **Durable Job Store**: SQLite-backed background job queue (`.agent_state/jobs.sqlite3`) with idempotency keys, progress tracking, survivor workers across supervisor restarts, constant-query list/status paths, and one persistent SQLite connection per running worker.
+- **Durable Job Store**: SQLite-backed background job queue (`.agent_state/jobs.sqlite3`) with idempotency keys, bounded max-running admission, lightweight worker scheduling, survivor workers across supervisor restarts, constant-query list/status paths, and one persistent SQLite connection per running worker.
 - **Concurrency Hardening**: Keyed resource locks protect filesystem read-modify-write operations and project-memory updates; browser navigation is serialized only within the same session rather than across unrelated sessions.
 - **System Diagnostics**: Live inspection of CPU, memory, disks, environment variables, installed applications, and Windows services.
 - **Codebase Intelligence**: Fast Python AST parsing for classes, functions, imports, and project summaries.
@@ -196,7 +196,7 @@ Use streaming mode when lowest first-page latency matters. Use `snapshot=true` w
 
 Phase E1 prepares the durable-job subsystem for bounded admission and future version-aware waiting without changing the per-running-job worker architecture:
 
-- The jobs database now carries an explicit SQLite schema revision (`PRAGMA user_version=2`). Existing `jobs.sqlite3` files are migrated in place under a serialized `BEGIN IMMEDIATE` migration; existing rows, request keys, command specs, and idempotency fingerprints are preserved.
+- Phase E1 introduced explicit SQLite job-schema revisioning. The current E2 schema is `PRAGMA user_version=3`: existing `jobs.sqlite3` files migrate in place under serialized `BEGIN IMMEDIATE` transactions, preserving rows, request keys, command specs, and idempotency fingerprints while adding internal launch-reservation metadata.
 - Every durable job row has a monotonic integer `version`. New jobs start at `version=1`; worker claim, process metadata, cancellation, reconciliation, timeout, failure, and terminal-state updates increment the version. Public job status/list/output responses expose the current version for later `after_version` waiting.
 - `timeout_sec` remains the execution timeout and starts only after the command process has actually started. Queue age is no longer charged against execution time.
 - `queue_timeout_sec` is a new optional submit parameter. Its default is `None`, so queued jobs do not expire merely because they have waited longer than 60 seconds. When provided, it is stored as an absolute `queue_deadline`; expiry becomes a terminal `timed_out` result with an explicit queue-timeout error.
@@ -204,7 +204,27 @@ Phase E1 prepares the durable-job subsystem for bounded admission and future ver
 - Default submissions deliberately keep the pre-E1 fingerprint shape when no queue deadline is requested, so idempotency keys created before the migration remain reusable without false conflicts.
 - Schema initialization is safe under concurrent JobStore creation, including WAL setup contention; databases with a future unsupported jobs schema are rejected instead of being silently downgraded.
 
-E1 does **not** add max-running/max-launching admission yet and does not add `job_wait`; those are intentionally reserved for E2/E3 so each reliability change remains reviewable and separately benchmarkable.
+E1 deliberately left admission and `job_wait` for later subphases. E2 now implements admission/launch control; `job_wait` remains reserved for E3.
+
+### Durable Job Admission Control (Phase E2)
+
+Phase E2 keeps SQLite as the authoritative job state and preserves one independent worker per running job; it does **not** introduce a shared resident `jobd`:
+
+- `MCP_MAX_RUNNING_JOBS` bounds active durable jobs across processes; the conservative default is `4` and the accepted range is `1..256`. Both `running` jobs and `orphaned` commands that are still alive consume capacity.
+- Worker claims are serialized with `BEGIN IMMEDIATE` and capacity is derived from authoritative row state rather than a separate slot counter. Terminal transitions therefore release capacity naturally, while stale running/orphaned rows are reconciled before admission so a crashed worker cannot permanently leak a slot.
+- Queue cancellation is race-safe: queued jobs become terminal `cancelled` atomically, while a claim that wins first can only leave a running row with `cancel_requested=1`; a queued cancellation cannot silently race into an uncancelled command.
+- The initial E2 implementation let every queued job create a waiting worker. A real 50-job benchmark kept `peak_active_jobs=4` but still reached 155 processes and 3280.344 MiB peak process-tree RSS, so the roadmap's second-stage scheduler gate was triggered.
+- The final E2 launcher uses short-lived SQLite launch reservations (`launch_token` / `launch_started`) so concurrent schedulers reserve at most available capacity. Stale reservations are recoverable, a reserved worker must present the matching token before claiming the job, and launch failure becomes a durable terminal failure instead of an ambiguous replay.
+- Submission performs a synchronous launch pass before returning, so a short-lived submitter can exit without stranding the first durable worker. Each terminal worker also kicks a successor before exit; a small background scheduler remains only for recovery/coordination while queued work exists. Running commands remain independent processes and survive MCP runtime restarts.
+- On the same Windows host, the final committed 50-job default-cap benchmark (`e9fc0b9`) kept `peak_active_jobs=4` and completed in 20817.842 ms while reducing peak process-tree RSS from 3280.344 MiB to 491.629 MiB and peak process count from 155 to 25. A calibration run with `MCP_MAX_RUNNING_JOBS=8` completed the 50-job case in 17955.369 ms at 748.305 MiB / 37 processes; the default remains `4` to favor predictable local resource use. These are host-specific regression measurements, not universal guarantees.
+
+Configuration:
+
+```text
+MCP_MAX_RUNNING_JOBS=4
+```
+
+Short-job throughput is intentionally traded for bounded resource use because each running job still owns an independent durable worker. A warm shared worker pool remains deferred/conditional rather than being folded into E2.
 
 ### Runtime and Browser Pooling
 
