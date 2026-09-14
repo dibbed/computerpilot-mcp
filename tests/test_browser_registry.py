@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from tools.browser import registry
-from tools.browser.manager import BrowserManager, Session
+from tools.browser.manager import BrowserManager, PoolKey, Session
 
 ToolFunction = Callable[..., Any]
 
@@ -32,8 +32,8 @@ def test_click_keeps_session_locked_through_action(monkeypatch: pytest.MonkeyPat
             await release.wait()
 
         page = SimpleNamespace(url="about:blank", locator=lambda _: SimpleNamespace(first=SimpleNamespace(click=click)))
-        browser = SimpleNamespace(close=AsyncMock())
-        manager._sessions["a"] = Session(browser, None, page, "chromium", True)
+        context = SimpleNamespace(close=AsyncMock())
+        manager._sessions["a"] = Session(PoolKey("chromium", True), context, page, "chromium", True)
         monkeypatch.setattr(registry, "MANAGER", manager)
         monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
         registry.register(cast(Any, Capture()))
@@ -42,10 +42,11 @@ def test_click_keeps_session_locked_through_action(monkeypatch: pytest.MonkeyPat
         close = asyncio.create_task(functions["browser_close"]("a"))
         await asyncio.sleep(0)
         assert not close.done()
-        browser.close.assert_not_awaited()
+        context.close.assert_not_awaited()
         release.set()
         assert (await task)["ok"]
         assert (await close)["closed"]
+        context.close.assert_awaited_once()
         assert not manager._session_locks
 
     asyncio.run(run())

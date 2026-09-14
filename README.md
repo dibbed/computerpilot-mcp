@@ -15,7 +15,7 @@ A high-performance, full-access local Windows developer-agent backend powered by
 - **Codebase Intelligence**: Fast Python AST parsing for classes, functions, imports, and project summaries.
 - **Validation Suite**: Compact summaries from integrated `pytest`, `Ruff`, and `mypy` tools.
 - **Git Integration**: Working-tree status, diff statistics, and commit log pagination.
-- **Optional Browser Automation**: Playwright browser automation with screenshot capture and UI interaction.
+- **Optional Browser Automation**: Playwright automation with shared browser-process pools, isolated per-session contexts, idle eviction, crash recovery, screenshot capture, and UI interaction.
 - **Resilient Supervisor & Control Panel**: Heartbeat watchdog, automatic backoff recovery, and a loopback-only control panel at `http://127.0.0.1:8766`.
 
 ---
@@ -171,6 +171,26 @@ MCP_SEARCH_SNAPSHOT_MAX_COUNT   # default: 32 snapshots
 ```
 
 Use streaming mode when lowest first-page latency matters. Use `snapshot=true` when stable multi-page traversal matters more than first-page latency. If a bounded scan itself is truncated, the response reports `scan_truncated=true`; it never invents a cursor beyond results that were actually captured.
+
+### Runtime and Browser Pooling
+
+Version `0.0.15` changes browser ownership from one Playwright `Browser` per session to shared compatible browser pools with one isolated `BrowserContext` per session:
+
+- Pool identity includes browser engine, headless mode, and launch-affecting configuration, so incompatible configurations never share a process.
+- Compatible sessions share one Playwright `Browser` instance while cookies, local/session storage, pages, and navigation state remain isolated inside separate contexts.
+- Closing one session closes only that session's context. Reopening the same session with an incompatible configuration is transactional: the old context stays usable until the replacement context has opened and navigated successfully.
+- Per-session locking remains the operation boundary. Navigation or interaction in one session does not reintroduce a global browser lock.
+- Idle contexts are reclaimed after `MCP_BROWSER_IDLE_SEC` (default `900` seconds). An empty browser pool is reclaimed after `MCP_BROWSER_POOL_IDLE_SEC` (default `120` seconds). Cleanup is single-flight and will not evict a context while an operation or context attach is active.
+- Browser disconnects invalidate the dead pool and mark dependent sessions stale. Non-open operations return a specific stale-session error, while a later `browser_open_page` can recreate a healthy compatible pool. Launch/context failures do not publish half-created sessions.
+
+Browser idle controls:
+
+```text
+MCP_BROWSER_IDLE_SEC       # default: 900 seconds
+MCP_BROWSER_POOL_IDLE_SEC  # default: 120 seconds
+```
+
+The browser benchmark reports Playwright browser-instance count and active-context count separately from operating-system process-tree count. On the local Windows validation host, the 20-session Chromium case changed from 20 Browser instances in `v0.0.14` to 1 shared Browser instance plus 20 contexts in `v0.0.15`. In the same one-run comparison, peak process-tree RSS changed from 3757.762 MiB to 1506.699 MiB, peak process count from 83 to 26, and elapsed time from 2606.737 ms to 1272.600 ms. These host-specific measurements are regression evidence, not universal performance guarantees. The mixed Chromium/Firefox benchmark is also available; it is reported as skipped when both optional browser runtimes are not installed.
 
 ---
 

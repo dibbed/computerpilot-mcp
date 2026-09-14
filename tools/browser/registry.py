@@ -158,7 +158,7 @@ def register(mcp: MCPServer) -> None:
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("browser_close")
     async def browser_close(session_id: SessionArg = "default") -> dict[str, Any]:
-        """Close one Playwright browser session and release its processes."""
+        """Close one Playwright browser session and release its isolated context."""
 
         audit_action("browser_close", target=session_id)
         return await MANAGER.close(session_id)
