@@ -16,8 +16,9 @@ import psutil
 
 from core.audit import audit_action
 from core.config import SETTINGS
-from core.executor import _creation_flags, terminate_process_tree
+from core.executor import _creation_flags
 from core.jobs import JobStore
+from core.windows_job import OwnedProcess, spawn_owned_process
 
 
 def _poll_interval(elapsed: float) -> float:
@@ -62,7 +63,7 @@ def _update(db: sqlite3.Connection, job_id: str, **values: Any) -> None:
 
 def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
     store = JobStore(path, initialize=False)
-    process: subprocess.Popen[bytes] | None = None
+    process: OwnedProcess | None = None
     # The worker owns one SQLite connection for its lifetime. Short transactions
     # keep WAL readers/writers independent while avoiding a connection per poll.
     with closing(store.connect()) as db:
@@ -95,7 +96,7 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = spec["encoding"]
             with (directory / "stdout.bin").open("ab") as stdout, (directory / "stderr.bin").open("ab") as stderr:
-                process = subprocess.Popen(
+                process = spawn_owned_process(
                     spec["command"],
                     cwd=spec["cwd"],
                     env=env,
@@ -126,7 +127,7 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                             target=str(process.pid),
                             details={"job_id": job_id, "reason": status},
                         )
-                        terminate_process_tree(process.pid, force=True)
+                        process.terminate_tree(force=True)
                         code = process.wait(timeout=5)
                         break
                     wait_for = min(_poll_interval(now - started), max(deadline - now, 0.001))
@@ -136,6 +137,7 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                         code = None
                 if status == "succeeded" and code != 0:
                     status = "failed"
+                process.close_ownership()
             _update(db, job_id, status=status, exit_code=code)
         except BaseException as exc:
             if process is not None and process.poll() is None:
@@ -144,13 +146,16 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                     target=str(process.pid),
                     details={"job_id": job_id, "reason": "worker_error"},
                 )
-                terminate_process_tree(process.pid, force=True)
+                process.terminate_tree(force=True)
             try:
                 _update(db, job_id, status="failed", error=str(exc))
             except sqlite3.Error:
                 # Recovery path only: a broken worker connection must still make
                 # the terminal state visible if the database itself is reachable.
                 store.update(job_id, status="failed", error=str(exc))
+        finally:
+            if process is not None:
+                process.close_ownership()
     _kick_successor(store)
 
 

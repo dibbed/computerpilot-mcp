@@ -213,7 +213,7 @@ def test_worker_never_claims_job_after_queue_deadline(tmp_path: Path, monkeypatc
     def unexpected_spawn(*args: object, **kwargs: object) -> None:
         raise AssertionError("expired queued job must not spawn a command")
 
-    monkeypatch.setattr(job_worker.subprocess, "Popen", unexpected_spawn)
+    monkeypatch.setattr(job_worker, "spawn_owned_process", unexpected_spawn)
     job_worker.run(store.path, job_id)
     row = store.raw(job_id)
     assert row["status"] == "timed_out"
@@ -235,7 +235,10 @@ def test_old_queued_age_does_not_reduce_execution_timeout(tmp_path: Path, monkey
         def poll(self) -> int | None:
             return 0
 
-    monkeypatch.setattr(job_worker.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+        def close_ownership(self) -> None:
+            pass
+
+    monkeypatch.setattr(job_worker, "spawn_owned_process", lambda *args, **kwargs: FakeProcess())
     monkeypatch.setattr(job_worker.psutil, "Process", lambda *args: SimpleNamespace(create_time=lambda: 1.0))
     monkeypatch.setattr(job_worker, "audit_action", lambda *args, **kwargs: None)
     job_worker.run(store.path, job_id)
