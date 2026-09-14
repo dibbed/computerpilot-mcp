@@ -13,6 +13,7 @@ from pydantic import ConfigDict
 
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.heartbeat import lifespan
+from core.recovery import OPERATION_RECOVERY
 from core.timings import ToolRequestTimingMiddleware, install_sdk_timing_hooks
 from core.tooling import READ_ONLY, compact_errors
 from tools.browser import register as register_browser
@@ -81,6 +82,7 @@ def create_server() -> MCPServer:
             "windows": os.name == "nt",
             "browser_optional_installed": importlib.util.find_spec("playwright") is not None,
             "audit_log": str(SETTINGS.audit_log),
+            "operation_recovery": OPERATION_RECOVERY.summary(),
         }
 
     return server

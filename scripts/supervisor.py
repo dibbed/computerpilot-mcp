@@ -368,6 +368,7 @@ class Supervisor:
                 env["MCP_HEARTBEAT_FILE"] = str(self.heartbeat)
                 env["MCP_LIFECYCLE_CONTROL_FILE"] = str(control_path)
                 env["MCP_LIFECYCLE_STATUS_FILE"] = str(status_path)
+                env["MCP_RUNTIME_GENERATION_ID"] = control_path.stem.removeprefix("control-")
                 started = time.monotonic()
                 process = None
                 readers: list[threading.Thread] = []

@@ -13,6 +13,7 @@ import pytest
 
 from core.jobs import JobStore
 from core.lifecycle import RuntimeLifecycle
+from core.recovery import OperationRecoveryJournal
 from scripts import supervisor as module
 from scripts.supervisor import Supervisor, make_panel, restart_delay
 
@@ -281,3 +282,88 @@ def test_watchdog_drain_is_bounded_when_mutation_does_not_finish(tmp_path: Path)
         process.kill()
         process.wait(timeout=5)
         close_logger(supervisor)
+
+
+def test_watchdog_restart_marks_inflight_mutation_uncertain_without_replay(tmp_path: Path) -> None:
+    attempts = tmp_path / "attempts.txt"
+    marker = tmp_path / "side-effect.txt"
+    journal_path = tmp_path / "operation-recovery.jsonl"
+    script = tmp_path / "uncertain_runtime.py"
+    script.write_text(
+        f"""
+import os
+import threading
+import time
+from pathlib import Path
+import sys
+sys.path.insert(0, {str(module.PROJECT_ROOT)!r})
+from core.lifecycle import RUNTIME_LIFECYCLE
+from core.recovery import OperationRecoveryJournal
+
+heartbeat = Path(os.environ["MCP_HEARTBEAT_FILE"])
+attempts = Path({str(attempts)!r})
+marker = Path({str(marker)!r})
+journal_path = Path({str(journal_path)!r})
+RUNTIME_LIFECYCLE.configure_from_env()
+journal = OperationRecoveryJournal()
+journal.configure(journal_path, os.environ["MCP_RUNTIME_GENERATION_ID"])
+number = int(attempts.read_text()) + 1 if attempts.exists() else 1
+attempts.write_text(str(number), encoding="ascii")
+
+
+def watch() -> None:
+    while True:
+        RUNTIME_LIFECYCLE.poll_control()
+        time.sleep(0.005)
+
+
+threading.Thread(target=watch, daemon=True).start()
+if number == 1:
+    heartbeat.write_text(str(os.getpid()), encoding="ascii")
+    os.utime(heartbeat, (0, 0))
+    with RUNTIME_LIFECYCLE.mutation("run_process"):
+        journal.begin("run_process", "cwd=test")
+        marker.write_text("once", encoding="utf-8")
+        while True:
+            time.sleep(1)
+else:
+    while True:
+        heartbeat.write_text(str(os.getpid()), encoding="ascii")
+        time.sleep(0.03)
+""",
+        encoding="utf-8",
+    )
+    supervisor = Supervisor(
+        [sys.executable, str(script)],
+        readiness_url=None,
+        state_dir=tmp_path,
+        grace=0.12,
+        interval=0.025,
+        drain_timeout=1,
+        watchdog_drain_timeout=0.12,
+    )
+    thread = threading.Thread(target=supervisor.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state = supervisor.snapshot()
+            if state["restart_count"] >= 1 and state["state"] == "running":
+                break
+            time.sleep(0.03)
+        else:
+            raise AssertionError(supervisor.snapshot())
+        assert marker.read_text(encoding="utf-8") == "once"
+        assert attempts.read_text(encoding="ascii") == "2"
+        journal = OperationRecoveryJournal()
+        journal.configure(journal_path, "inspection-runtime")
+        summary = journal.summary()
+        assert summary["uncertain_count"] == 1
+        assert summary["uncertain"][0]["operation_type"] == "run_process"
+        assert state["last_exit_reason"] == "watchdog_unhealthy"
+        assert state["last_drain_result"]["drained"] is False
+    finally:
+        supervisor.stop.set()
+        thread.join(timeout=10)
+        close_logger(supervisor)
+    assert not thread.is_alive()
