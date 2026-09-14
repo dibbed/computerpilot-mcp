@@ -6,7 +6,7 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 ## Current Status
 
-The optimization roadmap is complete through **Phase D / v0.0.15**. The `main` branch also contains the final post-release D hardening for externally closed Playwright pages/contexts and expanded browser lifecycle benchmarks; the published `v0.0.15` tag remains immutable.
+The optimization roadmap is complete through **Phase E / v0.0.16**. The published `v0.0.15` tag remains immutable, and Phase E closes the durable-jobs/reliability work with bounded admission, version-aware waiting, restart drain safety, uncertain-operation recovery, and Windows Job Object ownership.
 
 | Phase | Release | Focus | Status |
 | --- | --- | --- | --- |
@@ -14,13 +14,14 @@ The optimization roadmap is complete through **Phase D / v0.0.15**. The `main` b
 | B | `v0.0.13` | Core Performance | ✅ Complete |
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
-| E | `v0.0.16` | Durable Jobs & Reliability | 🚧 In progress — E1/E2/E3/E4/E5 complete |
+| E | `v0.0.16` | Durable Jobs & Reliability | ✅ Complete |
+| F | `v0.0.17` | State & Long-term Maintenance | ⏭ Next |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
 The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 intentionally adds one read-only typed tool, `job_wait`, bringing the current full surface to **60 tools**.
 
-Current Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. **Phase E / v0.0.16 — Durable Jobs & Reliability** is now complete through E5: E1 established versioned job state and timeout separation, E2 added bounded admission, E3 added version-aware `job_wait`, E4 added mutation-aware drain/restart safety, and E5 adds uncertain-operation journaling/no-blind-replay hardening plus Windows Job Object process ownership. A dedicated post-E1–E5 audit also hardened transient supervisor control/status-file races and bounded the recovery journal with compaction while preserving pending/uncertain operations. Only E6 final release benchmark/docs/version/tag/release work remains; the project version intentionally stays `0.0.15` until that release step.
+Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. A focused release-candidate crash/restart suite also passes **71/71** tests. The canonical 3-run jobs benchmark on audit commit `8e06fee` completed 1/10/50 concurrent jobs with all jobs succeeding and `MCP_MAX_RUNNING_JOBS=4` enforced; the 50-job median was **18.370 s**, peak active jobs **4**, peak process-tree RSS **509.648 MiB**, and peak process count **25**. The 50-waiter `job_wait` case observed the same authoritative version with **76.823 ms** wake latency and no extra child processes. **Phase E / v0.0.16 — Durable Jobs & Reliability is complete.** Phase F / `v0.0.17` is the next roadmap step for bounded long-running state, retention, provenance, and storage budgets.
 
 ---
 

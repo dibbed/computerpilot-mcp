@@ -6,6 +6,8 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+## [0.0.16] - 2026-09-15
+
 ### Added
 - Add Phase E1 durable-job state versioning. Every job row now carries a monotonic `version` exposed through status/list/output responses, forming the foundation for future `job_wait(after_version, timeout)` support.
 - Add optional `queue_timeout_sec` submission semantics. The default remains no queue deadline; explicit queue expiry is stored separately from execution timeout and returns a terminal `timed_out` result.
@@ -67,6 +69,7 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Phase E5 Windows Job Object integration passed on the real Windows host even though the MCP process itself was already inside a Job Object. Parent/grandchild kill-on-close, synchronous descendant cleanup, background root-exit cleanup, durable-worker crash cleanup, runtime-owned cleanup, and no-double-execution fallback paths all pass. A 30-run no-op calibration measured ordinary `Popen` at 36.166 ms median / 40.781 ms p95 versus 55.670 ms median / 56.384 ms p95 for suspended Job Object ownership, a 19.505 ms median fixed overhead accepted for deterministic process-tree ownership.
 - Phase E5 final validation completed with 261 passing pytest tests, Ruff with zero violations, mypy with zero issues across 88 source files, successful compileall, a passing 60-tool health check, and Full Doctor in local-http mode including a real disposable Chromium launch.
 - A dedicated post-E1–E5 hardening audit completed with **267 passing pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch. Live stress checks reconfirmed 20 jobs from 4 independent submitter processes with an actual-command peak exactly equal to cap 3, 16 independent duplicate submitters converging to one job/one side effect, 1/10/50-job benchmark success with peak active jobs capped at 4, and 50 concurrent `job_wait` callers observing the same authoritative version. A synthetic 10,001-record / 1.84 MiB recovery journal compacted to 2 records / 453 bytes while preserving the uncertain operation, and a force-killed `safe_refactor` after the file write but before validation was recovered as `uncertain` without automatic replay.
+- Phase E6 release-candidate validation passed a focused **71-test** crash/restart/recovery suite. The canonical 3-run jobs benchmark on audit commit `8e06fee` completed all 1/10/50 concurrent job cases successfully with `MCP_MAX_RUNNING_JOBS=4`; the 50-job median was **18.370 s** with peak active jobs **4**, peak process-tree RSS **509.648 MiB**, and peak process count **25**. The 50-waiter `job_wait` case observed version 2 across all waiters with **76.823 ms** wake latency, **75.387 MiB** peak RSS, and no additional child process.
 
 ## [0.0.15] - 2026-09-14
 
