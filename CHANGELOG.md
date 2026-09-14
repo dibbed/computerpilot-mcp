@@ -12,6 +12,7 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Add additive jobs database migrations: E1 introduced schema revision 2 with `version`/`queue_deadline`, and E2 advances to revision 3 with internal `launch_token`/`launch_started` reservation metadata while preserving existing rows and legacy idempotency fingerprints.
 - Add Phase E2 process-safe durable-job admission with configurable `MCP_MAX_RUNNING_JOBS` (default `4`), atomic capacity-aware claims, and active-slot accounting that includes live orphaned commands.
 - Add a lightweight SQLite-backed worker launcher that reserves only available capacity, recovers stale launch reservations, preserves independent per-running-job workers, and resumes queued work without introducing a shared resident job daemon.
+- Add Phase E3 `job_wait(job_id, after_version, timeout)` as a bounded read-only long-poll over the authoritative monotonic job version. Wait timeout is capped at 300 seconds, timeout returns normal unchanged state, and an ahead-of-current version returns controlled `job_version_ahead` guidance.
 
 ### Fixed
 - Detect externally closed Playwright pages/contexts as stale sessions. `browser_open_page` now recreates the session context inside the existing healthy pool instead of retaining a dead page, while non-open operations return `browser_session_stale`.
@@ -30,6 +31,8 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Refresh the README with an explicit completed-roadmap snapshot for Phases A-D (`v0.0.12` through `v0.0.15`), the benchmark-gated compact-tool decision, current post-D validation, and the next Phase E target.
 - Document Phase E1 job timeout semantics explicitly: `timeout_sec` begins after command execution starts, while optional queue waiting uses its own deadline.
 - Extend durable-job benchmarks with configured max-running, peak active-job, and peak queued-job details; short benchmark commands now remain alive long enough for admission behavior to be measurable.
+- Extend the jobs benchmark with `job_wait` version-change, bounded-timeout, and 50-concurrent-waiter cases. E3 intentionally keeps adaptive SQLite polling with one reused connection per wait; Named Event/Pipe IPC remains deferred because the measured long-poll path does not justify the added recovery complexity.
+- Increase the current typed MCP surface from 59 to 60 tools by adding the read-only `job_wait` API; this is an intentional Phase E feature addition, not the benchmark-rejected compact-tool profile from Phase D.
 
 ### Validation
 - Real Chromium validation confirmed recovery from both externally closed Page and BrowserContext while preserving the same Browser pool.
@@ -39,6 +42,8 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Phase E2's initial worker-waiting design correctly capped 50 submitted jobs at 4 active jobs but still peaked at 3280.344 MiB / 155 processes, triggering the roadmap's lightweight-launcher gate. The final committed scheduler benchmark (`e9fc0b9`) kept the same 4-active-job cap and completed the 50-job case in 20817.842 ms at 491.629 MiB / 25 processes; a calibration run with cap 8 completed in 17955.369 ms at 748.305 MiB / 37 processes.
 - Phase E2 final validation completed with 225 passing pytest tests, Ruff with zero violations, mypy with zero issues across 81 source files, successful compileall, a passing 59-tool health check, and Full Doctor including a real disposable Chromium launch.
 - A post-E1/E2 hardening audit completed with 229 passing pytest tests, Ruff with zero violations, mypy with zero issues across 83 source files, successful compileall, a passing 59-tool health check, and Full Doctor. Additional live stress checks covered 48 concurrent duplicate submissions resolving to one job, 20 jobs submitted from 4 independent processes with an actual command peak exactly equal to cap 3, and a forced worker crash where the live orphaned child retained capacity until exit before the successor job started. A dedicated migration regression also verifies schema 2 -> 3 preserves existing version/queue-deadline state.
+- Phase E3 validation completed with 239 passing pytest tests, Ruff with zero violations, mypy with zero issues across 82 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch. MCP integration verifies `job_wait` does not block unrelated event-loop work and a second MCP client can follow a durable job by version after the first client disconnects.
+- The committed E3 benchmark (`9b328f8`) measured one waiter waking 54.006 ms after an authoritative version update, a 200 ms wait timing out in 211.776 ms, and 50 concurrent waiters observing the same change with 46.787 ms wake latency, 75.164 MiB peak process-tree RSS, and no additional child process.
 
 ## [0.0.15] - 2026-09-14
 

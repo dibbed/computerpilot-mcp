@@ -14,13 +14,13 @@ The optimization roadmap is complete through **Phase D / v0.0.15**. The `main` b
 | B | `v0.0.13` | Core Performance | ✅ Complete |
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
-| E | `v0.0.16` | Durable Jobs & Reliability | 🚧 In progress — E1/E2 complete |
+| E | `v0.0.16` | Durable Jobs & Reliability | 🚧 In progress — E1/E2/E3 complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
-The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify introducing another tool-profile mode without stronger host-level token/context evidence. The default full 59-tool surface therefore remains unchanged.
+The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 intentionally adds one read-only typed tool, `job_wait`, bringing the current full surface to **60 tools**.
 
-Current post-D validation on Windows: **203 pytest tests**, Ruff with zero violations, mypy with zero issues across 79 source files, compileall, the 59-tool health check, Full Doctor, real Chromium recovery tests, and a real mixed Chromium/Firefox pooling benchmark all pass. **Phase E / v0.0.16 — Durable Jobs & Reliability** is now in progress; E1 establishes versioned job state and queue/execution-timeout separation, and E2 adds bounded durable-job admission plus lightweight worker launching. Version-aware `job_wait` remains the next E subphase.
+Current Phase-E validation on Windows: **239 pytest tests**, Ruff with zero violations, mypy with zero issues across 82 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. **Phase E / v0.0.16 — Durable Jobs & Reliability** is now complete through E3: E1 established versioned job state and queue/execution-timeout separation, E2 added bounded admission and lightweight worker launching, and E3 adds bounded version-aware `job_wait`. Supervisor drain/restart safety remains the next E subphase.
 
 ---
 
@@ -29,7 +29,7 @@ Current post-D validation on Windows: **203 pytest tests**, Ruff with zero viola
 - **Robust Filesystem Tools**: Atomic file creation, writing, copying, moving, and deletion; paginated listing and regex file search; complete reads with streaming byte cursors.
 - **Precision Code Editing**: Exact match, anchored replacements, and AST function/class body substitutions with syntax validation and rollback on syntax error.
 - **Process & Command Execution**: Synchronous and background execution for PowerShell, CMD, and native Windows executables with streaming spooling (1 MiB RAM limit rolling over to temp disk), bounded auto-delivery, byte cursors, and reusable finalized artifacts.
-- **Durable Job Store**: SQLite-backed background job queue (`.agent_state/jobs.sqlite3`) with idempotency keys, bounded max-running admission, lightweight worker scheduling, survivor workers across supervisor restarts, constant-query list/status paths, and one persistent SQLite connection per running worker.
+- **Durable Job Store**: SQLite-backed background job queue (`.agent_state/jobs.sqlite3`) with idempotency keys, bounded max-running admission, lightweight worker scheduling, survivor workers across supervisor restarts, monotonic state versions, bounded `job_wait` long-polling, and persistent SQLite connections for running workers/waits.
 - **Concurrency Hardening**: Keyed resource locks protect filesystem read-modify-write operations and project-memory updates; browser navigation is serialized only within the same session rather than across unrelated sessions.
 - **System Diagnostics**: Live inspection of CPU, memory, disks, environment variables, installed applications, and Windows services.
 - **Codebase Intelligence**: Fast Python AST parsing for classes, functions, imports, and project summaries.
@@ -204,7 +204,7 @@ Phase E1 prepares the durable-job subsystem for bounded admission and future ver
 - Default submissions deliberately keep the pre-E1 fingerprint shape when no queue deadline is requested, so idempotency keys created before the migration remain reusable without false conflicts.
 - Schema initialization is safe under concurrent JobStore creation, including WAL setup contention; databases with a future unsupported jobs schema are rejected instead of being silently downgraded.
 
-E1 deliberately left admission and `job_wait` for later subphases. E2 now implements admission/launch control; `job_wait` remains reserved for E3.
+E1 deliberately left admission and `job_wait` for later subphases. E2 implemented admission/launch control, and E3 now consumes the monotonic version foundation through bounded `job_wait` long-polling.
 
 ### Durable Job Admission Control (Phase E2)
 
@@ -225,6 +225,23 @@ MCP_MAX_RUNNING_JOBS=4
 ```
 
 Short-job throughput is intentionally traded for bounded resource use because each running job still owns an independent durable worker. A warm shared worker pool remains deferred/conditional rather than being folded into E2.
+
+### Versioned Durable Job Wait (Phase E3)
+
+Phase E3 adds a typed read-only long-poll API without introducing Windows event/pipe IPC:
+
+```text
+job_wait(job_id, after_version, timeout=30)
+```
+
+- `version` remains the authoritative synchronization primitive. `after_version=0` returns the current job state immediately because every job starts at version 1; when the current version equals `after_version`, the call waits until that version advances or the bounded timeout expires.
+- The public timeout range is `0..300` seconds. Timeout is a normal response (`changed=false`, `timed_out=true`) rather than an exception, and it includes the latest observed job state/version so the caller can immediately wait again.
+- If `after_version` is ahead of the authoritative current version, the call returns controlled `job_version_ahead` guidance instead of waiting for an impossible/mismatched state.
+- Each wait reuses exactly one SQLite connection for its lifetime. Polling is adaptive: 50 ms during the first second, 100 ms through 5 seconds, 250 ms through 30 seconds, then 500 ms for longer waits. State reconciliation still runs while waiting, so queue-deadline expiry and dead-worker/orphan transitions can advance the version even without another client call.
+- The synchronous MCP tool is offloaded by the SDK rather than blocking the server event loop. Integration coverage verifies a state update can execute while `job_wait` is blocked.
+- Lost notifications are avoided by design because there is no event as the source of truth: every wake cycle re-reads the monotonic version. A change occurring between a read and sleep is observed on the next bounded poll.
+
+The committed E3 benchmark (`9b328f8`) on the local Windows host measured a single waiter waking **54.006 ms** after the authoritative update, a 200 ms timeout returning in **211.776 ms**, and **50 concurrent waiters** all observing the same version change with **46.787 ms** wake latency, **75.164 MiB** peak process-tree RSS, and no extra child processes. These host-specific results do not justify the extra failure/recovery complexity of Named Events or pipes, so event IPC remains deliberately deferred behind the roadmap benchmark gate.
 
 ### Runtime and Browser Pooling
 
