@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import hashlib
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -37,6 +38,18 @@ QUEUE_TIMEOUT_ERROR = "Queue deadline exceeded before execution started."
 LAUNCH_RESERVATION_STALE_SEC = 10.0
 ACTIVE_JOB_STATUSES = ("running", "orphaned")
 ClaimResult = Literal["claimed", "wait", "terminal"]
+MAX_JOB_WAIT_SEC = 300.0
+
+
+def _job_wait_poll_interval(elapsed: float) -> float:
+    """Poll quickly at first, then reduce SQLite read pressure for long waits."""
+    if elapsed < 1.0:
+        return 0.05
+    if elapsed < 5.0:
+        return 0.1
+    if elapsed < 30.0:
+        return 0.25
+    return 0.5
 
 
 def same_process(pid: int | None, created: float | None) -> bool:
@@ -438,6 +451,50 @@ class JobStore:
 
     def get(self, job_id: str) -> dict[str, Any]:
         return self._public(self._reconcile([self._status_raw(job_id)])[0])
+
+    def wait(self, job_id: str, after_version: int, timeout: float) -> dict[str, Any]:
+        """Long-poll one job until its authoritative version advances or timeout expires."""
+        if after_version < 0:
+            raise ValueError("after_version must be non-negative.")
+        if not math.isfinite(timeout) or timeout < 0 or timeout > MAX_JOB_WAIT_SEC:
+            raise ValueError(f"timeout must be between 0 and {MAX_JOB_WAIT_SEC:g} seconds.")
+        started = time.monotonic()
+        deadline = started + timeout
+        with closing(self.connect()) as db:
+            while True:
+                row = db.execute(
+                    f"SELECT {JOB_STATUS_COLUMNS} FROM jobs WHERE id=?",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    raise ToolError("job_not_found", "Unknown job_id.")
+                current = self._reconcile([dict(row)], db=db)[0]
+                version = int(current["version"])
+                if after_version > version:
+                    raise ToolError(
+                        "job_version_ahead",
+                        f"after_version {after_version} is newer than current job version {version}.",
+                        hint="Refresh job_status and retry with the returned version.",
+                    )
+                if version > after_version:
+                    return {
+                        "ok": True,
+                        "changed": True,
+                        "timed_out": False,
+                        "after_version": after_version,
+                        **self._public(current),
+                    }
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {
+                        "ok": True,
+                        "changed": False,
+                        "timed_out": True,
+                        "after_version": after_version,
+                        **self._public(current),
+                    }
+                elapsed = time.monotonic() - started
+                time.sleep(min(_job_wait_poll_interval(elapsed), remaining))
 
     def list(self, offset: int, limit: int) -> dict[str, Any]:
         with closing(self.connect()) as db:

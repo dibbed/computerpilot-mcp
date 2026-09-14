@@ -11,7 +11,7 @@ from core.artifacts import default_delivery
 from core.audit import audit_action
 from core.config import resolve_path
 from core.job_scheduler import ensure_job_scheduler
-from core.jobs import JobStore
+from core.jobs import MAX_JOB_WAIT_SEC, JobStore
 from core.tooling import DESTRUCTIVE, OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 
 JobId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
@@ -49,6 +49,16 @@ def register(mcp: MCPServer) -> None:
     def job_status(job_id: JobId) -> dict[str, Any]:
         """Read a durable job status by ID after reconnect or server restart."""
         return {"ok": True, **store.get(job_id)}
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("job_wait")
+    def job_wait(
+        job_id: JobId,
+        after_version: Annotated[int, Field(ge=0)],
+        timeout: Annotated[float, Field(ge=0, le=MAX_JOB_WAIT_SEC)] = 30,
+    ) -> dict[str, Any]:
+        """Wait for a durable job version to advance; return unchanged state when the bounded timeout expires."""
+        return store.wait(job_id, after_version, timeout)
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("list_jobs")
