@@ -29,6 +29,7 @@ class BrowserPool:
     active_contexts: int = 0
     pending_contexts: int = 0
     last_used: float = 0.0
+    dead: bool = False
 
 
 @dataclass(slots=True)
@@ -39,6 +40,8 @@ class Session:
     browser_name: BrowserName
     headless: bool
     last_used: float = 0.0
+    pool: BrowserPool | None = None
+    stale: bool = False
 
 
 class BrowserManager:
@@ -112,6 +115,45 @@ class BrowserManager:
         # options cannot accidentally reuse an incompatible browser process.
         return PoolKey(browser_name=browser_name, headless=headless)
 
+    @staticmethod
+    def _browser_connected(browser: Any) -> bool:
+        checker = getattr(browser, "is_connected", None)
+        if checker is None:
+            return True
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    def _mark_pool_dead(self, pool: BrowserPool) -> None:
+        if pool.dead:
+            return
+        pool.dead = True
+        if self._pools.get(pool.key) is pool:
+            self._pools.pop(pool.key, None)
+        for session in self._sessions.values():
+            if session.pool is pool:
+                session.stale = True
+
+    def _watch_pool(self, pool: BrowserPool) -> None:
+        on = getattr(pool.browser, "on", None)
+        if not callable(on):
+            return
+        try:
+            on("disconnected", lambda *args: self._mark_pool_dead(pool))
+        except Exception:
+            pass
+
+    def _session_usable(self, session: Session) -> bool:
+        pool = session.pool
+        if session.stale or pool is None:
+            return not session.stale
+        if pool.dead or self._pools.get(pool.key) is not pool or not self._browser_connected(pool.browser):
+            self._mark_pool_dead(pool)
+            session.stale = True
+            return False
+        return True
+
     def _ensure_cleanup_task(self) -> None:
         if self._cleanup_task is None or self._cleanup_task.done():
             self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name="browser-idle-cleanup")
@@ -133,6 +175,9 @@ class BrowserManager:
         runtime = await self._runtime()
         async with self._pool_lock:
             existing = self._pools.get(key)
+            if existing is not None and (existing.dead or not self._browser_connected(existing.browser)):
+                self._mark_pool_dead(existing)
+                existing = None
             if existing is not None:
                 existing.pending_contexts += 1
                 existing.last_used = self._clock()
@@ -155,6 +200,7 @@ class BrowserManager:
                 last_used=self._clock(),
             )
             self._pools[key] = pool
+            self._watch_pool(pool)
             self._ensure_cleanup_task()
             return pool
 
@@ -170,19 +216,37 @@ class BrowserManager:
             context = await pool.browser.new_context()
             page = await context.new_page()
         except BaseException:
+            async with self._pool_lock:
+                pool.pending_contexts = max(0, pool.pending_contexts - 1)
+                pool.last_used = self._clock()
             if context is not None:
                 try:
                     await context.close()
                 except Exception:
                     pass
             raise
-        finally:
-            async with self._pool_lock:
-                pool.pending_contexts = max(0, pool.pending_contexts - 1)
-                pool.last_used = self._clock()
+
+        invalid_pool = False
         async with self._pool_lock:
-            pool.active_contexts += 1
+            pool.pending_contexts = max(0, pool.pending_contexts - 1)
             pool.last_used = self._clock()
+            if pool.dead or self._pools.get(pool.key) is not pool or not self._browser_connected(pool.browser):
+                self._mark_pool_dead(pool)
+                invalid_pool = True
+            else:
+                pool.active_contexts += 1
+
+        if invalid_pool:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            raise ToolError(
+                "browser_disconnected",
+                f"{browser_name} browser disconnected while opening a session.",
+                hint="Retry browser_open_page to recreate the browser pool.",
+            )
+
         return Session(
             pool_key=pool.key,
             context=context,
@@ -190,18 +254,24 @@ class BrowserManager:
             browser_name=browser_name,
             headless=headless,
             last_used=self._clock(),
+            pool=pool,
         )
 
-    async def _close_session_context(self, session: Session) -> None:
+    async def _close_session_context(self, session: Session, *, suppress_errors: bool = False) -> None:
+        close_error: Exception | None = None
         try:
             await session.context.close()
+        except Exception as exc:
+            close_error = exc
         finally:
             async with self._pool_lock:
-                pool = self._pools.get(session.pool_key)
+                pool = session.pool or self._pools.get(session.pool_key)
                 if pool is not None:
                     if pool.active_contexts > 0:
                         pool.active_contexts -= 1
                     pool.last_used = self._clock()
+        if close_error is not None and not suppress_errors:
+            raise close_error
 
     @staticmethod
     def _compatible(session: Session, *, browser_name: BrowserName, headless: bool) -> bool:
@@ -233,8 +303,21 @@ class BrowserManager:
     ) -> dict[str, Any]:
         async with self.session(session_id):
             existing = self._sessions.get(session_id)
-            if existing is not None and self._compatible(existing, browser_name=browser_name, headless=headless):
-                result = await self._navigate(existing, url, timeout_ms=timeout_ms, wait_until=wait_until)
+            if (
+                existing is not None
+                and self._compatible(existing, browser_name=browser_name, headless=headless)
+                and self._session_usable(existing)
+            ):
+                try:
+                    result = await self._navigate(existing, url, timeout_ms=timeout_ms, wait_until=wait_until)
+                except Exception as exc:
+                    if not self._session_usable(existing):
+                        raise ToolError(
+                            "browser_disconnected",
+                            f"Browser session {session_id!r} lost its browser process.",
+                            hint="Retry browser_open_page to recreate the session.",
+                        ) from exc
+                    raise
                 existing.last_used = self._clock()
                 return {"session_id": session_id, **result}
 
@@ -250,7 +333,7 @@ class BrowserManager:
             replacement.last_used = self._clock()
             self._sessions[session_id] = replacement
             if existing is not None:
-                await self._close_session_context(existing)
+                await self._close_session_context(existing, suppress_errors=True)
             return {"session_id": session_id, **result}
 
     def page(self, session_id: str) -> Any:
@@ -261,6 +344,12 @@ class BrowserManager:
                 f"Browser session {session_id!r} is not open.",
                 hint="Call browser_open_page first.",
             )
+        if not self._session_usable(session):
+            raise ToolError(
+                "browser_session_stale",
+                f"Browser session {session_id!r} lost its browser process.",
+                hint="Call browser_open_page to recreate the session.",
+            )
         return session.page
 
     async def close(self, session_id: str) -> dict[str, Any]:
@@ -268,7 +357,7 @@ class BrowserManager:
             session = self._sessions.pop(session_id, None)
             if session is None:
                 return {"ok": True, "session_id": session_id, "closed": False, "reason": "not_found"}
-            await self._close_session_context(session)
+            await self._close_session_context(session, suppress_errors=session.stale)
             return {"ok": True, "session_id": session_id, "closed": True}
 
     async def cleanup_idle(self) -> dict[str, Any]:
@@ -289,7 +378,7 @@ class BrowserManager:
                     if self._clock() - current.last_used < self._session_idle_sec:
                         continue
                     self._sessions.pop(session_id, None)
-                    await self._close_session_context(current)
+                    await self._close_session_context(current, suppress_errors=True)
                     evicted_sessions += 1
 
             pools_to_close: list[BrowserPool] = []
@@ -305,15 +394,22 @@ class BrowserManager:
                         pools_to_close.append(pool)
 
             closed_pools = 0
+            pool_close_errors = 0
             for pool in pools_to_close:
-                await pool.browser.close()
-                closed_pools += 1
+                try:
+                    await pool.browser.close()
+                except Exception:
+                    pool_close_errors += 1
+                finally:
+                    pool.dead = True
+                    closed_pools += 1
 
             return {
                 "ok": True,
                 "skipped": False,
                 "evicted_sessions": evicted_sessions,
                 "closed_pools": closed_pools,
+                "pool_close_errors": pool_close_errors,
                 "active_sessions": len(self._sessions),
                 "active_pools": len(self._pools),
             }
