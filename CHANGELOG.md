@@ -14,6 +14,8 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Add a lightweight SQLite-backed worker launcher that reserves only available capacity, recovers stale launch reservations, preserves independent per-running-job workers, and resumes queued work without introducing a shared resident job daemon.
 - Add Phase E3 `job_wait(job_id, after_version, timeout)` as a bounded read-only long-poll over the authoritative monotonic job version. Wait timeout is capped at 300 seconds, timeout returns normal unchanged state, and an ahead-of-current version returns controlled `job_version_ahead` guidance.
 - Add Phase E4 runtime lifecycle tracking (`RUNNING -> DRAINING -> STOPPING`) with a centrally enforced mutating-tool counter and private per-runtime control/status handshake for supervisor drain requests.
+- Add Phase E5 metadata-only operation recovery journaling for supervised mutations. In-flight operations from a dead runtime generation become explicit `status="uncertain"` records; arbitrary mutations are never replayed automatically.
+- Add the benchmark-gated Windows Job Object ownership backend for MCP-owned and durable-worker-owned command trees, with suspended assign-before-run spawning, kill-on-close cleanup, psutil fallback, and emergency `MCP_WINDOWS_JOB_OBJECTS=0` opt-out.
 
 ### Fixed
 - Detect externally closed Playwright pages/contexts as stale sessions. `browser_open_page` now recreates the session context inside the existing healthy pool instead of retaining a dead page, while non-open operations return `browser_session_stale`.
@@ -30,6 +32,10 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Require current-request drain acknowledgement plus `active_mutations=0` before user restart/stop cleanup, closing the race where a stale zero-count snapshot could otherwise be mistaken for a drained runtime.
 - Retry lifecycle status publication on every valid control poll so transient Windows file-sharing contention cannot permanently lose the drain acknowledgement.
 - Bound unhealthy-watchdog drain attempts separately from normal user restart/stop so a wedged runtime cannot block watchdog recovery indefinitely.
+- Fail closed before a supervised mutation starts if its recovery-journal `begin` record cannot be durably appended/fsynced; tolerate a crash-truncated final record without allowing it to consume later recovery records.
+- Prevent blind replay after watchdog/runtime failure: a side effect completed before an uncertain crash remains single-execution and is surfaced for reconciliation rather than reissued.
+- Close Windows Job Object ownership when synchronous/durable command roots finish and proactively reap descendants of background roots even when no later `process_output` call occurs.
+- Ensure Job Object setup/assignment fallback happens while the candidate process is still suspended, preventing double execution when nested assignment is unavailable on a host.
 
 ### Changed
 - Browser benchmarks now report open latency, parallel-navigation latency, and cleanup latency for the 1/5/20-session cases, plus a dedicated background idle-eviction case with separate session and empty-pool reclamation timings.
@@ -40,6 +46,8 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Increase the current typed MCP surface from 59 to 60 tools by adding the read-only `job_wait` API; this is an intentional Phase E feature addition, not the benchmark-rejected compact-tool profile from Phase D.
 - Add configurable supervisor drain deadlines: `MCP_SUPERVISOR_DRAIN_SEC` defaults to 15 seconds for user restart/stop and `MCP_SUPERVISOR_WATCHDOG_DRAIN_SEC` defaults to 2 seconds for best-effort unhealthy-runtime recovery.
 - Keep standalone/non-supervised MCP instances backward-compatible by making lifecycle mutation tracking managed only when the private supervisor control/status paths are configured.
+- Expose a bounded `operation_recovery` summary through `server_health`, including uncertain and currently pending supervised mutations without journaling command/file/text payload bodies.
+- Enable Windows Job Object ownership by default after the real-host gate; retain `MCP_WINDOWS_JOB_OBJECTS=0` as an emergency compatibility fallback and identify fallback execution as `psutil_fallback` in process results.
 
 ### Validation
 - Real Chromium validation confirmed recovery from both externally closed Page and BrowserContext while preserving the same Browser pool.
@@ -52,6 +60,9 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Phase E3 validation completed with 239 passing pytest tests, Ruff with zero violations, mypy with zero issues across 82 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch. MCP integration verifies `job_wait` does not block unrelated event-loop work and a second MCP client can follow a durable job by version after the first client disconnects.
 - The committed E3 benchmark (`9b328f8`) measured one waiter waking 54.006 ms after an authoritative version update, a 200 ms wait timing out in 211.776 ms, and 50 concurrent waiters observing the same change with 46.787 ms wake latency, 75.164 MiB peak process-tree RSS, and no additional child process.
 - Phase E4 validation completed with 247 passing pytest tests, Ruff with zero violations, mypy with zero issues across 84 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch. Integration coverage includes a real `run_process` held active through drain, read-only access during drain, a real supervisor restart requested mid-mutation that waits for completion before cleanup, bounded watchdog fallback, durable-job restart survival, mutating-annotation guard coverage, and transient lifecycle-status publish retry.
+- Phase E5 recovery tests cover durable `begin/result/uncertain` transitions, fsync failure before dispatch, crash-truncated journal tails, metadata-only records, health visibility, and a real watchdog restart where the side effect occurs exactly once and the interrupted operation becomes `uncertain` rather than being replayed.
+- Phase E5 Windows Job Object integration passed on the real Windows host even though the MCP process itself was already inside a Job Object. Parent/grandchild kill-on-close, synchronous descendant cleanup, background root-exit cleanup, durable-worker crash cleanup, runtime-owned cleanup, and no-double-execution fallback paths all pass. A 30-run no-op calibration measured ordinary `Popen` at 36.166 ms median / 40.781 ms p95 versus 55.670 ms median / 56.384 ms p95 for suspended Job Object ownership, a 19.505 ms median fixed overhead accepted for deterministic process-tree ownership.
+- Phase E5 final validation completed with 261 passing pytest tests, Ruff with zero violations, mypy with zero issues across 88 source files, successful compileall, a passing 60-tool health check, and Full Doctor in local-http mode including a real disposable Chromium launch.
 
 ## [0.0.15] - 2026-09-14
 
