@@ -125,6 +125,16 @@ class BrowserManager:
         except Exception:
             return False
 
+    @staticmethod
+    def _page_closed(page: Any) -> bool:
+        checker = getattr(page, "is_closed", None)
+        if checker is None:
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return True
+
     def _mark_pool_dead(self, pool: BrowserPool) -> None:
         if pool.dead:
             return
@@ -145,9 +155,14 @@ class BrowserManager:
             pass
 
     def _session_usable(self, session: Session) -> bool:
+        if session.stale:
+            return False
+        if self._page_closed(session.page):
+            session.stale = True
+            return False
         pool = session.pool
-        if session.stale or pool is None:
-            return not session.stale
+        if pool is None:
+            return True
         if pool.dead or self._pools.get(pool.key) is not pool or not self._browser_connected(pool.browser):
             self._mark_pool_dead(pool)
             session.stale = True
@@ -312,10 +327,18 @@ class BrowserManager:
                     result = await self._navigate(existing, url, timeout_ms=timeout_ms, wait_until=wait_until)
                 except Exception as exc:
                     if not self._session_usable(existing):
+                        pool = existing.pool
+                        browser_alive = pool is None or (not pool.dead and self._browser_connected(pool.browser))
+                        if browser_alive:
+                            raise ToolError(
+                                "browser_session_stale",
+                                f"Browser session {session_id!r} lost its page or context.",
+                                hint="Retry browser_open_page to recreate the session context.",
+                            ) from exc
                         raise ToolError(
                             "browser_disconnected",
                             f"Browser session {session_id!r} lost its browser process.",
-                            hint="Retry browser_open_page to recreate the session.",
+                            hint="Retry browser_open_page to recreate the browser pool.",
                         ) from exc
                     raise
                 existing.last_used = self._clock()

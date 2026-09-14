@@ -6,6 +6,17 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Fixed
+- Detect externally closed Playwright pages/contexts as stale sessions. `browser_open_page` now recreates the session context inside the existing healthy pool instead of retaining a dead page, while non-open operations return `browser_session_stale`.
+- Distinguish a page/context closed during navigation from a disconnected Browser process so the controlled error code and retry hint describe the actual failure.
+
+### Changed
+- Browser benchmarks now report open latency, parallel-navigation latency, and cleanup latency for the 1/5/20-session cases, plus a dedicated background idle-eviction case with separate session and empty-pool reclamation timings.
+
+### Validation
+- Real Chromium validation confirmed recovery from both externally closed Page and BrowserContext while preserving the same Browser pool.
+- After installing the optional Playwright Firefox runtime on the validation host, the mixed 5 Chromium + 5 Firefox benchmark completed with exactly 2 Browser instances and 10 isolated contexts.
+
 ## [0.0.15] - 2026-09-14
 
 ### Added

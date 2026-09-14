@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -15,6 +16,7 @@ from scripts.perf_benchmark import (
     PROFILE_LIMITS,
     BenchmarkSkip,
     MiB,
+    _browser_batch_once,
     _browser_pool_details,
     _cleanup_stale_temp_roots,
     _launcher_validation_once,
@@ -57,6 +59,36 @@ def test_browser_pool_details_report_instances_contexts_and_keys() -> None:
         {"browser": "chromium", "headless": True, "active_contexts": 5},
         {"browser": "firefox", "headless": True, "active_contexts": 5},
     ]
+
+
+def test_browser_batch_reports_open_navigation_and_cleanup_timings(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tools.browser.manager as browser_manager_module
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self._pools = {
+                "chromium": SimpleNamespace(
+                    active_contexts=2,
+                    key=SimpleNamespace(browser_name="chromium", headless=True),
+                )
+            }
+            self._playwright = SimpleNamespace(stop=AsyncMock())
+
+        async def open(self, *args: object, **kwargs: object) -> dict[str, bool]:
+            await asyncio.sleep(0)
+            return {"ok": True}
+
+        async def close(self, session_id: str) -> dict[str, bool]:
+            await asyncio.sleep(0)
+            return {"ok": True}
+
+    monkeypatch.setattr(browser_manager_module, "BrowserManager", FakeManager)
+    details = _browser_batch_once(2)
+    assert details["browser_instances"] == 1
+    assert details["contexts"] == 2
+    assert details["open_latency_ms"] >= 0
+    assert details["parallel_navigation_ms"] >= 0
+    assert details["cleanup_latency_ms"] >= 0
 
 
 def test_stats_are_stable_and_population_based() -> None:
