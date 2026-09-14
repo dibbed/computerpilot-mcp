@@ -21,10 +21,22 @@ from core.artifacts import Delivery, deliver_file
 from core.config import PROJECT_ROOT, SETTINGS
 from core.errors import ToolError
 
+JOB_SCHEMA_VERSION = 2
 JOB_STATUS_COLUMNS = (
-    "id,status,created,updated,worker_pid,worker_created,pid,pid_created,"
+    "id,status,created,updated,version,queue_deadline,worker_pid,worker_created,pid,pid_created,"
     "exit_code,cancel_requested,error"
 )
+JOB_MUTABLE_COLUMNS = {
+    "status",
+    "worker_pid",
+    "worker_created",
+    "pid",
+    "pid_created",
+    "exit_code",
+    "cancel_requested",
+    "error",
+}
+QUEUE_TIMEOUT_ERROR = "Queue deadline exceeded before execution started."
 
 
 def same_process(pid: int | None, created: float | None) -> bool:
@@ -44,34 +56,87 @@ class JobStore:
         self.output_dir = self.path.parent / "jobs"
         self.output_dir.mkdir(exist_ok=True)
         if initialize:
-            with closing(self.connect()) as db, db:
-                db.execute("PRAGMA journal_mode=WAL")
+            self._initialize_schema()
+
+    def _initialize_schema(self) -> None:
+        with closing(self.connect()) as db:
+            db.execute("PRAGMA busy_timeout=10000")
+            for attempt in range(50):
+                try:
+                    db.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).casefold() or attempt == 49:
+                        raise
+                    time.sleep(0.05)
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                current = int(db.execute("PRAGMA user_version").fetchone()[0])
+                if current > JOB_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"Job database schema {current} is newer than supported schema {JOB_SCHEMA_VERSION}."
+                    )
                 db.execute("""CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL, fingerprint TEXT NOT NULL,
                     spec TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1, queue_deadline REAL,
                     worker_pid INTEGER, worker_created REAL, pid INTEGER, pid_created REAL,
                     exit_code INTEGER, cancel_requested INTEGER NOT NULL DEFAULT 0, error TEXT
                 )""")
+                columns = {str(row[1]) for row in db.execute("PRAGMA table_info(jobs)")}
+                if "version" not in columns:
+                    db.execute("ALTER TABLE jobs ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+                if "queue_deadline" not in columns:
+                    db.execute("ALTER TABLE jobs ADD COLUMN queue_deadline REAL")
+                db.execute(f"PRAGMA user_version={JOB_SCHEMA_VERSION}")
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
         return db
 
-    def submit(self, command: list[str], cwd: Path, timeout_sec: float, request_key: str,
-               encoding: str = "utf-8") -> dict[str, Any]:
+    def submit(
+        self,
+        command: list[str],
+        cwd: Path,
+        timeout_sec: float,
+        request_key: str,
+        encoding: str = "utf-8",
+        *,
+        queue_timeout_sec: float | None = None,
+    ) -> dict[str, Any]:
         if not command or not command[0] or not cwd.is_dir():
             raise ValueError("An executable and existing working directory are required.")
+        if timeout_sec <= 0:
+            raise ValueError("Execution timeout must be positive.")
+        if queue_timeout_sec is not None and queue_timeout_sec <= 0:
+            raise ValueError("Queue timeout must be positive when provided.")
         codecs.lookup(encoding)
-        spec = json.dumps({"command": command, "cwd": str(cwd.resolve()), "timeout_sec": timeout_sec,
-                           "encoding": encoding}, sort_keys=True)
+        spec_data: dict[str, Any] = {
+            "command": command,
+            "cwd": str(cwd.resolve()),
+            "timeout_sec": timeout_sec,
+            "encoding": encoding,
+        }
+        # Preserve the pre-E1 fingerprint when no queue deadline is requested so
+        # idempotency keys created before the schema migration remain reusable.
+        if queue_timeout_sec is not None:
+            spec_data["queue_timeout_sec"] = queue_timeout_sec
+        spec = json.dumps(spec_data, sort_keys=True)
         fingerprint = hashlib.sha256(spec.encode()).hexdigest()
         job_id = uuid.uuid4().hex
         now = time.time()
+        queue_deadline = None if queue_timeout_sec is None else now + queue_timeout_sec
         with closing(self.connect()) as db, db:
             inserted = db.execute(
-                "INSERT OR IGNORE INTO jobs (id,request_key,fingerprint,spec,status,created,updated) VALUES (?,?,?,?,?,?,?)",
-                (job_id, request_key, fingerprint, spec, "queued", now, now),
+                "INSERT OR IGNORE INTO jobs "
+                "(id,request_key,fingerprint,spec,status,created,updated,version,queue_deadline) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (job_id, request_key, fingerprint, spec, "queued", now, now, 1, queue_deadline),
             ).rowcount
             existing = db.execute("SELECT id,fingerprint FROM jobs WHERE request_key=?", (request_key,)).fetchone()
         if not inserted:
@@ -97,13 +162,15 @@ class JobStore:
         return {"ok": True, "deduplicated": False, **self.get(job_id)}
 
     def update(self, job_id: str, **values: Any) -> None:
-        allowed = {"status", "worker_pid", "worker_created", "pid", "pid_created", "exit_code", "cancel_requested", "error"}
-        if not values.keys() <= allowed:
+        if not values or not values.keys() <= JOB_MUTABLE_COLUMNS:
             raise ValueError("Unsupported job update.")
         values["updated"] = time.time()
         assignment = ",".join(f"{key}=?" for key in values)
         with closing(self.connect()) as db, db:
-            db.execute(f"UPDATE jobs SET {assignment} WHERE id=?", (*values.values(), job_id))
+            db.execute(
+                f"UPDATE jobs SET {assignment},version=version+1 WHERE id=?",
+                (*values.values(), job_id),
+            )
 
     def raw(self, job_id: str) -> dict[str, Any]:
         with closing(self.connect()) as db:
@@ -122,18 +189,25 @@ class JobStore:
     def _reconcile(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Check active processes outside the DB lock, then reconcile in one transaction."""
         now = time.time()
-        changes = []
+        changes: list[tuple[str, str | None, float, str, str]] = []
         for row in rows:
             if row["status"] == "running" and not same_process(row["worker_pid"], row["worker_created"]):
                 status = "orphaned" if same_process(row["pid"], row["pid_created"]) else "interrupted"
-                changes.append((status, now, row["id"], "running"))
-            elif row["status"] == "queued" and now - row["created"] > 60:
-                changes.append(("interrupted", now, row["id"], "queued"))
+                changes.append((status, None, now, row["id"], "running"))
+            elif (
+                row["status"] == "queued"
+                and row["queue_deadline"] is not None
+                and now >= float(row["queue_deadline"])
+            ):
+                changes.append(("timed_out", QUEUE_TIMEOUT_ERROR, now, row["id"], "queued"))
         if changes:
             with closing(self.connect()) as db, db:
                 # The worker may have committed a terminal result during the process checks.
-                db.executemany("UPDATE jobs SET status=?,updated=? WHERE id=? AND status=?", changes)
-                ids = [change[2] for change in changes]
+                db.executemany(
+                    "UPDATE jobs SET status=?,error=?,updated=?,version=version+1 WHERE id=? AND status=?",
+                    changes,
+                )
+                ids = [change[3] for change in changes]
                 refreshed = {}
                 # Bound variables even for direct callers requesting unusually large pages.
                 for start in range(0, len(ids), 500):
@@ -148,7 +222,7 @@ class JobStore:
     @staticmethod
     def _public(row: dict[str, Any]) -> dict[str, Any]:
         return {"job_id": row["id"], **{key: row[key] for key in
-                ("status", "created", "updated", "pid", "exit_code", "cancel_requested", "error")}}
+                ("status", "created", "updated", "version", "queue_deadline", "pid", "exit_code", "cancel_requested", "error")}}
 
     def get(self, job_id: str) -> dict[str, Any]:
         return self._public(self._reconcile([self._status_raw(job_id)])[0])

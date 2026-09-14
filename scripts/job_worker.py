@@ -16,7 +16,7 @@ import psutil
 
 from core.audit import audit_action
 from core.executor import _creation_flags, terminate_process_tree
-from core.jobs import JobStore
+from core.jobs import QUEUE_TIMEOUT_ERROR, JobStore
 
 
 def _poll_interval(elapsed: float) -> float:
@@ -39,7 +39,10 @@ def _update(db: sqlite3.Connection, job_id: str, **values: Any) -> None:
     values["updated"] = time.time()
     assignment = ",".join(f"{key}=?" for key in values)
     with db:
-        db.execute(f"UPDATE jobs SET {assignment} WHERE id=?", (*values.values(), job_id))
+        db.execute(
+            f"UPDATE jobs SET {assignment},version=version+1 WHERE id=?",
+            (*values.values(), job_id),
+        )
 
 
 def run(path: Path, job_id: str) -> None:
@@ -48,11 +51,19 @@ def run(path: Path, job_id: str) -> None:
     # The worker owns one SQLite connection for its lifetime. Short transactions
     # keep WAL readers/writers independent while avoiding a connection per poll.
     with closing(store.connect()) as db:
+        claim_time = time.time()
         with db:
             claimed = db.execute(
-                "UPDATE jobs SET status='running',worker_pid=?,worker_created=?,updated=? WHERE id=? AND status='queued'",
-                (os.getpid(), psutil.Process().create_time(), time.time(), job_id),
+                "UPDATE jobs SET status='running',worker_pid=?,worker_created=?,updated=?,version=version+1 "
+                "WHERE id=? AND status='queued' AND (queue_deadline IS NULL OR queue_deadline>?)",
+                (os.getpid(), psutil.Process().create_time(), claim_time, job_id, claim_time),
             ).rowcount
+            if not claimed:
+                db.execute(
+                    "UPDATE jobs SET status='timed_out',error=?,updated=?,version=version+1 "
+                    "WHERE id=? AND status='queued' AND queue_deadline IS NOT NULL AND queue_deadline<=?",
+                    (QUEUE_TIMEOUT_ERROR, claim_time, job_id, claim_time),
+                )
         if not claimed:
             return
         try:

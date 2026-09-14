@@ -29,13 +29,18 @@ def register(mcp: MCPServer) -> None:
         cwd: Annotated[str, Field(max_length=32767)] = ".",
         timeout_sec: Annotated[float, Field(gt=0, le=86400)] = 3600,
         encoding: Annotated[str, Field(min_length=1, max_length=40)] = "utf-8",
+        queue_timeout_sec: Annotated[float | None, Field(gt=0, le=86400)] = None,
     ) -> dict[str, Any]:
-        """Submit a durable command; reuse its key after reconnect to avoid replay.
-
-        Output is UTF-8; uncertain jobs are never retried automatically.
-        """
+        """Submit a retry-safe durable command. Execution timeout starts after launch; optional queue timeout bounds pre-launch waiting."""
         audit_action("submit_job", target=resolve_path(cwd), details={"executable": executable})
-        return store.submit([executable, *(args or [])], resolve_path(cwd), timeout_sec, idempotency_key, encoding)
+        return store.submit(
+            [executable, *(args or [])],
+            resolve_path(cwd),
+            timeout_sec,
+            idempotency_key,
+            encoding,
+            queue_timeout_sec=queue_timeout_sec,
+        )
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_status")
