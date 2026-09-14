@@ -492,7 +492,7 @@ def _job_batch_once(store: JobStore, count: int, run_key: int) -> dict[str, Any]
     job_ids: list[str] = []
     for index in range(count):
         submitted = store.submit(
-            [sys.executable, "-c", "pass"],
+            [sys.executable, "-c", "import time; time.sleep(0.1)"],
             PROJECT_ROOT,
             30.0,
             f"benchmark-{run_key}-{count}-{index}",
@@ -500,8 +500,14 @@ def _job_batch_once(store: JobStore, count: int, run_key: int) -> dict[str, Any]
         job_ids.append(str(submitted["job_id"]))
     deadline = time.monotonic() + 60
     states: list[str] = []
+    peak_active = 0
+    peak_queued = 0
     while time.monotonic() < deadline:
         states = [str(store.get(job_id)["status"]) for job_id in job_ids]
+        active = sum(state in {"running", "orphaned"} for state in states)
+        queued = sum(state == "queued" for state in states)
+        peak_active = max(peak_active, active)
+        peak_queued = max(peak_queued, queued)
         if all(state in FINAL_JOB_STATES for state in states):
             break
         time.sleep(0.02)
@@ -517,7 +523,13 @@ def _job_batch_once(store: JobStore, count: int, run_key: int) -> dict[str, Any]
         time.sleep(0.02)
     else:
         raise RuntimeError(f"Timed out waiting for {count} benchmark workers to exit.")
-    return {"jobs": count, "states": states}
+    return {
+        "jobs": count,
+        "states": states,
+        "max_running_jobs": SETTINGS.max_running_jobs,
+        "peak_active_jobs": peak_active,
+        "peak_queued_jobs": peak_queued,
+    }
 
 
 def _browser_pool_details(manager: Any, sessions: int) -> dict[str, Any]:
