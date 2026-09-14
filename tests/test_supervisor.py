@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from core.jobs import JobStore
+from core.lifecycle import RuntimeLifecycle
+from core.recovery import OperationRecoveryJournal
 from scripts import supervisor as module
 from scripts.supervisor import Supervisor, make_panel, restart_delay
 
@@ -136,4 +138,308 @@ def test_runtime_restart_preserves_durable_job(tmp_path: Path) -> None:
     finally:
         supervisor.stop.set()
         thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+def test_user_restart_drains_active_mutation_before_cleanup(tmp_path: Path) -> None:
+    attempts = tmp_path / "attempts.txt"
+    target = tmp_path / "mutation.txt"
+    script = tmp_path / "runtime_probe.py"
+    script.write_text(
+        f"""
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+sys.path.insert(0, {str(module.PROJECT_ROOT)!r})
+from core.lifecycle import RUNTIME_LIFECYCLE
+
+heartbeat = Path(os.environ["MCP_HEARTBEAT_FILE"])
+attempts = Path({str(attempts)!r})
+target = Path({str(target)!r})
+RUNTIME_LIFECYCLE.configure_from_env()
+
+
+def watch() -> None:
+    while True:
+        RUNTIME_LIFECYCLE.poll_control()
+        time.sleep(0.01)
+
+
+def pulse() -> None:
+    while True:
+        heartbeat.write_text(str(os.getpid()), encoding="ascii")
+        time.sleep(0.03)
+
+
+threading.Thread(target=watch, daemon=True).start()
+threading.Thread(target=pulse, daemon=True).start()
+number = int(attempts.read_text()) + 1 if attempts.exists() else 1
+attempts.write_text(str(number))
+if number == 1:
+    with RUNTIME_LIFECYCLE.mutation("safe_refactor"):
+        target.write_text("started", encoding="utf-8")
+        time.sleep(0.45)
+        target.write_text("complete", encoding="utf-8")
+while True:
+    time.sleep(1)
+""",
+        encoding="utf-8",
+    )
+    supervisor = Supervisor(
+        [sys.executable, str(script)],
+        readiness_url=None,
+        state_dir=tmp_path,
+        grace=3,
+        interval=0.02,
+        drain_timeout=2,
+        watchdog_drain_timeout=0.2,
+    )
+    thread = threading.Thread(target=supervisor.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if target.exists() and target.read_text(encoding="utf-8") == "started":
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(supervisor.snapshot())
+
+        supervisor.restart.set()
+        while time.monotonic() < deadline:
+            state = supervisor.snapshot()
+            if state["restart_count"] >= 1 and state["state"] == "running":
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(supervisor.snapshot())
+
+        assert target.read_text(encoding="utf-8") == "complete"
+        drain = state["last_drain_result"]
+        assert drain["reason"] == "user_restart"
+        assert drain["acknowledged"] is True
+        assert drain["drained"] is True
+        assert drain["active_mutations"] == 0
+        assert drain["elapsed_ms"] >= 250
+    finally:
+        supervisor.stop.set()
+        thread.join(timeout=10)
+        close_logger(supervisor)
+    assert not thread.is_alive()
+
+
+def test_lifecycle_control_write_retries_transient_windows_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "control.json"
+    original_replace = module.os.replace
+    calls = 0
+
+    def flaky_replace(source: str | bytes | Path, destination: str | bytes | Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise OSError("transient sharing violation")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(module.os, "replace", flaky_replace)
+    Supervisor._write_lifecycle_control(path, "drain", "request-1", time.time() + 5)
+    assert calls == 3
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["command"] == "drain"
+    assert payload["request_id"] == "request-1"
+
+
+def test_drain_ignores_transient_status_read_failure_after_runtime_was_seen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = tmp_path / "control.json"
+    status = tmp_path / "status.json"
+    process = module.subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    supervisor = Supervisor(
+        [],
+        readiness_url=None,
+        state_dir=tmp_path,
+        drain_timeout=1.0,
+        watchdog_drain_timeout=0.2,
+    )
+    calls = 0
+
+    def intermittent_read(path: Path) -> dict[str, object] | None:
+        nonlocal calls
+        calls += 1
+        payload = json.loads(control.read_text(encoding="utf-8"))
+        request_id = payload["request_id"]
+        if calls <= 11:
+            return {
+                "schema_version": 1,
+                "request_id": request_id,
+                "state": "DRAINING",
+                "active_mutations": 1,
+            }
+        if calls == 12:
+            return None
+        return {
+            "schema_version": 1,
+            "request_id": request_id,
+            "state": "DRAINING",
+            "active_mutations": 0,
+        }
+
+    monkeypatch.setattr(supervisor, "_read_lifecycle_status", intermittent_read)
+    try:
+        result = supervisor.drain_runtime(
+            process,
+            reason="user_restart",
+            control_path=control,
+            status_path=status,
+        )
+        assert calls >= 13
+        assert result["acknowledged"] is True
+        assert result["drained"] is True
+        assert result["active_mutations"] == 0
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+        close_logger(supervisor)
+
+
+def test_watchdog_drain_is_bounded_when_mutation_does_not_finish(tmp_path: Path) -> None:
+    control = tmp_path / "control.json"
+    status = tmp_path / "status.json"
+    lifecycle = RuntimeLifecycle()
+    lifecycle.configure(control, status)
+    entered = threading.Event()
+    release = threading.Event()
+    watcher_stop = threading.Event()
+
+    def mutate() -> None:
+        with lifecycle.mutation("run_process"):
+            entered.set()
+            release.wait(timeout=5)
+
+    def watch() -> None:
+        while not watcher_stop.is_set():
+            lifecycle.poll_control()
+            time.sleep(0.005)
+
+    mutation_thread = threading.Thread(target=mutate)
+    watcher_thread = threading.Thread(target=watch)
+    mutation_thread.start()
+    watcher_thread.start()
+    assert entered.wait(timeout=5)
+    process = module.subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    supervisor = Supervisor(
+        [],
+        readiness_url=None,
+        state_dir=tmp_path,
+        drain_timeout=1,
+        watchdog_drain_timeout=0.12,
+    )
+    try:
+        result = supervisor.drain_runtime(
+            process,
+            reason="watchdog_unhealthy",
+            control_path=control,
+            status_path=status,
+        )
+        assert result["acknowledged"] is True
+        assert result["drained"] is False
+        assert result["timed_out"] is True
+        assert result["active_mutations"] == 1
+        assert result["elapsed_ms"] < 500
+    finally:
+        release.set()
+        mutation_thread.join(timeout=5)
+        watcher_stop.set()
+        watcher_thread.join(timeout=5)
+        process.kill()
+        process.wait(timeout=5)
+        close_logger(supervisor)
+
+
+def test_watchdog_restart_marks_inflight_mutation_uncertain_without_replay(tmp_path: Path) -> None:
+    attempts = tmp_path / "attempts.txt"
+    marker = tmp_path / "side-effect.txt"
+    journal_path = tmp_path / "operation-recovery.jsonl"
+    script = tmp_path / "uncertain_runtime.py"
+    script.write_text(
+        f"""
+import os
+import threading
+import time
+from pathlib import Path
+import sys
+sys.path.insert(0, {str(module.PROJECT_ROOT)!r})
+from core.lifecycle import RUNTIME_LIFECYCLE
+from core.recovery import OperationRecoveryJournal
+
+heartbeat = Path(os.environ["MCP_HEARTBEAT_FILE"])
+attempts = Path({str(attempts)!r})
+marker = Path({str(marker)!r})
+journal_path = Path({str(journal_path)!r})
+RUNTIME_LIFECYCLE.configure_from_env()
+journal = OperationRecoveryJournal()
+journal.configure(journal_path, os.environ["MCP_RUNTIME_GENERATION_ID"])
+number = int(attempts.read_text()) + 1 if attempts.exists() else 1
+attempts.write_text(str(number), encoding="ascii")
+
+
+def watch() -> None:
+    while True:
+        RUNTIME_LIFECYCLE.poll_control()
+        time.sleep(0.005)
+
+
+threading.Thread(target=watch, daemon=True).start()
+if number == 1:
+    heartbeat.write_text(str(os.getpid()), encoding="ascii")
+    os.utime(heartbeat, (0, 0))
+    with RUNTIME_LIFECYCLE.mutation("run_process"):
+        journal.begin("run_process", "cwd=test")
+        marker.write_text("once", encoding="utf-8")
+        while True:
+            time.sleep(1)
+else:
+    while True:
+        heartbeat.write_text(str(os.getpid()), encoding="ascii")
+        time.sleep(0.03)
+""",
+        encoding="utf-8",
+    )
+    supervisor = Supervisor(
+        [sys.executable, str(script)],
+        readiness_url=None,
+        state_dir=tmp_path,
+        grace=0.12,
+        interval=0.025,
+        drain_timeout=1,
+        watchdog_drain_timeout=0.12,
+    )
+    thread = threading.Thread(target=supervisor.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state = supervisor.snapshot()
+            if state["restart_count"] >= 1 and state["state"] == "running":
+                break
+            time.sleep(0.03)
+        else:
+            raise AssertionError(supervisor.snapshot())
+        assert marker.read_text(encoding="utf-8") == "once"
+        assert attempts.read_text(encoding="ascii") == "2"
+        journal = OperationRecoveryJournal()
+        journal.configure(journal_path, "inspection-runtime")
+        summary = journal.summary()
+        assert summary["uncertain_count"] == 1
+        assert summary["uncertain"][0]["operation_type"] == "run_process"
+        assert state["last_exit_reason"] == "watchdog_unhealthy"
+        assert state["last_drain_result"]["drained"] is False
+    finally:
+        supervisor.stop.set()
+        thread.join(timeout=10)
+        close_logger(supervisor)
     assert not thread.is_alive()

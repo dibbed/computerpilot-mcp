@@ -15,8 +15,10 @@ from typing import Any
 import psutil
 
 from core.audit import audit_action
-from core.executor import _creation_flags, terminate_process_tree
+from core.config import SETTINGS
+from core.executor import _creation_flags
 from core.jobs import JobStore
+from core.windows_job import OwnedProcess, spawn_owned_process
 
 
 def _poll_interval(elapsed: float) -> float:
@@ -26,6 +28,20 @@ def _poll_interval(elapsed: float) -> float:
     if elapsed < 30.0:
         return 0.5
     return 1.0
+
+
+def _admission_poll_interval(attempt: int) -> float:
+    """Back off queued workers cheaply while keeping slot handoff responsive."""
+    return min(0.1 * (2 ** min(attempt, 3)), 1.0)
+
+
+def _kick_successor(store: JobStore) -> None:
+    try:
+        from core.job_scheduler import ensure_job_scheduler
+        from core.jobs import JobStore as SchedulerStore
+        ensure_job_scheduler(SchedulerStore(store.path, initialize=False))
+    except Exception:
+        pass
 
 
 def _row(db: sqlite3.Connection, job_id: str) -> dict[str, Any]:
@@ -39,33 +55,48 @@ def _update(db: sqlite3.Connection, job_id: str, **values: Any) -> None:
     values["updated"] = time.time()
     assignment = ",".join(f"{key}=?" for key in values)
     with db:
-        db.execute(f"UPDATE jobs SET {assignment} WHERE id=?", (*values.values(), job_id))
+        db.execute(
+            f"UPDATE jobs SET {assignment},version=version+1 WHERE id=?",
+            (*values.values(), job_id),
+        )
 
 
-def run(path: Path, job_id: str) -> None:
+def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
     store = JobStore(path, initialize=False)
-    process: subprocess.Popen[bytes] | None = None
+    process: OwnedProcess | None = None
     # The worker owns one SQLite connection for its lifetime. Short transactions
     # keep WAL readers/writers independent while avoiding a connection per poll.
     with closing(store.connect()) as db:
-        with db:
-            claimed = db.execute(
-                "UPDATE jobs SET status='running',worker_pid=?,worker_created=?,updated=? WHERE id=? AND status='queued'",
-                (os.getpid(), psutil.Process().create_time(), time.time(), job_id),
-            ).rowcount
-        if not claimed:
-            return
+        worker_created = psutil.Process().create_time()
+        admission_attempt = 0
+        while True:
+            claim = store.claim_for_execution(
+                job_id,
+                worker_pid=os.getpid(),
+                worker_created=worker_created,
+                max_running=SETTINGS.max_running_jobs,
+                launch_token=launch_token,
+                db=db,
+            )
+            if claim == "claimed":
+                break
+            if claim == "terminal":
+                _kick_successor(store)
+                return
+            time.sleep(_admission_poll_interval(admission_attempt))
+            admission_attempt += 1
         try:
             row = _row(db, job_id)
             if row["cancel_requested"]:
                 _update(db, job_id, status="cancelled")
+                _kick_successor(store)
                 return
             spec = json.loads(row["spec"])
             directory = store.output_dir / job_id
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = spec["encoding"]
             with (directory / "stdout.bin").open("ab") as stdout, (directory / "stderr.bin").open("ab") as stderr:
-                process = subprocess.Popen(
+                process = spawn_owned_process(
                     spec["command"],
                     cwd=spec["cwd"],
                     env=env,
@@ -96,7 +127,7 @@ def run(path: Path, job_id: str) -> None:
                             target=str(process.pid),
                             details={"job_id": job_id, "reason": status},
                         )
-                        terminate_process_tree(process.pid, force=True)
+                        process.terminate_tree(force=True)
                         code = process.wait(timeout=5)
                         break
                     wait_for = min(_poll_interval(now - started), max(deadline - now, 0.001))
@@ -106,6 +137,7 @@ def run(path: Path, job_id: str) -> None:
                         code = None
                 if status == "succeeded" and code != 0:
                     status = "failed"
+                process.close_ownership()
             _update(db, job_id, status=status, exit_code=code)
         except BaseException as exc:
             if process is not None and process.poll() is None:
@@ -114,14 +146,18 @@ def run(path: Path, job_id: str) -> None:
                     target=str(process.pid),
                     details={"job_id": job_id, "reason": "worker_error"},
                 )
-                terminate_process_tree(process.pid, force=True)
+                process.terminate_tree(force=True)
             try:
                 _update(db, job_id, status="failed", error=str(exc))
             except sqlite3.Error:
                 # Recovery path only: a broken worker connection must still make
                 # the terminal state visible if the database itself is reachable.
                 store.update(job_id, status="failed", error=str(exc))
+        finally:
+            if process is not None:
+                process.close_ownership()
+    _kick_successor(store)
 
 
 if __name__ == "__main__":
-    run(Path(sys.argv[1]), sys.argv[2])
+    run(Path(sys.argv[1]), sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)

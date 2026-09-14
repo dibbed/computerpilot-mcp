@@ -10,7 +10,8 @@ from pydantic import Field
 from core.artifacts import default_delivery
 from core.audit import audit_action
 from core.config import resolve_path
-from core.jobs import JobStore
+from core.job_scheduler import ensure_job_scheduler
+from core.jobs import MAX_JOB_WAIT_SEC, JobStore
 from core.tooling import DESTRUCTIVE, OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 
 JobId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
@@ -18,6 +19,7 @@ JobId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
 
 def register(mcp: MCPServer) -> None:
     store = JobStore()
+    ensure_job_scheduler(store)
     output_default = default_delivery()
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
@@ -29,19 +31,34 @@ def register(mcp: MCPServer) -> None:
         cwd: Annotated[str, Field(max_length=32767)] = ".",
         timeout_sec: Annotated[float, Field(gt=0, le=86400)] = 3600,
         encoding: Annotated[str, Field(min_length=1, max_length=40)] = "utf-8",
+        queue_timeout_sec: Annotated[float | None, Field(gt=0, le=86400)] = None,
     ) -> dict[str, Any]:
-        """Submit a durable command; reuse its key after reconnect to avoid replay.
-
-        Output is UTF-8; uncertain jobs are never retried automatically.
-        """
+        """Submit a retry-safe durable command. Execution timeout starts after launch; optional queue timeout bounds pre-launch waiting."""
         audit_action("submit_job", target=resolve_path(cwd), details={"executable": executable})
-        return store.submit([executable, *(args or [])], resolve_path(cwd), timeout_sec, idempotency_key, encoding)
+        return store.submit(
+            [executable, *(args or [])],
+            resolve_path(cwd),
+            timeout_sec,
+            idempotency_key,
+            encoding,
+            queue_timeout_sec=queue_timeout_sec,
+        )
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_status")
     def job_status(job_id: JobId) -> dict[str, Any]:
         """Read a durable job status by ID after reconnect or server restart."""
         return {"ok": True, **store.get(job_id)}
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("job_wait")
+    def job_wait(
+        job_id: JobId,
+        after_version: Annotated[int, Field(ge=0)],
+        timeout: Annotated[float, Field(ge=0, le=MAX_JOB_WAIT_SEC)] = 30,
+    ) -> dict[str, Any]:
+        """Wait for a durable job version to advance; return unchanged state when the bounded timeout expires."""
+        return store.wait(job_id, after_version, timeout)
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("list_jobs")

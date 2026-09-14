@@ -64,9 +64,16 @@ def test_worker_reuses_one_runtime_connection(tmp_path: Path, monkeypatch: pytes
         def poll(self) -> int | None:
             return 0 if self.finished else None
 
+        def close_ownership(self) -> None:
+            pass
+
+        def terminate_tree(self, *, force: bool = True) -> dict[str, object]:
+            self.finished = True
+            return {"targeted_pids": [self.pid], "terminated_pids": [self.pid], "alive_pids": []}
+
     process = FakeProcess()
     monkeypatch.setattr(job_worker, "JobStore", CountingStore)
-    monkeypatch.setattr(job_worker.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(job_worker, "spawn_owned_process", lambda *args, **kwargs: process)
     monkeypatch.setattr(job_worker.psutil, "Process", lambda *args: SimpleNamespace(create_time=lambda: 1.0))
     monkeypatch.setattr(job_worker, "audit_action", lambda *args, **kwargs: None)
 
@@ -104,15 +111,18 @@ def test_worker_sees_external_cancel_on_persistent_connection(tmp_path: Path, mo
         def poll(self) -> int | None:
             return -1 if self.finished else None
 
+        def close_ownership(self) -> None:
+            pass
+
+        def terminate_tree(self, *, force: bool = True) -> dict[str, object]:
+            terminated.append(self.pid)
+            self.finished = True
+            return {"targeted_pids": [self.pid], "terminated_pids": [self.pid], "alive_pids": []}
+
     process = FakeProcess()
 
-    def terminate(pid: int, *, force: bool = False) -> None:
-        terminated.append(pid)
-        process.finished = True
-
-    monkeypatch.setattr(job_worker.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(job_worker, "spawn_owned_process", lambda *args, **kwargs: process)
     monkeypatch.setattr(job_worker.psutil, "Process", lambda *args: SimpleNamespace(create_time=lambda: 1.0))
-    monkeypatch.setattr(job_worker, "terminate_process_tree", terminate)
     monkeypatch.setattr(job_worker, "audit_action", lambda *args, **kwargs: None)
 
     job_worker.run(path, job_id)

@@ -23,9 +23,12 @@ def seed(store: JobStore, count: int, status: str = "succeeded") -> None:
         )
 
 
-@pytest.mark.parametrize("status,selects", [("succeeded", 2), ("running", 3), ("queued", 3)])
+@pytest.mark.parametrize(
+    "status,selects,expected_status",
+    [("succeeded", 2, "succeeded"), ("running", 3, "interrupted"), ("queued", 2, "queued")],
+)
 def test_listing_fifty_rows_has_constant_select_count(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, selects: int,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, selects: int, expected_status: str,
 ) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
     seed(store, 50, status)
@@ -43,7 +46,7 @@ def test_listing_fifty_rows_has_constant_select_count(
     assert sum(statement.startswith("SELECT") for statement in statements) == selects
     assert not any("SELECT * FROM jobs" in statement for statement in statements)
     assert not any("spec" in statement.casefold() for statement in statements if statement.startswith("SELECT"))
-    assert all(row["status"] == ("succeeded" if status == "succeeded" else "interrupted") for row in result["items"])
+    assert all(row["status"] == expected_status for row in result["items"])
     assert all("spec" not in row and "fingerprint" not in row for row in result["items"])
 
 

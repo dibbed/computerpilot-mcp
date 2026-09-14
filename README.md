@@ -6,7 +6,7 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 ## Current Status
 
-The optimization roadmap is complete through **Phase D / v0.0.15**. The `main` branch also contains the final post-release D hardening for externally closed Playwright pages/contexts and expanded browser lifecycle benchmarks; the published `v0.0.15` tag remains immutable.
+The optimization roadmap is complete through **Phase E / v0.0.16**. The published `v0.0.15` tag remains immutable, and Phase E closes the durable-jobs/reliability work with bounded admission, version-aware waiting, restart drain safety, uncertain-operation recovery, and Windows Job Object ownership.
 
 | Phase | Release | Focus | Status |
 | --- | --- | --- | --- |
@@ -14,12 +14,14 @@ The optimization roadmap is complete through **Phase D / v0.0.15**. The `main` b
 | B | `v0.0.13` | Core Performance | ✅ Complete |
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
+| E | `v0.0.16` | Durable Jobs & Reliability | ✅ Complete |
+| F | `v0.0.17` | State & Long-term Maintenance | ⏭ Next |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
-The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify introducing another tool-profile mode without stronger host-level token/context evidence. The default full 59-tool surface therefore remains unchanged.
+The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 intentionally adds one read-only typed tool, `job_wait`, bringing the current full surface to **60 tools**.
 
-Current post-D validation on Windows: **203 pytest tests**, Ruff with zero violations, mypy with zero issues across 79 source files, compileall, the 59-tool health check, Full Doctor, real Chromium recovery tests, and a real mixed Chromium/Firefox pooling benchmark all pass. The next planned roadmap phase is **Phase E / v0.0.16 — Durable Jobs & Reliability**.
+Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. A focused release-candidate crash/restart suite also passes **71/71** tests. The canonical 3-run jobs benchmark on audit commit `8e06fee` completed 1/10/50 concurrent jobs with all jobs succeeding and `MCP_MAX_RUNNING_JOBS=4` enforced; the 50-job median was **18.370 s**, peak active jobs **4**, peak process-tree RSS **509.648 MiB**, and peak process count **25**. The 50-waiter `job_wait` case observed the same authoritative version with **76.823 ms** wake latency and no extra child processes. **Phase E / v0.0.16 — Durable Jobs & Reliability is complete.** Phase F / `v0.0.17` is the next roadmap step for bounded long-running state, retention, provenance, and storage budgets.
 
 ---
 
@@ -27,15 +29,15 @@ Current post-D validation on Windows: **203 pytest tests**, Ruff with zero viola
 
 - **Robust Filesystem Tools**: Atomic file creation, writing, copying, moving, and deletion; paginated listing and regex file search; complete reads with streaming byte cursors.
 - **Precision Code Editing**: Exact match, anchored replacements, and AST function/class body substitutions with syntax validation and rollback on syntax error.
-- **Process & Command Execution**: Synchronous and background execution for PowerShell, CMD, and native Windows executables with streaming spooling (1 MiB RAM limit rolling over to temp disk), bounded auto-delivery, byte cursors, and reusable finalized artifacts.
-- **Durable Job Store**: SQLite-backed background job queue (`.agent_state/jobs.sqlite3`) with idempotency keys, progress tracking, survivor workers across supervisor restarts, constant-query list/status paths, and one persistent SQLite connection per running worker.
+- **Process & Command Execution**: Synchronous and background execution for PowerShell, CMD, and native Windows executables with streaming spooling, bounded auto-delivery, byte cursors, reusable finalized artifacts, and Windows Job Object ownership for deterministic runtime-owned process-tree cleanup.
+- **Durable Job Store**: SQLite-backed background job queue (`.agent_state/jobs.sqlite3`) with idempotency keys, bounded max-running admission, lightweight worker scheduling, survivor workers across supervisor restarts, monotonic state versions, bounded `job_wait` long-polling, and persistent SQLite connections for running workers/waits.
 - **Concurrency Hardening**: Keyed resource locks protect filesystem read-modify-write operations and project-memory updates; browser navigation is serialized only within the same session rather than across unrelated sessions.
 - **System Diagnostics**: Live inspection of CPU, memory, disks, environment variables, installed applications, and Windows services.
 - **Codebase Intelligence**: Fast Python AST parsing for classes, functions, imports, and project summaries.
 - **Validation Suite**: Compact summaries from integrated `pytest`, `Ruff`, and `mypy` tools.
 - **Git Integration**: Working-tree status, diff statistics, and commit log pagination.
 - **Optional Browser Automation**: Playwright automation with shared browser-process pools, isolated per-session contexts, idle eviction, crash recovery, screenshot capture, and UI interaction.
-- **Resilient Supervisor & Control Panel**: Heartbeat watchdog, automatic backoff recovery, and a loopback-only control panel at `http://127.0.0.1:8766`.
+- **Resilient Supervisor & Control Panel**: Heartbeat watchdog, automatic backoff recovery, mutation-aware bounded drain before restart/stop, and a loopback-only control panel at `http://127.0.0.1:8766`.
 
 ---
 
@@ -190,6 +192,88 @@ MCP_SEARCH_SNAPSHOT_MAX_COUNT   # default: 32 snapshots
 ```
 
 Use streaming mode when lowest first-page latency matters. Use `snapshot=true` when stable multi-page traversal matters more than first-page latency. If a bounded scan itself is truncated, the response reports `scan_truncated=true`; it never invents a cursor beyond results that were actually captured.
+
+### Durable Job State Foundation (Phase E1)
+
+Phase E1 prepares the durable-job subsystem for bounded admission and future version-aware waiting without changing the per-running-job worker architecture:
+
+- Phase E1 introduced explicit SQLite job-schema revisioning. The current E2 schema is `PRAGMA user_version=3`: existing `jobs.sqlite3` files migrate in place under serialized `BEGIN IMMEDIATE` transactions, preserving rows, request keys, command specs, and idempotency fingerprints while adding internal launch-reservation metadata.
+- Every durable job row has a monotonic integer `version`. New jobs start at `version=1`; worker claim, process metadata, cancellation, reconciliation, timeout, failure, and terminal-state updates increment the version. Public job status/list/output responses expose the current version for later `after_version` waiting.
+- `timeout_sec` remains the execution timeout and starts only after the command process has actually started. Queue age is no longer charged against execution time.
+- `queue_timeout_sec` is a new optional submit parameter. Its default is `None`, so queued jobs do not expire merely because they have waited longer than 60 seconds. When provided, it is stored as an absolute `queue_deadline`; expiry becomes a terminal `timed_out` result with an explicit queue-timeout error.
+- The worker's atomic `queued -> running` claim includes the queue deadline predicate, so a job cannot race past an already-expired queue deadline even if status reconciliation and worker startup happen concurrently.
+- Default submissions deliberately keep the pre-E1 fingerprint shape when no queue deadline is requested, so idempotency keys created before the migration remain reusable without false conflicts.
+- Schema initialization is safe under concurrent JobStore creation, including WAL setup contention; databases with a future unsupported jobs schema are rejected instead of being silently downgraded.
+
+E1 deliberately left admission and `job_wait` for later subphases. E2 implemented admission/launch control, and E3 now consumes the monotonic version foundation through bounded `job_wait` long-polling.
+
+### Durable Job Admission Control (Phase E2)
+
+Phase E2 keeps SQLite as the authoritative job state and preserves one independent worker per running job; it does **not** introduce a shared resident `jobd`:
+
+- `MCP_MAX_RUNNING_JOBS` bounds active durable jobs across processes; the conservative default is `4` and the accepted range is `1..256`. Both `running` jobs and `orphaned` commands that are still alive consume capacity.
+- Worker claims are serialized with `BEGIN IMMEDIATE` and capacity is derived from authoritative row state rather than a separate slot counter. Terminal transitions therefore release capacity naturally, while stale running/orphaned rows are reconciled before admission so a crashed worker cannot permanently leak a slot.
+- Queue cancellation is race-safe: queued jobs become terminal `cancelled` atomically, while a claim that wins first can only leave a running row with `cancel_requested=1`; a queued cancellation cannot silently race into an uncancelled command.
+- The initial E2 implementation let every queued job create a waiting worker. A real 50-job benchmark kept `peak_active_jobs=4` but still reached 155 processes and 3280.344 MiB peak process-tree RSS, so the roadmap's second-stage scheduler gate was triggered.
+- The final E2 launcher uses short-lived SQLite launch reservations (`launch_token` / `launch_started`) so concurrent schedulers reserve at most available capacity. Stale reservations are recoverable, a reserved worker must present the matching token before claiming the job, and launch failure becomes a durable terminal failure instead of an ambiguous replay.
+- Submission performs a synchronous launch pass before returning, so a short-lived submitter can exit without stranding the first durable worker. Each terminal worker also kicks a successor before exit; a small background scheduler remains only for recovery/coordination while queued work exists. Running commands remain independent processes and survive MCP runtime restarts.
+- On the same Windows host, the final committed 50-job default-cap benchmark (`e9fc0b9`) kept `peak_active_jobs=4` and completed in 20817.842 ms while reducing peak process-tree RSS from 3280.344 MiB to 491.629 MiB and peak process count from 155 to 25. A calibration run with `MCP_MAX_RUNNING_JOBS=8` completed the 50-job case in 17955.369 ms at 748.305 MiB / 37 processes; the default remains `4` to favor predictable local resource use. These are host-specific regression measurements, not universal guarantees.
+
+Configuration:
+
+```text
+MCP_MAX_RUNNING_JOBS=4
+```
+
+Short-job throughput is intentionally traded for bounded resource use because each running job still owns an independent durable worker. A warm shared worker pool remains deferred/conditional rather than being folded into E2.
+
+### Versioned Durable Job Wait (Phase E3)
+
+Phase E3 adds a typed read-only long-poll API without introducing Windows event/pipe IPC:
+
+```text
+job_wait(job_id, after_version, timeout=30)
+```
+
+- `version` remains the authoritative synchronization primitive. `after_version=0` returns the current job state immediately because every job starts at version 1; when the current version equals `after_version`, the call waits until that version advances or the bounded timeout expires.
+- The public timeout range is `0..300` seconds. Timeout is a normal response (`changed=false`, `timed_out=true`) rather than an exception, and it includes the latest observed job state/version so the caller can immediately wait again.
+- If `after_version` is ahead of the authoritative current version, the call returns controlled `job_version_ahead` guidance instead of waiting for an impossible/mismatched state.
+- Each wait reuses exactly one SQLite connection for its lifetime. Polling is adaptive: 50 ms during the first second, 100 ms through 5 seconds, 250 ms through 30 seconds, then 500 ms for longer waits. State reconciliation still runs while waiting, so queue-deadline expiry and dead-worker/orphan transitions can advance the version even without another client call.
+- The synchronous MCP tool is offloaded by the SDK rather than blocking the server event loop. Integration coverage verifies a state update can execute while `job_wait` is blocked.
+- Lost notifications are avoided by design because there is no event as the source of truth: every wake cycle re-reads the monotonic version. A change occurring between a read and sleep is observed on the next bounded poll.
+
+The committed E3 benchmark (`9b328f8`) on the local Windows host measured a single waiter waking **54.006 ms** after the authoritative update, a 200 ms timeout returning in **211.776 ms**, and **50 concurrent waiters** all observing the same version change with **46.787 ms** wake latency, **75.164 MiB** peak process-tree RSS, and no extra child processes. These host-specific results do not justify the extra failure/recovery complexity of Named Events or pipes, so event IPC remains deliberately deferred behind the roadmap benchmark gate.
+
+### Runtime Mutation Drain and Restart Safety (Phase E4)
+
+Phase E4 gives the MCP runtime an explicit lifecycle used only when it is supervised:
+
+```text
+RUNNING → DRAINING → STOPPING
+```
+
+- Every MCP tool whose annotation is mutating/non-read-only is centrally guarded by `core/tooling.py`. The guard set is verified against the registered tool annotations so a future mutating tool cannot silently bypass lifecycle tracking.
+- While `RUNNING`, each mutating tool increments a process-local active-mutation counter for the complete tool body and decrements it in `finally`, including command execution, filesystem validation/refactor work, browser/desktop mutations, job submit/cancel, and test/lint execution. Durable job commands themselves are not owned by this counter after submission and retain their existing restart-survival semantics.
+- The supervisor gives each runtime generation unique private control/status files under local state. On restart/stop it writes a `drain` request; the runtime watcher acknowledges `DRAINING`, rejects new mutations with retryable `runtime_draining`, continues serving read-only tools, and publishes `active_mutations` until it reaches zero. Only after an acknowledged zero count does the supervisor send `stop` and clean up the runtime.
+- The handshake closes the enter-vs-restart race: the supervisor never treats a stale `active_mutations=0` snapshot as drained; it requires the runtime to acknowledge the current request ID after entering `DRAINING`. Status publication is retried on every valid control poll so transient Windows read/replace sharing contention cannot permanently lose an acknowledgement.
+- User restart/stop uses `MCP_SUPERVISOR_DRAIN_SEC` (default `15` seconds). Watchdog recovery is deliberately best-effort and uses `MCP_SUPERVISOR_WATCHDOG_DRAIN_SEC` (default `2` seconds), so an actually unhealthy runtime cannot block recovery forever. If the MCP lifespan never reached request-serving state and produced no lifecycle status, the supervisor does not spend the full drain deadline waiting for an impossible acknowledgement.
+- Standalone MCP servers without supervisor lifecycle paths remain backward-compatible: mutation guards are unmanaged/no-op, so direct development/test servers are not left in a stale `STOPPING` state across repeated in-process server instances.
+
+E4 integration coverage includes a real `run_process` mutation staying active across a drain request, read-only access continuing while new writes are rejected, a real supervisor restart requested during an in-flight mutation that waits for completion before cleanup, bounded watchdog fallback for a mutation that does not finish, durable-job restart survival, and retry of a transiently failed status-file acknowledgement.
+
+### Uncertain Operations and Windows Process Ownership (Phase E5)
+
+Phase E5 completes the reliability hardening that deliberately remained outside E4. It does **not** retry arbitrary mutations after a restart.
+
+- Every supervised mutating tool writes a metadata-only `begin` record to ignored local `.agent_state/operation-recovery.jsonl` and `fsync`s it **before** user-visible mutation work starts. Records contain an operation ID, runtime-generation ID, operation type, bounded target identity, timestamps, and known-result state; command arguments, file contents, typed text, and other payload bodies are not journaled.
+- Normal completion writes a durable `status="completed"` result. If a runtime disappears after `begin` but before a known result, the next runtime generation appends `status="uncertain"` with `reason="runtime_ended_without_known_result"`. `server_health.operation_recovery` exposes the bounded uncertain summary so the state is detectable and can be reconciled manually/client-side.
+- Journal begin is fail-closed: if the runtime cannot durably record recovery metadata, the mutation is not started. A truncated final JSON record after a crash is ignored, and future appends first restore a newline boundary so a damaged tail cannot consume the subsequent uncertainty record.
+- There is intentionally no supervisor callback that re-executes journaled operations. A watchdog integration test kills a runtime in the middle of a side effect; generation two marks the operation uncertain while the side-effect marker remains exactly once.
+- On Windows, normal MCP-owned command processes now start with `CREATE_SUSPENDED`, are assigned to a non-inheritable Job Object configured with `KILL_ON_JOB_CLOSE`, and only then have their primary thread resumed. This removes the child-assignment window. When the runtime dies, the OS closes its Job Object handles and cleans the entire owned tree even if Python cleanup never runs.
+- Durable job commands use the same backend but the Job Object handle belongs to the independent **job worker**, not the MCP runtime. Therefore an MCP/supervisor restart does not kill durable work, while a worker crash deterministically terminates that worker's command and descendants. Existing psutil cleanup remains the fallback for external PIDs and for hosts where Job Object setup is unavailable.
+- The Windows backend has an emergency opt-out, `MCP_WINDOWS_JOB_OBJECTS=0`. When enabled but unavailable, fallback occurs while the first candidate process is still suspended, so user code is not double-executed; responses report `process_ownership="psutil_fallback"` rather than pretending Job Object ownership succeeded.
+
+The E5 gate passed on the real Windows validation host while the MCP process itself was already inside a Job Object, proving nested assignment in this environment. A parent and grandchild were both alive before Job Object close and both dead afterward; runtime-owned background cleanup and worker-crash cleanup also passed. In a 30-run no-op spawn calibration, ordinary `Popen` measured **36.166 ms median / 40.781 ms p95**, while suspended Job Object spawning measured **55.670 ms median / 56.384 ms p95**, a **19.505 ms median fixed overhead** accepted in exchange for deterministic ownership. These are host-specific validation numbers, not universal performance guarantees.
 
 ### Runtime and Browser Pooling
 

@@ -22,6 +22,7 @@ import psutil
 from core.artifacts import Delivery, deliver_stream
 from core.errors import ToolError
 from core.timings import timing_span
+from core.windows_job import OwnedProcess, spawn_owned_process
 
 OutputMode = Literal["head", "tail", "both"]
 SPOOL_MEMORY_BYTES = 1_048_576
@@ -236,12 +237,13 @@ def run_bounded(
     chosen_encoding = encoding or locale.getpreferredencoding(False) or "utf-8"
     stdout = OutputCapture(stdout_limit, output_mode)
     stderr = OutputCapture(stderr_limit, output_mode)
+    process: OwnedProcess | None = None
     try:
         started = time.perf_counter()
         with timing_span("process_spawn"):
-            process = subprocess.Popen(
-                list(command),
-                cwd=str(cwd),
+            process = spawn_owned_process(
+                command,
+                cwd=cwd,
                 env=_process_env(env),
                 stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -264,8 +266,11 @@ def run_bounded(
                 exit_code = process.wait(timeout=timeout_sec)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                terminate_process_tree(process.pid, force=True)
+                process.terminate_tree(force=True)
                 exit_code = process.wait(timeout=5.0)
+        # Closing a successful command's Job Object kills any descendants that
+        # outlived the root and releases inherited pipe handles before drain.
+        process.close_ownership()
         with timing_span("process_drain"):
             stdout_thread.join(timeout=2.0)
             stderr_thread.join(timeout=2.0)
@@ -284,22 +289,26 @@ def run_bounded(
             "pid": process.pid,
             "exit_code": exit_code,
             "timed_out": timed_out,
+            "process_ownership": process.ownership_backend,
             "duration_ms": round((time.perf_counter() - started) * 1_000, 1),
             "stdout": stdout_result,
             "stderr": stderr_result,
         }
     finally:
+        if process is not None:
+            process.close_ownership()
         stdout.close()
         stderr.close()
 
 
 @dataclass(slots=True)
 class BackgroundRecord:
-    process: subprocess.Popen[bytes]
+    process: OwnedProcess
     stdout: OutputCapture
     stderr: OutputCapture
     stdout_thread: threading.Thread
     stderr_thread: threading.Thread
+    ownership_thread: threading.Thread
     started_at: str
     cwd: str
     executable: str
@@ -308,6 +317,16 @@ class BackgroundRecord:
 
 _BACKGROUND: dict[int, BackgroundRecord] = {}
 _BACKGROUND_LOCK = threading.Lock()
+
+
+def _release_background_ownership(process: OwnedProcess) -> None:
+    """Release the Job Object as soon as the root exits, reaping surviving descendants."""
+    try:
+        process.wait()
+    except (OSError, subprocess.SubprocessError):
+        return
+    finally:
+        process.close_ownership()
 
 
 def start_background(
@@ -330,9 +349,9 @@ def start_background(
     stderr = OutputCapture(capture_limit, output_mode)
     try:
         with timing_span("process_spawn"):
-            process = subprocess.Popen(
-                list(command),
-                cwd=str(cwd),
+            process = spawn_owned_process(
+                command,
+                cwd=cwd,
                 env=_process_env(env),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -345,14 +364,17 @@ def start_background(
         raise
     stdout_thread = threading.Thread(target=_read_pipe, args=(process.stdout, stdout), daemon=True)
     stderr_thread = threading.Thread(target=_read_pipe, args=(process.stderr, stderr), daemon=True)
+    ownership_thread = threading.Thread(target=_release_background_ownership, args=(process,), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
+    ownership_thread.start()
     record = BackgroundRecord(
         process=process,
         stdout=stdout,
         stderr=stderr,
         stdout_thread=stdout_thread,
         stderr_thread=stderr_thread,
+        ownership_thread=ownership_thread,
         started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         cwd=str(cwd),
         executable=str(command[0]),
@@ -373,6 +395,7 @@ def start_background(
         "cwd": record.cwd,
         "executable": record.executable,
         "capture_limit": capture_limit,
+        "process_ownership": process.ownership_backend,
     }
 
 
@@ -389,6 +412,7 @@ def background_output(
         )
     exit_code = record.process.poll()
     if exit_code is not None:
+        record.process.close_ownership()
         record.stdout_thread.join(timeout=0.5)
         record.stderr_thread.join(timeout=0.5)
     with timing_span("output_delivery"):
@@ -412,12 +436,15 @@ def background_output(
         "running": exit_code is None,
         "exit_code": exit_code,
         "started_at": record.started_at,
+        "process_ownership": record.process.ownership_backend,
         "stdout": stdout_result,
         "stderr": stderr_result,
     }
 
 
 def _close_background_record(record: BackgroundRecord) -> None:
+    record.process.close_ownership()
+    record.ownership_thread.join(timeout=0.5)
     record.stdout_thread.join(timeout=0.5)
     record.stderr_thread.join(timeout=0.5)
     record.stdout.close()

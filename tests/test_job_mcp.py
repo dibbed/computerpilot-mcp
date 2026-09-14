@@ -27,12 +27,16 @@ def test_jobs_and_artifacts_across_mcp_clients(tmp_path: Path, monkeypatch: pyte
             response = await client.call_tool("submit_job", args)
             assert response.structured_content and response.structured_content["deduplicated"]
             assert response.structured_content["job_id"] == job_id
-            for _ in range(100):
-                response = await client.call_tool("job_status", {"job_id": job_id})
-                assert response.structured_content
-                if response.structured_content["status"] == "succeeded":
+            state = response.structured_content
+            for _ in range(20):
+                if state["status"] == "succeeded":
                     break
-                await asyncio.sleep(0.05)
+                response = await client.call_tool(
+                    "job_wait",
+                    {"job_id": job_id, "after_version": state["version"], "timeout": 1},
+                )
+                assert response.structured_content
+                state = response.structured_content
             else:
                 raise AssertionError("Job failed to finish")
             response = await client.call_tool("job_output", {"job_id": job_id, "delivery": "file"})
