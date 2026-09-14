@@ -6,18 +6,28 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Added
+- Add Phase E1 durable-job state versioning. Every job row now carries a monotonic `version` exposed through status/list/output responses, forming the foundation for future `job_wait(after_version, timeout)` support.
+- Add optional `queue_timeout_sec` submission semantics. The default remains no queue deadline; explicit queue expiry is stored separately from execution timeout and returns a terminal `timed_out` result.
+- Add an additive jobs database migration to schema revision 2 with `version` and `queue_deadline` columns while preserving existing rows and legacy idempotency fingerprints.
+
 ### Fixed
 - Detect externally closed Playwright pages/contexts as stale sessions. `browser_open_page` now recreates the session context inside the existing healthy pool instead of retaining a dead page, while non-open operations return `browser_session_stale`.
 - Distinguish a page/context closed during navigation from a disconnected Browser process so the controlled error code and retry hint describe the actual failure.
+- Remove the old implicit 60-second queued-job interruption heuristic so queue waiting no longer consumes or conflicts with execution-timeout semantics.
+- Prevent a worker from claiming a queued job after its explicit queue deadline, including races between worker startup and status reconciliation.
+- Make concurrent JobStore schema initialization resilient to SQLite WAL setup contention and reject unsupported future jobs schemas instead of silently downgrading them.
 
 ### Changed
 - Browser benchmarks now report open latency, parallel-navigation latency, and cleanup latency for the 1/5/20-session cases, plus a dedicated background idle-eviction case with separate session and empty-pool reclamation timings.
 - Refresh the README with an explicit completed-roadmap snapshot for Phases A-D (`v0.0.12` through `v0.0.15`), the benchmark-gated compact-tool decision, current post-D validation, and the next Phase E target.
+- Document Phase E1 job timeout semantics explicitly: `timeout_sec` begins after command execution starts, while optional queue waiting uses its own deadline.
 
 ### Validation
 - Real Chromium validation confirmed recovery from both externally closed Page and BrowserContext while preserving the same Browser pool.
 - After installing the optional Playwright Firefox runtime on the validation host, the mixed 5 Chromium + 5 Firefox benchmark completed with exactly 2 Browser instances and 10 isolated contexts.
 - Final post-D validation completed with 203 passing pytest tests, Ruff with zero violations, mypy with zero issues across 79 source files, successful compileall, a passing 59-tool health check, and Full Doctor.
+- Phase E1 validation completed with 214 passing pytest tests, Ruff with zero violations, mypy with zero issues across 80 source files, successful compileall, and a passing 59-tool health check. The jobs migration was also validated against a transactionally copied real local database with all 4 existing rows/request keys preserved across schema 0 -> 2.
 
 ## [0.0.15] - 2026-09-14
 

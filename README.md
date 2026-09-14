@@ -14,12 +14,13 @@ The optimization roadmap is complete through **Phase D / v0.0.15**. The `main` b
 | B | `v0.0.13` | Core Performance | ✅ Complete |
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
+| E | `v0.0.16` | Durable Jobs & Reliability | 🚧 In progress — E1 complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
 The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify introducing another tool-profile mode without stronger host-level token/context evidence. The default full 59-tool surface therefore remains unchanged.
 
-Current post-D validation on Windows: **203 pytest tests**, Ruff with zero violations, mypy with zero issues across 79 source files, compileall, the 59-tool health check, Full Doctor, real Chromium recovery tests, and a real mixed Chromium/Firefox pooling benchmark all pass. The next planned roadmap phase is **Phase E / v0.0.16 — Durable Jobs & Reliability**.
+Current post-D validation on Windows: **203 pytest tests**, Ruff with zero violations, mypy with zero issues across 79 source files, compileall, the 59-tool health check, Full Doctor, real Chromium recovery tests, and a real mixed Chromium/Firefox pooling benchmark all pass. **Phase E / v0.0.16 — Durable Jobs & Reliability** is now in progress; E1 establishes the versioned job-state and queue/execution-timeout foundation, while admission control and `job_wait` remain later E subphases.
 
 ---
 
@@ -190,6 +191,20 @@ MCP_SEARCH_SNAPSHOT_MAX_COUNT   # default: 32 snapshots
 ```
 
 Use streaming mode when lowest first-page latency matters. Use `snapshot=true` when stable multi-page traversal matters more than first-page latency. If a bounded scan itself is truncated, the response reports `scan_truncated=true`; it never invents a cursor beyond results that were actually captured.
+
+### Durable Job State Foundation (Phase E1)
+
+Phase E1 prepares the durable-job subsystem for bounded admission and future version-aware waiting without changing the per-running-job worker architecture:
+
+- The jobs database now carries an explicit SQLite schema revision (`PRAGMA user_version=2`). Existing `jobs.sqlite3` files are migrated in place under a serialized `BEGIN IMMEDIATE` migration; existing rows, request keys, command specs, and idempotency fingerprints are preserved.
+- Every durable job row has a monotonic integer `version`. New jobs start at `version=1`; worker claim, process metadata, cancellation, reconciliation, timeout, failure, and terminal-state updates increment the version. Public job status/list/output responses expose the current version for later `after_version` waiting.
+- `timeout_sec` remains the execution timeout and starts only after the command process has actually started. Queue age is no longer charged against execution time.
+- `queue_timeout_sec` is a new optional submit parameter. Its default is `None`, so queued jobs do not expire merely because they have waited longer than 60 seconds. When provided, it is stored as an absolute `queue_deadline`; expiry becomes a terminal `timed_out` result with an explicit queue-timeout error.
+- The worker's atomic `queued -> running` claim includes the queue deadline predicate, so a job cannot race past an already-expired queue deadline even if status reconciliation and worker startup happen concurrently.
+- Default submissions deliberately keep the pre-E1 fingerprint shape when no queue deadline is requested, so idempotency keys created before the migration remain reusable without false conflicts.
+- Schema initialization is safe under concurrent JobStore creation, including WAL setup contention; databases with a future unsupported jobs schema are rejected instead of being silently downgraded.
+
+E1 does **not** add max-running/max-launching admission yet and does not add `job_wait`; those are intentionally reserved for E2/E3 so each reliability change remains reviewable and separately benchmarkable.
 
 ### Runtime and Browser Pooling
 
