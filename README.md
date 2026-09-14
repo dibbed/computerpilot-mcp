@@ -14,13 +14,13 @@ The optimization roadmap is complete through **Phase D / v0.0.15**. The `main` b
 | B | `v0.0.13` | Core Performance | ✅ Complete |
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
-| E | `v0.0.16` | Durable Jobs & Reliability | 🚧 In progress — E1/E2/E3 complete |
+| E | `v0.0.16` | Durable Jobs & Reliability | 🚧 In progress — E1/E2/E3/E4 complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
 The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 intentionally adds one read-only typed tool, `job_wait`, bringing the current full surface to **60 tools**.
 
-Current Phase-E validation on Windows: **239 pytest tests**, Ruff with zero violations, mypy with zero issues across 82 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. **Phase E / v0.0.16 — Durable Jobs & Reliability** is now complete through E3: E1 established versioned job state and queue/execution-timeout separation, E2 added bounded admission and lightweight worker launching, and E3 adds bounded version-aware `job_wait`. Supervisor drain/restart safety remains the next E subphase.
+Current Phase-E validation on Windows: **247 pytest tests**, Ruff with zero violations, mypy with zero issues across 84 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. **Phase E / v0.0.16 — Durable Jobs & Reliability** is now complete through E4: E1 established versioned job state and queue/execution-timeout separation, E2 added bounded admission and lightweight worker launching, E3 added bounded version-aware `job_wait`, and E4 adds mutation-aware supervisor drain/restart safety. Uncertain-operation journaling/no-blind-replay hardening and the benchmark-gated Windows Job Object evaluation remain for E5.
 
 ---
 
@@ -36,7 +36,7 @@ Current Phase-E validation on Windows: **239 pytest tests**, Ruff with zero viol
 - **Validation Suite**: Compact summaries from integrated `pytest`, `Ruff`, and `mypy` tools.
 - **Git Integration**: Working-tree status, diff statistics, and commit log pagination.
 - **Optional Browser Automation**: Playwright automation with shared browser-process pools, isolated per-session contexts, idle eviction, crash recovery, screenshot capture, and UI interaction.
-- **Resilient Supervisor & Control Panel**: Heartbeat watchdog, automatic backoff recovery, and a loopback-only control panel at `http://127.0.0.1:8766`.
+- **Resilient Supervisor & Control Panel**: Heartbeat watchdog, automatic backoff recovery, mutation-aware bounded drain before restart/stop, and a loopback-only control panel at `http://127.0.0.1:8766`.
 
 ---
 
@@ -242,6 +242,23 @@ job_wait(job_id, after_version, timeout=30)
 - Lost notifications are avoided by design because there is no event as the source of truth: every wake cycle re-reads the monotonic version. A change occurring between a read and sleep is observed on the next bounded poll.
 
 The committed E3 benchmark (`9b328f8`) on the local Windows host measured a single waiter waking **54.006 ms** after the authoritative update, a 200 ms timeout returning in **211.776 ms**, and **50 concurrent waiters** all observing the same version change with **46.787 ms** wake latency, **75.164 MiB** peak process-tree RSS, and no extra child processes. These host-specific results do not justify the extra failure/recovery complexity of Named Events or pipes, so event IPC remains deliberately deferred behind the roadmap benchmark gate.
+
+### Runtime Mutation Drain and Restart Safety (Phase E4)
+
+Phase E4 gives the MCP runtime an explicit lifecycle used only when it is supervised:
+
+```text
+RUNNING → DRAINING → STOPPING
+```
+
+- Every MCP tool whose annotation is mutating/non-read-only is centrally guarded by `core/tooling.py`. The guard set is verified against the registered tool annotations so a future mutating tool cannot silently bypass lifecycle tracking.
+- While `RUNNING`, each mutating tool increments a process-local active-mutation counter for the complete tool body and decrements it in `finally`, including command execution, filesystem validation/refactor work, browser/desktop mutations, job submit/cancel, and test/lint execution. Durable job commands themselves are not owned by this counter after submission and retain their existing restart-survival semantics.
+- The supervisor gives each runtime generation unique private control/status files under local state. On restart/stop it writes a `drain` request; the runtime watcher acknowledges `DRAINING`, rejects new mutations with retryable `runtime_draining`, continues serving read-only tools, and publishes `active_mutations` until it reaches zero. Only after an acknowledged zero count does the supervisor send `stop` and clean up the runtime.
+- The handshake closes the enter-vs-restart race: the supervisor never treats a stale `active_mutations=0` snapshot as drained; it requires the runtime to acknowledge the current request ID after entering `DRAINING`. Status publication is retried on every valid control poll so transient Windows read/replace sharing contention cannot permanently lose an acknowledgement.
+- User restart/stop uses `MCP_SUPERVISOR_DRAIN_SEC` (default `15` seconds). Watchdog recovery is deliberately best-effort and uses `MCP_SUPERVISOR_WATCHDOG_DRAIN_SEC` (default `2` seconds), so an actually unhealthy runtime cannot block recovery forever. If the MCP lifespan never reached request-serving state and produced no lifecycle status, the supervisor does not spend the full drain deadline waiting for an impossible acknowledgement.
+- Standalone MCP servers without supervisor lifecycle paths remain backward-compatible: mutation guards are unmanaged/no-op, so direct development/test servers are not left in a stale `STOPPING` state across repeated in-process server instances.
+
+E4 integration coverage includes a real `run_process` mutation staying active across a drain request, read-only access continuing while new writes are rejected, a real supervisor restart requested during an in-flight mutation that waits for completion before cleanup, bounded watchdog fallback for a mutation that does not finish, durable-job restart survival, and retry of a transiently failed status-file acknowledgement. E4 does **not** yet add an uncertain-operation recovery journal or automatic replay policy; those are intentionally isolated to E5.
 
 ### Runtime and Browser Pooling
 

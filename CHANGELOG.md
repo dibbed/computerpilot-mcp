@@ -13,6 +13,7 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Add Phase E2 process-safe durable-job admission with configurable `MCP_MAX_RUNNING_JOBS` (default `4`), atomic capacity-aware claims, and active-slot accounting that includes live orphaned commands.
 - Add a lightweight SQLite-backed worker launcher that reserves only available capacity, recovers stale launch reservations, preserves independent per-running-job workers, and resumes queued work without introducing a shared resident job daemon.
 - Add Phase E3 `job_wait(job_id, after_version, timeout)` as a bounded read-only long-poll over the authoritative monotonic job version. Wait timeout is capped at 300 seconds, timeout returns normal unchanged state, and an ahead-of-current version returns controlled `job_version_ahead` guidance.
+- Add Phase E4 runtime lifecycle tracking (`RUNNING -> DRAINING -> STOPPING`) with a centrally enforced mutating-tool counter and private per-runtime control/status handshake for supervisor drain requests.
 
 ### Fixed
 - Detect externally closed Playwright pages/contexts as stale sessions. `browser_open_page` now recreates the session context inside the existing healthy pool instead of retaining a dead page, while non-open operations return `browser_session_stale`.
@@ -25,6 +26,10 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Preserve submitter-exit durability under bounded launching by synchronously launching available workers before `submit()` returns and having terminal workers kick queued successors before exit.
 - Make durable-job output-directory setup idempotent so a concurrent deduplicated submit can kick the scheduler and pre-create the job directory without causing the original inserter to fail or truncate already-created output files.
 - Reuse one process-local scheduler coordinator under concurrent scheduler kicks, and remove failed-to-start coordinators from the registry so thread-start failure cannot poison later recovery attempts.
+- Reject new mutating MCP tools with retryable `runtime_draining`/`runtime_stopping` responses after the supervised runtime acknowledges drain, while allowing read-only calls to continue until cleanup.
+- Require current-request drain acknowledgement plus `active_mutations=0` before user restart/stop cleanup, closing the race where a stale zero-count snapshot could otherwise be mistaken for a drained runtime.
+- Retry lifecycle status publication on every valid control poll so transient Windows file-sharing contention cannot permanently lose the drain acknowledgement.
+- Bound unhealthy-watchdog drain attempts separately from normal user restart/stop so a wedged runtime cannot block watchdog recovery indefinitely.
 
 ### Changed
 - Browser benchmarks now report open latency, parallel-navigation latency, and cleanup latency for the 1/5/20-session cases, plus a dedicated background idle-eviction case with separate session and empty-pool reclamation timings.
@@ -33,6 +38,8 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Extend durable-job benchmarks with configured max-running, peak active-job, and peak queued-job details; short benchmark commands now remain alive long enough for admission behavior to be measurable.
 - Extend the jobs benchmark with `job_wait` version-change, bounded-timeout, and 50-concurrent-waiter cases. E3 intentionally keeps adaptive SQLite polling with one reused connection per wait; Named Event/Pipe IPC remains deferred because the measured long-poll path does not justify the added recovery complexity.
 - Increase the current typed MCP surface from 59 to 60 tools by adding the read-only `job_wait` API; this is an intentional Phase E feature addition, not the benchmark-rejected compact-tool profile from Phase D.
+- Add configurable supervisor drain deadlines: `MCP_SUPERVISOR_DRAIN_SEC` defaults to 15 seconds for user restart/stop and `MCP_SUPERVISOR_WATCHDOG_DRAIN_SEC` defaults to 2 seconds for best-effort unhealthy-runtime recovery.
+- Keep standalone/non-supervised MCP instances backward-compatible by making lifecycle mutation tracking managed only when the private supervisor control/status paths are configured.
 
 ### Validation
 - Real Chromium validation confirmed recovery from both externally closed Page and BrowserContext while preserving the same Browser pool.
@@ -44,6 +51,7 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - A post-E1/E2 hardening audit completed with 229 passing pytest tests, Ruff with zero violations, mypy with zero issues across 83 source files, successful compileall, a passing 59-tool health check, and Full Doctor. Additional live stress checks covered 48 concurrent duplicate submissions resolving to one job, 20 jobs submitted from 4 independent processes with an actual command peak exactly equal to cap 3, and a forced worker crash where the live orphaned child retained capacity until exit before the successor job started. A dedicated migration regression also verifies schema 2 -> 3 preserves existing version/queue-deadline state.
 - Phase E3 validation completed with 239 passing pytest tests, Ruff with zero violations, mypy with zero issues across 82 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch. MCP integration verifies `job_wait` does not block unrelated event-loop work and a second MCP client can follow a durable job by version after the first client disconnects.
 - The committed E3 benchmark (`9b328f8`) measured one waiter waking 54.006 ms after an authoritative version update, a 200 ms wait timing out in 211.776 ms, and 50 concurrent waiters observing the same change with 46.787 ms wake latency, 75.164 MiB peak process-tree RSS, and no additional child process.
+- Phase E4 validation completed with 247 passing pytest tests, Ruff with zero violations, mypy with zero issues across 84 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch. Integration coverage includes a real `run_process` held active through drain, read-only access during drain, a real supervisor restart requested mid-mutation that waits for completion before cleanup, bounded watchdog fallback, durable-job restart survival, mutating-annotation guard coverage, and transient lifecycle-status publish retry.
 
 ## [0.0.15] - 2026-09-14
 
