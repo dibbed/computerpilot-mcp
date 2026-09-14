@@ -14,6 +14,7 @@ from typing import Any, Literal
 from core.errors import ToolError
 
 JOURNAL_SCHEMA_VERSION = 1
+COMPACT_AFTER_RECORDS = 4_096
 _MAX_LINE_BYTES = 32_768
 _MAX_TARGET_CHARS = 1_000
 
@@ -37,16 +38,23 @@ class OperationRecoveryJournal:
         self._path: Path | None = None
         self._runtime_id: str | None = None
         self._enabled = False
+        self._record_count = 0
+        self._next_compact_at = COMPACT_AFTER_RECORDS
 
     def configure(self, path: Path | None, runtime_id: str | None) -> None:
         with self._lock:
             self._path = path
             self._runtime_id = runtime_id
             self._enabled = path is not None and bool(runtime_id)
+            self._record_count = 0
+            self._next_compact_at = COMPACT_AFTER_RECORDS
             if self._enabled:
                 assert path is not None
                 path.parent.mkdir(parents=True, exist_ok=True)
-                self._recover_previous_locked()
+                records = self._load_locked()
+                self._record_count = len(records)
+                self._recover_previous_locked(records)
+                self._maybe_compact_locked()
 
     def configure_from_env(self, state_dir: Path) -> None:
         runtime_id = os.environ.get("MCP_RUNTIME_GENERATION_ID", "").strip() or None
@@ -77,6 +85,7 @@ class OperationRecoveryJournal:
                 handle.seek(0, os.SEEK_END)
                 handle.write(payload)
                 os.fsync(handle.fileno())
+            self._record_count += 1
         except OSError as exc:
             raise ToolError(
                 "operation_journal_unavailable",
@@ -122,11 +131,12 @@ class OperationRecoveryJournal:
                 state[operation_id][record_type] = record
         return state
 
-    def _recover_previous_locked(self) -> None:
+    def _recover_previous_locked(self, records: list[dict[str, Any]] | None = None) -> None:
         runtime_id = self._runtime_id
         if runtime_id is None:
             return
-        records = self._load_locked()
+        if records is None:
+            records = self._load_locked()
         for operation_id, item in self._state(records).items():
             begin = item.get("begin")
             if not begin or item.get("result") or item.get("uncertain"):
@@ -143,6 +153,59 @@ class OperationRecoveryJournal:
                 "marked_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "reason": "runtime_ended_without_known_result",
             })
+
+    def _compact_locked(self) -> None:
+        """Drop completed history while preserving every pending/uncertain operation."""
+        path = self._path
+        if not self._enabled or path is None:
+            return
+        records = self._load_locked()
+        retained: list[dict[str, Any]] = []
+        for item in self._state(records).values():
+            begin = item.get("begin")
+            if begin is None or item.get("result") is not None:
+                continue
+            retained.append(begin)
+            uncertain = item.get("uncertain")
+            if uncertain is not None:
+                retained.append(uncertain)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("wb", buffering=0) as handle:
+                for record in retained:
+                    payload = (
+                        json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+                    ).encode("utf-8")
+                    if len(payload) > _MAX_LINE_BYTES:
+                        raise ToolError(
+                            "operation_journal_record_too_large",
+                            "Recovery journal metadata exceeded its bounded record size.",
+                        )
+                    handle.write(payload)
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except OSError as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ToolError(
+                "operation_journal_unavailable",
+                "Could not compact the operation recovery journal.",
+            ) from exc
+        self._record_count = len(retained)
+        self._next_compact_at = self._record_count + COMPACT_AFTER_RECORDS
+
+    def _maybe_compact_locked(self) -> None:
+        if self._record_count < self._next_compact_at:
+            return
+        try:
+            self._compact_locked()
+        except ToolError:
+            # Compaction is maintenance only. The append that triggered it is
+            # already fsync'd, so never turn a known operation result into an
+            # apparent failure that could encourage a duplicate retry.
+            self._next_compact_at = self._record_count + COMPACT_AFTER_RECORDS
 
     def begin(self, operation_type: str, target: str | None = None) -> OperationHandle | None:
         with self._lock:
@@ -184,6 +247,7 @@ class OperationRecoveryJournal:
                 "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "known_result": known_result[:100],
             })
+            self._maybe_compact_locked()
 
     def finish_returned(self, handle: OperationHandle | None, result: Any) -> None:
         if isinstance(result, dict) and isinstance(result.get("ok"), bool):
