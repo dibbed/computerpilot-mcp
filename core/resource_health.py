@@ -163,6 +163,7 @@ def collect_resource_metrics(browser: dict[str, int]) -> dict[str, Any]:
     return {
         "rss_mb": round(process.memory_info().rss / (1024 * 1024), 3),
         "ast_cache_entries": ast_stats["entries"],
+        "ast_cache_bytes": ast_stats["bytes"],
         "ast_cache_estimated_bytes": ast_stats["bytes"],
         "cached_files": ast_stats["entries"],
         "search_snapshot_count": snapshot_stats["count"],
@@ -177,6 +178,7 @@ def collect_resource_metrics(browser: dict[str, int]) -> dict[str, Any]:
         "active_processes": background["running"] + jobs["active_jobs"],
         "artifact_count": artifact_count,
         "artifact_bytes": artifact_bytes,
+        "artifact_storage_bytes": artifact_bytes,
         "backup_count": backup_count,
         "backup_bytes": backup_bytes,
         "audit_files": audit_files,

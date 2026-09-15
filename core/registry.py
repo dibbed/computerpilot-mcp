@@ -75,6 +75,7 @@ def create_server() -> MCPServer:
         tools = await server.list_tools()
         browser_stats = await BROWSER_MANAGER.stats()
         resources = collect_resource_metrics(browser_stats)
+        resource_usage = resources.pop("budgets")
         return {
             "ok": True,
             "server": SETTINGS.server_name,
@@ -88,7 +89,8 @@ def create_server() -> MCPServer:
             "audit_log": str(SETTINGS.audit_log),
             "operation_recovery": OPERATION_RECOVERY.summary(),
             "resource_budgets": SETTINGS.resource_budgets(),
-            "resources": resources,
+            "resource_usage": resource_usage,
+            **resources,
         }
 
     return server

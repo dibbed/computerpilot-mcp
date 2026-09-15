@@ -172,6 +172,42 @@ def test_browser_session_budget_rejects_new_logical_session() -> None:
     asyncio.run(run())
 
 
+def test_concurrent_browser_session_reservations_do_not_exceed_budget() -> None:
+    async def run() -> None:
+        manager = BrowserManager(max_sessions=1)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def goto(*args: object, **kwargs: object) -> None:
+            entered.set()
+            await release.wait()
+
+        page = SimpleNamespace(
+            set_default_timeout=lambda n: None,
+            goto=goto,
+            title=AsyncMock(return_value="title"),
+            url="about:blank",
+        )
+        context = SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock())
+        browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)))
+
+        first = asyncio.create_task(
+            manager.open("one", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        )
+        await entered.wait()
+        with pytest.raises(ToolError) as exc_info:
+            await manager.open("two", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        assert exc_info.value.code == "browser_session_limit"
+        release.set()
+        await first
+        stats = await manager.stats()
+        assert stats["active_sessions"] == 1
+        assert stats["pending_sessions"] == 0
+
+    asyncio.run(run())
+
+
 def test_browser_pool_budget_rejects_incompatible_new_pool() -> None:
     async def run() -> None:
         manager = BrowserManager(max_pools=1)
