@@ -16,6 +16,7 @@ from core.errors import ToolError
 MEMORY_SCHEMA_VERSION = 2
 MEMORY_MAX_BYTES = 131_072
 SECTIONS = ("architecture_decisions", "important_paths", "user_preferences", "previous_fixes")
+MEMORY_SOURCES = ("user", "project_scan", "manual", "tool", "legacy")
 
 
 def utc_now() -> str:
@@ -67,7 +68,10 @@ def _normalize_record(
         return {
             "id": _legacy_id(project_name, section, index, text),
             "text": text,
+            "source": "legacy",
+            "source_ref": None,
             "created_at": legacy_created_at,
+            "verified_at": None,
             "revision": 1,
         }
     if not isinstance(raw, dict):
@@ -76,15 +80,32 @@ def _normalize_record(
     if not text:
         return None
     item_id = raw.get("id")
+    source = raw.get("source", "manual")
+    source_ref = raw.get("source_ref")
     created_at = raw.get("created_at")
+    verified_at = raw.get("verified_at")
     revision = raw.get("revision", 1)
     if not isinstance(item_id, str) or not item_id or len(item_id) > 128:
         raise ToolError("memory_corrupt", f"Memory section '{section}' contains an invalid item id.")
+    if source not in MEMORY_SOURCES:
+        raise ToolError("memory_corrupt", f"Memory section '{section}' contains an invalid source.")
+    if source_ref is not None and (not isinstance(source_ref, str) or len(source_ref) > 2_000):
+        raise ToolError("memory_corrupt", f"Memory section '{section}' contains an invalid source_ref value.")
     if not isinstance(created_at, str) or not created_at or len(created_at) > 100:
         raise ToolError("memory_corrupt", f"Memory section '{section}' contains an invalid created_at value.")
+    if verified_at is not None and (not isinstance(verified_at, str) or len(verified_at) > 100):
+        raise ToolError("memory_corrupt", f"Memory section '{section}' contains an invalid verified_at value.")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
         raise ToolError("memory_corrupt", f"Memory section '{section}' contains an invalid item revision.")
-    return {"id": item_id, "text": text, "created_at": created_at, "revision": revision}
+    return {
+        "id": item_id,
+        "text": text,
+        "source": source,
+        "source_ref": source_ref,
+        "created_at": created_at,
+        "verified_at": verified_at,
+        "revision": revision,
+    }
 
 
 def load_memory(path: Path, project_name: str) -> dict[str, Any]:
@@ -139,9 +160,49 @@ def merge_texts(
     incoming: dict[str, list[str]],
     *,
     replace: bool,
+    source: str | None = None,
+    source_ref: str | None = None,
+    verified: bool = False,
     now: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     timestamp = now or utc_now()
+    if source is not None and source not in MEMORY_SOURCES[:-1]:
+        raise ToolError("invalid_memory_source", f"Unsupported memory source: {source}")
+    if source_ref is not None:
+        source_ref = source_ref.strip()
+        if len(source_ref) > 2_000:
+            raise ToolError("invalid_memory_source_ref", "Memory source_ref exceeds 2000 characters.")
+        if not source_ref:
+            source_ref = None
+
+    def new_record(text: str) -> dict[str, Any]:
+        return {
+            "id": uuid.uuid4().hex,
+            "text": text,
+            "source": source or "manual",
+            "source_ref": source_ref,
+            "created_at": timestamp,
+            "verified_at": timestamp if verified else None,
+            "revision": 1,
+        }
+
+    def refresh_record(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        refreshed = dict(record)
+        item_changed = False
+        if source is not None and (refreshed.get("source") != source or refreshed.get("source_ref") != source_ref):
+            refreshed["source"] = source
+            refreshed["source_ref"] = source_ref
+            item_changed = True
+        elif source is None and source_ref is not None and refreshed.get("source_ref") != source_ref:
+            refreshed["source_ref"] = source_ref
+            item_changed = True
+        if verified and refreshed.get("verified_at") is None:
+            refreshed["verified_at"] = timestamp
+            item_changed = True
+        if item_changed:
+            refreshed["revision"] = int(refreshed.get("revision", 1)) + 1
+        return refreshed, item_changed
+
     changed = False
     next_data = empty_memory(str(current["project"]))
     next_data["revision"] = int(current.get("revision", 0))
@@ -162,20 +223,30 @@ def merge_texts(
             records: list[dict[str, Any]] = []
             for text in incoming_texts:
                 previous = previous_by_text.get(text)
-                if previous is not None:
-                    records.append(dict(previous))
+                if previous is None:
+                    records.append(new_record(text))
+                    changed = True
                 else:
-                    records.append({"id": uuid.uuid4().hex, "text": text, "created_at": timestamp, "revision": 1})
+                    refreshed, item_changed = refresh_record(previous)
+                    records.append(refreshed)
+                    changed = changed or item_changed
             if [record["text"] for record in records] != [record["text"] for record in current_records]:
                 changed = True
         else:
             records = current_records
-            existing_texts = {str(record["text"]) for record in records}
+            index_by_text = {str(record["text"]): index for index, record in enumerate(records)}
             for text in incoming_texts:
-                if text in existing_texts or len(records) >= 100:
+                existing_index = index_by_text.get(text)
+                if existing_index is not None:
+                    refreshed, item_changed = refresh_record(records[existing_index])
+                    if item_changed:
+                        records[existing_index] = refreshed
+                        changed = True
                     continue
-                records.append({"id": uuid.uuid4().hex, "text": text, "created_at": timestamp, "revision": 1})
-                existing_texts.add(text)
+                if len(records) >= 100:
+                    continue
+                records.append(new_record(text))
+                index_by_text[text] = len(records) - 1
                 changed = True
         next_data[section] = records[:100]
 

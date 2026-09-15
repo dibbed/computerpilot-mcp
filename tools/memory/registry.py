@@ -80,8 +80,11 @@ def register(mcp: MCPServer) -> None:
         user_preferences: MemoryItems = None,
         previous_fixes: MemoryItems = None,
         replace: bool = False,
+        source: Literal["user", "project_scan", "manual", "tool"] | None = None,
+        source_ref: Annotated[str | None, Field(max_length=2_000)] = None,
+        verified: bool = False,
     ) -> dict[str, Any]:
-        """Merge or replace bounded project memory while preserving versioned record identity."""
+        """Merge or replace bounded project memory with explicit provenance metadata."""
 
         with RESOURCE_LOCKS.sync(_path(project_name)):
             path = _path(project_name)
@@ -92,7 +95,14 @@ def register(mcp: MCPServer) -> None:
                 "user_preferences": user_preferences or [],
                 "previous_fixes": previous_fixes or [],
             }
-            next_data, changed = merge_texts(current, incoming, replace=replace)
+            next_data, changed = merge_texts(
+                current,
+                incoming,
+                replace=replace,
+                source=source,
+                source_ref=source_ref,
+                verified=verified,
+            )
             audit_action(
                 "memory_update",
                 target=path,
@@ -101,6 +111,8 @@ def register(mcp: MCPServer) -> None:
                     "changed": changed,
                     "revision_before": current["revision"],
                     "revision_after": next_data["revision"],
+                    "source": source or "manual",
+                    "verified": verified,
                     "item_counts": {key: len(value) for key, value in incoming.items()},
                 },
             )
