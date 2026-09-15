@@ -37,11 +37,13 @@ def _records(paths: list[Path]) -> list[dict[str, object]]:
     return records
 
 
-def _policy(*, batch_size: int = 16, queue_max: int = 128) -> AuditPolicy:
+def _policy(*, batch_size: int = 16, queue_max: int = 128, max_file_bytes: int = 1_000_000, keep_files: int = 5) -> AuditPolicy:
     return AuditPolicy(
         batch_size=batch_size,
         flush_interval_sec=0.01,
         queue_max=queue_max,
+        max_file_bytes=max_file_bytes,
+        keep_files=keep_files,
     )
 
 
@@ -76,6 +78,36 @@ def test_durable_record_fsyncs_before_submit_returns(tmp_path: Path, monkeypatch
     writer.close()
 
 
+def test_rotation_and_retention_keep_bounded_valid_json_files(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    writer = AuditWriter(path, _policy(batch_size=4, max_file_bytes=700, keep_files=2))
+    for index in range(80):
+        writer.submit(_payload(index))
+    writer.close()
+
+    retained = [candidate for candidate in [path, tmp_path / "audit.1.jsonl", tmp_path / "audit.2.jsonl"] if candidate.exists()]
+    assert path.exists()
+    assert (tmp_path / "audit.3.jsonl").exists() is False
+    assert 1 <= len(retained) <= 3
+    assert _records(retained)
+    for candidate in retained:
+        assert candidate.stat().st_size > 0
+
+
+def test_lower_retention_prunes_old_rotations_on_start(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    for index in range(1, 6):
+        (tmp_path / f"audit.{index}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    writer = AuditWriter(path, _policy(keep_files=2))
+    writer.close()
+    assert (tmp_path / "audit.1.jsonl").exists()
+    assert (tmp_path / "audit.2.jsonl").exists()
+    assert not (tmp_path / "audit.3.jsonl").exists()
+    assert not (tmp_path / "audit.4.jsonl").exists()
+    assert not (tmp_path / "audit.5.jsonl").exists()
+
+
 def test_background_write_failure_is_reported_on_flush(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     writer = AuditWriter(tmp_path / "audit.jsonl", _policy())
 
@@ -88,7 +120,7 @@ def test_background_write_failure_is_reported_on_flush(tmp_path: Path, monkeypat
         writer.flush_now()
 
 
-def test_multiple_processes_share_audit_file_without_corrupting_json(tmp_path: Path) -> None:
+def test_multiple_processes_share_rotation_without_corrupting_json(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
     helper = tmp_path / "writer_helper.py"
     repo = Path(__file__).resolve().parents[1]
@@ -101,7 +133,7 @@ def test_multiple_processes_share_audit_file_without_corrupting_json(tmp_path: P
                 "from core.audit import AuditPolicy, AuditWriter",
                 "path = Path(sys.argv[1])",
                 "worker = int(sys.argv[2])",
-                "policy = AuditPolicy(batch_size=8, flush_interval_sec=0.01, queue_max=64)",
+                "policy = AuditPolicy(batch_size=8, flush_interval_sec=0.01, queue_max=64, max_file_bytes=4096, keep_files=64)",
                 "writer = AuditWriter(path, policy)",
                 "for index in range(100):",
                 "    payload = (json.dumps({'worker': worker, 'index': index}, separators=(',', ':')) + '\\n').encode('utf-8')",

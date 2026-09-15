@@ -42,6 +42,8 @@ class Settings:
     audit_batch_size: int = _env_int("MCP_AUDIT_BATCH_SIZE", 64, 1, 1_024)
     audit_flush_ms: int = _env_int("MCP_AUDIT_FLUSH_MS", 50, 1, 5_000)
     audit_queue_max: int = _env_int("MCP_AUDIT_QUEUE_MAX", 2_048, 64, 100_000)
+    audit_max_file_bytes: int = _env_int("MCP_AUDIT_MAX_FILE_BYTES", 8 * 1_024 * 1_024, 65_536, 1_073_741_824)
+    audit_keep_files: int = _env_int("MCP_AUDIT_KEEP_FILES", 5, 1, 100)
     state_dir: Path = PROJECT_ROOT / ".agent_state"
     memory_dir: Path = PROJECT_ROOT / "memory"
 

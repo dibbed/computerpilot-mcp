@@ -6,6 +6,7 @@ import atexit
 import json
 import os
 import queue
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -31,6 +32,8 @@ class AuditPolicy:
     batch_size: int
     flush_interval_sec: float
     queue_max: int
+    max_file_bytes: int
+    keep_files: int
 
 
 @dataclass(slots=True)
@@ -47,6 +50,8 @@ def _policy_from_settings(settings: Settings) -> AuditPolicy:
         batch_size=settings.audit_batch_size,
         flush_interval_sec=settings.audit_flush_ms / 1_000,
         queue_max=settings.audit_queue_max,
+        max_file_bytes=settings.audit_max_file_bytes,
+        keep_files=settings.audit_keep_files,
     )
 
 
@@ -103,6 +108,7 @@ class AuditWriter:
         self._closed = False
         self._failure_lock = threading.Lock()
         self._failure: BaseException | None = None
+        self._prune_excess_rotations()
 
     def _set_failure(self, exc: BaseException) -> None:
         with self._failure_lock:
@@ -115,6 +121,42 @@ class AuditWriter:
         if failure is not None:
             raise RuntimeError(f"Audit writer failed: {failure}") from failure
 
+    def _rotation_path(self, index: int) -> Path:
+        return self.path.with_name(f"{self.path.stem}.{index}{self.path.suffix}")
+
+    def _prune_excess_rotations_locked(self) -> None:
+        pattern = re.compile(
+            rf"^{re.escape(self.path.stem)}\.(\d+){re.escape(self.path.suffix)}$",
+            re.IGNORECASE,
+        )
+        for candidate in self.path.parent.glob(f"{self.path.stem}.*{self.path.suffix}"):
+            match = pattern.fullmatch(candidate.name)
+            if match and int(match.group(1)) > self.policy.keep_files:
+                candidate.unlink(missing_ok=True)
+
+    def _prune_excess_rotations(self) -> None:
+        with _interprocess_lock(self.path):
+            self._prune_excess_rotations_locked()
+
+    def _rotate_locked(self, incoming_bytes: int) -> None:
+        try:
+            current_size = self.path.stat().st_size
+        except FileNotFoundError:
+            current_size = 0
+        if current_size == 0 or current_size + incoming_bytes <= self.policy.max_file_bytes:
+            self._prune_excess_rotations_locked()
+            return
+
+        oldest = self._rotation_path(self.policy.keep_files)
+        oldest.unlink(missing_ok=True)
+        for index in range(self.policy.keep_files - 1, 0, -1):
+            source = self._rotation_path(index)
+            if source.exists():
+                os.replace(source, self._rotation_path(index + 1))
+        if self.path.exists():
+            os.replace(self.path, self._rotation_path(1))
+        self._prune_excess_rotations_locked()
+
     def _append_payloads(self, payloads: list[bytes], *, durable: bool) -> None:
         combined = b"".join(payloads)
         last_error: OSError | TimeoutError | None = None
@@ -122,6 +164,7 @@ class AuditWriter:
             try:
                 with _interprocess_lock(self.path):
                     if combined:
+                        self._rotate_locked(len(combined))
                         with self.path.open("ab", buffering=0) as handle:
                             handle.write(combined)
                             if durable:
@@ -280,6 +323,8 @@ def _writer_key(settings: Settings) -> tuple[object, ...]:
         settings.audit_batch_size,
         settings.audit_flush_ms,
         settings.audit_queue_max,
+        settings.audit_max_file_bytes,
+        settings.audit_keep_files,
     )
 
 

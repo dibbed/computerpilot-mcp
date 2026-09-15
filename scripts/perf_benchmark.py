@@ -872,6 +872,8 @@ def _audit_batched_once(path: Path, events: int, threads: int) -> dict[str, Any]
         batch_size=SETTINGS.audit_batch_size,
         flush_interval_sec=SETTINGS.audit_flush_ms / 1_000,
         queue_max=SETTINGS.audit_queue_max,
+        max_file_bytes=max(SETTINGS.audit_max_file_bytes, events * len(payload) * 2),
+        keep_files=SETTINGS.audit_keep_files,
     )
     writer = AuditWriter(path, policy)
     latencies: list[float] = []
