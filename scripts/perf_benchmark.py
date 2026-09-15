@@ -17,6 +17,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -25,10 +26,12 @@ from typing import Any, Literal
 
 import psutil
 
+from core.artifact_retention import ArtifactPolicy, cleanup_artifacts
 from core.audit import AuditPolicy, AuditWriter
 from core.backups import BackupPolicy, backup_created_at, cleanup_backups
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
+from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
 from core.registry import create_server
 from tools.filesystem.search_snapshots import SearchSnapshotStore, search_fingerprint
@@ -45,6 +48,8 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "browser_counts": [1],
         "audit_events": [2_000],
         "backup_files": [500],
+        "artifact_files": [1_000],
+        "job_history_rows": [500],
     },
     "full": {
         "output_sizes": [1_024, MiB, 100 * MiB],
@@ -54,9 +59,11 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "browser_counts": [1, 5, 20],
         "audit_events": [20_000],
         "backup_files": [2_000],
+        "artifact_files": [5_000],
+        "job_history_rows": [2_000],
     },
 }
-SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "backups")
+SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "backups", "retention")
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
 
@@ -980,6 +987,121 @@ def _backup_retention_once(directory: Path, files: int) -> dict[str, Any]:
     return {"fixture_files": files, "file_size": size, **result.to_dict()}
 
 
+def _artifact_inventory_once(directory: Path) -> dict[str, Any]:
+    files: list[tuple[int, float]] = []
+    now = time.time()
+    if directory.is_dir():
+        for path in directory.glob("*.bin"):
+            try:
+                if path.is_file():
+                    stat = path.stat()
+                    files.append((stat.st_size, max(0.0, (now - stat.st_mtime) / 86_400)))
+            except OSError:
+                continue
+    return {
+        "files": len(files),
+        "bytes": sum(size for size, _ in files),
+        "age_days_median": round(statistics.median(age for _, age in files), 3) if files else 0.0,
+        "age_days_max": round(max(age for _, age in files), 3) if files else 0.0,
+        "size_max": max((size for size, _ in files), default=0),
+    }
+
+
+def _artifact_retention_once(directory: Path, files: int) -> dict[str, Any]:
+    shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    size = 1_024
+    old_cutoff = files // 2
+    for index in range(files):
+        path = directory / f"{index:08d}.bin"
+        path.write_bytes(index.to_bytes(4, "little") * (size // 4))
+        mtime = now - 10 * 86_400 if index < old_cutoff else now - (files - index)
+        os.utime(path, (mtime, mtime))
+    policy = ArtifactPolicy(
+        max_bytes=max(size, files * size // 8),
+        max_age_sec=7 * 86_400,
+        max_count=max(1, files // 4),
+        cleanup_interval_sec=0,
+    )
+    started = time.perf_counter()
+    result = cleanup_artifacts(directory, policy, now=now)
+    cleanup_ms = (time.perf_counter() - started) * 1_000
+    return {"fixture_files": files, "file_size": size, "cleanup_ms": round(cleanup_ms, 3), **result.to_dict()}
+
+
+def _job_history_inventory_once(db_path: Path) -> dict[str, Any]:
+    if not db_path.is_file():
+        return {"rows": 0, "terminal_rows": 0, "active_rows": 0, "output_bytes": 0, "db_bytes": 0}
+    store = JobStore(db_path)
+    with closing(store.connect()) as db:
+        rows = [dict(row) for row in db.execute("SELECT id,status FROM jobs")]
+    output_bytes = 0
+    for row in rows:
+        directory = store.output_dir / str(row["id"])
+        if directory.is_dir():
+            output_bytes += sum(path.stat().st_size for path in directory.iterdir() if path.is_file())
+    terminal = sum(1 for row in rows if row["status"] in FINAL_JOB_STATES)
+    return {
+        "rows": len(rows),
+        "terminal_rows": terminal,
+        "active_rows": len(rows) - terminal,
+        "output_bytes": output_bytes,
+        "db_bytes": db_path.stat().st_size,
+    }
+
+
+def _job_history_retention_once(root: Path, rows: int) -> dict[str, Any]:
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    store = JobStore(root / "jobs.sqlite3")
+    now = time.time()
+    spec = json.dumps({"command": ["python"], "cwd": str(root), "timeout_sec": 1, "encoding": "utf-8"})
+    with closing(store.connect()) as db, db:
+        for index in range(rows):
+            job_id = f"{index + 1:032x}"
+            updated = now - 40 * 86_400 if index < rows // 2 else now - (rows - index)
+            db.execute(
+                "INSERT INTO jobs (id,request_key,fingerprint,spec,status,created,updated,version) VALUES (?,?,?,?,?,?,?,1)",
+                (job_id, f"bench-{job_id}", f"fp-{job_id}", spec, "succeeded", updated, updated),
+            )
+            directory = store.output_dir / job_id
+            directory.mkdir(exist_ok=True)
+            (directory / "stdout.bin").write_bytes(index.to_bytes(4, "little") * 512)
+            (directory / "stderr.bin").write_bytes(b"")
+            os.utime(directory, (updated, updated))
+        for suffix, status in (("a", "queued"), ("b", "running"), ("c", "orphaned")):
+            job_id = suffix * 32
+            db.execute(
+                "INSERT INTO jobs (id,request_key,fingerprint,spec,status,created,updated,version) VALUES (?,?,?,?,?,?,?,1)",
+                (job_id, f"bench-{job_id}", f"fp-{job_id}", spec, status, now - 100, now - 100),
+            )
+            directory = store.output_dir / job_id
+            directory.mkdir(exist_ok=True)
+            (directory / "stdout.bin").write_bytes(b"active")
+            (directory / "stderr.bin").write_bytes(b"")
+    policy = JobHistoryPolicy(
+        max_age_sec=30 * 86_400,
+        max_count=max(1, rows // 4),
+        max_bytes=max(2_048, rows * 2_048 // 8),
+        cleanup_interval_sec=0,
+        orphan_grace_sec=60,
+    )
+    started = time.perf_counter()
+    result = cleanup_job_history(store.path, store.output_dir, policy, now=now)
+    cleanup_ms = (time.perf_counter() - started) * 1_000
+    with closing(store.connect()) as db:
+        active_remaining = int(db.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running','orphaned')").fetchone()[0])
+    return {
+        "fixture_terminal_rows": rows,
+        "active_rows": 3,
+        "active_rows_remaining": active_remaining,
+        "output_bytes_per_terminal_job": 2_048,
+        "cleanup_ms": round(cleanup_ms, 3),
+        **result.to_dict(),
+    }
+
+
 def _cleanup_stale_temp_roots(
     parent: Path | None = None,
     *,
@@ -1070,6 +1192,28 @@ def run_benchmarks(
                 measure(
                     f"backup_retention_{backup_files}_files",
                     partial(_backup_retention_once, Path(temporary) / "fixture", backup_files),
+                    runs,
+                )
+            )
+
+    if "retention" in suites:
+        artifact_files = max(limits["artifact_files"])
+        job_rows = max(limits["job_history_rows"])
+        results.append(measure("artifact_inventory", partial(_artifact_inventory_once, SETTINGS.state_dir / "artifacts"), 1))
+        results.append(measure("job_history_inventory", partial(_job_history_inventory_once, SETTINGS.state_dir / "jobs.sqlite3"), 1))
+        with _temporary_root("retention") as temporary:
+            root = Path(temporary)
+            results.append(
+                measure(
+                    f"artifact_retention_{artifact_files}_files",
+                    partial(_artifact_retention_once, root / "artifacts", artifact_files),
+                    runs,
+                )
+            )
+            results.append(
+                measure(
+                    f"job_history_retention_{job_rows}_rows",
+                    partial(_job_history_retention_once, root / "jobs", job_rows),
                     runs,
                 )
             )

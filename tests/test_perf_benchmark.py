@@ -17,6 +17,8 @@ from scripts.perf_benchmark import (
     PROFILE_LIMITS,
     BenchmarkSkip,
     MiB,
+    _artifact_inventory_once,
+    _artifact_retention_once,
     _audit_batched_once,
     _audit_legacy_sync_once,
     _backup_inventory_once,
@@ -24,6 +26,8 @@ from scripts.perf_benchmark import (
     _browser_batch_once,
     _browser_pool_details,
     _cleanup_stale_temp_roots,
+    _job_history_inventory_once,
+    _job_history_retention_once,
     _job_wait_change_once,
     _job_wait_timeout_once,
     _launcher_validation_once,
@@ -45,6 +49,8 @@ def test_benchmark_profiles_cover_planned_scale_points() -> None:
     assert full["browser_counts"] == [1, 5, 20]
     assert full["audit_events"] == [20_000]
     assert full["backup_files"] == [2_000]
+    assert full["artifact_files"] == [5_000]
+    assert full["job_history_rows"] == [2_000]
 
 
 def test_browser_pool_details_report_instances_contexts_and_keys() -> None:
@@ -330,4 +336,50 @@ def test_backup_suite_is_available_through_benchmark_runner(monkeypatch: pytest.
     )
     results = {item["name"]: item for item in report["results"]}
     assert set(results) == {"backup_inventory", "backup_retention_500_files"}
+    assert all(item["status"] == "ok" for item in results.values())
+
+
+def test_retention_benchmark_helpers_cover_artifacts_and_jobs(tmp_path: Path) -> None:
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+    (artifacts_dir / "a.bin").write_bytes(b"123")
+    inventory = _artifact_inventory_once(artifacts_dir)
+    assert inventory["files"] == 1
+    assert inventory["bytes"] == 3
+
+    artifact_result = _artifact_retention_once(tmp_path / "artifact-fixture", files=40)
+    assert artifact_result["removed_for_age"] == 20
+    assert artifact_result["remaining_files"] <= 10
+    assert artifact_result["quota_satisfied"] is True
+
+    job_root = tmp_path / "job-fixture"
+    job_result = _job_history_retention_once(job_root, rows=40)
+    assert job_result["removed_for_age"] == 20
+    assert job_result["active_rows_remaining"] == 3
+    assert job_result["remaining_terminal_rows"] <= 10
+    assert job_result["quota_satisfied"] is True
+    job_inventory = _job_history_inventory_once(job_root / "jobs.sqlite3")
+    assert job_inventory["active_rows"] == 3
+
+
+def test_retention_suite_is_available_through_benchmark_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import scripts.perf_benchmark as perf
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(perf, "SETTINGS", SimpleNamespace(state_dir=state_dir))
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"retention"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    results = {item["name"]: item for item in report["results"]}
+    assert set(results) == {
+        "artifact_inventory",
+        "job_history_inventory",
+        "artifact_retention_1000_files",
+        "job_history_retention_500_rows",
+    }
     assert all(item["status"] == "ok" for item in results.values())

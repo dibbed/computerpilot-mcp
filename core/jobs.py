@@ -18,6 +18,7 @@ import psutil
 from core.artifacts import Delivery, deliver_file
 from core.config import SETTINGS
 from core.errors import ToolError
+from core.resource_locks import RESOURCE_LOCKS
 
 JOB_SCHEMA_VERSION = 3
 JOB_STATUS_COLUMNS = (
@@ -558,13 +559,18 @@ class JobStore:
 
     def output(self, job_id: str, since_byte: int = 0, stderr_since_byte: int = 0,
                delivery: Delivery = "inline") -> dict[str, Any]:
-        raw = self._reconcile([self.raw(job_id)])[0]
-        row = self._public(raw)
-        directory = self.output_dir / row["job_id"]
-        encoding = json.loads(raw["spec"])["encoding"]
-        final = row["status"] not in {"queued", "running", "orphaned"}
-        return {"ok": True, **row,
-                "stdout": deliver_file(directory / "stdout.bin", encoding=encoding,
-                                       offset=since_byte, delivery=delivery, final=final),
-                "stderr": deliver_file(directory / "stderr.bin", encoding=encoding,
-                                       offset=stderr_since_byte, delivery=delivery, final=final)}
+        directory = self.output_dir / job_id
+        stdout = directory / "stdout.bin"
+        stderr = directory / "stderr.bin"
+        # Retention takes the same locks before deleting a terminal row/output
+        # pair, closing the row-read -> directory-delete race for job_output.
+        with RESOURCE_LOCKS.sync(stdout, stderr):
+            raw = self._reconcile([self.raw(job_id)])[0]
+            row = self._public(raw)
+            encoding = json.loads(raw["spec"])["encoding"]
+            final = row["status"] not in {"queued", "running", "orphaned"}
+            return {"ok": True, **row,
+                    "stdout": deliver_file(stdout, encoding=encoding,
+                                           offset=since_byte, delivery=delivery, final=final),
+                    "stderr": deliver_file(stderr, encoding=encoding,
+                                           offset=stderr_since_byte, delivery=delivery, final=final)}

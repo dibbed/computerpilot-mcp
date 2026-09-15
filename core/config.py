@@ -51,6 +51,10 @@ class Settings:
     artifact_max_age_hours: int = _env_int("MCP_ARTIFACT_MAX_AGE_HOURS", 168, 0, 24 * 3_650)
     artifact_max_count: int = _env_int("MCP_ARTIFACT_MAX_COUNT", 512, 0, 1_000_000)
     artifact_cleanup_interval_sec: int = _env_int("MCP_ARTIFACT_CLEANUP_INTERVAL_SEC", 5, 1, 3_600)
+    job_history_max_age_days: int = _env_int("MCP_JOB_HISTORY_MAX_AGE_DAYS", 30, 0, 3_650)
+    job_history_max_count: int = _env_int("MCP_JOB_HISTORY_MAX_COUNT", 1_000, 0, 1_000_000)
+    job_history_max_bytes: int = _env_int("MCP_JOB_HISTORY_MAX_BYTES", 1 * 1_024 * 1_024 * 1_024, 0, 100 * 1_024 * 1_024 * 1_024)
+    job_history_cleanup_interval_sec: int = _env_int("MCP_JOB_HISTORY_CLEANUP_INTERVAL_SEC", 30, 1, 86_400)
     state_dir: Path = PROJECT_ROOT / ".agent_state"
     memory_dir: Path = PROJECT_ROOT / "memory"
 
