@@ -12,17 +12,25 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Add repeatable `audit` cases to `scripts.perf_benchmark`, covering legacy synchronous and production batched writes with both 1-thread and 8-thread contention.
 - Add Phase F2 background/coalesced backup retention with configurable `MCP_BACKUP_MAX_BYTES` (default 256 MiB), `MCP_BACKUP_MAX_AGE_DAYS` (default 30), and `MCP_BACKUP_CLEANUP_INTERVAL_SEC` (default 5 seconds). Age and byte cleanup preserve at least the newest restore point and protect the backup produced by the current successful write.
 - Add repeatable `backups` benchmark cases for real backup-storage duplicate inventory and a synthetic 2000-file age/quota retention workload.
+- Add Phase F3 disk-backed artifact retention with configurable age/count/byte limits (`MCP_ARTIFACT_MAX_AGE_HOURS=168`, `MCP_ARTIFACT_MAX_COUNT=512`, `MCP_ARTIFACT_MAX_BYTES=512 MiB`) and coalesced cleanup after artifact creation plus runtime startup maintenance.
+- Add terminal durable-job history/output retention with configurable age/count/byte limits (`30 days`, `1000` terminal rows, `1 GiB` by default); queued, running, and orphaned rows are never eligible.
+- Add repeatable `retention` benchmark cases covering the real artifact/job-storage inventory plus synthetic 5000-artifact and 2000-terminal-job cleanup workloads.
 
 ### Changed
 - Destructive audit events for file deletion/move, process termination, durable-job cancellation, and supervisor runtime termination now use durable fsync-backed audit boundaries; normal MCP lifecycle shutdown explicitly flushes queued audit records. Audit payloads remain metadata-only.
 - Filesystem backups are now copied to a temporary file, fsynced, and atomically published before the target replacement continues. Retention age uses the backup-event timestamp encoded in the filename instead of the source file's copied mtime.
 - Content-addressed backup deduplication remains intentionally unimplemented after the F2 benchmark gate found only 95,960 bytes (0.2872%) of potential savings across the real 33.41 MB backup corpus, below the 1 MiB + 10% implementation threshold.
+- Runtime lifecycle maintenance now schedules artifact and durable-job retention from the supervised MCP process rather than independent job workers, preserving Phase-E durable process ownership semantics.
+- `job_output` now holds the same keyed stdout/stderr locks used by retention while reading row state and output, closing the terminal row-read/output-delete race. Terminal cleanup commits the DB-row deletion before removing its output directory so a crash can leave only a detectable orphan directory, never a live history row pointing at already-pruned output.
+- Expired terminal-job rows no longer retain their idempotency keys indefinitely; reusing a key after its history record has been pruned may submit a new job.
 
 ### Validation
 - Phase F1 validation completed with **275 passing pytest tests**, Ruff with zero violations, mypy with zero issues across 91 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch.
 - The canonical 3-run F1 audit benchmark on commit `26cb41f` preserved all 20,000 records per sample. Single-thread median wall time improved from **2077.088 ms** (legacy synchronous) to **268.806 ms** (batched); 8-thread median improved from **2199.630 ms** to **396.403 ms**. The 8-thread caller p95 dropped from **4.4194 ms** to **0.2427 ms**.
 - Phase F2 validation completed with **290 passing pytest tests**, Ruff with zero violations, mypy with zero issues across 93 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch.
 - The canonical F2 backup benchmark on commit `e8cf7a0` scanned 1429 real backups totaling 33,409,275 bytes and measured only 95,960 bytes (0.2872%) of deduplication savings, so the content-addressed dedup gate failed intentionally. The 2000-file synthetic retention case removed 1000 files by age and 500 more by quota, retaining 500 files / 1,024,000 bytes with zero errors and a satisfied quota.
+- Phase F3 validation completed with **301 passing pytest tests**, Ruff with zero violations, mypy with zero issues across **97 source files**, successful compileall, a passing **60-tool** health check, and Full Doctor including a real disposable Chromium launch.
+- The canonical F3 retention benchmark on commit `a2900da` measured the real corpus at 22 artifacts / 6,600,000 bytes and 4 terminal jobs / 539 output bytes. The 5000-artifact synthetic cleanup removed 4375 files and completed in **1121.777 ms**, leaving 625 files / 640,000 bytes. The 2000-terminal-job cleanup removed 1750 rows and completed in **1732.422 ms**, leaving 250 terminal rows / 512,000 output bytes while preserving all 3 queued/running/orphaned rows. A pre-batching calibration took roughly 14.9 seconds for the same job-history cleanup scale; 100-job transaction/lock batching reduced that cleanup cost by about eightfold.
 
 ## [0.0.16] - 2026-09-15
 
