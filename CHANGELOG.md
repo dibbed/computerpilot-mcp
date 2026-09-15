@@ -10,13 +10,19 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Add Phase F1 bounded audit batching with a process-local queue, single writer thread, configurable batch/flush/queue limits, cross-process append serialization, and synchronous fallback when the bounded queue is saturated.
 - Add size-based audit rotation/retention with configurable `MCP_AUDIT_MAX_FILE_BYTES` (default 8 MiB) and `MCP_AUDIT_KEEP_FILES` (default 5 rotated files in addition to the active log).
 - Add repeatable `audit` cases to `scripts.perf_benchmark`, covering legacy synchronous and production batched writes with both 1-thread and 8-thread contention.
+- Add Phase F2 background/coalesced backup retention with configurable `MCP_BACKUP_MAX_BYTES` (default 256 MiB), `MCP_BACKUP_MAX_AGE_DAYS` (default 30), and `MCP_BACKUP_CLEANUP_INTERVAL_SEC` (default 5 seconds). Age and byte cleanup preserve at least the newest restore point and protect the backup produced by the current successful write.
+- Add repeatable `backups` benchmark cases for real backup-storage duplicate inventory and a synthetic 2000-file age/quota retention workload.
 
 ### Changed
 - Destructive audit events for file deletion/move, process termination, durable-job cancellation, and supervisor runtime termination now use durable fsync-backed audit boundaries; normal MCP lifecycle shutdown explicitly flushes queued audit records. Audit payloads remain metadata-only.
+- Filesystem backups are now copied to a temporary file, fsynced, and atomically published before the target replacement continues. Retention age uses the backup-event timestamp encoded in the filename instead of the source file's copied mtime.
+- Content-addressed backup deduplication remains intentionally unimplemented after the F2 benchmark gate found only 95,960 bytes (0.2872%) of potential savings across the real 33.41 MB backup corpus, below the 1 MiB + 10% implementation threshold.
 
 ### Validation
 - Phase F1 validation completed with **275 passing pytest tests**, Ruff with zero violations, mypy with zero issues across 91 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch.
 - The canonical 3-run F1 audit benchmark on commit `26cb41f` preserved all 20,000 records per sample. Single-thread median wall time improved from **2077.088 ms** (legacy synchronous) to **268.806 ms** (batched); 8-thread median improved from **2199.630 ms** to **396.403 ms**. The 8-thread caller p95 dropped from **4.4194 ms** to **0.2427 ms**.
+- Phase F2 validation completed with **290 passing pytest tests**, Ruff with zero violations, mypy with zero issues across 93 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch.
+- The canonical F2 backup benchmark on commit `e8cf7a0` scanned 1429 real backups totaling 33,409,275 bytes and measured only 95,960 bytes (0.2872%) of deduplication savings, so the content-addressed dedup gate failed intentionally. The 2000-file synthetic retention case removed 1000 files by age and 500 more by quota, retaining 500 files / 1,024,000 bytes with zero errors and a satisfied quota.
 
 ## [0.0.16] - 2026-09-15
 

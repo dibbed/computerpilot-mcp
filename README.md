@@ -6,7 +6,7 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 ## Current Status
 
-The optimization roadmap is complete through **Phase E / v0.0.16**, and **Phase F / v0.0.17 — State & Long-term Maintenance** is now in progress. F1 is complete with benchmark-gated audit batching plus bounded audit rotation/retention; the project version intentionally remains `0.0.16` until the final F6 release step.
+The optimization roadmap is complete through **Phase E / v0.0.16**, and **Phase F / v0.0.17 — State & Long-term Maintenance** is now in progress. F1 and F2 are complete with bounded audit maintenance plus backup age/byte retention; content-hash backup deduplication was benchmarked and intentionally not implemented because the real storage corpus did not justify the added complexity. The project version intentionally remains `0.0.16` until the final F6 release step.
 
 | Phase | Release | Focus | Status |
 | --- | --- | --- | --- |
@@ -15,13 +15,13 @@ The optimization roadmap is complete through **Phase E / v0.0.16**, and **Phase 
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
 | E | `v0.0.16` | Durable Jobs & Reliability | ✅ Complete |
-| F | `v0.0.17` | State & Long-term Maintenance | 🚧 In progress — F1 complete |
+| F | `v0.0.17` | State & Long-term Maintenance | 🚧 In progress — F1/F2 complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
 The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 intentionally adds one read-only typed tool, `job_wait`, bringing the current full surface to **60 tools**.
 
-Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. Phase F1 raises the current validation baseline to **275 pytest tests** with Ruff at zero violations, mypy at zero issues across 91 source files, compileall, the same **60-tool** health surface, and Full Doctor including a real disposable Chromium launch. The canonical F1 audit benchmark on commit `26cb41f` preserves all 20,000 records per sample while reducing single-thread median end-to-end audit time from **2077.088 ms** to **268.806 ms** and 8-thread median from **2199.630 ms** to **396.403 ms**. Phase F continues next with backup retention/quota work in F2.
+Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. Phase F2 raises the current validation baseline to **290 pytest tests** with Ruff at zero violations, mypy at zero issues across 93 source files, compileall, the same **60-tool** health surface, and Full Doctor including a real disposable Chromium launch. F1's canonical audit benchmark remains on commit `26cb41f`; F2's canonical backup benchmark on commit `e8cf7a0` scanned **1429 backups / 33.41 MB** and found only **95,960 bytes (0.2872%)** of content-addressable duplicate savings, below the documented **1 MiB + 10%** implementation gate, so backup deduplication remains intentionally unimplemented. The synthetic 2000-file retention case removed 1000 expired and 500 quota-evicted backups, leaving **500 files / 1.024 MB** with the quota satisfied and the restore safety floor preserved. Phase F continues next with artifact and durable-job history retention in F3.
 
 ---
 
@@ -39,6 +39,7 @@ Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violat
 - **Optional Browser Automation**: Playwright automation with shared browser-process pools, isolated per-session contexts, idle eviction, crash recovery, screenshot capture, and UI interaction.
 - **Resilient Supervisor & Control Panel**: Heartbeat watchdog, automatic backoff recovery, mutation-aware bounded drain before restart/stop, and a loopback-only control panel at `http://127.0.0.1:8766`.
 - **Bounded Audit Trail**: Metadata-only audit events use a bounded process-local batching queue, cross-process file serialization, durable flushes for destructive operations, and size-based rotation/retention for long-running deployments.
+- **Bounded Recoverable Backups**: Atomic filesystem edits keep recoverable `.bak` snapshots while background/coalesced retention enforces configurable age and byte budgets without deleting the newest restore point.
 
 ---
 
@@ -49,6 +50,16 @@ F1 keeps audit semantics metadata-only while removing per-event open/write/close
 Audit storage is now bounded by size-based rotation. The active `.agent_state/audit.jsonl` rotates at **8 MiB** by default and retains **5 rotated files** (`audit.1.jsonl` through `audit.5.jsonl`) in addition to the active file. Append and rotation are protected by a cross-process lock so the MCP runtime, supervisor, and independent durable-job workers can share the same audit trail safely. The policy is configurable with `MCP_AUDIT_BATCH_SIZE`, `MCP_AUDIT_FLUSH_MS`, `MCP_AUDIT_QUEUE_MAX`, `MCP_AUDIT_MAX_FILE_BYTES`, and `MCP_AUDIT_KEEP_FILES`.
 
 The benchmark gate passed decisively on the validation host. With 20,000 metadata events and three runs, legacy synchronous audit writes measured **2077.088 ms** median at one thread and **2199.630 ms** at eight threads. The production batched writer measured **268.806 ms** and **396.403 ms** respectively while preserving all 20,000 JSONL records and the same payload bytes. This is why batching is enabled rather than remaining a deferred experiment.
+
+---
+
+## Phase F2 — Backup Retention & Deduplication Gate
+
+F2 bounds `.agent_state/backups` without weakening the existing crash-safe edit pipeline. Recoverable backups are now published through a temporary file, fsynced, and atomically renamed before the target edit proceeds. Retention age is based on the UTC backup-event timestamp embedded in the backup filename rather than the source file's copied mtime, so a freshly-created backup of an old source file is never mistaken for an old backup.
+
+Cleanup is intentionally background/coalesced instead of scanning the backup directory in every foreground write. It runs on MCP startup and after successful backup-producing writes, applies age retention first and then an oldest-first byte quota, and always preserves at least the newest restore point. A backup created by the current write is explicitly protected during that cleanup pass. Defaults are **30 days** and **256 MiB**, configurable with `MCP_BACKUP_MAX_AGE_DAYS` and `MCP_BACKUP_MAX_BYTES`; setting either limit to `0` disables that dimension. `MCP_BACKUP_CLEANUP_INTERVAL_SEC` controls the minimum interval between coalesced scans.
+
+Content-addressed backup deduplication was evaluated but did not pass the production gate. The canonical F2 inventory on commit `e8cf7a0` scanned **1429 backups / 33,409,275 bytes** and found **169 duplicate files**, but their duplicate content represented only **95,960 bytes (0.2872%)** of recoverable storage. The gate requires at least **1 MiB** and **10%** potential savings, so a blob-store/dedup layer would add complexity without meaningful storage benefit and is intentionally not implemented. The same report's 2000-file synthetic retention case removed 1500 files (1000 by age and 500 by quota) and finished at **500 files / 1,024,000 bytes** with no cleanup errors.
 
 ---
 
