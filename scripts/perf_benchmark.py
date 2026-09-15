@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import os
 import platform
 import shutil
 import statistics
@@ -24,6 +26,7 @@ from typing import Any, Literal
 import psutil
 
 from core.audit import AuditPolicy, AuditWriter
+from core.backups import BackupPolicy, backup_created_at, cleanup_backups
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
 from core.jobs import JobStore, same_process
@@ -41,6 +44,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "job_counts": [1, 10],
         "browser_counts": [1],
         "audit_events": [2_000],
+        "backup_files": [500],
     },
     "full": {
         "output_sizes": [1_024, MiB, 100 * MiB],
@@ -49,9 +53,10 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "job_counts": [1, 10, 50],
         "browser_counts": [1, 5, 20],
         "audit_events": [20_000],
+        "backup_files": [2_000],
     },
 }
-SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit")
+SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "backups")
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
 
@@ -907,6 +912,74 @@ def _audit_batched_once(path: Path, events: int, threads: int) -> dict[str, Any]
         "queue_max": policy.queue_max,
     }
 
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(MiB), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _backup_inventory_once(directory: Path) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    sizes: dict[str, int] = {}
+    ages: list[float] = []
+    total_bytes = 0
+    files = 0
+    now = time.time()
+    if directory.is_dir():
+        for path in directory.glob("*.bak"):
+            try:
+                if not path.is_file():
+                    continue
+                stat = path.stat()
+                digest = _hash_file(path)
+            except OSError:
+                continue
+            files += 1
+            total_bytes += stat.st_size
+            ages.append(max(0.0, (now - backup_created_at(path, stat.st_mtime)) / 86_400))
+            counts[digest] = counts.get(digest, 0) + 1
+            sizes.setdefault(digest, stat.st_size)
+    unique_bytes = sum(sizes.values())
+    savings = max(total_bytes - unique_bytes, 0)
+    ratio = savings / total_bytes if total_bytes else 0.0
+    return {
+        "files": files,
+        "bytes": total_bytes,
+        "unique_hashes": len(counts),
+        "duplicate_files": max(files - len(counts), 0),
+        "dedup_savings_bytes": savings,
+        "dedup_savings_ratio": round(ratio, 6),
+        "dedup_gate_min_savings_bytes": MiB,
+        "dedup_gate_min_ratio": 0.10,
+        "dedup_gate_pass": savings >= MiB and ratio >= 0.10,
+        "age_days_median": round(statistics.median(ages), 3) if ages else 0.0,
+        "age_days_max": round(max(ages), 3) if ages else 0.0,
+    }
+
+
+def _backup_retention_once(directory: Path, files: int) -> dict[str, Any]:
+    shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    size = 2_048
+    old_cutoff = files // 2
+    for index in range(files):
+        payload = index.to_bytes(4, "little") * (size // 4)
+        path = directory / f"{index:06d}.bak"
+        path.write_bytes(payload)
+        mtime = now - 40 * 86_400 if index < old_cutoff else now - (files - index)
+        os.utime(path, (mtime, mtime))
+    policy = BackupPolicy(
+        max_bytes=max(size, files * size // 4),
+        max_age_sec=30 * 86_400,
+        cleanup_interval_sec=0,
+    )
+    result = cleanup_backups(directory, policy, now=now)
+    return {"fixture_files": files, "file_size": size, **result.to_dict()}
+
+
 def _cleanup_stale_temp_roots(
     parent: Path | None = None,
     *,
@@ -988,6 +1061,18 @@ def run_benchmarks(
                         runs,
                     )
                 )
+
+    if "backups" in suites:
+        results.append(measure("backup_inventory", partial(_backup_inventory_once, SETTINGS.backup_dir), 1))
+        backup_files = max(limits["backup_files"])
+        with _temporary_root("backups") as temporary:
+            results.append(
+                measure(
+                    f"backup_retention_{backup_files}_files",
+                    partial(_backup_retention_once, Path(temporary) / "fixture", backup_files),
+                    runs,
+                )
+            )
 
     if "project" in suites:
         max_count = max(limits["ast_files"])

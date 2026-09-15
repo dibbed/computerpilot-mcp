@@ -19,6 +19,8 @@ from scripts.perf_benchmark import (
     MiB,
     _audit_batched_once,
     _audit_legacy_sync_once,
+    _backup_inventory_once,
+    _backup_retention_once,
     _browser_batch_once,
     _browser_pool_details,
     _cleanup_stale_temp_roots,
@@ -42,6 +44,7 @@ def test_benchmark_profiles_cover_planned_scale_points() -> None:
     assert full["job_counts"] == [1, 10, 50]
     assert full["browser_counts"] == [1, 5, 20]
     assert full["audit_events"] == [20_000]
+    assert full["backup_files"] == [2_000]
 
 
 def test_browser_pool_details_report_instances_contexts_and_keys() -> None:
@@ -288,3 +291,43 @@ def test_audit_suite_is_available_through_benchmark_runner() -> None:
     }
     assert all(item["status"] == "ok" for item in results.values())
     assert all(item["details"]["lines"] == 2_000 for item in results.values())
+
+
+def test_backup_inventory_reports_dedup_savings_and_gate(tmp_path: Path) -> None:
+    (tmp_path / "a.bak").write_bytes(b"same")
+    (tmp_path / "b.bak").write_bytes(b"same")
+    (tmp_path / "c.bak").write_bytes(b"different")
+
+    result = _backup_inventory_once(tmp_path)
+
+    assert result["files"] == 3
+    assert result["unique_hashes"] == 2
+    assert result["duplicate_files"] == 1
+    assert result["dedup_savings_bytes"] == 4
+    assert result["dedup_gate_pass"] is False
+
+
+def test_backup_retention_benchmark_enforces_age_and_quota(tmp_path: Path) -> None:
+    result = _backup_retention_once(tmp_path / "fixture", files=40)
+
+    assert result["fixture_files"] == 40
+    assert result["removed_for_age"] == 20
+    assert result["removed_for_quota"] > 0
+    assert result["quota_satisfied"] is True
+    assert result["remaining_bytes"] <= 40 * 2_048 // 4
+
+
+def test_backup_suite_is_available_through_benchmark_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import scripts.perf_benchmark as perf
+
+    monkeypatch.setattr(perf, "SETTINGS", SimpleNamespace(backup_dir=tmp_path, state_dir=tmp_path / "state"))
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"backups"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    results = {item["name"]: item for item in report["results"]}
+    assert set(results) == {"backup_inventory", "backup_retention_500_files"}
+    assert all(item["status"] == "ok" for item in results.values())
