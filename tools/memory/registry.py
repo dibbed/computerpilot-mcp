@@ -1,12 +1,8 @@
-"""MCP registration for compact JSON project memory."""
+"""MCP registration for compact versioned JSON project memory."""
 
 from __future__ import annotations
 
-import json
-import os
 import re
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -16,11 +12,11 @@ from pydantic import Field
 from core.audit import audit_action
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.errors import ToolError
+from core.memory_store import MEMORY_SCHEMA_VERSION, SECTIONS, atomic_save, empty_memory, load_memory, merge_texts
 from core.resource_locks import RESOURCE_LOCKS
 from core.response import page
 from core.tooling import MUTATING, READ_ONLY, compact_errors
 
-SECTIONS = ("architecture_decisions", "important_paths", "user_preferences", "previous_fixes")
 ProjectName = Annotated[str, Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.-]+$")]
 MemoryItems = Annotated[list[str] | None, Field(max_length=100)]
 
@@ -33,50 +29,11 @@ def _path(project_name: str) -> Path:
 
 
 def _empty(project_name: str) -> dict[str, Any]:
-    return {"project": project_name, "updated_at": None, **{section: [] for section in SECTIONS}}
+    return empty_memory(project_name)
 
 
 def _load(project_name: str) -> dict[str, Any]:
-    path = _path(project_name)
-    if not path.exists():
-        return _empty(project_name)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ToolError("memory_corrupt", f"Cannot read project memory {path}: {exc}") from exc
-    result = _empty(project_name)
-    result["updated_at"] = data.get("updated_at")
-    for section in SECTIONS:
-        result[section] = [str(item) for item in data.get(section, [])][:100]
-    return result
-
-
-def _atomic_save(path: Path, data: dict[str, Any]) -> None:
-    raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    if len(raw) > 131_072:
-        raise ToolError("memory_too_large", "Project memory exceeds the 128 KiB compact-memory limit.")
-    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    temp = Path(temp_name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
-    finally:
-        temp.unlink(missing_ok=True)
-
-
-def _clean_items(items: list[str]) -> list[str]:
-    result = []
-    seen = set()
-    for raw in items:
-        item = raw.strip()[:2_000]
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        result.append(item)
-    return result[:100]
+    return load_memory(_path(project_name), project_name)
 
 
 def register(mcp: MCPServer) -> None:
@@ -88,24 +45,27 @@ def register(mcp: MCPServer) -> None:
         offset: Annotated[int, Field(ge=0, le=10_000)] = 0,
         max_items: Annotated[int, Field(ge=1, le=100)] = 20,
     ) -> dict[str, Any]:
-        """Read one compact project-memory section or bounded samples of all sections."""
+        """Read versioned compact project-memory records with bounded pagination."""
 
         data = _load(project_name)
+        common = {
+            "ok": True,
+            "schema_version": data["schema_version"],
+            "project": project_name,
+            "revision": data["revision"],
+            "updated_at": data["updated_at"],
+        }
         if section:
             values = data[section]
             return {
-                "ok": True,
-                "project": project_name,
-                "updated_at": data["updated_at"],
+                **common,
                 "section": section,
                 **page(values[offset : offset + max_items], total=len(values), offset=offset, limit=max_items),
             }
-        samples = {name: values[:max_items] for name, values in data.items() if name in SECTIONS}
+        samples = {name: data[name][:max_items] for name in SECTIONS}
         counts = {name: len(data[name]) for name in SECTIONS}
         return {
-            "ok": True,
-            "project": project_name,
-            "updated_at": data["updated_at"],
+            **common,
             "counts": counts,
             "sections": samples,
             "truncated": any(count > max_items for count in counts.values()),
@@ -121,33 +81,40 @@ def register(mcp: MCPServer) -> None:
         previous_fixes: MemoryItems = None,
         replace: bool = False,
     ) -> dict[str, Any]:
-        """Merge or replace bounded project memory without storing arbitrary raw transcripts."""
+        """Merge or replace bounded project memory while preserving versioned record identity."""
+
         with RESOURCE_LOCKS.sync(_path(project_name)):
             path = _path(project_name)
-            current = _empty(project_name) if replace else _load(project_name)
+            current = _load(project_name)
             incoming = {
                 "architecture_decisions": architecture_decisions or [],
                 "important_paths": important_paths or [],
                 "user_preferences": user_preferences or [],
                 "previous_fixes": previous_fixes or [],
             }
-            for section, items in incoming.items():
-                base = [] if replace else current[section]
-                current[section] = _clean_items([*base, *items])
-            current["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            next_data, changed = merge_texts(current, incoming, replace=replace)
             audit_action(
                 "memory_update",
                 target=path,
-                details={"replace": replace, "item_counts": {key: len(value) for key, value in incoming.items()}},
+                details={
+                    "replace": replace,
+                    "changed": changed,
+                    "revision_before": current["revision"],
+                    "revision_after": next_data["revision"],
+                    "item_counts": {key: len(value) for key, value in incoming.items()},
+                },
             )
-            _atomic_save(path, current)
+            size = atomic_save(path, next_data)
             return {
                 "ok": True,
+                "schema_version": MEMORY_SCHEMA_VERSION,
                 "project": project_name,
                 "path": str(path),
-                "updated_at": current["updated_at"],
-                "counts": {section: len(current[section]) for section in SECTIONS},
-                "bytes": path.stat().st_size,
+                "changed": changed,
+                "revision": next_data["revision"],
+                "updated_at": next_data["updated_at"],
+                "counts": {section: len(next_data[section]) for section in SECTIONS},
+                "bytes": size,
             }
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
@@ -156,17 +123,26 @@ def register(mcp: MCPServer) -> None:
         offset: Annotated[int, Field(ge=0, le=10_000)] = 0,
         max_items: Annotated[int, Field(ge=1, le=100)] = 20,
     ) -> dict[str, Any]:
-        """List local project-memory files with metadata and pagination."""
+        """List local project-memory files with schema/revision metadata and pagination."""
 
         ensure_runtime_dirs()
-        rows = []
+        rows: list[dict[str, Any]] = []
         for path in SETTINGS.memory_dir.glob("*.json"):
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                counts = {section: len(data.get(section, [])) for section in SECTIONS}
-                rows.append({"project": path.stem, "updated_at": data.get("updated_at"), "counts": counts, "bytes": path.stat().st_size})
-            except (OSError, ValueError):
-                rows.append({"project": path.stem, "error": "unreadable"})
+                data = load_memory(path, path.stem)
+                counts = {section: len(data[section]) for section in SECTIONS}
+                rows.append(
+                    {
+                        "project": path.stem,
+                        "schema_version": data["schema_version"],
+                        "revision": data["revision"],
+                        "updated_at": data["updated_at"],
+                        "counts": counts,
+                        "bytes": path.stat().st_size,
+                    }
+                )
+            except (OSError, ToolError) as exc:
+                rows.append({"project": path.stem, "error": exc.code if isinstance(exc, ToolError) else "unreadable"})
         rows.sort(key=lambda item: item["project"].casefold())
         total = len(rows)
         return {"ok": True, **page(rows[offset : offset + max_items], total=total, offset=offset, limit=max_items)}

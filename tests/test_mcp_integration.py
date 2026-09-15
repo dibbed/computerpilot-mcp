@@ -338,8 +338,13 @@ def test_memory_round_trip_stays_compact(tmp_path: Path) -> None:
                 )
             )
             assert updated["counts"]["architecture_decisions"] == 1
+            assert updated["revision"] == 1
             read = _structured(await client.call_tool("memory_read", {"project_name": project_name, "max_items": 1}))
-            assert read["sections"]["architecture_decisions"] == ["Use bounded structured responses."]
+            records = read["sections"]["architecture_decisions"]
+            assert len(records) == 1
+            assert records[0]["text"] == "Use bounded structured responses."
+            assert records[0]["revision"] == 1
+            assert read["revision"] == 1
             assert "raw_transcript" not in read
 
     try:
