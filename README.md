@@ -6,7 +6,7 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 ## Current Status
 
-The optimization roadmap is complete through **Phase E / v0.0.16**. The published `v0.0.15` tag remains immutable, and Phase E closes the durable-jobs/reliability work with bounded admission, version-aware waiting, restart drain safety, uncertain-operation recovery, and Windows Job Object ownership.
+The optimization roadmap is complete through **Phase E / v0.0.16**, and **Phase F / v0.0.17 — State & Long-term Maintenance** is now in progress. F1 is complete with benchmark-gated audit batching plus bounded audit rotation/retention; the project version intentionally remains `0.0.16` until the final F6 release step.
 
 | Phase | Release | Focus | Status |
 | --- | --- | --- | --- |
@@ -15,13 +15,13 @@ The optimization roadmap is complete through **Phase E / v0.0.16**. The publishe
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
 | E | `v0.0.16` | Durable Jobs & Reliability | ✅ Complete |
-| F | `v0.0.17` | State & Long-term Maintenance | ⏭ Next |
+| F | `v0.0.17` | State & Long-term Maintenance | 🚧 In progress — F1 complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
 The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 intentionally adds one read-only typed tool, `job_wait`, bringing the current full surface to **60 tools**.
 
-Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. A focused release-candidate crash/restart suite also passes **71/71** tests. The canonical 3-run jobs benchmark on audit commit `8e06fee` completed 1/10/50 concurrent jobs with all jobs succeeding and `MCP_MAX_RUNNING_JOBS=4` enforced; the 50-job median was **18.370 s**, peak active jobs **4**, peak process-tree RSS **509.648 MiB**, and peak process count **25**. The 50-waiter `job_wait` case observed the same authoritative version with **76.823 ms** wake latency and no extra child processes. **Phase E / v0.0.16 — Durable Jobs & Reliability is complete.** Phase F / `v0.0.17` is the next roadmap step for bounded long-running state, retention, provenance, and storage budgets.
+Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. Phase F1 raises the current validation baseline to **275 pytest tests** with Ruff at zero violations, mypy at zero issues across 91 source files, compileall, the same **60-tool** health surface, and Full Doctor including a real disposable Chromium launch. The canonical F1 audit benchmark on commit `26cb41f` preserves all 20,000 records per sample while reducing single-thread median end-to-end audit time from **2077.088 ms** to **268.806 ms** and 8-thread median from **2199.630 ms** to **396.403 ms**. Phase F continues next with backup retention/quota work in F2.
 
 ---
 
@@ -38,6 +38,17 @@ Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violat
 - **Git Integration**: Working-tree status, diff statistics, and commit log pagination.
 - **Optional Browser Automation**: Playwright automation with shared browser-process pools, isolated per-session contexts, idle eviction, crash recovery, screenshot capture, and UI interaction.
 - **Resilient Supervisor & Control Panel**: Heartbeat watchdog, automatic backoff recovery, mutation-aware bounded drain before restart/stop, and a loopback-only control panel at `http://127.0.0.1:8766`.
+- **Bounded Audit Trail**: Metadata-only audit events use a bounded process-local batching queue, cross-process file serialization, durable flushes for destructive operations, and size-based rotation/retention for long-running deployments.
+
+---
+
+## Phase F1 — Audit Batching, Rotation & Retention
+
+F1 keeps audit semantics metadata-only while removing per-event open/write/close overhead. Each process uses a bounded queue (`2048` by default), a single writer, batches up to `64` records, and flushes a partial batch within `50 ms`. Queue saturation falls back to synchronous append instead of silently dropping records. Destructive operations such as file deletion/move, process termination, job cancellation, and supervisor runtime termination use durable audit writes that are fsynced before returning; normal MCP lifecycle shutdown also explicitly flushes queued audit metadata.
+
+Audit storage is now bounded by size-based rotation. The active `.agent_state/audit.jsonl` rotates at **8 MiB** by default and retains **5 rotated files** (`audit.1.jsonl` through `audit.5.jsonl`) in addition to the active file. Append and rotation are protected by a cross-process lock so the MCP runtime, supervisor, and independent durable-job workers can share the same audit trail safely. The policy is configurable with `MCP_AUDIT_BATCH_SIZE`, `MCP_AUDIT_FLUSH_MS`, `MCP_AUDIT_QUEUE_MAX`, `MCP_AUDIT_MAX_FILE_BYTES`, and `MCP_AUDIT_KEEP_FILES`.
+
+The benchmark gate passed decisively on the validation host. With 20,000 metadata events and three runs, legacy synchronous audit writes measured **2077.088 ms** median at one thread and **2199.630 ms** at eight threads. The production batched writer measured **268.806 ms** and **396.403 ms** respectively while preserving all 20,000 JSONL records and the same payload bytes. This is why batching is enabled rather than remaining a deferred experiment.
 
 ---
 
