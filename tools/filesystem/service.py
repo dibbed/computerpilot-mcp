@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from core.backups import BACKUP_RETENTION
 from core.config import SETTINGS, ensure_runtime_dirs, resolve_path
 from core.errors import ToolError
 from core.executor import run_bounded
@@ -177,7 +178,17 @@ def _backup_file(path: Path, digest: str) -> str:
     ensure_runtime_dirs()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup = SETTINGS.backup_dir / f"{stamp}_{digest[:12]}_{path.name}.bak"
-    shutil.copy2(path, backup)
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{backup.name}.", suffix=".tmp", dir=str(SETTINGS.backup_dir))
+    os.close(descriptor)
+    temp = Path(temp_name)
+    try:
+        shutil.copy2(path, temp)
+        with temp.open("rb+") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, backup)
+    finally:
+        temp.unlink(missing_ok=True)
     return str(backup)
 
 
@@ -249,6 +260,8 @@ def atomic_write(
             os.replace(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
+    if backup_path is not None:
+        BACKUP_RETENTION.schedule(Path(backup_path))
     return {
         "ok": True,
         "path": str(path),

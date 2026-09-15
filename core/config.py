@@ -44,6 +44,9 @@ class Settings:
     audit_queue_max: int = _env_int("MCP_AUDIT_QUEUE_MAX", 2_048, 64, 100_000)
     audit_max_file_bytes: int = _env_int("MCP_AUDIT_MAX_FILE_BYTES", 8 * 1_024 * 1_024, 65_536, 1_073_741_824)
     audit_keep_files: int = _env_int("MCP_AUDIT_KEEP_FILES", 5, 1, 100)
+    backup_max_bytes: int = _env_int("MCP_BACKUP_MAX_BYTES", 256 * 1_024 * 1_024, 0, 100 * 1_024 * 1_024 * 1_024)
+    backup_max_age_days: int = _env_int("MCP_BACKUP_MAX_AGE_DAYS", 30, 0, 3_650)
+    backup_cleanup_interval_sec: int = _env_int("MCP_BACKUP_CLEANUP_INTERVAL_SEC", 5, 1, 3_600)
     state_dir: Path = PROJECT_ROOT / ".agent_state"
     memory_dir: Path = PROJECT_ROOT / "memory"
 
