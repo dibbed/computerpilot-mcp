@@ -1,19 +1,77 @@
-﻿{
-  \ project\: \sample_project\,
-  \updated_at\: \2026-01-01T00:00:00Z\,
-  \architecture_decisions\: [
-    \Use SQLite for background job persistence\,
-    \Loopback-only binding for local operator interface\
+{
+  "schema_version": 2,
+  "project": "sample_project",
+  "revision": 1,
+  "updated_at": "2026-01-01T00:00:00+00:00",
+  "architecture_decisions": [
+    {
+      "id": "11111111111111111111111111111111",
+      "text": "Use SQLite for background job persistence",
+      "source": "manual",
+      "source_ref": null,
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "verified_at": null,
+      "revision": 1
+    },
+    {
+      "id": "22222222222222222222222222222222",
+      "text": "Loopback-only binding for local operator interface",
+      "source": "manual",
+      "source_ref": null,
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "verified_at": null,
+      "revision": 1
+    }
   ],
-  \important_paths\: [
-    \core/\,
-    \tools/\,
-    \scripts/\
+  "important_paths": [
+    {
+      "id": "33333333333333333333333333333333",
+      "text": "core/",
+      "source": "manual",
+      "source_ref": null,
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "verified_at": null,
+      "revision": 1
+    },
+    {
+      "id": "44444444444444444444444444444444",
+      "text": "tools/",
+      "source": "manual",
+      "source_ref": null,
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "verified_at": null,
+      "revision": 1
+    },
+    {
+      "id": "55555555555555555555555555555555",
+      "text": "scripts/",
+      "source": "manual",
+      "source_ref": null,
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "verified_at": null,
+      "revision": 1
+    }
   ],
-  \user_preferences\: [
-    \Prefer exact string replacement over complete file rewrite\
+  "user_preferences": [
+    {
+      "id": "66666666666666666666666666666666",
+      "text": "Prefer exact string replacement over complete file rewrite",
+      "source": "user",
+      "source_ref": null,
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "verified_at": "2026-01-01T00:00:00+00:00",
+      "revision": 1
+    }
   ],
-  \previous_fixes\: [
-    \Ensured subprocess streams rollover to disk beyond 1 MiB\
+  "previous_fixes": [
+    {
+      "id": "77777777777777777777777777777777",
+      "text": "Ensured subprocess streams rollover to disk beyond 1 MiB",
+      "source": "manual",
+      "source_ref": "core/executor.py",
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "verified_at": null,
+      "revision": 1
+    }
   ]
 }

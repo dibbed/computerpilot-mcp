@@ -15,6 +15,9 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Add Phase F3 disk-backed artifact retention with configurable age/count/byte limits (`MCP_ARTIFACT_MAX_AGE_HOURS=168`, `MCP_ARTIFACT_MAX_COUNT=512`, `MCP_ARTIFACT_MAX_BYTES=512 MiB`) and coalesced cleanup after artifact creation plus runtime startup maintenance.
 - Add terminal durable-job history/output retention with configurable age/count/byte limits (`30 days`, `1000` terminal rows, `1 GiB` by default); queued, running, and orphaned rows are never eligible.
 - Add repeatable `retention` benchmark cases covering the real artifact/job-storage inventory plus synthetic 5000-artifact and 2000-terminal-job cleanup workloads.
+- Add Phase F4 schema-v2 project-memory records with stable IDs, item/project revisions, legacy `list[str]` normalization, and the existing 128 KiB compact-memory ceiling.
+- Add per-record memory provenance (`source`, optional `source_ref`) and verification timestamps while keeping memory metadata non-authoritative with respect to runtime/tool safety policy.
+- Add `expected_revision` optimistic concurrency to `memory_update`; stale writers receive `memory_conflict`, while destructive `replace=True` requires an explicit revision.
 
 ### Changed
 - Destructive audit events for file deletion/move, process termination, durable-job cancellation, and supervisor runtime termination now use durable fsync-backed audit boundaries; normal MCP lifecycle shutdown explicitly flushes queued audit records. Audit payloads remain metadata-only.
@@ -23,6 +26,8 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Runtime lifecycle maintenance now schedules artifact and durable-job retention from the supervised MCP process rather than independent job workers, preserving Phase-E durable process ownership semantics.
 - `job_output` now holds the same keyed stdout/stderr locks used by retention while reading row state and output, closing the terminal row-read/output-delete race. Terminal cleanup commits the DB-row deletion before removing its output directory so a crash can leave only a detectable orphan directory, never a live history row pointing at already-pruned output.
 - Expired terminal-job rows no longer retain their idempotency keys indefinitely; reusing a key after its history record has been pruned may submit a new job.
+- Legacy project-memory string arrays now load read-only as deterministic `source=legacy` records without rewriting the original file; the first successful update materializes schema v2 atomically while preserving semantic revision behavior.
+- `memory_read` now returns record metadata and project revision, while `memory_list` reports schema/revision metadata for each readable project memory file.
 
 ### Fixed
 - Harden F1 audit rotation so a large queued batch is split on complete JSONL record boundaries instead of allowing the active segment to exceed its configured ceiling; serialize submit/close acceptance, make close timeouts observable/retryable, and fsync every retained segment at explicit flush/shutdown boundaries.
@@ -31,6 +36,8 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Retry one durable-job submission when terminal-history retention removes the deduplicated row between the idempotency transaction and its follow-up status read, preserving the documented post-expiry reuse semantics.
 - Reap detached durable-worker `Popen` handles in a daemon waiter without changing worker ownership, survival, or SQLite authority, eliminating long-running parent-handle leakage and Python `ResourceWarning`s.
 - Close audit benchmark file readers explicitly so Windows validation runs do not retain file handles or contaminate cleanup/rotation measurements.
+- Serialize the F4 optimistic revision check/merge/atomic-save sequence across independent MCP processes with hashed lock files under `.agent_state/memory_locks`, preventing two stale writers from both committing the same expected revision.
+- Keep oversized structured-memory writes fail-closed before atomic replacement so `memory_too_large` preserves the previous memory file byte-for-byte; operational memory lock files no longer pollute the persistent `memory/` directory.
 
 ### Validation
 - Phase F1 validation completed with **275 passing pytest tests**, Ruff with zero violations, mypy with zero issues across 91 source files, successful compileall, a passing 60-tool health check, and Full Doctor including a real disposable Chromium launch.
@@ -42,6 +49,9 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - The dedicated post-F3 deep audit completed with **311 passing pytest tests**, Ruff with zero violations, mypy with zero issues across **95 source files**, successful compileall, a passing **60-tool** health check, and Full Doctor including a real disposable Chromium launch. Python `-X dev` integration runs are clean of the audit/job-worker handle warnings discovered during the audit.
 - Cross-feature stress preserved **4000/4000 unique audit records** across 8 writer processes under rotation, retained all 12 concurrently-created fresh artifacts with zero temporary-file leakage, kept fresh backup publication safe before converging back to quota, and preserved queued/running/orphaned jobs across 3 concurrent history-cleanup passes. A 100-iteration finalized-artifact cache/cleanup race produced zero dead returned paths.
 - The hardened F1 audit writer retained its performance gate after the correctness fixes: 20,000 events measured roughly **252.888 ms vs 2231.992 ms** synchronous at one thread and **289.107 ms vs 2335.559 ms** synchronous at eight threads while preserving every record and respecting the rotation ceiling.
+- Phase F4 validation completed with **326 passing pytest tests**, Ruff with zero violations, mypy with zero issues across **96 source files**, successful compileall, a passing **60-tool** health check, and Full Doctor including a real disposable Chromium launch.
+- The real legacy `memory/psychology_atlas.json` file remained byte-identical during read-only normalization and produced **115 stable `source=legacy` records** (46 architecture decisions, 34 important paths, 6 user preferences, 29 previous fixes). Materializing a copy as schema v2 produced a **37,041-byte** file from the original **18,839 bytes**, below the 128 KiB cap.
+- Cross-process F4 acceptance launched two independent writers with `expected_revision=0`; exactly one committed revision 1 and the other returned `memory_conflict`. The oversized-memory acceptance also verified that `memory_too_large` leaves the previous file SHA-256 unchanged.
 
 ## [0.0.16] - 2026-09-15
 
