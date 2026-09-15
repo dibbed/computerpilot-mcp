@@ -7,12 +7,19 @@ from pathlib import Path
 from core.artifact_retention import ArtifactPolicy, cleanup_artifacts
 
 
-def _policy(*, max_bytes: int = 1_000_000, max_age_sec: float = 0, max_count: int = 100) -> ArtifactPolicy:
+def _policy(
+    *,
+    max_bytes: int = 1_000_000,
+    max_age_sec: float = 0,
+    max_count: int = 100,
+    recent_grace_sec: float = 0,
+) -> ArtifactPolicy:
     return ArtifactPolicy(
         max_bytes=max_bytes,
         max_age_sec=max_age_sec,
         max_count=max_count,
         cleanup_interval_sec=0,
+        recent_grace_sec=recent_grace_sec,
     )
 
 
@@ -61,6 +68,23 @@ def test_artifact_retention_protects_current_and_newest(tmp_path: Path) -> None:
 
     assert old.exists() is False
     assert current.is_file()
+    assert newest.is_file()
+    assert result.remaining_files == 2
+    assert result.quota_satisfied is False
+
+
+def test_recent_artifacts_survive_cleanup_before_protection_request_is_observed(tmp_path: Path) -> None:
+    now = 10_000.0
+    recent = _artifact(tmp_path, "recent.bin", 100, now - 10)
+    newest = _artifact(tmp_path, "newest.bin", 100, now - 1)
+
+    result = cleanup_artifacts(
+        tmp_path,
+        _policy(max_bytes=1, max_count=1, recent_grace_sec=60),
+        now=now,
+    )
+
+    assert recent.is_file()
     assert newest.is_file()
     assert result.remaining_files == 2
     assert result.quota_satisfied is False

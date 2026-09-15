@@ -10,6 +10,8 @@ from pathlib import Path
 
 from core.config import SETTINGS, Settings
 
+BACKUP_RECENT_GRACE_SEC = 60.0
+
 
 @dataclass(frozen=True, slots=True)
 class BackupPolicy:
@@ -18,6 +20,7 @@ class BackupPolicy:
     max_bytes: int
     max_age_sec: float
     cleanup_interval_sec: float
+    recent_grace_sec: float = BACKUP_RECENT_GRACE_SEC
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +112,13 @@ def cleanup_backups(
     protected = {path.resolve(strict=False) for path in (protected_paths or set())}
     newest = entries[-1].path.resolve(strict=False)
     protected.add(newest)
+    if policy.recent_grace_sec > 0:
+        grace_cutoff = current - policy.recent_grace_sec
+        protected.update(
+            entry.path.resolve(strict=False)
+            for entry in entries
+            if entry.created_at >= grace_cutoff
+        )
     safety_floor_preserved = True
 
     survivors: list[BackupEntry] = []

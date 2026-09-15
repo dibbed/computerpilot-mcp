@@ -20,8 +20,19 @@ def _backup(path: Path, size: int, mtime: float) -> None:
     os.utime(path, (mtime, mtime))
 
 
-def _policy(*, max_bytes: int = 0, max_age_sec: float = 0, interval: float = 0) -> BackupPolicy:
-    return BackupPolicy(max_bytes=max_bytes, max_age_sec=max_age_sec, cleanup_interval_sec=interval)
+def _policy(
+    *,
+    max_bytes: int = 0,
+    max_age_sec: float = 0,
+    interval: float = 0,
+    recent_grace_sec: float = 0,
+) -> BackupPolicy:
+    return BackupPolicy(
+        max_bytes=max_bytes,
+        max_age_sec=max_age_sec,
+        cleanup_interval_sec=interval,
+        recent_grace_sec=recent_grace_sec,
+    )
 
 
 def test_age_retention_removes_expired_backups_but_preserves_newest(tmp_path: Path) -> None:
@@ -78,6 +89,25 @@ def test_protected_current_backup_is_not_removed_by_quota(tmp_path: Path) -> Non
     assert protected.is_file()
     assert (tmp_path / "newest.bak").is_file()
     assert result.remaining_bytes == 200
+    assert result.quota_satisfied is False
+
+
+def test_recent_backups_survive_cleanup_before_protection_request_is_observed(tmp_path: Path) -> None:
+    now = 1_000.0
+    recent = tmp_path / "recent.bak"
+    newest = tmp_path / "newest.bak"
+    _backup(recent, 100, now - 10)
+    _backup(newest, 100, now - 1)
+
+    result = cleanup_backups(
+        tmp_path,
+        _policy(max_bytes=1, recent_grace_sec=60),
+        now=now,
+    )
+
+    assert recent.is_file()
+    assert newest.is_file()
+    assert result.remaining_files == 2
     assert result.quota_satisfied is False
 
 

@@ -8,6 +8,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from core.config import SETTINGS, Settings
+from core.resource_locks import RESOURCE_LOCKS
+
+ARTIFACT_RECENT_GRACE_SEC = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +19,7 @@ class ArtifactPolicy:
     max_age_sec: float
     max_count: int
     cleanup_interval_sec: float
+    recent_grace_sec: float = ARTIFACT_RECENT_GRACE_SEC
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +96,13 @@ def cleanup_artifacts(
     current = time.time() if now is None else now
     protected = {path.resolve(strict=False) for path in (protected_paths or set())}
     protected.add(entries[-1].path.resolve(strict=False))
+    if policy.recent_grace_sec > 0:
+        grace_cutoff = current - policy.recent_grace_sec
+        protected.update(
+            entry.path.resolve(strict=False)
+            for entry in entries
+            if entry.mtime >= grace_cutoff
+        )
     survivors = entries[:]
     removed_files = 0
     removed_bytes = 0
@@ -101,11 +112,21 @@ def cleanup_artifacts(
 
     def remove(entry: ArtifactEntry) -> bool:
         nonlocal errors, removed_files, removed_bytes
-        try:
-            entry.path.unlink(missing_ok=True)
-        except OSError:
-            errors += 1
-            return False
+        with RESOURCE_LOCKS.sync(entry.path):
+            try:
+                stat = entry.path.stat()
+            except FileNotFoundError:
+                return True
+            except OSError:
+                errors += 1
+                return False
+            if policy.recent_grace_sec > 0 and stat.st_mtime >= current - policy.recent_grace_sec:
+                return False
+            try:
+                entry.path.unlink(missing_ok=True)
+            except OSError:
+                errors += 1
+                return False
         removed_files += 1
         removed_bytes += entry.size
         return True
