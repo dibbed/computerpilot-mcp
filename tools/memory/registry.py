@@ -12,7 +12,15 @@ from pydantic import Field
 from core.audit import audit_action
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.errors import ToolError
-from core.memory_store import MEMORY_SCHEMA_VERSION, SECTIONS, atomic_save, empty_memory, load_memory, merge_texts
+from core.memory_store import (
+    MEMORY_SCHEMA_VERSION,
+    SECTIONS,
+    atomic_save,
+    empty_memory,
+    load_memory,
+    memory_write_lock,
+    merge_texts,
+)
 from core.resource_locks import RESOURCE_LOCKS
 from core.response import page
 from core.tooling import MUTATING, READ_ONLY, compact_errors
@@ -89,60 +97,61 @@ def register(mcp: MCPServer) -> None:
 
         with RESOURCE_LOCKS.sync(_path(project_name)):
             path = _path(project_name)
-            current = _load(project_name)
-            current_revision = int(current["revision"])
-            if replace and expected_revision is None:
-                raise ToolError(
-                    "memory_revision_required",
-                    "replace=True requires expected_revision to prevent blind overwrites.",
-                    hint="Call memory_read first and retry with its current revision.",
+            with memory_write_lock(path):
+                current = _load(project_name)
+                current_revision = int(current["revision"])
+                if replace and expected_revision is None:
+                    raise ToolError(
+                        "memory_revision_required",
+                        "replace=True requires expected_revision to prevent blind overwrites.",
+                        hint="Call memory_read first and retry with its current revision.",
+                    )
+                if expected_revision is not None and expected_revision != current_revision:
+                    raise ToolError(
+                        "memory_conflict",
+                        f"Expected memory revision {expected_revision}, but current revision is {current_revision}.",
+                        hint="Read the latest memory, merge your changes, and retry with the new revision.",
+                    )
+                incoming = {
+                    "architecture_decisions": architecture_decisions or [],
+                    "important_paths": important_paths or [],
+                    "user_preferences": user_preferences or [],
+                    "previous_fixes": previous_fixes or [],
+                }
+                next_data, changed = merge_texts(
+                    current,
+                    incoming,
+                    replace=replace,
+                    source=source,
+                    source_ref=source_ref,
+                    verified=verified,
                 )
-            if expected_revision is not None and expected_revision != current_revision:
-                raise ToolError(
-                    "memory_conflict",
-                    f"Expected memory revision {expected_revision}, but current revision is {current_revision}.",
-                    hint="Read the latest memory, merge your changes, and retry with the new revision.",
+                audit_action(
+                    "memory_update",
+                    target=path,
+                    details={
+                        "replace": replace,
+                        "changed": changed,
+                        "revision_before": current["revision"],
+                        "revision_after": next_data["revision"],
+                        "expected_revision": expected_revision,
+                        "source": source or "manual",
+                        "verified": verified,
+                        "item_counts": {key: len(value) for key, value in incoming.items()},
+                    },
                 )
-            incoming = {
-                "architecture_decisions": architecture_decisions or [],
-                "important_paths": important_paths or [],
-                "user_preferences": user_preferences or [],
-                "previous_fixes": previous_fixes or [],
-            }
-            next_data, changed = merge_texts(
-                current,
-                incoming,
-                replace=replace,
-                source=source,
-                source_ref=source_ref,
-                verified=verified,
-            )
-            audit_action(
-                "memory_update",
-                target=path,
-                details={
-                    "replace": replace,
+                size = atomic_save(path, next_data)
+                return {
+                    "ok": True,
+                    "schema_version": MEMORY_SCHEMA_VERSION,
+                    "project": project_name,
+                    "path": str(path),
                     "changed": changed,
-                    "revision_before": current["revision"],
-                    "revision_after": next_data["revision"],
-                    "expected_revision": expected_revision,
-                    "source": source or "manual",
-                    "verified": verified,
-                    "item_counts": {key: len(value) for key, value in incoming.items()},
-                },
-            )
-            size = atomic_save(path, next_data)
-            return {
-                "ok": True,
-                "schema_version": MEMORY_SCHEMA_VERSION,
-                "project": project_name,
-                "path": str(path),
-                "changed": changed,
-                "revision": next_data["revision"],
-                "updated_at": next_data["updated_at"],
-                "counts": {section: len(next_data[section]) for section in SECTIONS},
-                "bytes": size,
-            }
+                    "revision": next_data["revision"],
+                    "updated_at": next_data["updated_at"],
+                    "counts": {section: len(next_data[section]) for section in SECTIONS},
+                    "bytes": size,
+                }
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("memory_list")

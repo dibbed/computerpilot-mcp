@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -323,6 +327,97 @@ def test_concurrent_updates_from_same_revision_never_silently_overwrite(
     assert read["revision"] == 1
     assert len(read["items"]) == 1
     assert read["items"][0]["text"] in {"left", "right"}
+
+
+def test_cross_process_expected_revision_allows_only_one_writer(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    memory_path = tmp_path / "shared.json"
+    go = tmp_path / "go"
+    helper = tmp_path / "memory_child.py"
+    helper.write_text(
+        "\n".join(
+            [
+                "import json, sys, time",
+                "from pathlib import Path",
+                f"sys.path.insert(0, {str(repo)!r})",
+                "from tools.memory import registry",
+                "functions = {}",
+                "class Capture:",
+                "    def tool(self, **kwargs):",
+                "        def decorate(fn):",
+                "            functions[fn.__name__] = fn",
+                "            return fn",
+                "        return decorate",
+                "memory_path = Path(sys.argv[1])",
+                "go = Path(sys.argv[2])",
+                "ready = Path(sys.argv[3])",
+                "text = sys.argv[4]",
+                "registry._path = lambda _name: memory_path",
+                "registry.audit_action = lambda *a, **k: None",
+                "registry.register(Capture())",
+                "ready.write_text('ready', encoding='utf-8')",
+                "deadline = time.monotonic() + 10",
+                "while not go.exists():",
+                "    if time.monotonic() >= deadline: raise SystemExit(3)",
+                "    time.sleep(0.01)",
+                "result = functions['memory_update']('shared', previous_fixes=[text], expected_revision=0)",
+                "print(json.dumps(result, sort_keys=True))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    processes: list[subprocess.Popen[str]] = []
+    for index, text in enumerate(("left", "right")):
+        ready = tmp_path / f"ready-{index}"
+        processes.append(
+            subprocess.Popen(
+                [sys.executable, str(helper), str(memory_path), str(go), str(ready), text],
+                cwd=repo,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        )
+    deadline = time.monotonic() + 10
+    while len(list(tmp_path.glob("ready-*"))) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(list(tmp_path.glob("ready-*"))) == 2
+    go.write_text("go", encoding="utf-8")
+
+    results: list[dict[str, Any]] = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 0, stderr
+        results.append(json.loads(stdout))
+
+    assert sum(result.get("ok") is True for result in results) == 1
+    assert sum(result.get("error") == "memory_conflict" for result in results) == 1
+    saved = json.loads(memory_path.read_text(encoding="utf-8"))
+    assert saved["revision"] == 1
+    assert len(saved["previous_fixes"]) == 1
+    assert saved["previous_fixes"][0]["text"] in {"left", "right"}
+
+
+def test_memory_size_overflow_preserves_previous_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    functions = _functions(tmp_path, monkeypatch)
+    first = functions["memory_update"]("project", previous_fixes=["small"])
+    path = tmp_path / "project.json"
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    oversized = [f"{index:03d}-" + ("x" * 1_996) for index in range(100)]
+
+    result = functions["memory_update"](
+        "project",
+        architecture_decisions=oversized,
+        expected_revision=first["revision"],
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "memory_too_large"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    read = functions["memory_read"]("project", section="previous_fixes")
+    assert read["revision"] == 1
+    assert [item["text"] for item in read["items"]] == ["small"]
 
 
 def test_future_memory_schema_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
