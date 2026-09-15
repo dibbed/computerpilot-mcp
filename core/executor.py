@@ -451,6 +451,19 @@ def _close_background_record(record: BackgroundRecord) -> None:
     record.stderr.close()
 
 
+def background_stats() -> dict[str, int]:
+    """Return process-local background execution usage without changing ownership."""
+
+    with _BACKGROUND_LOCK:
+        records = list(_BACKGROUND.values())
+    running = sum(record.process.poll() is None for record in records)
+    return {
+        "tracked": len(records),
+        "running": running,
+        "finished_retained": len(records) - running,
+    }
+
+
 def close_background_captures() -> None:
     """Release every spool retained for background-process output."""
 

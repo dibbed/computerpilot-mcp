@@ -98,6 +98,33 @@ def test_mcp_tool_timing_records_request_and_tool_body(monkeypatch: pytest.Monke
     assert ("serialization", "server_health") in phases
 
 
+def test_server_health_exposes_resource_usage_and_budgets() -> None:
+    async def scenario() -> None:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            health = _structured(await client.call_tool("server_health", {}))
+            resources = health["resources"]
+            budgets = health["resource_budgets"]
+            assert resources["rss_mb"] > 0
+            assert resources["ast_cache_entries"] >= 0
+            assert resources["search_snapshot_count"] >= 0
+            assert resources["active_browser_sessions"] >= 0
+            assert resources["active_background_processes"] >= 0
+            assert resources["queued_jobs"] >= 0
+            assert resources["running_jobs"] >= 0
+            assert resources["artifact_bytes"] >= 0
+            assert resources["backup_bytes"] >= 0
+            assert resources["audit_bytes"] >= 0
+            assert resources["resource_pressure"] in {"normal", "warning", "critical"}
+            assert budgets["browser_max_sessions"] == SETTINGS.browser_max_sessions
+            assert budgets["artifact_max_bytes"] == SETTINGS.artifact_max_bytes
+            assert resources["budgets"]["artifact_bytes"]["max"] == SETTINGS.artifact_max_bytes
+            assert resources["budgets"]["audit_bytes"]["max"] == SETTINGS.audit_max_file_bytes * (
+                SETTINGS.audit_keep_files + 1
+            )
+
+    asyncio.run(scenario())
+
+
 def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
