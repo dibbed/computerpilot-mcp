@@ -36,6 +36,8 @@ class Settings:
     search_snapshot_max_count: int = _env_int("MCP_SEARCH_SNAPSHOT_MAX_COUNT", 32, 1, 1_024)
     browser_idle_sec: int = _env_int("MCP_BROWSER_IDLE_SEC", 900, 1, 86_400)
     browser_pool_idle_sec: int = _env_int("MCP_BROWSER_POOL_IDLE_SEC", 120, 1, 86_400)
+    browser_max_sessions: int = _env_int("MCP_BROWSER_MAX_SESSIONS", 20, 1, 1_000)
+    browser_max_pools: int = _env_int("MCP_BROWSER_MAX_POOLS", 6, 1, 32)
     max_running_jobs: int = _env_int("MCP_MAX_RUNNING_JOBS", 4, 1, 256)
     supervisor_drain_sec: int = _env_int("MCP_SUPERVISOR_DRAIN_SEC", 15, 1, 300)
     supervisor_watchdog_drain_sec: int = _env_int("MCP_SUPERVISOR_WATCHDOG_DRAIN_SEC", 2, 1, 30)
@@ -73,6 +75,26 @@ class Settings:
     @property
     def search_snapshot_dir(self) -> Path:
         return self.state_dir / "search_snapshots"
+
+    def resource_budgets(self) -> dict[str, int]:
+        """Expose configured resource ceilings from one immutable source of truth."""
+
+        return {
+            "ast_cache_max_files": self.ast_cache_max_files,
+            "ast_cache_max_bytes": self.ast_cache_max_bytes,
+            "search_snapshot_max_count": self.search_snapshot_max_count,
+            "search_snapshot_max_bytes": self.search_snapshot_max_bytes,
+            "browser_max_sessions": self.browser_max_sessions,
+            "browser_max_pools": self.browser_max_pools,
+            "max_running_jobs": self.max_running_jobs,
+            "artifact_max_count": self.artifact_max_count,
+            "artifact_max_bytes": self.artifact_max_bytes,
+            "backup_max_bytes": self.backup_max_bytes,
+            "job_history_max_count": self.job_history_max_count,
+            "job_history_max_bytes": self.job_history_max_bytes,
+            "audit_max_file_bytes": self.audit_max_file_bytes,
+            "audit_keep_files": self.audit_keep_files,
+        }
 
 
 SETTINGS = Settings()

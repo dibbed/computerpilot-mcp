@@ -50,6 +50,8 @@ class BrowserManager:
         *,
         session_idle_sec: float | None = None,
         pool_idle_sec: float | None = None,
+        max_sessions: int | None = None,
+        max_pools: int | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._playwright: Any = None
@@ -57,11 +59,17 @@ class BrowserManager:
         self._pools: dict[PoolKey, BrowserPool] = {}
         self._runtime_lock = asyncio.Lock()
         self._pool_lock = asyncio.Lock()
+        self._capacity_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._session_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
+        self._pending_sessions = 0
         self._session_idle_sec = float(SETTINGS.browser_idle_sec if session_idle_sec is None else session_idle_sec)
         self._pool_idle_sec = float(SETTINGS.browser_pool_idle_sec if pool_idle_sec is None else pool_idle_sec)
+        self._max_sessions = SETTINGS.browser_max_sessions if max_sessions is None else max_sessions
+        self._max_pools = SETTINGS.browser_max_pools if max_pools is None else max_pools
+        if self._max_sessions < 1 or self._max_pools < 1:
+            raise ValueError("Browser session and pool budgets must be positive.")
         self._cleanup_interval_sec = max(0.01, min(30.0, self._session_idle_sec / 2, self._pool_idle_sec / 2))
         self._clock = clock
 
@@ -197,6 +205,12 @@ class BrowserManager:
                 existing.pending_contexts += 1
                 existing.last_used = self._clock()
                 return existing
+            if len(self._pools) >= self._max_pools:
+                raise ToolError(
+                    "browser_pool_limit",
+                    f"Browser pool limit reached ({self._max_pools}).",
+                    hint="Close unused browser sessions or wait for idle pool cleanup before retrying.",
+                )
             try:
                 browser = await getattr(runtime, browser_name).launch(headless=headless)
             except Exception as exc:
@@ -344,20 +358,36 @@ class BrowserManager:
                 existing.last_used = self._clock()
                 return {"session_id": session_id, **result}
 
-            replacement = await self._new_session(browser_name=browser_name, headless=headless)
+            reserved_slot = False
+            if existing is None:
+                async with self._capacity_lock:
+                    if len(self._sessions) + self._pending_sessions >= self._max_sessions:
+                        raise ToolError(
+                            "browser_session_limit",
+                            f"Browser session limit reached ({self._max_sessions}).",
+                            hint="Close an unused browser session or wait for idle cleanup before retrying.",
+                        )
+                    self._pending_sessions += 1
+                    reserved_slot = True
             try:
-                result = await self._navigate(replacement, url, timeout_ms=timeout_ms, wait_until=wait_until)
-            except BaseException:
-                await self._close_session_context(replacement)
-                raise
+                replacement = await self._new_session(browser_name=browser_name, headless=headless)
+                try:
+                    result = await self._navigate(replacement, url, timeout_ms=timeout_ms, wait_until=wait_until)
+                except BaseException:
+                    await self._close_session_context(replacement)
+                    raise
 
-            # Publish only after the replacement has navigated successfully. This keeps
-            # the existing session usable if launch/context/navigation fails.
-            replacement.last_used = self._clock()
-            self._sessions[session_id] = replacement
-            if existing is not None:
-                await self._close_session_context(existing, suppress_errors=True)
-            return {"session_id": session_id, **result}
+                # Publish only after the replacement has navigated successfully. This keeps
+                # the existing session usable if launch/context/navigation fails.
+                replacement.last_used = self._clock()
+                self._sessions[session_id] = replacement
+                if existing is not None:
+                    await self._close_session_context(existing, suppress_errors=True)
+                return {"session_id": session_id, **result}
+            finally:
+                if reserved_slot:
+                    async with self._capacity_lock:
+                        self._pending_sessions = max(0, self._pending_sessions - 1)
 
     def page(self, session_id: str) -> Any:
         session = self._sessions.get(session_id)
@@ -382,6 +412,21 @@ class BrowserManager:
                 return {"ok": True, "session_id": session_id, "closed": False, "reason": "not_found"}
             await self._close_session_context(session, suppress_errors=session.stale)
             return {"ok": True, "session_id": session_id, "closed": True}
+
+    async def stats(self) -> dict[str, int]:
+        """Return bounded browser resource usage without starting Playwright."""
+
+        async with self._capacity_lock:
+            async with self._pool_lock:
+                return {
+                    "active_sessions": len(self._sessions),
+                    "pending_sessions": self._pending_sessions,
+                    "max_sessions": self._max_sessions,
+                    "active_pools": len(self._pools),
+                    "max_pools": self._max_pools,
+                    "active_contexts": sum(pool.active_contexts for pool in self._pools.values()),
+                    "pending_contexts": sum(pool.pending_contexts for pool in self._pools.values()),
+                }
 
     async def cleanup_idle(self) -> dict[str, Any]:
         if self._cleanup_lock.locked():
