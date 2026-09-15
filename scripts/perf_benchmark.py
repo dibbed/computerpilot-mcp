@@ -23,6 +23,7 @@ from typing import Any, Literal
 
 import psutil
 
+from core.audit import AuditPolicy, AuditWriter
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
 from core.jobs import JobStore, same_process
@@ -39,6 +40,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "search_files": [1_000],
         "job_counts": [1, 10],
         "browser_counts": [1],
+        "audit_events": [2_000],
     },
     "full": {
         "output_sizes": [1_024, MiB, 100 * MiB],
@@ -46,9 +48,10 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "search_files": [10_000, 100_000],
         "job_counts": [1, 10, 50],
         "browser_counts": [1, 5, 20],
+        "audit_events": [20_000],
     },
 }
-SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser")
+SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit")
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
 
@@ -799,6 +802,109 @@ def _browser_idle_eviction_once() -> dict[str, Any]:
     return asyncio.run(scenario())
 
 
+
+def _audit_payload() -> bytes:
+    return (
+        json.dumps(
+            {
+                "time": "2026-09-15T00:00:00.000+00:00",
+                "operation": "write_file",
+                "outcome": "succeeded",
+                "pid": 1234,
+                "target": "C:/work/example.txt",
+                "details": {"changed": True},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _percentile_95(samples: list[float]) -> float:
+    ordered = sorted(samples)
+    if not ordered:
+        return 0.0
+    return ordered[max(int(len(ordered) * 0.95) - 1, 0)]
+
+
+def _reset_audit_benchmark_files(path: Path) -> None:
+    path.unlink(missing_ok=True)
+    for candidate in path.parent.glob(f"{path.stem}.*{path.suffix}"):
+        candidate.unlink(missing_ok=True)
+
+
+def _audit_legacy_sync_once(path: Path, events: int, threads: int) -> dict[str, Any]:
+    _reset_audit_benchmark_files(path)
+    payload = _audit_payload()
+    lock = threading.Lock()
+    latencies: list[float] = []
+
+    def worker(count: int) -> None:
+        local: list[float] = []
+        for _ in range(count):
+            started = time.perf_counter_ns()
+            with lock, path.open("ab", buffering=0) as handle:
+                handle.write(payload)
+            local.append((time.perf_counter_ns() - started) / 1_000_000)
+        with lock:
+            latencies.extend(local)
+
+    counts = [events // threads + (1 if index < events % threads else 0) for index in range(threads)]
+    workers = [threading.Thread(target=worker, args=(count,)) for count in counts]
+    for worker_thread in workers:
+        worker_thread.start()
+    for worker_thread in workers:
+        worker_thread.join()
+    return {
+        "events": events,
+        "threads": threads,
+        "lines": sum(1 for _ in path.open("rb")),
+        "bytes": path.stat().st_size,
+        "caller_median_ms": round(statistics.median(latencies), 6),
+        "caller_p95_ms": round(_percentile_95(latencies), 6),
+    }
+
+
+def _audit_batched_once(path: Path, events: int, threads: int) -> dict[str, Any]:
+    _reset_audit_benchmark_files(path)
+    payload = _audit_payload()
+    policy = AuditPolicy(
+        batch_size=SETTINGS.audit_batch_size,
+        flush_interval_sec=SETTINGS.audit_flush_ms / 1_000,
+        queue_max=SETTINGS.audit_queue_max,
+    )
+    writer = AuditWriter(path, policy)
+    latencies: list[float] = []
+    latency_lock = threading.Lock()
+
+    def worker(count: int) -> None:
+        local: list[float] = []
+        for _ in range(count):
+            started = time.perf_counter_ns()
+            writer.submit(payload)
+            local.append((time.perf_counter_ns() - started) / 1_000_000)
+        with latency_lock:
+            latencies.extend(local)
+
+    counts = [events // threads + (1 if index < events % threads else 0) for index in range(threads)]
+    workers = [threading.Thread(target=worker, args=(count,)) for count in counts]
+    for worker_thread in workers:
+        worker_thread.start()
+    for worker_thread in workers:
+        worker_thread.join()
+    writer.close()
+    return {
+        "events": events,
+        "threads": threads,
+        "lines": sum(1 for _ in path.open("rb")),
+        "bytes": path.stat().st_size,
+        "caller_median_ms": round(statistics.median(latencies), 6),
+        "caller_p95_ms": round(_percentile_95(latencies), 6),
+        "batch_size": policy.batch_size,
+        "flush_interval_ms": round(policy.flush_interval_sec * 1_000, 3),
+        "queue_max": policy.queue_max,
+    }
+
 def _cleanup_stale_temp_roots(
     parent: Path | None = None,
     *,
@@ -860,6 +966,26 @@ def run_benchmarks(
     if "output" in suites:
         for size in limits["output_sizes"]:
             results.append(measure(f"output_{size}_bytes", partial(_output_once, size), runs))
+
+    if "audit" in suites:
+        events = max(limits["audit_events"])
+        with _temporary_root("audit") as temporary:
+            root = Path(temporary)
+            for threads in (1, 8):
+                results.append(
+                    measure(
+                        f"audit_legacy_sync_{events}_t{threads}",
+                        partial(_audit_legacy_sync_once, root / f"legacy-{threads}.jsonl", events, threads),
+                        runs,
+                    )
+                )
+                results.append(
+                    measure(
+                        f"audit_batched_{events}_t{threads}",
+                        partial(_audit_batched_once, root / f"batched-{threads}.jsonl", events, threads),
+                        runs,
+                    )
+                )
 
     if "project" in suites:
         max_count = max(limits["ast_files"])
@@ -972,7 +1098,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser"))
+    suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit"))
     report = run_benchmarks(
         profile=args.profile,
         runs=args.runs,

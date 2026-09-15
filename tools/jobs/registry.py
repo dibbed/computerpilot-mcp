@@ -79,5 +79,5 @@ def register(mcp: MCPServer) -> None:
     @compact_errors("cancel_job")
     def cancel_job(job_id: JobId) -> dict[str, Any]:
         """Request cancellation of a job and its command process tree."""
-        audit_action("cancel_job", target=job_id)
+        audit_action("cancel_job", target=job_id, durable=True)
         return store.cancel(job_id)

@@ -39,6 +39,9 @@ class Settings:
     max_running_jobs: int = _env_int("MCP_MAX_RUNNING_JOBS", 4, 1, 256)
     supervisor_drain_sec: int = _env_int("MCP_SUPERVISOR_DRAIN_SEC", 15, 1, 300)
     supervisor_watchdog_drain_sec: int = _env_int("MCP_SUPERVISOR_WATCHDOG_DRAIN_SEC", 2, 1, 30)
+    audit_batch_size: int = _env_int("MCP_AUDIT_BATCH_SIZE", 64, 1, 1_024)
+    audit_flush_ms: int = _env_int("MCP_AUDIT_FLUSH_MS", 50, 1, 5_000)
+    audit_queue_max: int = _env_int("MCP_AUDIT_QUEUE_MAX", 2_048, 64, 100_000)
     state_dir: Path = PROJECT_ROOT / ".agent_state"
     memory_dir: Path = PROJECT_ROOT / "memory"
 

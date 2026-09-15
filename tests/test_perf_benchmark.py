@@ -17,6 +17,8 @@ from scripts.perf_benchmark import (
     PROFILE_LIMITS,
     BenchmarkSkip,
     MiB,
+    _audit_batched_once,
+    _audit_legacy_sync_once,
     _browser_batch_once,
     _browser_pool_details,
     _cleanup_stale_temp_roots,
@@ -39,6 +41,7 @@ def test_benchmark_profiles_cover_planned_scale_points() -> None:
     assert full["search_files"] == [10_000, 100_000]
     assert full["job_counts"] == [1, 10, 50]
     assert full["browser_counts"] == [1, 5, 20]
+    assert full["audit_events"] == [20_000]
 
 
 def test_browser_pool_details_report_instances_contexts_and_keys() -> None:
@@ -254,3 +257,34 @@ def test_stale_benchmark_temp_cleanup_is_age_bounded(tmp_path: Path) -> None:
     assert removed == 1
     assert stale.exists() is False
     assert recent.is_dir()
+
+def test_audit_benchmark_preserves_all_records_and_reports_caller_latency(tmp_path: Path) -> None:
+    legacy = _audit_legacy_sync_once(tmp_path / "legacy.jsonl", events=200, threads=4)
+    batched = _audit_batched_once(tmp_path / "batched.jsonl", events=200, threads=4)
+
+    assert legacy["lines"] == 200
+    assert batched["lines"] == 200
+    assert legacy["bytes"] == batched["bytes"]
+    assert legacy["caller_p95_ms"] >= 0
+    assert batched["caller_p95_ms"] >= 0
+    assert batched["batch_size"] >= 1
+    assert batched["queue_max"] >= 64
+
+
+def test_audit_suite_is_available_through_benchmark_runner() -> None:
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"audit"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    results = {item["name"]: item for item in report["results"]}
+    assert set(results) == {
+        "audit_legacy_sync_2000_t1",
+        "audit_batched_2000_t1",
+        "audit_legacy_sync_2000_t8",
+        "audit_batched_2000_t8",
+    }
+    assert all(item["status"] == "ok" for item in results.values())
+    assert all(item["details"]["lines"] == 2_000 for item in results.values())

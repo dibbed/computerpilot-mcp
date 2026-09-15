@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+from core.audit import flush_audit
 from core.config import SETTINGS
 from core.lifecycle import RUNTIME_LIFECYCLE
 from core.recovery import OPERATION_RECOVERY
@@ -43,6 +44,7 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+        flush_audit()
         # Preserve the published STOPPING acknowledgement on disk while keeping
         # repeated in-process MCP server instances isolated from the old lifecycle.
         OPERATION_RECOVERY.configure(None, None)
