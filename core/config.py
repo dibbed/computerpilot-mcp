@@ -47,6 +47,10 @@ class Settings:
     backup_max_bytes: int = _env_int("MCP_BACKUP_MAX_BYTES", 256 * 1_024 * 1_024, 0, 100 * 1_024 * 1_024 * 1_024)
     backup_max_age_days: int = _env_int("MCP_BACKUP_MAX_AGE_DAYS", 30, 0, 3_650)
     backup_cleanup_interval_sec: int = _env_int("MCP_BACKUP_CLEANUP_INTERVAL_SEC", 5, 1, 3_600)
+    artifact_max_bytes: int = _env_int("MCP_ARTIFACT_MAX_BYTES", 512 * 1_024 * 1_024, 0, 100 * 1_024 * 1_024 * 1_024)
+    artifact_max_age_hours: int = _env_int("MCP_ARTIFACT_MAX_AGE_HOURS", 168, 0, 24 * 3_650)
+    artifact_max_count: int = _env_int("MCP_ARTIFACT_MAX_COUNT", 512, 0, 1_000_000)
+    artifact_cleanup_interval_sec: int = _env_int("MCP_ARTIFACT_CLEANUP_INTERVAL_SEC", 5, 1, 3_600)
     state_dir: Path = PROJECT_ROOT / ".agent_state"
     memory_dir: Path = PROJECT_ROOT / "memory"
 

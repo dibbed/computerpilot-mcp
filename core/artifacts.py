@@ -13,6 +13,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
+from core.artifact_retention import schedule_artifact_retention
 from core.config import SETTINGS
 from core.resource_locks import RESOURCE_LOCKS, canonical_path
 from core.timings import timing_span
@@ -225,6 +226,7 @@ def deliver_stream(
                 next_byte=next_byte,
                 has_more=next_byte < total,
             )
+        schedule_artifact_retention(target, settings=SETTINGS)
         return result
     except BaseException:
         target.unlink(missing_ok=True)

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+from core.artifact_retention import schedule_artifact_retention
 from core.audit import flush_audit
 from core.backups import BACKUP_RETENTION
 from core.config import SETTINGS
@@ -32,6 +33,7 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     RUNTIME_LIFECYCLE.configure_from_env()
     OPERATION_RECOVERY.configure_from_env(SETTINGS.state_dir)
     BACKUP_RETENTION.schedule()
+    schedule_artifact_retention(settings=SETTINGS)
     value = os.environ.get("MCP_HEARTBEAT_FILE")
     task = asyncio.create_task(pulse(Path(value))) if value else None
     lifecycle_task = asyncio.create_task(watch_lifecycle())
