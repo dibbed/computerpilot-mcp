@@ -4,12 +4,14 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from core import audit
-from core.audit import AuditPolicy, AuditWriter
+from core.audit import AuditPolicy, AuditWriter, _QueuedRecord
 
 
 def _payload(index: int) -> bytes:
@@ -118,6 +120,108 @@ def test_background_write_failure_is_reported_on_flush(tmp_path: Path, monkeypat
     writer.submit(_payload(1))
     with pytest.raises(RuntimeError, match="Audit writer failed"):
         writer.flush_now()
+
+
+def test_large_batch_respects_rotation_ceiling_on_record_boundaries(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    writer = AuditWriter(path, _policy(batch_size=64, max_file_bytes=512, keep_files=32))
+    for index in range(40):
+        writer.submit(_payload(index))
+    writer.close()
+
+    paths = sorted(tmp_path.glob("audit*.jsonl"))
+    assert len(_records(paths)) == 40
+    assert all(candidate.stat().st_size <= 512 for candidate in paths)
+
+
+def test_flush_fsyncs_active_and_rotated_segments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "audit.jsonl"
+    writer = AuditWriter(path, _policy(batch_size=8, max_file_bytes=512, keep_files=8))
+    for index in range(30):
+        writer.submit(_payload(index))
+    writer._queue.join()
+    retained = [candidate for candidate in tmp_path.glob("audit*.jsonl") if candidate.is_file()]
+    assert len(retained) >= 2
+
+    original_fsync = audit.os.fsync
+    calls = 0
+
+    def counting_fsync(fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        original_fsync(fd)
+
+    monkeypatch.setattr(audit.os, "fsync", counting_fsync)
+    writer.flush_now()
+    assert calls == len(retained)
+    writer.close()
+
+
+def test_submit_accepted_before_close_is_drained_before_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "audit.jsonl"
+    writer = AuditWriter(path, _policy(batch_size=1))
+    entered = threading.Event()
+    release = threading.Event()
+    close_done = threading.Event()
+    original_put = writer._queue.put
+
+    def blocked_put(item: _QueuedRecord, block: bool = True, timeout: float | None = None) -> None:
+        if item.payload is not None and not entered.is_set():
+            entered.set()
+            assert release.wait(2)
+        original_put(item, block=block, timeout=timeout)
+
+    monkeypatch.setattr(writer._queue, "put", blocked_put)
+    def close_writer() -> None:
+        writer.close()
+        close_done.set()
+
+    submitter = threading.Thread(target=lambda: writer.submit(_payload(1)))
+    closer = threading.Thread(target=close_writer)
+    submitter.start()
+    assert entered.wait(1)
+    closer.start()
+    time.sleep(0.05)
+    assert close_done.is_set() is False
+
+    release.set()
+    submitter.join(3)
+    closer.join(3)
+    assert close_done.is_set()
+    assert len(_records([path])) == 1
+
+
+def test_close_timeout_keeps_writer_retryable_until_thread_stops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = AuditWriter(tmp_path / "audit.jsonl", _policy(batch_size=1))
+    entered = threading.Event()
+    release = threading.Event()
+    original = writer._append_payloads
+
+    def blocked(payloads: list[bytes], *, durable: bool) -> None:
+        if payloads and not release.is_set():
+            entered.set()
+            assert release.wait(2)
+        original(payloads, durable=durable)
+
+    monkeypatch.setattr(audit, "_DURABLE_WAIT_SEC", 0.05)
+    monkeypatch.setattr(writer, "_append_payloads", blocked)
+    writer.submit(_payload(1))
+    assert entered.wait(1)
+
+    with pytest.raises(TimeoutError, match="Timed out draining"):
+        writer.close()
+    assert writer._thread is not None
+    assert writer._thread.is_alive()
+
+    release.set()
+    writer.close()
+    assert writer._thread is None
 
 
 def test_multiple_processes_share_rotation_without_corrupting_json(tmp_path: Path) -> None:

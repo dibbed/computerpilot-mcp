@@ -103,9 +103,10 @@ class AuditWriter:
         self.policy = policy
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._queue: queue.Queue[_QueuedRecord] = queue.Queue(maxsize=policy.queue_max)
-        self._thread_lock = threading.Lock()
+        self._thread_lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._closed = False
+        self._stop_completed: threading.Event | None = None
         self._failure_lock = threading.Lock()
         self._failure: BaseException | None = None
         self._prune_excess_rotations()
@@ -157,21 +158,72 @@ class AuditWriter:
             os.replace(self.path, self._rotation_path(1))
         self._prune_excess_rotations_locked()
 
+    def _fsync_retained_locked(self) -> None:
+        candidates = [self.path, *(self._rotation_path(index) for index in range(1, self.policy.keep_files + 1))]
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                with candidate.open("ab", buffering=0) as handle:
+                    os.fsync(handle.fileno())
+            except FileNotFoundError:
+                continue
+
     def _append_payloads(self, payloads: list[bytes], *, durable: bool) -> None:
-        combined = b"".join(payloads)
+        """Append complete JSONL records without letting one batch bypass rotation limits."""
+
         last_error: OSError | TimeoutError | None = None
         for attempt in range(_WRITE_RETRIES):
             try:
                 with _interprocess_lock(self.path):
-                    if combined:
-                        self._rotate_locked(len(combined))
-                        with self.path.open("ab", buffering=0) as handle:
-                            handle.write(combined)
-                            if durable:
+                    if payloads:
+                        try:
+                            current_size = self.path.stat().st_size
+                        except FileNotFoundError:
+                            current_size = 0
+                        handle = None
+                        pending: list[bytes] = []
+                        pending_bytes = 0
+
+                        def flush_pending() -> None:
+                            nonlocal handle, current_size, pending, pending_bytes
+                            if not pending:
+                                return
+                            if handle is None:
+                                handle = self.path.open("ab", buffering=0)
+                            view = memoryview(b"".join(pending))
+                            while view:
+                                written = handle.write(view)
+                                if not written:
+                                    raise OSError("Short audit write.")
+                                view = view[written:]
+                            current_size += pending_bytes
+                            pending = []
+                            pending_bytes = 0
+
+                        try:
+                            for payload in payloads:
+                                effective_size = current_size + pending_bytes
+                                if effective_size > 0 and effective_size + len(payload) > self.policy.max_file_bytes:
+                                    flush_pending()
+                                    if handle is not None:
+                                        handle.close()
+                                        handle = None
+                                    self._rotate_locked(len(payload))
+                                    try:
+                                        current_size = self.path.stat().st_size
+                                    except FileNotFoundError:
+                                        current_size = 0
+                                pending.append(payload)
+                                pending_bytes += len(payload)
+                            flush_pending()
+                            if durable and handle is not None:
                                 os.fsync(handle.fileno())
-                    elif durable and self.path.exists():
-                        with self.path.open("ab", buffering=0) as handle:
-                            os.fsync(handle.fileno())
+                        finally:
+                            if handle is not None:
+                                handle.close()
+                    elif durable:
+                        self._fsync_retained_locked()
                 return
             except (OSError, TimeoutError) as exc:
                 last_error = exc
@@ -259,17 +311,18 @@ class AuditWriter:
             self._thread.start()
 
     def submit(self, payload: bytes, *, durable: bool = False) -> None:
-        """Queue one record; fall back to synchronous append when the queue is saturated."""
+        """Queue one record; fall back synchronously without racing writer shutdown."""
 
-        self._raise_failure()
-        self._ensure_thread()
         completed = threading.Event() if durable else None
         item = _QueuedRecord(payload=payload, durable=durable, completed=completed)
-        try:
-            self._queue.put(item, timeout=_SYNC_FALLBACK_WAIT_SEC)
-        except queue.Full:
-            self._append_payloads([payload], durable=durable)
-            return
+        with self._thread_lock:
+            self._raise_failure()
+            self._ensure_thread()
+            try:
+                self._queue.put(item, timeout=_SYNC_FALLBACK_WAIT_SEC)
+            except queue.Full:
+                self._append_payloads([payload], durable=durable)
+                return
 
         if completed is not None:
             if not completed.wait(_DURABLE_WAIT_SEC):
@@ -277,39 +330,60 @@ class AuditWriter:
             self._raise_failure()
 
     def flush_now(self) -> None:
-        """Flush all previously queued records and fsync the active audit file."""
+        """Flush all previously accepted records and fsync every retained audit segment."""
 
-        self._raise_failure()
-        with self._thread_lock:
-            thread = self._thread
-        if thread is None:
-            return
         completed = threading.Event()
-        self._queue.put(_QueuedRecord(barrier=True, completed=completed), timeout=_DURABLE_WAIT_SEC)
+        with self._thread_lock:
+            self._raise_failure()
+            thread = self._thread
+            if thread is None:
+                return
+            if self._closed:
+                stop_completed = self._stop_completed
+                if stop_completed is None:
+                    raise RuntimeError("Audit writer is closed.")
+                completed = stop_completed
+            else:
+                self._queue.put(_QueuedRecord(barrier=True, completed=completed), timeout=_DURABLE_WAIT_SEC)
         if not completed.wait(_DURABLE_WAIT_SEC):
             raise TimeoutError("Timed out flushing the audit writer.")
         self._raise_failure()
 
     def close(self) -> None:
-        """Drain queued records and stop the writer thread."""
+        """Drain queued records and stop the writer thread, surfacing bounded shutdown failure."""
 
         with self._thread_lock:
-            if self._closed:
-                return
             self._closed = True
             thread = self._thread
-        if thread is None:
-            return
-        self._raise_failure()
-        try:
-            completed = threading.Event()
-            self._queue.put(_QueuedRecord(barrier=True, stop=True, completed=completed), timeout=_DURABLE_WAIT_SEC)
-            completed.wait(_DURABLE_WAIT_SEC)
-            thread.join(timeout=_DURABLE_WAIT_SEC)
+            if thread is None:
+                return
             self._raise_failure()
-        finally:
-            with self._thread_lock:
+            completed = self._stop_completed
+            if completed is None:
+                completed = threading.Event()
+                self._stop_completed = completed
+                try:
+                    self._queue.put(
+                        _QueuedRecord(barrier=True, stop=True, completed=completed),
+                        timeout=_DURABLE_WAIT_SEC,
+                    )
+                except BaseException:
+                    if self._stop_completed is completed:
+                        self._stop_completed = None
+                    raise
+        if not completed.wait(_DURABLE_WAIT_SEC):
+            if not thread.is_alive():
+                self._raise_failure()
+            raise TimeoutError("Timed out draining the audit writer during close.")
+        thread.join(timeout=_DURABLE_WAIT_SEC)
+        if thread.is_alive():
+            raise TimeoutError("Timed out stopping the audit writer thread.")
+        self._raise_failure()
+        with self._thread_lock:
+            if self._thread is thread:
                 self._thread = None
+            if self._stop_completed is completed:
+                self._stop_completed = None
 
 
 _WRITER_LOCK = threading.Lock()

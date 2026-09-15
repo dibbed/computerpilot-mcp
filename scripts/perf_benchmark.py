@@ -845,6 +845,11 @@ def _reset_audit_benchmark_files(path: Path) -> None:
         candidate.unlink(missing_ok=True)
 
 
+def _line_count(path: Path) -> int:
+    with path.open("rb") as handle:
+        return sum(1 for _ in handle)
+
+
 def _audit_legacy_sync_once(path: Path, events: int, threads: int) -> dict[str, Any]:
     _reset_audit_benchmark_files(path)
     payload = _audit_payload()
@@ -870,7 +875,7 @@ def _audit_legacy_sync_once(path: Path, events: int, threads: int) -> dict[str, 
     return {
         "events": events,
         "threads": threads,
-        "lines": sum(1 for _ in path.open("rb")),
+        "lines": _line_count(path),
         "bytes": path.stat().st_size,
         "caller_median_ms": round(statistics.median(latencies), 6),
         "caller_p95_ms": round(_percentile_95(latencies), 6),
@@ -910,7 +915,7 @@ def _audit_batched_once(path: Path, events: int, threads: int) -> dict[str, Any]
     return {
         "events": events,
         "threads": threads,
-        "lines": sum(1 for _ in path.open("rb")),
+        "lines": _line_count(path),
         "bytes": path.stat().st_size,
         "caller_median_ms": round(statistics.median(latencies), 6),
         "caller_p95_ms": round(_percentile_95(latencies), 6),
@@ -982,6 +987,7 @@ def _backup_retention_once(directory: Path, files: int) -> dict[str, Any]:
         max_bytes=max(size, files * size // 4),
         max_age_sec=30 * 86_400,
         cleanup_interval_sec=0,
+        recent_grace_sec=0,
     )
     result = cleanup_backups(directory, policy, now=now)
     return {"fixture_files": files, "file_size": size, **result.to_dict()}
@@ -1023,6 +1029,7 @@ def _artifact_retention_once(directory: Path, files: int) -> dict[str, Any]:
         max_age_sec=7 * 86_400,
         max_count=max(1, files // 4),
         cleanup_interval_sec=0,
+        recent_grace_sec=0,
     )
     started = time.perf_counter()
     result = cleanup_artifacts(directory, policy, now=now)
