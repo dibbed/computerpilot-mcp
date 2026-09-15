@@ -127,6 +127,7 @@ class JobStore:
         encoding: str = "utf-8",
         *,
         queue_timeout_sec: float | None = None,
+        _retention_retry: bool = False,
     ) -> dict[str, Any]:
         if not command or not command[0] or not cwd.is_dir():
             raise ValueError("An executable and existing working directory are required.")
@@ -159,7 +160,24 @@ class JobStore:
         if not inserted:
             if existing["fingerprint"] != fingerprint:
                 raise ToolError("idempotency_conflict", "This request key already belongs to a different command.")
-            result = self.get(existing["id"])
+            try:
+                result = self.get(existing["id"])
+            except ToolError as exc:
+                if exc.code != "job_not_found" or _retention_retry:
+                    raise
+                # Terminal-history retention may delete the row after the
+                # idempotency transaction commits but before the follow-up
+                # status read. Retry once: if the history row is truly gone,
+                # the same request key is now eligible to create a fresh job.
+                return self.submit(
+                    command,
+                    cwd,
+                    timeout_sec,
+                    request_key,
+                    encoding,
+                    queue_timeout_sec=queue_timeout_sec,
+                    _retention_retry=True,
+                )
             if result["status"] == "queued":
                 from core.job_scheduler import ensure_job_scheduler
                 ensure_job_scheduler(self)

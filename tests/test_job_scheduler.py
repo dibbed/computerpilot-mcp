@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -186,6 +188,20 @@ def test_scheduler_start_failure_does_not_poison_registry(
     with pytest.raises(RuntimeError, match="cannot start thread"):
         job_scheduler.ensure_job_scheduler(cast(JobStore, FakeStore()))
     assert job_scheduler._SCHEDULERS == {}
+
+
+def test_detached_worker_reaper_waits_without_affecting_child_lifetime() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.05)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    job_scheduler._start_worker_reaper(process)
+    deadline = time.monotonic() + 2
+    while process.returncode is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert process.returncode == 0
 
 
 def test_reserved_worker_claim_requires_matching_launch_token(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -195,3 +196,43 @@ def test_orphan_cleanup_rechecks_database_before_deleting_directory(tmp_path: Pa
     assert active in _ids(store)
     assert directory.is_dir()
     assert result.orphan_dirs_removed == 0
+
+
+def test_submit_retries_if_terminal_history_is_pruned_between_dedup_and_status_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import core.job_scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "ensure_job_scheduler", lambda _store: None)
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    command = [sys.executable, "-c", "pass"]
+    old = store.submit(command, tmp_path, 1, "same-key")
+    old_id = str(old["job_id"])
+    store.update(old_id, status="succeeded")
+    newest = store.submit(command, tmp_path, 1, "newest-key")
+    newest_id = str(newest["job_id"])
+    store.update(newest_id, status="succeeded")
+    now = time.time()
+    with store.connect() as db, db:
+        db.execute("UPDATE jobs SET updated=? WHERE id=?", (now - 100, old_id))
+
+    original_get = store.get
+    raced = False
+
+    def racing_get(job_id: str) -> dict[str, Any]:
+        nonlocal raced
+        if job_id == old_id and not raced:
+            raced = True
+            cleanup_job_history(store.path, store.output_dir, _policy(age=1, grace=0), now=now)
+        return original_get(job_id)
+
+    monkeypatch.setattr(store, "get", racing_get)
+    result = store.submit(command, tmp_path, 1, "same-key")
+
+    assert raced is True
+    assert result["deduplicated"] is False
+    assert result["job_id"] != old_id
+    assert result["status"] == "queued"
+    assert old_id not in _ids(store)
+    assert newest_id in _ids(store)
