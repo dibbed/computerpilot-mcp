@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -134,7 +135,12 @@ def test_replace_preserves_record_identity_for_unchanged_text(
     before = functions["memory_read"]("project", section="important_paths", max_items=10)
     one = next(item for item in before["items"] if item["text"] == "one")
 
-    replaced = functions["memory_update"]("project", important_paths=["one", "three"], replace=True)
+    replaced = functions["memory_update"](
+        "project",
+        important_paths=["one", "three"],
+        replace=True,
+        expected_revision=1,
+    )
     after = functions["memory_read"]("project", section="important_paths", max_items=10)
     one_after = next(item for item in after["items"] if item["text"] == "one")
 
@@ -244,6 +250,79 @@ def test_existing_versioned_record_without_provenance_defaults_to_manual(
     assert record["source_ref"] is None
     assert record["verified_at"] is None
     assert record["revision"] == 2
+
+
+def test_replace_requires_expected_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    functions = _functions(tmp_path, monkeypatch)
+    functions["memory_update"]("project", important_paths=["one"])
+
+    result = functions["memory_update"]("project", important_paths=["two"], replace=True)
+
+    assert result["ok"] is False
+    assert result["error"] == "memory_revision_required"
+    assert {item["text"] for item in functions["memory_read"]("project", section="important_paths")["items"]} == {"one"}
+
+
+def test_stale_expected_revision_returns_memory_conflict_without_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    functions = _functions(tmp_path, monkeypatch)
+    functions["memory_update"]("project", previous_fixes=["first"])
+
+    result = functions["memory_update"](
+        "project",
+        previous_fixes=["stale"],
+        expected_revision=0,
+    )
+    read = functions["memory_read"]("project", section="previous_fixes")
+
+    assert result["ok"] is False
+    assert result["error"] == "memory_conflict"
+    assert read["revision"] == 1
+    assert [item["text"] for item in read["items"]] == ["first"]
+
+
+def test_matching_expected_revision_allows_update(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    functions = _functions(tmp_path, monkeypatch)
+    functions["memory_update"]("project", previous_fixes=["first"])
+
+    result = functions["memory_update"](
+        "project",
+        previous_fixes=["second"],
+        expected_revision=1,
+    )
+
+    assert result["ok"] is True
+    assert result["revision"] == 2
+    assert {item["text"] for item in functions["memory_read"]("project", section="previous_fixes")["items"]} == {
+        "first",
+        "second",
+    }
+
+
+def test_concurrent_updates_from_same_revision_never_silently_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    functions = _functions(tmp_path, monkeypatch)
+    barrier = threading.Barrier(2)
+
+    def update(text: str) -> dict[str, Any]:
+        barrier.wait(timeout=3)
+        return functions["memory_update"]("project", previous_fixes=[text], expected_revision=0)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(update, ["left", "right"]))
+
+    successes = [result for result in results if result.get("ok") is True]
+    conflicts = [result for result in results if result.get("error") == "memory_conflict"]
+    read = functions["memory_read"]("project", section="previous_fixes")
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    assert read["revision"] == 1
+    assert len(read["items"]) == 1
+    assert read["items"][0]["text"] in {"left", "right"}
 
 
 def test_future_memory_schema_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -83,12 +83,26 @@ def register(mcp: MCPServer) -> None:
         source: Literal["user", "project_scan", "manual", "tool"] | None = None,
         source_ref: Annotated[str | None, Field(max_length=2_000)] = None,
         verified: bool = False,
+        expected_revision: Annotated[int | None, Field(ge=0)] = None,
     ) -> dict[str, Any]:
-        """Merge or replace bounded project memory with explicit provenance metadata."""
+        """Merge or replace bounded project memory with provenance and optimistic revision checks."""
 
         with RESOURCE_LOCKS.sync(_path(project_name)):
             path = _path(project_name)
             current = _load(project_name)
+            current_revision = int(current["revision"])
+            if replace and expected_revision is None:
+                raise ToolError(
+                    "memory_revision_required",
+                    "replace=True requires expected_revision to prevent blind overwrites.",
+                    hint="Call memory_read first and retry with its current revision.",
+                )
+            if expected_revision is not None and expected_revision != current_revision:
+                raise ToolError(
+                    "memory_conflict",
+                    f"Expected memory revision {expected_revision}, but current revision is {current_revision}.",
+                    hint="Read the latest memory, merge your changes, and retry with the new revision.",
+                )
             incoming = {
                 "architecture_decisions": architecture_decisions or [],
                 "important_paths": important_paths or [],
@@ -111,6 +125,7 @@ def register(mcp: MCPServer) -> None:
                     "changed": changed,
                     "revision_before": current["revision"],
                     "revision_after": next_data["revision"],
+                    "expected_revision": expected_revision,
                     "source": source or "manual",
                     "verified": verified,
                     "item_counts": {key: len(value) for key, value in incoming.items()},
