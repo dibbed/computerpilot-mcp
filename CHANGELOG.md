@@ -18,6 +18,9 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Add Phase F4 schema-v2 project-memory records with stable IDs, item/project revisions, legacy `list[str]` normalization, and the existing 128 KiB compact-memory ceiling.
 - Add per-record memory provenance (`source`, optional `source_ref`) and verification timestamps while keeping memory metadata non-authoritative with respect to runtime/tool safety policy.
 - Add `expected_revision` optimistic concurrency to `memory_update`; stale writers receive `memory_conflict`, while destructive `replace=True` requires an explicit revision.
+- Add Phase F5 centralized resource-budget reporting for AST cache, search snapshots, browser capacity/idle policy, durable-job admission/history, artifacts, backups, and audit retention.
+- Add hard browser-capacity budgets with `MCP_BROWSER_MAX_SESSIONS=20` and `MCP_BROWSER_MAX_POOLS=6` defaults; concurrent session creation reserves capacity before asynchronous context/navigation work.
+- Expand `server_health` with live RSS, cache/snapshot, browser, background-process, durable-job, artifact, backup, and audit usage plus per-resource value/max/unit/usage-ratio telemetry and overall pressure classification.
 
 ### Changed
 - Destructive audit events for file deletion/move, process termination, durable-job cancellation, and supervisor runtime termination now use durable fsync-backed audit boundaries; normal MCP lifecycle shutdown explicitly flushes queued audit records. Audit payloads remain metadata-only.
@@ -28,6 +31,7 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Expired terminal-job rows no longer retain their idempotency keys indefinitely; reusing a key after its history record has been pruned may submit a new job.
 - Legacy project-memory string arrays now load read-only as deterministic `source=legacy` records without rewriting the original file; the first successful update materializes schema v2 atomically while preserving semantic revision behavior.
 - `memory_read` now returns record metadata and project revision, while `memory_list` reports schema/revision metadata for each readable project memory file.
+- `server_health` resource collection is observational only: it reports bounded resource state without triggering cleanup, eviction, process termination, or policy changes. The optional incremental storage-counter architecture remains deferred because measured health scans stay below 100 ms on the current bounded corpus.
 
 ### Fixed
 - Harden F1 audit rotation so a large queued batch is split on complete JSONL record boundaries instead of allowing the active segment to exceed its configured ceiling; serialize submit/close acceptance, make close timeouts observable/retryable, and fsync every retained segment at explicit flush/shutdown boundaries.
@@ -52,6 +56,9 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Phase F4 validation completed with **326 passing pytest tests**, Ruff with zero violations, mypy with zero issues across **96 source files**, successful compileall, a passing **60-tool** health check, and Full Doctor including a real disposable Chromium launch.
 - The real legacy `memory/psychology_atlas.json` file remained byte-identical during read-only normalization and produced **115 stable `source=legacy` records** (46 architecture decisions, 34 important paths, 6 user preferences, 29 previous fixes). Materializing a copy as schema v2 produced a **37,041-byte** file from the original **18,839 bytes**, below the 128 KiB cap.
 - Cross-process F4 acceptance launched two independent writers with `expected_revision=0`; exactly one committed revision 1 and the other returned `memory_conflict`. The oversized-memory acceptance also verified that `memory_too_large` leaves the previous file SHA-256 unchanged.
+- Phase F5 validation completed with **330 passing pytest tests**, Ruff with zero violations, mypy with zero issues across **99 source files**, successful compileall, a passing **60-tool** health check, and Full Doctor including a real disposable Chromium launch.
+- F5 live health sampling on the bounded state corpus measured **82.87 ms median**, **85.24 ms p95**, and **98.82 ms maximum** across 50 runs. At measurement time pressure was `normal`, with roughly 74 MiB RSS, 22 artifacts / 6.6 MB, about 35 MB of backups, about 3.4 MB of audit data, 4 terminal jobs, and no active browser/background/durable-job work.
+- Browser budget acceptance verified both direct limit errors and concurrent pending-session accounting: a second logical session cannot oversubscribe `MCP_BROWSER_MAX_SESSIONS` while the first session is still navigating and not yet published.
 
 ## [0.0.16] - 2026-09-15
 

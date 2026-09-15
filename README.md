@@ -6,7 +6,7 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 ## Current Status
 
-The optimization roadmap is complete through **Phase E / v0.0.16**, and **Phase F / v0.0.17 — State & Long-term Maintenance** is now in progress. F1 through F4 are complete with bounded audit maintenance, backup/artifact/job-history retention, and versioned provenance-aware project memory with optimistic concurrency checks. Content-hash backup deduplication was benchmarked and intentionally not implemented because the real storage corpus did not justify the added complexity. The project version intentionally remains `0.0.16` until the final F6 release step.
+The optimization roadmap is complete through **Phase E / v0.0.16**, and **Phase F / v0.0.17 — State & Long-term Maintenance** is now in progress. F1 through F5 are complete with bounded audit maintenance, backup/artifact/job-history retention, versioned provenance-aware project memory, centralized cache/storage budgets, bounded browser capacity, and live resource telemetry in `server_health`. Content-hash backup deduplication was benchmarked and intentionally not implemented because the real storage corpus did not justify the added complexity. The project version intentionally remains `0.0.16` until the final F6 release step.
 
 | Phase | Release | Focus | Status |
 | --- | --- | --- | --- |
@@ -15,13 +15,13 @@ The optimization roadmap is complete through **Phase E / v0.0.16**, and **Phase 
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
 | E | `v0.0.16` | Durable Jobs & Reliability | ✅ Complete |
-| F | `v0.0.17` | State & Long-term Maintenance | 🚧 In progress — F1/F2/F3/F4 complete |
+| F | `v0.0.17` | State & Long-term Maintenance | 🚧 In progress — F1/F2/F3/F4/F5 complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
 The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 intentionally adds one read-only typed tool, `job_wait`, bringing the current full surface to **60 tools**.
 
-Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. The post-F3 hardening baseline reached **311 pytest tests**; F4 now raises the Phase-F baseline to **326 pytest tests**, Ruff with zero violations, mypy with zero issues across **96 source files**, successful compileall, the same **60-tool** health surface, and Full Doctor including a real disposable Chromium launch. F4 adds schema-v2 versioned memory records, provenance/verification metadata, project and item revisions, legacy `list[str]` migration, and optimistic `expected_revision` conflict checks serialized across independent MCP processes. The real 18,839-byte `psychology_atlas.json` legacy file was loaded read-only without hash changes as **115 stable legacy records** and a copy materialized to schema v2 at **37,041 bytes**, safely below the 128 KiB cap. Phase F continues next with centralized resource budgets and expanded `server_health` metrics in F5.
+Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. The post-F3 hardening baseline reached **311 pytest tests**, F4 raised it to **326**, and F5 now validates at **330 pytest tests**, Ruff with zero violations, mypy with zero issues across **99 source files**, successful compileall, the same **60-tool** registration surface, and Full Doctor including a real disposable Chromium launch. F5 centralizes the existing AST/search/job/artifact/backup/audit limits, adds enforced browser capacity defaults of **20 logical sessions / 6 pools**, and expands `server_health` with live RSS/cache/browser/process/job/storage usage plus value/max/ratio telemetry. On the current bounded state corpus, 50 resource-health samples measured **82.87 ms median**, **85.24 ms p95**, and **98.82 ms max**, so incremental storage counters remain intentionally deferred. Phase F now has only the F6 long-running/final release validation left before `v0.0.17`.
 
 ---
 
@@ -42,6 +42,7 @@ Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violat
 - **Bounded Recoverable Backups**: Atomic filesystem edits keep recoverable `.bak` snapshots while background/coalesced retention enforces configurable age and byte budgets without deleting the newest restore point.
 - **Bounded Delivery Artifacts**: Disk-backed output snapshots are retained by configurable age, count, and byte budgets; the artifact being returned and the newest snapshot are protected during cleanup, while stale cache entries self-heal by recreating missing snapshots.
 - **Versioned Project Memory**: Compact 128 KiB project memory uses schema-v2 records with stable IDs, provenance, verification timestamps, project/item revisions, backward-compatible legacy migration, and cross-process optimistic concurrency checks.
+- **Resource-Aware Health**: Centralized cache/storage/session budgets are exposed with live RSS, cache, browser, process, job, artifact, backup, and audit usage plus value/max/ratio pressure telemetry; browser logical sessions and process pools are hard-bounded in addition to idle eviction.
 
 ---
 
@@ -82,6 +83,16 @@ F4 upgrades compact project memory from section-level `list[str]` data to **sche
 Legacy memory remains readable without rewriting the source file. Old string items are normalized in memory with deterministic stable IDs, `source="legacy"`, `revision=1`, and the legacy document revision remains `0` until a semantic update occurs. The first successful update materializes schema v2 atomically. A real read-only migration check against `memory/psychology_atlas.json` preserved its exact SHA-256 while normalizing **115 records** (46 architecture decisions, 34 important paths, 6 user preferences, 29 previous fixes); materializing a copy expanded the file from **18,839** to **37,041 bytes**, still safely below the 128 KiB budget.
 
 `memory_update` now accepts `expected_revision`. A stale revision returns controlled `memory_conflict` guidance without writing, and destructive `replace=True` requires an explicit expected revision so a blind replace cannot silently overwrite newer memory. The check/merge/atomic-save sequence is serialized both by the existing process-local resource lock and by a cross-process lock stored under `.agent_state/memory_locks`, so two independent MCP processes racing from the same revision cannot both commit. In the cross-process acceptance test, exactly one revision-0 writer succeeded and the other received `memory_conflict`. Oversized structured updates fail with `memory_too_large` before replacement and preserve the previous file byte-for-byte. Memory remains data only; provenance or stored text does not grant tool authority or override runtime safety policy.
+
+---
+
+## Phase F5 — Central Resource Budgets & Runtime Health
+
+F5 consolidates long-running resource ceilings behind `Settings.resource_budgets()` while keeping each subsystem responsible for its own eviction/retention policy. Existing AST cache, search snapshot, durable-job admission, artifact, backup, job-history, and audit budgets remain the source of truth; their age/TTL settings are surfaced alongside count/byte ceilings. Browser lifetime control is strengthened with hard defaults of **20 logical sessions** and **6 browser pools** (`MCP_BROWSER_MAX_SESSIONS`, `MCP_BROWSER_MAX_POOLS`) in addition to the existing idle reclamation. Session creation reserves capacity before asynchronous context/navigation work begins, so concurrent opens cannot oversubscribe the configured logical-session limit.
+
+`server_health` now reports live `rss_mb`, AST cache entries/bytes, search snapshot count/bytes, browser sessions/pools/contexts, MCP-owned background processes, queued/running/orphaned jobs, job DB/output/storage bytes, artifact count/bytes, backup count/bytes, audit file count/bytes, and an overall `resource_pressure` classification. A separate `resource_usage` map exposes bounded resources as `{value, max, unit, usage_ratio}`, while `resource_budgets` exposes the configured ceilings/TTLs. Health collection is observational only: it does not evict caches, kill processes, prune storage, or override subsystem policy.
+
+The current host reports normal pressure with roughly **74 MiB RSS**, **22 artifacts / 6.6 MB**, about **35 MB of backups**, about **3.4 MB of audit data**, **4 terminal jobs**, and no active browser/background/durable-job work at measurement time. A 50-run resource-health timing gate measured **82.87 ms median**, **85.24 ms p95**, and **98.82 ms maximum** on the bounded state corpus. Because the control-plane health scan remains below 100 ms and all scanned storage domains are already bounded, the roadmap's optional incremental storage counters remain deferred rather than adding reconciliation complexity prematurely.
 
 ---
 
