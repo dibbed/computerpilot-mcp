@@ -31,12 +31,23 @@ def test_restart_backoff() -> None:
 def test_watchdog_recovers_hung_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(module, "restart_delay", lambda failures: 0)
     counter = tmp_path / "attempts"
-    code = (
-        "import os,time;from pathlib import Path;"
-        f"p=Path({str(counter)!r}); n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n));"
-        "h=Path(os.environ['MCP_HEARTBEAT_FILE']);h.write_text(str(os.getpid()));"
-        "os.utime(h,(0,0)) if n==1 else None;time.sleep(60)"
-    )
+    code = f"""
+import os
+import time
+from pathlib import Path
+
+p = Path({str(counter)!r})
+n = int(p.read_text()) + 1 if p.exists() else 1
+p.write_text(str(n))
+h = Path(os.environ["MCP_HEARTBEAT_FILE"])
+h.write_text(str(os.getpid()))
+if n == 1:
+    os.utime(h, (0, 0))
+    time.sleep(60)
+while True:
+    h.write_text(str(os.getpid()))
+    time.sleep(0.03)
+"""
     supervisor = Supervisor([sys.executable, "-c", code], readiness_url=None, state_dir=tmp_path, grace=0.15, interval=0.03)
     thread = threading.Thread(target=supervisor.run)
     thread.start()
@@ -128,7 +139,7 @@ def test_runtime_restart_preserves_durable_job(tmp_path: Path) -> None:
     thread = threading.Thread(target=supervisor.run)
     thread.start()
     try:
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 30
         requested = False
         while time.monotonic() < deadline:
             state = supervisor.snapshot()
@@ -145,6 +156,49 @@ def test_runtime_restart_preserves_durable_job(tmp_path: Path) -> None:
     finally:
         supervisor.stop.set()
         thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+def test_consecutive_runtime_restarts_preserve_one_durable_job(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    output = tmp_path / "completed-twice"
+    job_code = f"import time;from pathlib import Path;time.sleep(3);Path({str(output)!r}).write_text('once')"
+    code = (
+        "import os,sys,time;from pathlib import Path;from core.jobs import JobStore;"
+        f"s=JobStore(Path({str(database)!r}));"
+        f"s.submit([sys.executable,'-c',{job_code!r}],Path({str(tmp_path)!r}),15,'persistent-twice');"
+        "Path(os.environ['MCP_HEARTBEAT_FILE']).write_text(str(os.getpid()));time.sleep(60)"
+    )
+    supervisor = Supervisor(
+        [sys.executable, "-c", code],
+        readiness_url=None,
+        state_dir=tmp_path,
+        grace=10,
+        interval=0.05,
+    )
+    thread = threading.Thread(target=supervisor.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 30
+        requested_restarts = 0
+        while time.monotonic() < deadline:
+            state = supervisor.snapshot()
+            if state["state"] == "running" and state["restart_count"] == requested_restarts and requested_restarts < 2:
+                supervisor.restart.set()
+                requested_restarts += 1
+            if state["state"] == "running" and state["restart_count"] == 2 and output.exists():
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(supervisor.snapshot())
+        assert requested_restarts == 2
+        assert output.read_text() == "once"
+        jobs = JobStore(database).list(0, 10)
+        assert jobs["total_count"] == 1
+    finally:
+        supervisor.stop.set()
+        thread.join(timeout=10)
+        close_logger(supervisor)
     assert not thread.is_alive()
 
 

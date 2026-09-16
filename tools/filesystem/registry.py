@@ -121,7 +121,7 @@ def register(mcp: MCPServer) -> None:
             return _model_image_result(target)
 
         result = service.read_window(
-            target,
+            str(target),
             start_line=start_line,
             end_line=end_line,
             offset=offset,

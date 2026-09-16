@@ -22,6 +22,7 @@ from core.response import bounded_text, failure
 from core.timings import flush_timings, timing_span, tool_timing
 from tools.browser.registry import _url_result
 from tools.desktop.native import virtual_key
+from tools.filesystem import service
 from tools.filesystem.registry import RefactorEdit
 from tools.filesystem.service import (
     anchor_replace,
@@ -270,6 +271,64 @@ def test_safe_refactor_rolls_back_failed_validation(tmp_path: Path) -> None:
         )
     assert caught.value.code == "validation_failed_rolled_back"
     assert target.read_text(encoding="utf-8") == original
+
+
+def test_atomic_write_retries_transient_windows_replace_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "atomic.txt"
+    target.write_text("old", encoding="utf-8")
+    original_replace = service.os.replace
+    calls = 0
+
+    def flaky_replace(source: str | bytes | Path, destination: str | bytes | Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise PermissionError(13, "Access is denied")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(service.os, "replace", flaky_replace)
+    result = service.atomic_write(
+        target,
+        "new",
+        encoding="utf-8",
+        create_parents=False,
+        backup=False,
+        validate_python=False,
+    )
+
+    assert calls == 3
+    assert result["ok"] is True
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_atomic_write_does_not_retry_nontransient_replace_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "atomic.txt"
+    target.write_text("old", encoding="utf-8")
+    calls = 0
+
+    def missing_replace(source: str | bytes | Path, destination: str | bytes | Path) -> None:
+        nonlocal calls
+        calls += 1
+        raise FileNotFoundError("replace source vanished")
+
+    monkeypatch.setattr(service.os, "replace", missing_replace)
+    with pytest.raises(FileNotFoundError, match="replace source vanished"):
+        service.atomic_write(
+            target,
+            "new",
+            encoding="utf-8",
+            create_parents=False,
+            backup=False,
+            validate_python=False,
+        )
+    assert calls == 1
+    assert target.read_text(encoding="utf-8") == "old"
 
 
 def test_pytest_summary_parser_and_hotkey_mapping() -> None:

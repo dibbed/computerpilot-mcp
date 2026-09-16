@@ -43,6 +43,37 @@ def test_previous_runtime_pending_operation_becomes_uncertain(tmp_path: Path) ->
     assert all(record["schema_version"] == JOURNAL_SCHEMA_VERSION for record in records)
 
 
+def test_repeated_runtime_recovery_marks_pending_operation_uncertain_once(tmp_path: Path) -> None:
+    path = tmp_path / "operations.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "runtime-a")
+    handle = journal.begin("write_file", "path=C:/work/restart-safe.txt")
+    assert handle is not None
+
+    journal.configure(path, "runtime-b")
+    first_records = _records(path)
+    first_markers = [
+        record for record in first_records
+        if record.get("type") == "uncertain" and record.get("operation_id") == handle.operation_id
+    ]
+    assert len(first_markers) == 1
+    assert first_markers[0]["marked_by_runtime_id"] == "runtime-b"
+
+    journal.configure(path, "runtime-c")
+    journal.configure(path, "runtime-d")
+    records = _records(path)
+    markers = [
+        record for record in records
+        if record.get("type") == "uncertain" and record.get("operation_id") == handle.operation_id
+    ]
+    assert len(markers) == 1
+    assert markers[0] == first_markers[0]
+    summary = journal.summary()
+    assert summary["uncertain_count"] == 1
+    assert summary["pending_count"] == 0
+    assert summary["uncertain"][0]["operation_id"] == handle.operation_id
+
+
 def test_known_result_is_never_reclassified_uncertain(tmp_path: Path) -> None:
     path = tmp_path / "operations.jsonl"
     journal = OperationRecoveryJournal()
