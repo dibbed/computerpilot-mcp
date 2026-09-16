@@ -6,7 +6,7 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 ## Current Status
 
-The optimization roadmap is complete through **Phase F / v0.0.17 — State & Long-term Maintenance**. Pre-1.0 **Phase G** now covers multimodal screenshots and the ChatGPT vision bridge: `v0.0.18` added native MCP image content, `v0.0.19` added validated synchronous `view_image`, and `v0.0.20` makes browser screenshot vision catalog-compatible by letting the existing `read_file(..., delivery="auto")` tool expose validated PNG/JPEG/WebP pixels directly. F1 through F6 remain complete with bounded audit maintenance, retention, versioned project memory, resource budgets, and long-running/restart validation. Content-hash backup deduplication remains intentionally unimplemented because the measured storage corpus did not justify it. The current project version is `0.0.20`.
+The optimization roadmap and the pre-1.0 multimodal bridge are now stabilized as **v0.1.0 - Optimized Architecture**. Phases A through G remain complete: measurement, core performance, project intelligence, browser/runtime isolation, durable jobs/reliability, long-running state maintenance, and model-visible screenshot delivery are all covered by the stabilization regression, recovery, and concurrency suites. Content-hash backup deduplication remains intentionally unimplemented because the measured storage corpus did not justify it. The current project version is `0.1.0`.
 
 | Phase | Release | Focus | Status |
 | --- | --- | --- | --- |
@@ -16,17 +16,32 @@ The optimization roadmap is complete through **Phase F / v0.0.17 — State & Lon
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
 | E | `v0.0.16` | Durable Jobs & Reliability | ✅ Complete |
 | F | `v0.0.17` | State & Long-term Maintenance | ✅ Complete |
-| G | `v0.0.18`–`v0.0.20` | Multimodal Screenshot Delivery & ChatGPT Vision Bridge | ✅ Complete |
+| G | `v0.0.18`-`v0.0.20` | Multimodal Screenshot Delivery & ChatGPT Vision Bridge | ✅ Complete |
+| Milestone | `v0.1.0` | Stabilization & Optimized Architecture | ✅ Complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
 The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 added `job_wait`, and `v0.0.19` adds the read-only synchronous `view_image` bridge, bringing the current full surface to **61 tools**.
 
-Final Phase-E validation on Windows completed with **267 pytest tests**. Phase F progressively raised that baseline through the F3 hardening audit (**311 tests**), F4 (**326 tests**), and the final F5/F6 release candidate at **330 pytest tests**. Phase G reached **334 passing pytest tests** in `v0.0.18`, **336** in `v0.0.19`, and **337** in `v0.0.20` after adding catalog-compatible image delivery through the existing `read_file` tool. The `v0.0.20` candidate passes Ruff with zero violations, mypy with zero issues, compileall, the **61-tool** health check, and Full Doctor including a real disposable Chromium launch. Live ChatGPT testing confirmed both direct desktop vision and the browser `screenshot path -> read_file(delivery="auto") -> ImageContent` path end to end. `server_health` reports version `0.0.20` with normal resource pressure on the validation host.
+Final Phase-E validation on Windows completed with **267 pytest tests**. Phase F progressively raised that baseline through the F3 hardening audit (**311 tests**), F4 (**326 tests**), and the final F5/F6 release candidate at **330 pytest tests**. Phase G reached **334 passing pytest tests** in `v0.0.18`, **336** in `v0.0.19`, and **337** in `v0.0.20`. The `v0.1.0` stabilization suite now contains **341 passing pytest tests**. Its full performance profile completed **42 benchmark cases** with three runs per case, zero errors/skips, and no comparison exceeding the 1.5x regression gate. Recovery-focused validation passes **21 tests**, concurrency/isolation validation passes **39 tests**, Ruff reports zero violations, mypy reports zero issues across **101 source files**, and compileall passes the full source/test surface. Live ChatGPT testing continues to confirm both direct desktop vision and the browser `screenshot path -> read_file(delivery="auto") -> ImageContent` path end to end.
 
 ---
 
-## Phase G — Multimodal Screenshot Delivery & Vision Bridge (`v0.0.18`–`v0.0.20`)
+## v0.1.0 - Optimized Architecture Milestone
+
+`v0.1.0` is a stabilization release, not a feature expansion. It takes the architecture built from the `v0.0.11` baseline through `v0.0.20` and validates the complete system under performance, restart/recovery, and concurrency pressure before declaring the first optimized-architecture milestone.
+
+The runtime architecture now combines fast startup validation with a separate full Doctor path, bounded output and reusable artifacts, keyed resource mutation locks, version-aware AST caching, streaming and snapshot search, shared Playwright browser pools with isolated per-session contexts, bounded durable-job admission and versioned waiting, mutation-aware drain before supervised restart, Windows Job Object process ownership, versioned/provenance-aware project memory, bounded long-running storage budgets, and model-visible desktop/browser screenshots.
+
+The milestone regression profile covers catalog/startup, output through 100 MiB, AST/project workloads through 10,000 files, search through 100,000 files, durable jobs through 50 concurrent submissions, browser workloads through 20 sessions plus mixed Chromium/Firefox coverage, audit batching, backup retention, artifact retention, and durable-job history retention. The full profile completed all 42 cases without errors or skips, and no measured comparison crossed the 1.5x regression gate.
+
+Recovery validation now explicitly covers repeated runtime generations, single-mark uncertain mutation recovery, consecutive supervisor restarts while a durable job survives independently, bounded watchdog drain, and no-replay behavior for uncertain mutations. Concurrency validation includes process-local resource-lock contention, cross-process durable-job admission, browser session/pool isolation, and optimistic cross-process project-memory updates.
+
+Experimental designs such as Persistent PowerShell, a typed batch tool, a warm analysis worker, and a session REPL remain outside `v0.1.0`; they are still benchmark-gated follow-up work rather than hidden requirements of this milestone.
+
+---
+
+## Phase G - Multimodal Screenshot Delivery & Vision Bridge (`v0.0.18`-`v0.0.20`)
 
 `v0.0.18` added protocol-native `ImageContent` output to `browser_screenshot` and `desktop_screenshot`. Live ChatGPT connector testing then exposed a host-specific compatibility difference: synchronous desktop image results render directly, while image content returned from the async Playwright screenshot tool can be wrapped as an opaque connector resource instead of reaching the model as vision input.
 
