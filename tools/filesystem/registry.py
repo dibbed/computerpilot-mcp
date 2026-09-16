@@ -16,6 +16,7 @@ from core.artifacts import deliver_text
 from core.audit import audit_action
 from core.config import resolve_path
 from core.errors import ToolError
+from core.media import image_tool_result, inspect_image
 from core.resource_locks import RESOURCE_LOCKS
 from core.response import ok, page
 from core.tooling import DESTRUCTIVE, MUTATING, READ_ONLY, PathArg, compact_errors
@@ -79,6 +80,23 @@ def _invalidate_if_changed(path: Path, result: dict[str, Any]) -> None:
 
 
 def register(mcp: MCPServer) -> None:
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("view_image")
+    def view_image(path: PathArg) -> dict[str, Any]:
+        """Validate and expose a local PNG, JPEG, or WebP as model-visible MCP image content."""
+
+        target = resolve_path(path)
+        info = inspect_image(target)
+        metadata = {
+            "ok": True,
+            "path": str(target),
+            "bytes": info["bytes"],
+            "width": info["width"],
+            "height": info["height"],
+            "mime_type": info["mime_type"],
+        }
+        return image_tool_result(metadata, target, delivery="auto")
+
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("read_file")
     def read_file(

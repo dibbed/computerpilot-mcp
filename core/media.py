@@ -9,22 +9,40 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from mcp.types import CallToolResult, ContentBlock, ImageContent, TextContent
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from core.config import SETTINGS
+from core.errors import ToolError
 
 ImageDelivery = Literal["path", "image", "auto"]
 
-_MIME_BY_SUFFIX = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-}
+_MIME_BY_FORMAT = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
 
 
-def _mime_type(path: Path) -> str:
-    return _MIME_BY_SUFFIX.get(path.suffix.casefold(), "application/octet-stream")
+def inspect_image(path: str | Path) -> dict[str, Any]:
+    """Validate one supported image before exposing it as model-visible MCP media."""
+
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"Image file not found: {source}")
+    try:
+        with Image.open(source) as opened:
+            image_format = (opened.format or "").upper()
+            width, height = opened.size
+            if image_format not in _MIME_BY_FORMAT:
+                raise ToolError("unsupported_image", f"Unsupported image format: {image_format or source.suffix or 'unknown'}")
+            opened.verify()
+    except ToolError:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ToolError("invalid_image", f"Image cannot be decoded: {source}") from exc
+    return {
+        "path": str(source),
+        "bytes": source.stat().st_size,
+        "width": width,
+        "height": height,
+        "mime_type": _MIME_BY_FORMAT[image_format],
+    }
 
 
 def _jpeg_preview(source: Path, *, max_bytes: int, quality: int) -> tuple[bytes, int, int]:
@@ -65,13 +83,15 @@ def _vision_payload(
     if delivery == "path":
         return None, None, False, None, None
 
-    raw = path.read_bytes()
-    source_mime = _mime_type(path)
-    if delivery == "image" or len(raw) <= max_bytes:
-        return raw, source_mime, False, None, None
+    info = inspect_image(path)
+    source_mime = str(info["mime_type"])
+    source_bytes = int(info["bytes"])
+    if delivery == "auto" and source_bytes > max_bytes:
+        preview, width, height = _jpeg_preview(path, max_bytes=max_bytes, quality=jpeg_quality)
+        return preview, "image/jpeg", True, width, height
 
-    preview, width, height = _jpeg_preview(path, max_bytes=max_bytes, quality=jpeg_quality)
-    return preview, "image/jpeg", True, width, height
+    raw = path.read_bytes()
+    return raw, source_mime, False, None, None
 
 
 def image_tool_result(

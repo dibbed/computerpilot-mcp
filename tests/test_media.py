@@ -101,3 +101,31 @@ def test_desktop_screenshot_returns_image_content_through_mcp(
             assert base64.b64decode(image_block.data) == target.read_bytes()
 
     asyncio.run(scenario())
+
+
+def test_view_image_returns_model_visible_pixels_through_mcp(tmp_path: Path) -> None:
+    target = tmp_path / "view.png"
+    Image.new("RGB", (80, 60), "green").save(target)
+
+    async def scenario() -> None:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            result = await client.call_tool("view_image", {"path": str(target)})
+            assert result.is_error is not True
+            assert isinstance(result.structured_content, dict)
+            assert result.structured_content["ok"] is True
+            assert result.structured_content["width"] == 80
+            assert result.structured_content["height"] == 60
+            assert result.structured_content["mime_type"] == "image/png"
+            assert [block.type for block in result.content] == ["text", "image"]
+            image_block = result.content[1]
+            assert isinstance(image_block, ImageContent)
+            assert base64.b64decode(image_block.data) == target.read_bytes()
+
+    asyncio.run(scenario())
+
+
+def test_browser_screenshot_defaults_to_path_for_chatgpt_bridge() -> None:
+    tools = {tool.name: tool for tool in asyncio.run(create_server().list_tools())}
+    delivery = tools["browser_screenshot"].input_schema["properties"]["delivery"]
+    assert delivery["default"] == "path"
+    assert delivery["enum"] == ["path", "image", "auto"]
