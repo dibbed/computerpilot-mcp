@@ -129,3 +129,24 @@ def test_browser_screenshot_defaults_to_path_for_chatgpt_bridge() -> None:
     delivery = tools["browser_screenshot"].input_schema["properties"]["delivery"]
     assert delivery["default"] == "path"
     assert delivery["enum"] == ["path", "image", "auto"]
+
+
+def test_read_file_auto_exposes_image_through_existing_catalog_tool(tmp_path: Path) -> None:
+    target = tmp_path / "catalog.png"
+    Image.new("RGB", (72, 54), "blue").save(target)
+
+    async def scenario() -> None:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            result = await client.call_tool("read_file", {"path": str(target), "delivery": "auto"})
+            assert result.is_error is not True
+            assert isinstance(result.structured_content, dict)
+            assert result.structured_content["path"] == str(target)
+            assert result.structured_content["width"] == 72
+            assert result.structured_content["height"] == 54
+            assert result.structured_content["mime_type"] == "image/png"
+            assert [block.type for block in result.content] == ["text", "image"]
+            image_block = result.content[1]
+            assert isinstance(image_block, ImageContent)
+            assert base64.b64decode(image_block.data) == target.read_bytes()
+
+    asyncio.run(scenario())

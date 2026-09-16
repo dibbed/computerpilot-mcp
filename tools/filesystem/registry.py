@@ -79,23 +79,29 @@ def _invalidate_if_changed(path: Path, result: dict[str, Any]) -> None:
         PYTHON_METADATA_CACHE.invalidate(path)
 
 
+_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
+
+
+def _model_image_result(target: Path) -> dict[str, Any]:
+    info = inspect_image(target)
+    metadata = {
+        "ok": True,
+        "path": str(target),
+        "bytes": info["bytes"],
+        "width": info["width"],
+        "height": info["height"],
+        "mime_type": info["mime_type"],
+    }
+    return image_tool_result(metadata, target, delivery="auto")
+
+
 def register(mcp: MCPServer) -> None:
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("view_image")
     def view_image(path: PathArg) -> dict[str, Any]:
         """Validate and expose a local PNG, JPEG, or WebP as model-visible MCP image content."""
 
-        target = resolve_path(path)
-        info = inspect_image(target)
-        metadata = {
-            "ok": True,
-            "path": str(target),
-            "bytes": info["bytes"],
-            "width": info["width"],
-            "height": info["height"],
-            "mime_type": info["mime_type"],
-        }
-        return image_tool_result(metadata, target, delivery="auto")
+        return _model_image_result(resolve_path(path))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("read_file")
@@ -108,10 +114,14 @@ def register(mcp: MCPServer) -> None:
         encoding: EncodingArg = "auto",
         delivery: Literal["inline", "file", "auto"] = "inline",
     ) -> dict[str, Any]:
-        """Read a text window; max_chars optionally limits the returned characters."""
+        """Read text, or with delivery=auto expose a PNG/JPEG/WebP as model-visible image content."""
+
+        target = resolve_path(path)
+        if delivery == "auto" and target.suffix.casefold() in _IMAGE_SUFFIXES:
+            return _model_image_result(target)
 
         result = service.read_window(
-            path,
+            target,
             start_line=start_line,
             end_line=end_line,
             offset=offset,
