@@ -6,7 +6,7 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 ## Current Status
 
-The optimization roadmap is complete through **Phase E / v0.0.16**, and **Phase F / v0.0.17 — State & Long-term Maintenance** is now in progress. F1 through F5 are complete with bounded audit maintenance, backup/artifact/job-history retention, versioned provenance-aware project memory, centralized cache/storage budgets, bounded browser capacity, and live resource telemetry in `server_health`. Content-hash backup deduplication was benchmarked and intentionally not implemented because the real storage corpus did not justify the added complexity. The project version intentionally remains `0.0.16` until the final F6 release step.
+The optimization roadmap is complete through **Phase F / v0.0.17 — State & Long-term Maintenance**. F1 through F6 are complete with bounded audit maintenance, backup/artifact/job-history retention, versioned provenance-aware project memory, centralized cache/storage budgets, bounded browser capacity, live resource telemetry in `server_health`, and final long-running/restart validation. Content-hash backup deduplication was benchmarked and intentionally not implemented because the real storage corpus did not justify the added complexity. The current project version is `0.0.17`.
 
 | Phase | Release | Focus | Status |
 | --- | --- | --- | --- |
@@ -15,13 +15,13 @@ The optimization roadmap is complete through **Phase E / v0.0.16**, and **Phase 
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
 | E | `v0.0.16` | Durable Jobs & Reliability | ✅ Complete |
-| F | `v0.0.17` | State & Long-term Maintenance | 🚧 In progress — F1/F2/F3/F4/F5 complete |
+| F | `v0.0.17` | State & Long-term Maintenance | ✅ Complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
 The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 intentionally adds one read-only typed tool, `job_wait`, bringing the current full surface to **60 tools**.
 
-Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. The post-F3 hardening baseline reached **311 pytest tests**, F4 raised it to **326**, and F5 now validates at **330 pytest tests**, Ruff with zero violations, mypy with zero issues across **99 source files**, successful compileall, the same **60-tool** registration surface, and Full Doctor including a real disposable Chromium launch. F5 centralizes the existing AST/search/job/artifact/backup/audit limits, adds enforced browser capacity defaults of **20 logical sessions / 6 pools**, and expands `server_health` with live RSS/cache/browser/process/job/storage usage plus value/max/ratio telemetry. On the current bounded state corpus, 50 resource-health samples measured **82.87 ms median**, **85.24 ms p95**, and **98.82 ms max**, so incremental storage counters remain intentionally deferred. Phase F now has only the F6 long-running/final release validation left before `v0.0.17`.
+Final Phase-E validation on Windows completed with **267 pytest tests**. Phase F progressively raised that baseline through the F3 hardening audit (**311 tests**), F4 (**326 tests**), and the final F5/F6 release candidate at **330 pytest tests**. The `v0.0.17` release candidate passes Ruff with zero violations, mypy with zero issues across **99 source files**, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch. F6 additionally completed three warning-clean state/concurrency soak cycles under Python `-X dev`, **20/20** fresh-process MCP health startups, a 20-cycle bounded storage-growth soak, and full-scale audit/backup/artifact/job-history benchmarks. `server_health` reports version `0.0.17` with normal resource pressure on the validation host.
 
 ---
 
@@ -93,6 +93,14 @@ F5 consolidates long-running resource ceilings behind `Settings.resource_budgets
 `server_health` now reports live `rss_mb`, AST cache entries/bytes, search snapshot count/bytes, browser sessions/pools/contexts, MCP-owned background processes, queued/running/orphaned jobs, job DB/output/storage bytes, artifact count/bytes, backup count/bytes, audit file count/bytes, and an overall `resource_pressure` classification. A separate `resource_usage` map exposes bounded resources as `{value, max, unit, usage_ratio}`, while `resource_budgets` exposes the configured ceilings/TTLs. Health collection is observational only: it does not evict caches, kill processes, prune storage, or override subsystem policy.
 
 The current host reports normal pressure with roughly **74 MiB RSS**, **22 artifacts / 6.6 MB**, about **35 MB of backups**, about **3.4 MB of audit data**, **4 terminal jobs**, and no active browser/background/durable-job work at measurement time. A 50-run resource-health timing gate measured **82.87 ms median**, **85.24 ms p95**, and **98.82 ms maximum** on the bounded state corpus. Because the control-plane health scan remains below 100 ms and all scanned storage domains are already bounded, the roadmap's optional incremental storage counters remain deferred rather than adding reconciliation complexity prematurely.
+
+---
+
+## Phase F6 — Long-Running Validation & Release
+
+F6 validates the completed Phase-F state model rather than adding another runtime feature. The release-candidate soak ran three complete cycles of the audit, backup, artifact, job-retention, memory, browser, and MCP-integration suites under Python `-X dev` with `ResourceWarning` promoted to an error. A separate restart/recovery pass covered durable workers, admission, lifecycle drain, operation recovery, supervisor restart, and launcher behavior. That pass exposed two validation-harness resource leaks—an unclosed crash-helper stderr pipe and unclosed HTTP error responses—which were fixed before repeating the suite warning-free.
+
+Fresh-process stability was checked with **20 independent MCP health startups**, all returning the full **60-tool** surface. A 20-cycle storage-growth soak repeatedly added backup, artifact, and terminal-job history data and verified convergence on the configured synthetic ceilings every cycle: backups and artifacts remained at or below **64 KiB**, job history at or below **50 KiB**, and all three queued/running/orphaned control rows survived every cleanup pass. Full-scale release benchmarks also revalidated **20,000 audit events**, **2,000 backups**, **5,000 artifacts**, and **2,000 terminal jobs** with zero retention errors or lost active state; the live backup corpus still fails the deduplication gate at only about **0.27%** potential savings.
 
 ---
 

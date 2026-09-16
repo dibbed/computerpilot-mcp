@@ -6,6 +6,8 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+## [0.0.17] - 2026-09-16
+
 ### Added
 - Add Phase F1 bounded audit batching with a process-local queue, single writer thread, configurable batch/flush/queue limits, cross-process append serialization, and synchronous fallback when the bounded queue is saturated.
 - Add size-based audit rotation/retention with configurable `MCP_AUDIT_MAX_FILE_BYTES` (default 8 MiB) and `MCP_AUDIT_KEEP_FILES` (default 5 rotated files in addition to the active log).
@@ -59,6 +61,11 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Phase F5 validation completed with **330 passing pytest tests**, Ruff with zero violations, mypy with zero issues across **99 source files**, successful compileall, a passing **60-tool** health check, and Full Doctor including a real disposable Chromium launch.
 - F5 live health sampling on the bounded state corpus measured **82.87 ms median**, **85.24 ms p95**, and **98.82 ms maximum** across 50 runs. At measurement time pressure was `normal`, with roughly 74 MiB RSS, 22 artifacts / 6.6 MB, about 35 MB of backups, about 3.4 MB of audit data, 4 terminal jobs, and no active browser/background/durable-job work.
 - Browser budget acceptance verified both direct limit errors and concurrent pending-session accounting: a second logical session cannot oversubscribe `MCP_BROWSER_MAX_SESSIONS` while the first session is still navigating and not yet published.
+- Phase F6 release-candidate soak completed three warning-clean cycles of the audit/backup/artifact/job-retention/memory/browser/MCP integration suites under Python `-X dev`, plus **20/20** independent fresh-process health startups exposing the full 60-tool surface.
+- The F6 storage-growth soak ran **20 cycles** of repeated backup/artifact/job-history growth and cleanup. Backups and artifacts converged at or below **64 KiB**, terminal job output at or below **50 KiB**, and queued/running/orphaned rows remained present in every cycle.
+- Full-scale F6 benchmarks revalidated 20,000 audit events, 2,000 backups, 5,000 artifacts, and 2,000 terminal job rows with zero retention errors. Batched audit medians were **307.320 ms** at one thread and **339.084 ms** at eight threads versus **2715.650 ms** and **3184.445 ms** synchronous; the live backup corpus still showed only **0.2722%** deduplication savings.
+- Restart/recovery validation exposed and fixed two test-harness resource leaks (a crash-helper stderr pipe and HTTP error response sockets); the durable-worker/lifecycle/recovery/supervisor/launcher suite then completed warning-free under `-X dev`.
+- Final `v0.0.17` release-candidate validation completed with **330 passing pytest tests**, Ruff with zero violations, mypy with zero issues across **99 source files**, successful compileall, a passing **60-tool** health check reporting version `0.0.17` and normal resource pressure, and Full Doctor including a real disposable Chromium launch.
 
 ## [0.0.16] - 2026-09-15
 
