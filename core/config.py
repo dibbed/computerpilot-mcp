@@ -25,7 +25,7 @@ class Settings:
     """Small immutable runtime configuration."""
 
     server_name: str = "ali_windows_agent_mcp"
-    version: str = "0.0.18"
+    version: str = "0.0.19"
     default_list_limit: int = _env_int("MCP_DEFAULT_LIST_LIMIT", 50, 1, 500)
     max_list_limit: int = _env_int("MCP_MAX_LIST_LIMIT", 500, 10, 5_000)
     max_file_write_chars: int = _env_int("MCP_MAX_FILE_WRITE_CHARS", 2_000_000, 1_024, 20_000_000)

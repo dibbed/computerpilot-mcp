@@ -16,6 +16,7 @@ from core.registry import create_server
 from core.timings import flush_timings
 
 REQUIRED_TOOLS = {
+    "view_image",
     "read_file",
     "write_file",
     "create_file",
@@ -131,7 +132,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
-    assert len(names) == 60
+    assert len(names) == 61
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     for tool in tools:

@@ -15,6 +15,7 @@ from mcp.client.stdio import stdio_client
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REQUIRED_TOOLS = {
+    "view_image",
     "read_file",
     "write_file",
     "create_file",

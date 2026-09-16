@@ -133,10 +133,10 @@ def register(mcp: MCPServer) -> None:
         full_page: bool = False,
         image_type: Literal["png", "jpeg", "webp"] = "png",
         quality: Annotated[int | None, Field(ge=1, le=100)] = None,
-        delivery: ImageDelivery = "auto",
+        delivery: ImageDelivery = "path",
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
     ) -> dict[str, Any]:
-        """Capture a page/element screenshot and return metadata plus optional MCP image content."""
+        """Capture a page/element screenshot; default path mode pairs reliably with view_image."""
         async with MANAGER.session(session_id):
             ensure_runtime_dirs()
             page = MANAGER.page(session_id)

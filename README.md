@@ -6,7 +6,7 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 ## Current Status
 
-The optimization roadmap is complete through **Phase F / v0.0.17 — State & Long-term Maintenance**. A focused pre-1.0 **Phase G / v0.0.18 — Multimodal Screenshot Delivery** now adds real MCP image content for browser and desktop screenshots without adding another tool. F1 through F6 remain complete with bounded audit maintenance, retention, versioned project memory, resource budgets, and long-running/restart validation. Content-hash backup deduplication remains intentionally unimplemented because the measured storage corpus did not justify it. The current project version is `0.0.18`.
+The optimization roadmap is complete through **Phase F / v0.0.17 — State & Long-term Maintenance**. Pre-1.0 **Phase G** now covers multimodal screenshots and the ChatGPT vision bridge: `v0.0.18` added native MCP image content, while `v0.0.19` adds a validated synchronous `view_image` tool and a reliable browser screenshot handoff for ChatGPT connectors. F1 through F6 remain complete with bounded audit maintenance, retention, versioned project memory, resource budgets, and long-running/restart validation. Content-hash backup deduplication remains intentionally unimplemented because the measured storage corpus did not justify it. The current project version is `0.0.19`.
 
 | Phase | Release | Focus | Status |
 | --- | --- | --- | --- |
@@ -16,23 +16,23 @@ The optimization roadmap is complete through **Phase F / v0.0.17 — State & Lon
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
 | E | `v0.0.16` | Durable Jobs & Reliability | ✅ Complete |
 | F | `v0.0.17` | State & Long-term Maintenance | ✅ Complete |
-| G | `v0.0.18` | Multimodal Screenshot Delivery | ✅ Complete |
+| G | `v0.0.18`–`v0.0.19` | Multimodal Screenshot Delivery & ChatGPT Vision Bridge | ✅ Complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
-The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 intentionally adds one read-only typed tool, `job_wait`, bringing the current full surface to **60 tools**.
+The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 added `job_wait`, and `v0.0.19` adds the read-only synchronous `view_image` bridge, bringing the current full surface to **61 tools**.
 
-Final Phase-E validation on Windows completed with **267 pytest tests**. Phase F progressively raised that baseline through the F3 hardening audit (**311 tests**), F4 (**326 tests**), and the final F5/F6 release candidate at **330 pytest tests**. Phase G adds four multimodal media tests, bringing the suite to **334 passing pytest tests**. The `v0.0.18` candidate passes Ruff with zero violations, mypy with zero issues across **101 source files**, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch. A real Chromium MCP probe also returned `content_types=['text','image']` with a decodable `image/png` payload. `server_health` reports version `0.0.18` with normal resource pressure on the validation host.
+Final Phase-E validation on Windows completed with **267 pytest tests**. Phase F progressively raised that baseline through the F3 hardening audit (**311 tests**), F4 (**326 tests**), and the final F5/F6 release candidate at **330 pytest tests**. Phase G initially reached **334 passing pytest tests** in `v0.0.18`; the `v0.0.19` bridge adds two focused compatibility tests, bringing the suite to **336 passing pytest tests**. The `v0.0.19` candidate passes Ruff with zero violations, mypy with zero issues, compileall, the **61-tool** health check, and Full Doctor including a real disposable Chromium launch. Live ChatGPT testing confirmed that `desktop_screenshot` renders model-visible pixels directly, while browser screenshots are reliably consumed through the default metadata path followed by synchronous `view_image`. `server_health` reports version `0.0.19` with normal resource pressure on the validation host.
 
 ---
 
-## Phase G — Multimodal Screenshot Delivery (`v0.0.18`)
+## Phase G — Multimodal Screenshot Delivery & Vision Bridge (`v0.0.18`–`v0.0.19`)
 
-`browser_screenshot` and `desktop_screenshot` now keep their structured path/size metadata while also returning a native MCP `ImageContent` block, so multimodal MCP clients can inspect the actual screenshot pixels instead of receiving only a Windows file path. No new tool is added and the typed surface remains at 60 tools.
+`v0.0.18` added protocol-native `ImageContent` output to `browser_screenshot` and `desktop_screenshot`. Live ChatGPT connector testing then exposed a host-specific compatibility difference: synchronous desktop image results render directly, while image content returned from the async Playwright screenshot tool can be wrapped as an opaque connector resource instead of reaching the model as vision input.
 
-Both tools accept `delivery="auto|image|path"`. `auto` is the default: screenshots at or below `MCP_VISION_MAX_BYTES` (8 MiB by default) are sent in their original image format, while larger screenshots are converted to a bounded JPEG preview using `MCP_VISION_JPEG_QUALITY` (88 by default). The original screenshot always remains on disk at the returned path. `image` forces the original image bytes into MCP content, and `path` preserves metadata-only behavior for clients that do not want image payloads.
+`v0.0.19` closes that gap with a read-only synchronous `view_image(path)` tool. `browser_screenshot` now defaults to `delivery="path"`, returning compact structured metadata and a stable screenshot path; the agent immediately passes that path to `view_image`, which validates PNG/JPEG/WebP content and emits a bounded native MCP image block. `desktop_screenshot` keeps `delivery="auto"` because its direct image path works end to end. Both screenshot tools still accept `auto|image|path` for other MCP clients.
 
-The image base64 exists only in the protocol-native image content block; it is never copied into `structured_content` or audit metadata. This preserves the existing machine-readable screenshot result while giving vision-capable clients a real media payload.
+Images at or below `MCP_VISION_MAX_BYTES` (8 MiB by default) are sent in their original validated format. Larger `auto` deliveries are converted to bounded JPEG previews using `MCP_VISION_JPEG_QUALITY` (88 by default), while the original file remains on disk. The bridge validates decodeability before exposing pixels, and base64 stays only in the protocol-native image content block rather than being duplicated into `structured_content` or audit metadata.
 
 ---
 
@@ -47,6 +47,7 @@ The image base64 exists only in the protocol-native image content block; it is n
 - **Codebase Intelligence**: Fast Python AST parsing for classes, functions, imports, and project summaries.
 - **Validation Suite**: Compact summaries from integrated `pytest`, `Ruff`, and `mypy` tools.
 - **Git Integration**: Working-tree status, diff statistics, and commit log pagination.
+- **Model-Visible Images**: Validated PNG/JPEG/WebP delivery through synchronous `view_image`, with bounded previews for oversized images and a reliable browser screenshot handoff into ChatGPT vision.
 - **Optional Browser Automation**: Playwright automation with shared browser-process pools, isolated per-session contexts, idle eviction, crash recovery, screenshot capture, and UI interaction.
 - **Resilient Supervisor & Control Panel**: Heartbeat watchdog, automatic backoff recovery, mutation-aware bounded drain before restart/stop, and a loopback-only control panel at `http://127.0.0.1:8766`.
 - **Bounded Audit Trail**: Metadata-only audit events use a bounded process-local batching queue, cross-process file serialization, durable flushes for destructive operations, and size-based rotation/retention for long-running deployments.
