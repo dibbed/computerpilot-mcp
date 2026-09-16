@@ -6,6 +6,27 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+## [0.0.19] - 2026-09-16
+
+### Added
+- Add a read-only synchronous `view_image(path)` tool that validates PNG/JPEG/WebP files and returns protocol-native MCP `ImageContent`, allowing ChatGPT vision to consume local screenshots and image files directly.
+- Add image validation before model-visible delivery so corrupt or unsupported files fail with compact tool errors instead of producing undecodable image blocks.
+- Add focused MCP tests for `view_image` and the browser screenshot compatibility default.
+
+### Changed
+- Change `browser_screenshot` default delivery from `auto` to `path` for ChatGPT connector compatibility. The returned path is intended to be passed immediately to `view_image`; explicit `delivery="auto"` and `delivery="image"` remain available for MCP clients that preserve async image blocks correctly.
+- Keep `desktop_screenshot` on direct `delivery="auto"` because live ChatGPT testing confirms its synchronous image result reaches the model as vision input.
+- Avoid reading the full source image into memory before deciding whether an oversized `auto` delivery needs a bounded JPEG preview.
+- Expand the typed MCP surface from 60 to 61 tools.
+
+### Validation
+- Full pytest regression suite: **336 passed**, zero failures/errors/skips/warnings on the final clean run.
+- The pre-release full-suite investigation also exposed one unrelated durable-job timing flake on an earlier run; the isolated job-admission test passed immediately on rerun and the final full suite passed cleanly.
+- Ruff: zero violations.
+- mypy: zero issues across the checked source/test surface.
+- Live `desktop_screenshot` from the connected ChatGPT session rendered the actual 3840x1145 desktop pixels, confirming end-to-end model-visible image delivery.
+- Live browser testing confirmed the host-specific failure mode: async screenshot image content may surface as an opaque connector resource, while `delivery="path"` returns stable metadata for the `view_image` bridge.
+
 ## [0.0.18] - 2026-09-16
 
 ### Added
