@@ -6,6 +6,28 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-16
+
+### Milestone
+- Mark the first optimized-architecture stabilization milestone after the `v0.0.11` baseline and the incremental `v0.0.12` through `v0.0.20` optimization releases.
+- Add no new runtime feature in this milestone; the release is focused on performance regression testing, crash/restart recovery, concurrency/isolation coverage, and release validation.
+
+### Stabilization
+- Run the full performance profile with three runs per case across catalog/startup, output up to 100 MiB, Python AST/project analysis up to 10,000 files, search up to 100,000 files, durable jobs up to 50 concurrent submissions, browser pools/sessions up to 20 sessions, audit batching, backup retention, artifact retention, and durable-job history retention.
+- Complete all **42** full-profile benchmark cases with zero errors and zero skips; comparison against the nearest stored baselines found no case exceeding the 1.5x regression gate.
+- Expand recovery coverage so repeated runtime generations mark one incomplete mutation uncertain exactly once, and consecutive supervisor restarts preserve a single durable job without replay.
+- Make the watchdog recovery fixture deterministic under load by keeping the recovered runtime heartbeat alive instead of relying on a one-shot heartbeat write.
+- Expand concurrency coverage with a 64-operation/16-thread same-resource exclusion stress case and a four-process durable-job reservation race proving that admission never exceeds `max_running=4`.
+- Close two pre-release validation gaps carried from the `v0.0.20` vision bridge: fix one Ruff line-length violation and restore the declared `str` type contract for text `read_file` calls after image-path detection.
+
+### Validation
+- Full pytest regression suite: **341 passed**, zero failures/errors/skips/warnings on the stabilization branch before release packaging.
+- Recovery-focused suite: **21 passed** after the new restart and uncertainty cases.
+- Concurrency/isolation suite: **39 passed** across resource locks, durable-job scheduling, browser management, and project-memory concurrency.
+- Ruff: zero violations.
+- mypy: zero issues across **101 source files**.
+- compileall: passed for `core`, `tools`, `scripts`, `tests`, and both entry points.
+
 ## [0.0.20] - 2026-09-16
 
 ### Added
