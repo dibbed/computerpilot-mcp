@@ -12,6 +12,7 @@ from pydantic import Field
 
 from core.audit import audit_action
 from core.config import SETTINGS, ensure_runtime_dirs, resolve_path
+from core.media import ImageDelivery, image_tool_result
 from core.tooling import OPEN_WORLD_READ, OPEN_WORLD_WRITE, compact_errors
 from tools.browser.manager import MANAGER
 
@@ -132,9 +133,10 @@ def register(mcp: MCPServer) -> None:
         full_page: bool = False,
         image_type: Literal["png", "jpeg", "webp"] = "png",
         quality: Annotated[int | None, Field(ge=1, le=100)] = None,
+        delivery: ImageDelivery = "auto",
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
     ) -> dict[str, Any]:
-        """Save one page or element screenshot and return its path and byte size."""
+        """Capture a page/element screenshot and return metadata plus optional MCP image content."""
         async with MANAGER.session(session_id):
             ensure_runtime_dirs()
             page = MANAGER.page(session_id)
@@ -153,7 +155,8 @@ def register(mcp: MCPServer) -> None:
                 kwargs["full_page"] = full_page
                 await page.screenshot(**kwargs)
             audit_action("browser_screenshot", target=output, details={"session_id": session_id, "selector": bool(selector)})
-            return {"ok": True, "session_id": session_id, "path": str(output), "bytes": output.stat().st_size, **_url_result(page.url)}
+            metadata = {"ok": True, "session_id": session_id, "path": str(output), "bytes": output.stat().st_size, **_url_result(page.url)}
+            return image_tool_result(metadata, output, delivery=delivery)
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("browser_close")
