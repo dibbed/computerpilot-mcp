@@ -232,6 +232,8 @@ asyncio.run(main())
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
+        if process.stderr is not None:
+            process.stderr.close()
 
     journal = OperationRecoveryJournal()
     journal.configure(tmp_path / "operation-recovery.jsonl", "runtime-safe-refactor-b")
