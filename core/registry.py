@@ -57,7 +57,7 @@ def create_server() -> MCPServer:
         instructions=(
             "Use absolute paths for external projects. Text output is complete by default and accepts optional explicit limits. "
             "Paginate listing and analysis results. Prefer replace_exact, anchored, or AST symbol edits over write_file. "
-            "For browser screenshots, use the returned path with view_image to expose pixels reliably to ChatGPT. "
+            "For browser screenshots, pass the returned path to read_file with delivery=auto for catalog-compatible ChatGPT vision; view_image is equivalent after tool refresh. "
             "Mutating operations are metadata-audited locally."
         ),
         version=SETTINGS.version,

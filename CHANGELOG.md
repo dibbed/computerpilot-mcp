@@ -6,6 +6,21 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+## [0.0.20] - 2026-09-16
+
+### Added
+- Extend the existing synchronous `read_file` tool so `delivery="auto"` on PNG/JPEG/WebP returns validated model-visible MCP image content instead of attempting a text decode.
+- Add focused coverage for catalog-compatible image delivery through `read_file`.
+
+### Changed
+- Keep the reliable browser vision path independent of newly-added tool discovery: `browser_screenshot` returns a stable path and `read_file(path, delivery="auto")` exposes the actual pixels to ChatGPT vision.
+- Keep `view_image` as the explicit image-reading tool for refreshed clients while reusing the same validation and bounded preview pipeline from both entry points.
+
+### Validation
+- Full pytest regression suite: **337 passed**, zero failures/errors/skips/warnings on the final run.
+- Live ChatGPT end-to-end test rendered the `https://example.com/` browser screenshot through `browser_screenshot -> read_file(delivery="auto")`; the model visibly read `Example Domain` and the page copy from the returned pixels.
+- Runtime health reports version `0.0.20`, **61 tools**, unique tool names, and normal resource pressure.
+
 ## [0.0.19] - 2026-09-16
 
 ### Added
