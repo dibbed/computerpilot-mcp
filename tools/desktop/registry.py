@@ -11,6 +11,7 @@ from pydantic import Field
 from core.audit import audit_action
 from core.config import SETTINGS, ensure_runtime_dirs, resolve_path
 from core.errors import ToolError
+from core.media import ImageDelivery, image_tool_result
 from core.tooling import MUTATING, READ_ONLY, compact_errors
 from tools.desktop import native
 
@@ -27,8 +28,9 @@ def register(mcp: MCPServer) -> None:
         height: Annotated[int | None, Field(gt=0, le=100_000)] = None,
         image_format: Literal["png", "jpeg"] = "png",
         quality: Annotated[int, Field(ge=1, le=100)] = 90,
+        delivery: ImageDelivery = "auto",
     ) -> dict[str, Any]:
-        """Capture all screens or one rectangle to a file without embedding image bytes."""
+        """Capture the desktop and return metadata plus optional MCP image content."""
 
         native.require_windows()
         try:
@@ -54,7 +56,8 @@ def register(mcp: MCPServer) -> None:
         save_args = {"quality": quality} if image_format == "jpeg" else {}
         image.save(output, format=image_format.upper(), **save_args)
         audit_action("desktop_screenshot", target=output, details={"all_screens": all_screens, "region": bbox})
-        return {"ok": True, "path": str(output), "bytes": output.stat().st_size, "width": image.width, "height": image.height}
+        metadata = {"ok": True, "path": str(output), "bytes": output.stat().st_size, "width": image.width, "height": image.height}
+        return image_tool_result(metadata, output, delivery=delivery)
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("active_window")

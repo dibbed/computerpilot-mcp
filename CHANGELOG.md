@@ -6,6 +6,28 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+## [0.0.18] - 2026-09-16
+
+### Added
+- Add protocol-native multimodal screenshot delivery for `browser_screenshot` and `desktop_screenshot`. Successful calls keep their existing structured metadata and now also return an MCP `ImageContent` block containing the actual screenshot pixels.
+- Add `delivery="auto|image|path"` to both screenshot tools. `auto` is the new default, `image` forces original image bytes, and `path` preserves metadata-only behavior.
+- Add `core/media.py` as the shared media-delivery primitive plus configurable `MCP_VISION_MAX_BYTES` (8 MiB default) and `MCP_VISION_JPEG_QUALITY` (88 default).
+- Add focused media tests covering exact image payloads, metadata-only fallback, automatic large-image preview compression, and end-to-end MCP desktop screenshot content.
+
+### Changed
+- `delivery="auto"` sends the original screenshot when it is within the configured image budget and otherwise emits a bounded JPEG preview while retaining the original screenshot on disk at the structured `path`.
+- Image base64 is kept only in the protocol-native image content block; structured output and audit metadata remain compact and do not duplicate pixel data.
+- The typed MCP surface remains at 60 tools; multimodal delivery extends existing screenshot tools instead of adding a dispatcher or separate image tool.
+
+### Validation
+- Full pytest regression suite: **334 passed**, zero failures/errors/skips/warnings.
+- Ruff: zero violations.
+- mypy: zero issues across **101 source files**.
+- compileall passed for core/tools/scripts and entry points.
+- MCP health smoke passed with **60 tools**.
+- Full Doctor passed in local-http mode including dependency imports, `pip check`, MCP filesystem/terminal smoke, browser imports, and a real disposable Chromium launch.
+- A real Chromium MCP screenshot probe returned `content_types=['text', 'image']`; the `image/png` block decoded to the exact reported screenshot byte count. `server_health` reports version `0.0.18` with normal resource pressure.
+
 ## [0.0.17] - 2026-09-16
 
 ### Added

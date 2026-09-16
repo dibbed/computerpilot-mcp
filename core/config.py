@@ -25,7 +25,7 @@ class Settings:
     """Small immutable runtime configuration."""
 
     server_name: str = "ali_windows_agent_mcp"
-    version: str = "0.0.17"
+    version: str = "0.0.18"
     default_list_limit: int = _env_int("MCP_DEFAULT_LIST_LIMIT", 50, 1, 500)
     max_list_limit: int = _env_int("MCP_MAX_LIST_LIMIT", 500, 10, 5_000)
     max_file_write_chars: int = _env_int("MCP_MAX_FILE_WRITE_CHARS", 2_000_000, 1_024, 20_000_000)
@@ -38,6 +38,8 @@ class Settings:
     browser_pool_idle_sec: int = _env_int("MCP_BROWSER_POOL_IDLE_SEC", 120, 1, 86_400)
     browser_max_sessions: int = _env_int("MCP_BROWSER_MAX_SESSIONS", 20, 1, 1_000)
     browser_max_pools: int = _env_int("MCP_BROWSER_MAX_POOLS", 6, 1, 32)
+    vision_max_bytes: int = _env_int("MCP_VISION_MAX_BYTES", 8 * 1_024 * 1_024, 262_144, 64 * 1_024 * 1_024)
+    vision_jpeg_quality: int = _env_int("MCP_VISION_JPEG_QUALITY", 88, 40, 95)
     max_running_jobs: int = _env_int("MCP_MAX_RUNNING_JOBS", 4, 1, 256)
     supervisor_drain_sec: int = _env_int("MCP_SUPERVISOR_DRAIN_SEC", 15, 1, 300)
     supervisor_watchdog_drain_sec: int = _env_int("MCP_SUPERVISOR_WATCHDOG_DRAIN_SEC", 2, 1, 30)
@@ -89,6 +91,7 @@ class Settings:
             "browser_pool_idle_sec": self.browser_pool_idle_sec,
             "browser_max_sessions": self.browser_max_sessions,
             "browser_max_pools": self.browser_max_pools,
+            "vision_max_bytes": self.vision_max_bytes,
             "max_running_jobs": self.max_running_jobs,
             "artifact_max_count": self.artifact_max_count,
             "artifact_max_bytes": self.artifact_max_bytes,
