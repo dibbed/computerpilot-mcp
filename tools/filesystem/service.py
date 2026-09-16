@@ -14,6 +14,7 @@ import shutil
 import stat
 import tempfile
 import textwrap
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,6 +40,26 @@ COMMON_EXCLUDES = {
     "build",
     "dist",
 }
+
+_WINDOWS_REPLACE_RETRIES = 8
+_WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
+
+
+def _replace_with_retry(source: Path, destination: Path) -> None:
+    """Retry bounded transient Windows replace failures, then preserve the original error."""
+
+    for attempt in range(_WINDOWS_REPLACE_RETRIES):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            retryable = os.name == "nt" and (
+                isinstance(exc, PermissionError) or winerror in _WINDOWS_TRANSIENT_REPLACE_ERRORS
+            )
+            if not retryable or attempt + 1 >= _WINDOWS_REPLACE_RETRIES:
+                raise
+            time.sleep(min(0.01 * (2**attempt), 0.1))
 
 
 def detect_encoding(path: Path) -> str:
@@ -186,7 +207,7 @@ def _backup_file(path: Path, digest: str) -> str:
         with temp.open("rb+") as handle:
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, backup)
+        _replace_with_retry(temp, backup)
     finally:
         temp.unlink(missing_ok=True)
     return str(backup)
@@ -257,7 +278,7 @@ def atomic_write(
         if exclusive_create:
             os.link(temp_path, path)
         else:
-            os.replace(temp_path, path)
+            _replace_with_retry(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
     if backup_path is not None:
