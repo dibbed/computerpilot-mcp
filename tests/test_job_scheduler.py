@@ -56,6 +56,73 @@ def test_concurrent_reservation_never_launches_above_capacity(tmp_path: Path) ->
     assert running == 0
 
 
+def test_cross_process_reservations_do_not_exceed_capacity(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    _seed(store, 20)
+    repo = Path(__file__).resolve().parents[1]
+    go = tmp_path / "go"
+    helper = tmp_path / "reserve_child.py"
+    helper.write_text(
+        "\n".join(
+            [
+                "import json, sys, time",
+                "from pathlib import Path",
+                f"sys.path.insert(0, {str(repo)!r})",
+                "from core.jobs import JobStore",
+                "db_path = Path(sys.argv[1])",
+                "go = Path(sys.argv[2])",
+                "ready = Path(sys.argv[3])",
+                "store = JobStore(db_path, initialize=False)",
+                "ready.write_text('ready', encoding='utf-8')",
+                "deadline = time.monotonic() + 10",
+                "while not go.exists():",
+                "    if time.monotonic() >= deadline: raise SystemExit(3)",
+                "    time.sleep(0.01)",
+                "reservations, queued = store.reserve_worker_launches(max_running=4)",
+                "print(json.dumps({'reservations': reservations, 'queued': queued}, sort_keys=True))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    processes: list[subprocess.Popen[str]] = []
+    for index in range(4):
+        ready = tmp_path / f"ready-{index}"
+        processes.append(
+            subprocess.Popen(
+                [sys.executable, str(helper), str(store.path), str(go), str(ready)],
+                cwd=repo,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        )
+
+    deadline = time.monotonic() + 10
+    while len(list(tmp_path.glob("ready-*"))) < 4 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(list(tmp_path.glob("ready-*"))) == 4
+    go.write_text("go", encoding="utf-8")
+
+    reservations: list[list[str]] = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 0, stderr
+        payload = json.loads(stdout)
+        reservations.extend(payload["reservations"])
+
+    assert len(reservations) == 4
+    assert len({job_id for job_id, _token in reservations}) == 4
+    with closing(store.connect()) as db:
+        reserved = int(
+            db.execute(
+                "SELECT count(*) FROM jobs WHERE status='queued' AND launch_token IS NOT NULL"
+            ).fetchone()[0]
+        )
+    assert reserved == 4
+
+
 def test_live_launch_reservation_is_not_duplicated(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
     job_id = _seed(store, 1)[0]
