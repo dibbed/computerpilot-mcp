@@ -442,7 +442,7 @@ class Supervisor:
                     if not reason.startswith("user_") and not self.snapshot()["last_error"]:
                         self.set_state(last_error=reason)
                     if reason in {"watchdog_unhealthy", "user_restart", "user_stop"}:
-                        audit_action("supervisor_terminate_runtime", target=str(process.pid), details={"reason": reason})
+                        audit_action("supervisor_terminate_runtime", target=str(process.pid), details={"reason": reason}, durable=True)
                 except Exception as exc:
                     self.event(f"Runtime launch failed: {type(exc).__name__}: {exc}")
                     self.set_state(last_error=str(exc))

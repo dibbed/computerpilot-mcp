@@ -104,9 +104,9 @@ def register(mcp: MCPServer) -> None:
     ) -> dict[str, Any]:
         """Terminate one PID and optionally its descendants, escalating only if needed."""
 
-        audit_action("kill_process", target=str(pid), details={"force": force, "include_children": include_children})
+        audit_action("kill_process", target=str(pid), details={"force": force, "include_children": include_children}, durable=True)
         result = terminate_process_tree(pid, force=force, include_children=include_children)
-        audit_action("kill_process", target=str(pid), outcome="succeeded", details=result)
+        audit_action("kill_process", target=str(pid), outcome="succeeded", details=result, durable=True)
         return {"ok": not result["alive_pids"], "pid": pid, **result}
 
     @mcp.tool(annotations=MUTATING, structured_output=True)

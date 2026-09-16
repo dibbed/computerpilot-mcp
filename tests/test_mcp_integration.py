@@ -98,6 +98,35 @@ def test_mcp_tool_timing_records_request_and_tool_body(monkeypatch: pytest.Monke
     assert ("serialization", "server_health") in phases
 
 
+def test_server_health_exposes_resource_usage_and_budgets() -> None:
+    async def scenario() -> None:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            health = _structured(await client.call_tool("server_health", {}))
+            budgets = health["resource_budgets"]
+            usage = health["resource_usage"]
+            assert health["rss_mb"] > 0
+            assert health["ast_cache_entries"] >= 0
+            assert health["ast_cache_bytes"] >= 0
+            assert health["search_snapshot_count"] >= 0
+            assert health["active_browser_sessions"] >= 0
+            assert health["active_background_processes"] >= 0
+            assert health["queued_jobs"] >= 0
+            assert health["running_jobs"] >= 0
+            assert health["artifact_bytes"] >= 0
+            assert health["artifact_storage_bytes"] == health["artifact_bytes"]
+            assert health["backup_bytes"] >= 0
+            assert health["audit_bytes"] >= 0
+            assert health["resource_pressure"] in {"normal", "warning", "critical"}
+            assert budgets["browser_max_sessions"] == SETTINGS.browser_max_sessions
+            assert budgets["browser_idle_sec"] == SETTINGS.browser_idle_sec
+            assert budgets["artifact_max_bytes"] == SETTINGS.artifact_max_bytes
+            assert budgets["artifact_max_age_hours"] == SETTINGS.artifact_max_age_hours
+            assert usage["artifact_bytes"]["max"] == SETTINGS.artifact_max_bytes
+            assert usage["audit_bytes"]["max"] == SETTINGS.audit_max_file_bytes * (SETTINGS.audit_keep_files + 1)
+
+    asyncio.run(scenario())
+
+
 def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
@@ -338,8 +367,13 @@ def test_memory_round_trip_stays_compact(tmp_path: Path) -> None:
                 )
             )
             assert updated["counts"]["architecture_decisions"] == 1
+            assert updated["revision"] == 1
             read = _structured(await client.call_tool("memory_read", {"project_name": project_name, "max_items": 1}))
-            assert read["sections"]["architecture_decisions"] == ["Use bounded structured responses."]
+            records = read["sections"]["architecture_decisions"]
+            assert len(records) == 1
+            assert records[0]["text"] == "Use bounded structured responses."
+            assert records[0]["revision"] == 1
+            assert read["revision"] == 1
             assert "raw_transcript" not in read
 
     try:

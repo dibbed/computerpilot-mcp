@@ -14,9 +14,11 @@ from pydantic import ConfigDict
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.heartbeat import lifespan
 from core.recovery import OPERATION_RECOVERY
+from core.resource_health import collect_resource_metrics
 from core.timings import ToolRequestTimingMiddleware, install_sdk_timing_hooks
 from core.tooling import READ_ONLY, compact_errors
 from tools.browser import register as register_browser
+from tools.browser.manager import MANAGER as BROWSER_MANAGER
 from tools.desktop import register as register_desktop
 from tools.filesystem import register as register_filesystem
 from tools.git import register as register_git
@@ -71,6 +73,9 @@ def create_server() -> MCPServer:
         """Return compact runtime, registration, platform, and optional-browser health."""
 
         tools = await server.list_tools()
+        browser_stats = await BROWSER_MANAGER.stats()
+        resources = collect_resource_metrics(browser_stats)
+        resource_usage = resources.pop("budgets")
         return {
             "ok": True,
             "server": SETTINGS.server_name,
@@ -83,6 +88,9 @@ def create_server() -> MCPServer:
             "browser_optional_installed": importlib.util.find_spec("playwright") is not None,
             "audit_log": str(SETTINGS.audit_log),
             "operation_recovery": OPERATION_RECOVERY.summary(),
+            "resource_budgets": SETTINGS.resource_budgets(),
+            "resource_usage": resource_usage,
+            **resources,
         }
 
     return server

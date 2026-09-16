@@ -17,9 +17,17 @@ from scripts.perf_benchmark import (
     PROFILE_LIMITS,
     BenchmarkSkip,
     MiB,
+    _artifact_inventory_once,
+    _artifact_retention_once,
+    _audit_batched_once,
+    _audit_legacy_sync_once,
+    _backup_inventory_once,
+    _backup_retention_once,
     _browser_batch_once,
     _browser_pool_details,
     _cleanup_stale_temp_roots,
+    _job_history_inventory_once,
+    _job_history_retention_once,
     _job_wait_change_once,
     _job_wait_timeout_once,
     _launcher_validation_once,
@@ -39,6 +47,10 @@ def test_benchmark_profiles_cover_planned_scale_points() -> None:
     assert full["search_files"] == [10_000, 100_000]
     assert full["job_counts"] == [1, 10, 50]
     assert full["browser_counts"] == [1, 5, 20]
+    assert full["audit_events"] == [20_000]
+    assert full["backup_files"] == [2_000]
+    assert full["artifact_files"] == [5_000]
+    assert full["job_history_rows"] == [2_000]
 
 
 def test_browser_pool_details_report_instances_contexts_and_keys() -> None:
@@ -254,3 +266,120 @@ def test_stale_benchmark_temp_cleanup_is_age_bounded(tmp_path: Path) -> None:
     assert removed == 1
     assert stale.exists() is False
     assert recent.is_dir()
+
+def test_audit_benchmark_preserves_all_records_and_reports_caller_latency(tmp_path: Path) -> None:
+    legacy = _audit_legacy_sync_once(tmp_path / "legacy.jsonl", events=200, threads=4)
+    batched = _audit_batched_once(tmp_path / "batched.jsonl", events=200, threads=4)
+
+    assert legacy["lines"] == 200
+    assert batched["lines"] == 200
+    assert legacy["bytes"] == batched["bytes"]
+    assert legacy["caller_p95_ms"] >= 0
+    assert batched["caller_p95_ms"] >= 0
+    assert batched["batch_size"] >= 1
+    assert batched["queue_max"] >= 64
+
+
+def test_audit_suite_is_available_through_benchmark_runner() -> None:
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"audit"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    results = {item["name"]: item for item in report["results"]}
+    assert set(results) == {
+        "audit_legacy_sync_2000_t1",
+        "audit_batched_2000_t1",
+        "audit_legacy_sync_2000_t8",
+        "audit_batched_2000_t8",
+    }
+    assert all(item["status"] == "ok" for item in results.values())
+    assert all(item["details"]["lines"] == 2_000 for item in results.values())
+
+
+def test_backup_inventory_reports_dedup_savings_and_gate(tmp_path: Path) -> None:
+    (tmp_path / "a.bak").write_bytes(b"same")
+    (tmp_path / "b.bak").write_bytes(b"same")
+    (tmp_path / "c.bak").write_bytes(b"different")
+
+    result = _backup_inventory_once(tmp_path)
+
+    assert result["files"] == 3
+    assert result["unique_hashes"] == 2
+    assert result["duplicate_files"] == 1
+    assert result["dedup_savings_bytes"] == 4
+    assert result["dedup_gate_pass"] is False
+
+
+def test_backup_retention_benchmark_enforces_age_and_quota(tmp_path: Path) -> None:
+    result = _backup_retention_once(tmp_path / "fixture", files=40)
+
+    assert result["fixture_files"] == 40
+    assert result["removed_for_age"] == 20
+    assert result["removed_for_quota"] > 0
+    assert result["quota_satisfied"] is True
+    assert result["remaining_bytes"] <= 40 * 2_048 // 4
+
+
+def test_backup_suite_is_available_through_benchmark_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import scripts.perf_benchmark as perf
+
+    monkeypatch.setattr(perf, "SETTINGS", SimpleNamespace(backup_dir=tmp_path, state_dir=tmp_path / "state"))
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"backups"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    results = {item["name"]: item for item in report["results"]}
+    assert set(results) == {"backup_inventory", "backup_retention_500_files"}
+    assert all(item["status"] == "ok" for item in results.values())
+
+
+def test_retention_benchmark_helpers_cover_artifacts_and_jobs(tmp_path: Path) -> None:
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+    (artifacts_dir / "a.bin").write_bytes(b"123")
+    inventory = _artifact_inventory_once(artifacts_dir)
+    assert inventory["files"] == 1
+    assert inventory["bytes"] == 3
+
+    artifact_result = _artifact_retention_once(tmp_path / "artifact-fixture", files=40)
+    assert artifact_result["removed_for_age"] == 20
+    assert artifact_result["remaining_files"] <= 10
+    assert artifact_result["quota_satisfied"] is True
+
+    job_root = tmp_path / "job-fixture"
+    job_result = _job_history_retention_once(job_root, rows=40)
+    assert job_result["removed_for_age"] == 20
+    assert job_result["active_rows_remaining"] == 3
+    assert job_result["remaining_terminal_rows"] <= 10
+    assert job_result["quota_satisfied"] is True
+    job_inventory = _job_history_inventory_once(job_root / "jobs.sqlite3")
+    assert job_inventory["active_rows"] == 3
+
+
+def test_retention_suite_is_available_through_benchmark_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import scripts.perf_benchmark as perf
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(perf, "SETTINGS", SimpleNamespace(state_dir=state_dir))
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"retention"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    results = {item["name"]: item for item in report["results"]}
+    assert set(results) == {
+        "artifact_inventory",
+        "job_history_inventory",
+        "artifact_retention_1000_files",
+        "job_history_retention_500_rows",
+    }
+    assert all(item["status"] == "ok" for item in results.values())

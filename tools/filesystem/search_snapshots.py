@@ -222,6 +222,25 @@ class SearchSnapshotStore:
     def first_page(self, handle: SnapshotHandle, *, fingerprint: str, limit: int) -> SnapshotPage:
         return self.read_page(self.cursor(handle.snapshot_id, 0), fingerprint=fingerprint, limit=limit)
 
+    def stats(self) -> dict[str, int]:
+        """Return current bounded snapshot usage without mutating stored snapshots."""
+
+        with self._lock:
+            files = self._snapshot_files_locked()
+            total_bytes = 0
+            for path in files:
+                try:
+                    total_bytes += path.stat().st_size
+                except OSError:
+                    continue
+            return {
+                "count": len(files),
+                "bytes": total_bytes,
+                "max_count": self.max_count,
+                "max_bytes": self.max_bytes,
+                "ttl_sec": self.ttl_sec,
+            }
+
     def cleanup(self) -> dict[str, int]:
         now = self._clock()
         with self._lock:

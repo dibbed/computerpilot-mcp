@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import os
 import platform
 import shutil
 import statistics
@@ -15,6 +17,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -23,8 +26,12 @@ from typing import Any, Literal
 
 import psutil
 
+from core.artifact_retention import ArtifactPolicy, cleanup_artifacts
+from core.audit import AuditPolicy, AuditWriter
+from core.backups import BackupPolicy, backup_created_at, cleanup_backups
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
+from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
 from core.registry import create_server
 from tools.filesystem.search_snapshots import SearchSnapshotStore, search_fingerprint
@@ -39,6 +46,10 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "search_files": [1_000],
         "job_counts": [1, 10],
         "browser_counts": [1],
+        "audit_events": [2_000],
+        "backup_files": [500],
+        "artifact_files": [1_000],
+        "job_history_rows": [500],
     },
     "full": {
         "output_sizes": [1_024, MiB, 100 * MiB],
@@ -46,9 +57,13 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "search_files": [10_000, 100_000],
         "job_counts": [1, 10, 50],
         "browser_counts": [1, 5, 20],
+        "audit_events": [20_000],
+        "backup_files": [2_000],
+        "artifact_files": [5_000],
+        "job_history_rows": [2_000],
     },
 }
-SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser")
+SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "backups", "retention")
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
 
@@ -799,6 +814,301 @@ def _browser_idle_eviction_once() -> dict[str, Any]:
     return asyncio.run(scenario())
 
 
+
+def _audit_payload() -> bytes:
+    return (
+        json.dumps(
+            {
+                "time": "2026-09-15T00:00:00.000+00:00",
+                "operation": "write_file",
+                "outcome": "succeeded",
+                "pid": 1234,
+                "target": "C:/work/example.txt",
+                "details": {"changed": True},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _percentile_95(samples: list[float]) -> float:
+    ordered = sorted(samples)
+    if not ordered:
+        return 0.0
+    return ordered[max(int(len(ordered) * 0.95) - 1, 0)]
+
+
+def _reset_audit_benchmark_files(path: Path) -> None:
+    path.unlink(missing_ok=True)
+    for candidate in path.parent.glob(f"{path.stem}.*{path.suffix}"):
+        candidate.unlink(missing_ok=True)
+
+
+def _line_count(path: Path) -> int:
+    with path.open("rb") as handle:
+        return sum(1 for _ in handle)
+
+
+def _audit_legacy_sync_once(path: Path, events: int, threads: int) -> dict[str, Any]:
+    _reset_audit_benchmark_files(path)
+    payload = _audit_payload()
+    lock = threading.Lock()
+    latencies: list[float] = []
+
+    def worker(count: int) -> None:
+        local: list[float] = []
+        for _ in range(count):
+            started = time.perf_counter_ns()
+            with lock, path.open("ab", buffering=0) as handle:
+                handle.write(payload)
+            local.append((time.perf_counter_ns() - started) / 1_000_000)
+        with lock:
+            latencies.extend(local)
+
+    counts = [events // threads + (1 if index < events % threads else 0) for index in range(threads)]
+    workers = [threading.Thread(target=worker, args=(count,)) for count in counts]
+    for worker_thread in workers:
+        worker_thread.start()
+    for worker_thread in workers:
+        worker_thread.join()
+    return {
+        "events": events,
+        "threads": threads,
+        "lines": _line_count(path),
+        "bytes": path.stat().st_size,
+        "caller_median_ms": round(statistics.median(latencies), 6),
+        "caller_p95_ms": round(_percentile_95(latencies), 6),
+    }
+
+
+def _audit_batched_once(path: Path, events: int, threads: int) -> dict[str, Any]:
+    _reset_audit_benchmark_files(path)
+    payload = _audit_payload()
+    policy = AuditPolicy(
+        batch_size=SETTINGS.audit_batch_size,
+        flush_interval_sec=SETTINGS.audit_flush_ms / 1_000,
+        queue_max=SETTINGS.audit_queue_max,
+        max_file_bytes=max(SETTINGS.audit_max_file_bytes, events * len(payload) * 2),
+        keep_files=SETTINGS.audit_keep_files,
+    )
+    writer = AuditWriter(path, policy)
+    latencies: list[float] = []
+    latency_lock = threading.Lock()
+
+    def worker(count: int) -> None:
+        local: list[float] = []
+        for _ in range(count):
+            started = time.perf_counter_ns()
+            writer.submit(payload)
+            local.append((time.perf_counter_ns() - started) / 1_000_000)
+        with latency_lock:
+            latencies.extend(local)
+
+    counts = [events // threads + (1 if index < events % threads else 0) for index in range(threads)]
+    workers = [threading.Thread(target=worker, args=(count,)) for count in counts]
+    for worker_thread in workers:
+        worker_thread.start()
+    for worker_thread in workers:
+        worker_thread.join()
+    writer.close()
+    return {
+        "events": events,
+        "threads": threads,
+        "lines": _line_count(path),
+        "bytes": path.stat().st_size,
+        "caller_median_ms": round(statistics.median(latencies), 6),
+        "caller_p95_ms": round(_percentile_95(latencies), 6),
+        "batch_size": policy.batch_size,
+        "flush_interval_ms": round(policy.flush_interval_sec * 1_000, 3),
+        "queue_max": policy.queue_max,
+    }
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(MiB), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _backup_inventory_once(directory: Path) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    sizes: dict[str, int] = {}
+    ages: list[float] = []
+    total_bytes = 0
+    files = 0
+    now = time.time()
+    if directory.is_dir():
+        for path in directory.glob("*.bak"):
+            try:
+                if not path.is_file():
+                    continue
+                stat = path.stat()
+                digest = _hash_file(path)
+            except OSError:
+                continue
+            files += 1
+            total_bytes += stat.st_size
+            ages.append(max(0.0, (now - backup_created_at(path, stat.st_mtime)) / 86_400))
+            counts[digest] = counts.get(digest, 0) + 1
+            sizes.setdefault(digest, stat.st_size)
+    unique_bytes = sum(sizes.values())
+    savings = max(total_bytes - unique_bytes, 0)
+    ratio = savings / total_bytes if total_bytes else 0.0
+    return {
+        "files": files,
+        "bytes": total_bytes,
+        "unique_hashes": len(counts),
+        "duplicate_files": max(files - len(counts), 0),
+        "dedup_savings_bytes": savings,
+        "dedup_savings_ratio": round(ratio, 6),
+        "dedup_gate_min_savings_bytes": MiB,
+        "dedup_gate_min_ratio": 0.10,
+        "dedup_gate_pass": savings >= MiB and ratio >= 0.10,
+        "age_days_median": round(statistics.median(ages), 3) if ages else 0.0,
+        "age_days_max": round(max(ages), 3) if ages else 0.0,
+    }
+
+
+def _backup_retention_once(directory: Path, files: int) -> dict[str, Any]:
+    shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    size = 2_048
+    old_cutoff = files // 2
+    for index in range(files):
+        payload = index.to_bytes(4, "little") * (size // 4)
+        path = directory / f"{index:06d}.bak"
+        path.write_bytes(payload)
+        mtime = now - 40 * 86_400 if index < old_cutoff else now - (files - index)
+        os.utime(path, (mtime, mtime))
+    policy = BackupPolicy(
+        max_bytes=max(size, files * size // 4),
+        max_age_sec=30 * 86_400,
+        cleanup_interval_sec=0,
+        recent_grace_sec=0,
+    )
+    result = cleanup_backups(directory, policy, now=now)
+    return {"fixture_files": files, "file_size": size, **result.to_dict()}
+
+
+def _artifact_inventory_once(directory: Path) -> dict[str, Any]:
+    files: list[tuple[int, float]] = []
+    now = time.time()
+    if directory.is_dir():
+        for path in directory.glob("*.bin"):
+            try:
+                if path.is_file():
+                    stat = path.stat()
+                    files.append((stat.st_size, max(0.0, (now - stat.st_mtime) / 86_400)))
+            except OSError:
+                continue
+    return {
+        "files": len(files),
+        "bytes": sum(size for size, _ in files),
+        "age_days_median": round(statistics.median(age for _, age in files), 3) if files else 0.0,
+        "age_days_max": round(max(age for _, age in files), 3) if files else 0.0,
+        "size_max": max((size for size, _ in files), default=0),
+    }
+
+
+def _artifact_retention_once(directory: Path, files: int) -> dict[str, Any]:
+    shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    size = 1_024
+    old_cutoff = files // 2
+    for index in range(files):
+        path = directory / f"{index:08d}.bin"
+        path.write_bytes(index.to_bytes(4, "little") * (size // 4))
+        mtime = now - 10 * 86_400 if index < old_cutoff else now - (files - index)
+        os.utime(path, (mtime, mtime))
+    policy = ArtifactPolicy(
+        max_bytes=max(size, files * size // 8),
+        max_age_sec=7 * 86_400,
+        max_count=max(1, files // 4),
+        cleanup_interval_sec=0,
+        recent_grace_sec=0,
+    )
+    started = time.perf_counter()
+    result = cleanup_artifacts(directory, policy, now=now)
+    cleanup_ms = (time.perf_counter() - started) * 1_000
+    return {"fixture_files": files, "file_size": size, "cleanup_ms": round(cleanup_ms, 3), **result.to_dict()}
+
+
+def _job_history_inventory_once(db_path: Path) -> dict[str, Any]:
+    if not db_path.is_file():
+        return {"rows": 0, "terminal_rows": 0, "active_rows": 0, "output_bytes": 0, "db_bytes": 0}
+    store = JobStore(db_path)
+    with closing(store.connect()) as db:
+        rows = [dict(row) for row in db.execute("SELECT id,status FROM jobs")]
+    output_bytes = 0
+    for row in rows:
+        directory = store.output_dir / str(row["id"])
+        if directory.is_dir():
+            output_bytes += sum(path.stat().st_size for path in directory.iterdir() if path.is_file())
+    terminal = sum(1 for row in rows if row["status"] in FINAL_JOB_STATES)
+    return {
+        "rows": len(rows),
+        "terminal_rows": terminal,
+        "active_rows": len(rows) - terminal,
+        "output_bytes": output_bytes,
+        "db_bytes": db_path.stat().st_size,
+    }
+
+
+def _job_history_retention_once(root: Path, rows: int) -> dict[str, Any]:
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    store = JobStore(root / "jobs.sqlite3")
+    now = time.time()
+    spec = json.dumps({"command": ["python"], "cwd": str(root), "timeout_sec": 1, "encoding": "utf-8"})
+    with closing(store.connect()) as db, db:
+        for index in range(rows):
+            job_id = f"{index + 1:032x}"
+            updated = now - 40 * 86_400 if index < rows // 2 else now - (rows - index)
+            db.execute(
+                "INSERT INTO jobs (id,request_key,fingerprint,spec,status,created,updated,version) VALUES (?,?,?,?,?,?,?,1)",
+                (job_id, f"bench-{job_id}", f"fp-{job_id}", spec, "succeeded", updated, updated),
+            )
+            directory = store.output_dir / job_id
+            directory.mkdir(exist_ok=True)
+            (directory / "stdout.bin").write_bytes(index.to_bytes(4, "little") * 512)
+            (directory / "stderr.bin").write_bytes(b"")
+            os.utime(directory, (updated, updated))
+        for suffix, status in (("a", "queued"), ("b", "running"), ("c", "orphaned")):
+            job_id = suffix * 32
+            db.execute(
+                "INSERT INTO jobs (id,request_key,fingerprint,spec,status,created,updated,version) VALUES (?,?,?,?,?,?,?,1)",
+                (job_id, f"bench-{job_id}", f"fp-{job_id}", spec, status, now - 100, now - 100),
+            )
+            directory = store.output_dir / job_id
+            directory.mkdir(exist_ok=True)
+            (directory / "stdout.bin").write_bytes(b"active")
+            (directory / "stderr.bin").write_bytes(b"")
+    policy = JobHistoryPolicy(
+        max_age_sec=30 * 86_400,
+        max_count=max(1, rows // 4),
+        max_bytes=max(2_048, rows * 2_048 // 8),
+        cleanup_interval_sec=0,
+        orphan_grace_sec=60,
+    )
+    started = time.perf_counter()
+    result = cleanup_job_history(store.path, store.output_dir, policy, now=now)
+    cleanup_ms = (time.perf_counter() - started) * 1_000
+    with closing(store.connect()) as db:
+        active_remaining = int(db.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running','orphaned')").fetchone()[0])
+    return {
+        "fixture_terminal_rows": rows,
+        "active_rows": 3,
+        "active_rows_remaining": active_remaining,
+        "output_bytes_per_terminal_job": 2_048,
+        "cleanup_ms": round(cleanup_ms, 3),
+        **result.to_dict(),
+    }
+
+
 def _cleanup_stale_temp_roots(
     parent: Path | None = None,
     *,
@@ -860,6 +1170,60 @@ def run_benchmarks(
     if "output" in suites:
         for size in limits["output_sizes"]:
             results.append(measure(f"output_{size}_bytes", partial(_output_once, size), runs))
+
+    if "audit" in suites:
+        events = max(limits["audit_events"])
+        with _temporary_root("audit") as temporary:
+            root = Path(temporary)
+            for threads in (1, 8):
+                results.append(
+                    measure(
+                        f"audit_legacy_sync_{events}_t{threads}",
+                        partial(_audit_legacy_sync_once, root / f"legacy-{threads}.jsonl", events, threads),
+                        runs,
+                    )
+                )
+                results.append(
+                    measure(
+                        f"audit_batched_{events}_t{threads}",
+                        partial(_audit_batched_once, root / f"batched-{threads}.jsonl", events, threads),
+                        runs,
+                    )
+                )
+
+    if "backups" in suites:
+        results.append(measure("backup_inventory", partial(_backup_inventory_once, SETTINGS.backup_dir), 1))
+        backup_files = max(limits["backup_files"])
+        with _temporary_root("backups") as temporary:
+            results.append(
+                measure(
+                    f"backup_retention_{backup_files}_files",
+                    partial(_backup_retention_once, Path(temporary) / "fixture", backup_files),
+                    runs,
+                )
+            )
+
+    if "retention" in suites:
+        artifact_files = max(limits["artifact_files"])
+        job_rows = max(limits["job_history_rows"])
+        results.append(measure("artifact_inventory", partial(_artifact_inventory_once, SETTINGS.state_dir / "artifacts"), 1))
+        results.append(measure("job_history_inventory", partial(_job_history_inventory_once, SETTINGS.state_dir / "jobs.sqlite3"), 1))
+        with _temporary_root("retention") as temporary:
+            root = Path(temporary)
+            results.append(
+                measure(
+                    f"artifact_retention_{artifact_files}_files",
+                    partial(_artifact_retention_once, root / "artifacts", artifact_files),
+                    runs,
+                )
+            )
+            results.append(
+                measure(
+                    f"job_history_retention_{job_rows}_rows",
+                    partial(_job_history_retention_once, root / "jobs", job_rows),
+                    runs,
+                )
+            )
 
     if "project" in suites:
         max_count = max(limits["ast_files"])
@@ -972,7 +1336,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser"))
+    suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit"))
     report = run_benchmarks(
         profile=args.profile,
         runs=args.runs,

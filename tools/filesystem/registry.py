@@ -183,7 +183,7 @@ def register(mcp: MCPServer) -> None:
                 raise FileNotFoundError(f"Target not found: {target}")
             target_type = "directory" if target.is_dir() and not target.is_symlink() else "file"
             size = target.stat().st_size if target_type == "file" else None
-            audit_action("delete_file", target=target, details={"recursive": recursive, "type": target_type})
+            audit_action("delete_file", target=target, details={"recursive": recursive, "type": target_type}, durable=True)
             if target_type == "directory":
                 if not recursive:
                     target.rmdir()
@@ -192,7 +192,7 @@ def register(mcp: MCPServer) -> None:
             else:
                 target.unlink()
             PYTHON_METADATA_CACHE.invalidate(target, recursive=target_type == "directory")
-            audit_action("delete_file", target=target, outcome="succeeded", details={"type": target_type})
+            audit_action("delete_file", target=target, outcome="succeeded", details={"type": target_type}, durable=True)
             return ok(path=str(target), deleted=True, type=target_type, bytes_removed=size, recoverable=False)
 
     @mcp.tool(annotations=DESTRUCTIVE, structured_output=True)
@@ -218,18 +218,18 @@ def register(mcp: MCPServer) -> None:
             if dst.exists() or dst.is_symlink():
                 if not overwrite:
                     raise FileExistsError(f"Destination exists: {dst}")
-                audit_action("move_file_overwrite", target=dst, details={"source": str(src)})
+                audit_action("move_file_overwrite", target=dst, details={"source": str(src)}, durable=True)
                 shutil.rmtree(dst) if dst.is_dir() and not dst.is_symlink() else dst.unlink()
             if create_parents:
                 dst.parent.mkdir(parents=True, exist_ok=True)
             if not dst.parent.is_dir():
                 raise FileNotFoundError(f"Destination parent not found: {dst.parent}")
-            audit_action("move_file", target=src, details={"destination": str(dst), "overwrite": overwrite})
+            audit_action("move_file", target=src, details={"destination": str(dst), "overwrite": overwrite}, durable=True)
             shutil.move(str(src), str(dst))
             recursive_invalidation = src_is_dir or dst_was_dir
             PYTHON_METADATA_CACHE.invalidate(src, recursive=recursive_invalidation)
             PYTHON_METADATA_CACHE.invalidate(dst, recursive=recursive_invalidation)
-            audit_action("move_file", target=src, outcome="succeeded", details={"destination": str(dst)})
+            audit_action("move_file", target=src, outcome="succeeded", details={"destination": str(dst)}, durable=True)
             return ok(source=str(src), destination=str(dst), moved=True)
 
     @mcp.tool(annotations=MUTATING, structured_output=True)

@@ -18,6 +18,7 @@ import psutil
 from core.artifacts import Delivery, deliver_file
 from core.config import SETTINGS
 from core.errors import ToolError
+from core.resource_locks import RESOURCE_LOCKS
 
 JOB_SCHEMA_VERSION = 3
 JOB_STATUS_COLUMNS = (
@@ -126,6 +127,7 @@ class JobStore:
         encoding: str = "utf-8",
         *,
         queue_timeout_sec: float | None = None,
+        _retention_retry: bool = False,
     ) -> dict[str, Any]:
         if not command or not command[0] or not cwd.is_dir():
             raise ValueError("An executable and existing working directory are required.")
@@ -158,7 +160,24 @@ class JobStore:
         if not inserted:
             if existing["fingerprint"] != fingerprint:
                 raise ToolError("idempotency_conflict", "This request key already belongs to a different command.")
-            result = self.get(existing["id"])
+            try:
+                result = self.get(existing["id"])
+            except ToolError as exc:
+                if exc.code != "job_not_found" or _retention_retry:
+                    raise
+                # Terminal-history retention may delete the row after the
+                # idempotency transaction commits but before the follow-up
+                # status read. Retry once: if the history row is truly gone,
+                # the same request key is now eligible to create a fresh job.
+                return self.submit(
+                    command,
+                    cwd,
+                    timeout_sec,
+                    request_key,
+                    encoding,
+                    queue_timeout_sec=queue_timeout_sec,
+                    _retention_retry=True,
+                )
             if result["status"] == "queued":
                 from core.job_scheduler import ensure_job_scheduler
                 ensure_job_scheduler(self)
@@ -558,13 +577,18 @@ class JobStore:
 
     def output(self, job_id: str, since_byte: int = 0, stderr_since_byte: int = 0,
                delivery: Delivery = "inline") -> dict[str, Any]:
-        raw = self._reconcile([self.raw(job_id)])[0]
-        row = self._public(raw)
-        directory = self.output_dir / row["job_id"]
-        encoding = json.loads(raw["spec"])["encoding"]
-        final = row["status"] not in {"queued", "running", "orphaned"}
-        return {"ok": True, **row,
-                "stdout": deliver_file(directory / "stdout.bin", encoding=encoding,
-                                       offset=since_byte, delivery=delivery, final=final),
-                "stderr": deliver_file(directory / "stderr.bin", encoding=encoding,
-                                       offset=stderr_since_byte, delivery=delivery, final=final)}
+        directory = self.output_dir / job_id
+        stdout = directory / "stdout.bin"
+        stderr = directory / "stderr.bin"
+        # Retention takes the same locks before deleting a terminal row/output
+        # pair, closing the row-read -> directory-delete race for job_output.
+        with RESOURCE_LOCKS.sync(stdout, stderr):
+            raw = self._reconcile([self.raw(job_id)])[0]
+            row = self._public(raw)
+            encoding = json.loads(raw["spec"])["encoding"]
+            final = row["status"] not in {"queued", "running", "orphaned"}
+            return {"ok": True, **row,
+                    "stdout": deliver_file(stdout, encoding=encoding,
+                                           offset=since_byte, delivery=delivery, final=final),
+                    "stderr": deliver_file(stderr, encoding=encoding,
+                                           offset=stderr_since_byte, delivery=delivery, final=final)}

@@ -13,6 +13,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
+from core.artifact_retention import schedule_artifact_retention
 from core.config import SETTINGS
 from core.resource_locks import RESOURCE_LOCKS, canonical_path
 from core.timings import timing_span
@@ -171,11 +172,12 @@ def deliver_stream(
     directory = SETTINGS.state_dir / "artifacts"
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / f"{uuid.uuid4().hex}.bin"
+    temporary = directory / f".{target.name}.tmp"
     digest = hashlib.sha256()
     try:
         source.seek(offset)
         with timing_span("artifact_snapshot", metadata={"bytes": size}):
-            with target.open("xb") as output:
+            with temporary.open("xb") as output:
                 remaining = size
                 while remaining:
                     chunk = source.read(min(remaining, 1_048_576))
@@ -184,6 +186,7 @@ def deliver_stream(
                     output.write(chunk)
                     digest.update(chunk)
                     remaining -= len(chunk)
+            os.replace(temporary, target)
         sha256 = digest.hexdigest()
         result: dict[str, Any] = {
             "delivery": "file",
@@ -225,8 +228,10 @@ def deliver_stream(
                 next_byte=next_byte,
                 has_more=next_byte < total,
             )
+        schedule_artifact_retention(target, settings=SETTINGS)
         return result
     except BaseException:
+        temporary.unlink(missing_ok=True)
         target.unlink(missing_ok=True)
         raise
 
@@ -263,9 +268,17 @@ def deliver_file(
                     cached = _CACHE.get(key)
                     if cached is not None:
                         artifact = cached.get("path")
-                        if isinstance(artifact, str) and Path(artifact).is_file():
-                            _CACHE.move_to_end(key)
-                            return _copy_result(cached)
+                        if isinstance(artifact, str):
+                            artifact_path = Path(artifact)
+                            with RESOURCE_LOCKS.sync(artifact_path):
+                                if artifact_path.is_file():
+                                    try:
+                                        os.utime(artifact_path, None)
+                                    except OSError:
+                                        pass
+                                    else:
+                                        _CACHE.move_to_end(key)
+                                        return _copy_result(cached)
                         _CACHE.pop(key, None)
             result = deliver_stream(
                 source,

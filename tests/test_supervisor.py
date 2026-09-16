@@ -75,7 +75,10 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
             request = urllib.request.Request(base + "/api/restart", data=b"", headers={"Origin": origin, "X-Control-Token": key})
             with pytest.raises(urllib.error.HTTPError) as error:
                 urllib.request.urlopen(request)
-            assert error.value.code == 403
+            try:
+                assert error.value.code == 403
+            finally:
+                error.value.close()
         assert not supervisor.restart.is_set()
         for action, event in [("restart", supervisor.restart), ("stop", supervisor.stop)]:
             request = urllib.request.Request(base + "/api/" + action, data=b"",
@@ -86,10 +89,14 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         request = urllib.request.Request(base, headers={"Host": "evil.example"})
         with pytest.raises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(request)
-        assert error.value.code == 403
+        try:
+            assert error.value.code == 403
+        finally:
+            error.value.close()
     finally:
         panel.shutdown()
         panel.server_close()
+        thread.join(timeout=5)
         close_logger(supervisor)
 
 

@@ -6,7 +6,7 @@ A high-performance, full-access local Windows developer-agent backend powered by
 
 ## Current Status
 
-The optimization roadmap is complete through **Phase E / v0.0.16**. The published `v0.0.15` tag remains immutable, and Phase E closes the durable-jobs/reliability work with bounded admission, version-aware waiting, restart drain safety, uncertain-operation recovery, and Windows Job Object ownership.
+The optimization roadmap is complete through **Phase F / v0.0.17 — State & Long-term Maintenance**. F1 through F6 are complete with bounded audit maintenance, backup/artifact/job-history retention, versioned provenance-aware project memory, centralized cache/storage budgets, bounded browser capacity, live resource telemetry in `server_health`, and final long-running/restart validation. Content-hash backup deduplication was benchmarked and intentionally not implemented because the real storage corpus did not justify the added complexity. The current project version is `0.0.17`.
 
 | Phase | Release | Focus | Status |
 | --- | --- | --- | --- |
@@ -15,13 +15,13 @@ The optimization roadmap is complete through **Phase E / v0.0.16**. The publishe
 | C | `v0.0.14` | Project Intelligence | ✅ Complete |
 | D | `v0.0.15` | Runtime & Browser | ✅ Complete |
 | E | `v0.0.16` | Durable Jobs & Reliability | ✅ Complete |
-| F | `v0.0.17` | State & Long-term Maintenance | ⏭ Next |
+| F | `v0.0.17` | State & Long-term Maintenance | ✅ Complete |
 
 Phase A established structured timing and a repeatable benchmark baseline. Phase B added fast-start validation, bounded output/artifact reuse, keyed mutation locking, JobStore/query improvements, and single-flight/coalesced runtime work. Phase C added bounded version-aware Python metadata caching plus streaming and snapshot-based search pagination. Phase D completed shared Playwright browser pools, isolated session contexts, idle reclamation, crash/stale-session recovery, concurrency hardening, and browser lifecycle benchmarking.
 
 The optional compact MCP tool surface considered during Phase D remains intentionally **disabled/not implemented**: the measured catalog serialization cost did not justify another tool-profile mode. Phase D therefore kept its 59-tool typed surface; Phase E3 intentionally adds one read-only typed tool, `job_wait`, bringing the current full surface to **60 tools**.
 
-Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violations, mypy with zero issues across 90 source files, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch all pass. A focused release-candidate crash/restart suite also passes **71/71** tests. The canonical 3-run jobs benchmark on audit commit `8e06fee` completed 1/10/50 concurrent jobs with all jobs succeeding and `MCP_MAX_RUNNING_JOBS=4` enforced; the 50-job median was **18.370 s**, peak active jobs **4**, peak process-tree RSS **509.648 MiB**, and peak process count **25**. The 50-waiter `job_wait` case observed the same authoritative version with **76.823 ms** wake latency and no extra child processes. **Phase E / v0.0.16 — Durable Jobs & Reliability is complete.** Phase F / `v0.0.17` is the next roadmap step for bounded long-running state, retention, provenance, and storage budgets.
+Final Phase-E validation on Windows completed with **267 pytest tests**. Phase F progressively raised that baseline through the F3 hardening audit (**311 tests**), F4 (**326 tests**), and the final F5/F6 release candidate at **330 pytest tests**. The `v0.0.17` release candidate passes Ruff with zero violations, mypy with zero issues across **99 source files**, compileall, the **60-tool** health check, and Full Doctor including a real disposable Chromium launch. F6 additionally completed three warning-clean state/concurrency soak cycles under Python `-X dev`, **20/20** fresh-process MCP health startups, a 20-cycle bounded storage-growth soak, and full-scale audit/backup/artifact/job-history benchmarks. `server_health` reports version `0.0.17` with normal resource pressure on the validation host.
 
 ---
 
@@ -30,7 +30,7 @@ Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violat
 - **Robust Filesystem Tools**: Atomic file creation, writing, copying, moving, and deletion; paginated listing and regex file search; complete reads with streaming byte cursors.
 - **Precision Code Editing**: Exact match, anchored replacements, and AST function/class body substitutions with syntax validation and rollback on syntax error.
 - **Process & Command Execution**: Synchronous and background execution for PowerShell, CMD, and native Windows executables with streaming spooling, bounded auto-delivery, byte cursors, reusable finalized artifacts, and Windows Job Object ownership for deterministic runtime-owned process-tree cleanup.
-- **Durable Job Store**: SQLite-backed background job queue (`.agent_state/jobs.sqlite3`) with idempotency keys, bounded max-running admission, lightweight worker scheduling, survivor workers across supervisor restarts, monotonic state versions, bounded `job_wait` long-polling, and persistent SQLite connections for running workers/waits.
+- **Durable Job Store**: SQLite-backed background job queue (`.agent_state/jobs.sqlite3`) with idempotency keys, bounded max-running admission, lightweight worker scheduling, survivor workers across supervisor restarts, monotonic state versions, bounded `job_wait` long-polling, persistent SQLite connections for running workers/waits, and terminal-only history/output retention that never prunes queued/running/orphaned jobs.
 - **Concurrency Hardening**: Keyed resource locks protect filesystem read-modify-write operations and project-memory updates; browser navigation is serialized only within the same session rather than across unrelated sessions.
 - **System Diagnostics**: Live inspection of CPU, memory, disks, environment variables, installed applications, and Windows services.
 - **Codebase Intelligence**: Fast Python AST parsing for classes, functions, imports, and project summaries.
@@ -38,6 +38,69 @@ Final Phase-E validation on Windows: **267 pytest tests**, Ruff with zero violat
 - **Git Integration**: Working-tree status, diff statistics, and commit log pagination.
 - **Optional Browser Automation**: Playwright automation with shared browser-process pools, isolated per-session contexts, idle eviction, crash recovery, screenshot capture, and UI interaction.
 - **Resilient Supervisor & Control Panel**: Heartbeat watchdog, automatic backoff recovery, mutation-aware bounded drain before restart/stop, and a loopback-only control panel at `http://127.0.0.1:8766`.
+- **Bounded Audit Trail**: Metadata-only audit events use a bounded process-local batching queue, cross-process file serialization, durable flushes for destructive operations, and size-based rotation/retention for long-running deployments.
+- **Bounded Recoverable Backups**: Atomic filesystem edits keep recoverable `.bak` snapshots while background/coalesced retention enforces configurable age and byte budgets without deleting the newest restore point.
+- **Bounded Delivery Artifacts**: Disk-backed output snapshots are retained by configurable age, count, and byte budgets; the artifact being returned and the newest snapshot are protected during cleanup, while stale cache entries self-heal by recreating missing snapshots.
+- **Versioned Project Memory**: Compact 128 KiB project memory uses schema-v2 records with stable IDs, provenance, verification timestamps, project/item revisions, backward-compatible legacy migration, and cross-process optimistic concurrency checks.
+- **Resource-Aware Health**: Centralized cache/storage/session budgets are exposed with live RSS, cache, browser, process, job, artifact, backup, and audit usage plus value/max/ratio pressure telemetry; browser logical sessions and process pools are hard-bounded in addition to idle eviction.
+
+---
+
+## Phase F1 — Audit Batching, Rotation & Retention
+
+F1 keeps audit semantics metadata-only while removing per-event open/write/close overhead. Each process uses a bounded queue (`2048` by default), a single writer, batches up to `64` records, and flushes a partial batch within `50 ms`. Queue saturation falls back to synchronous append instead of silently dropping records. Destructive operations such as file deletion/move, process termination, job cancellation, and supervisor runtime termination use durable audit writes that are fsynced before returning; normal MCP lifecycle shutdown also explicitly flushes queued audit metadata.
+
+Audit storage is now bounded by size-based rotation. The active `.agent_state/audit.jsonl` rotates at **8 MiB** by default and retains **5 rotated files** (`audit.1.jsonl` through `audit.5.jsonl`) in addition to the active file. Append and rotation are protected by a cross-process lock so the MCP runtime, supervisor, and independent durable-job workers can share the same audit trail safely. The policy is configurable with `MCP_AUDIT_BATCH_SIZE`, `MCP_AUDIT_FLUSH_MS`, `MCP_AUDIT_QUEUE_MAX`, `MCP_AUDIT_MAX_FILE_BYTES`, and `MCP_AUDIT_KEEP_FILES`.
+
+The benchmark gate passed decisively on the validation host. With 20,000 metadata events and three runs, legacy synchronous audit writes measured **2077.088 ms** median at one thread and **2199.630 ms** at eight threads. The production batched writer measured **268.806 ms** and **396.403 ms** respectively while preserving all 20,000 JSONL records and the same payload bytes. This is why batching is enabled rather than remaining a deferred experiment.
+
+---
+
+## Phase F2 — Backup Retention & Deduplication Gate
+
+F2 bounds `.agent_state/backups` without weakening the existing crash-safe edit pipeline. Recoverable backups are now published through a temporary file, fsynced, and atomically renamed before the target edit proceeds. Retention age is based on the UTC backup-event timestamp embedded in the backup filename rather than the source file's copied mtime, so a freshly-created backup of an old source file is never mistaken for an old backup.
+
+Cleanup is intentionally background/coalesced instead of scanning the backup directory in every foreground write. It runs on MCP startup and after successful backup-producing writes, applies age retention first and then an oldest-first byte quota, and always preserves at least the newest restore point. A backup created by the current write is explicitly protected during that cleanup pass. Defaults are **30 days** and **256 MiB**, configurable with `MCP_BACKUP_MAX_AGE_DAYS` and `MCP_BACKUP_MAX_BYTES`; setting either limit to `0` disables that dimension. `MCP_BACKUP_CLEANUP_INTERVAL_SEC` controls the minimum interval between coalesced scans.
+
+Content-addressed backup deduplication was evaluated but did not pass the production gate. The canonical F2 inventory on commit `e8cf7a0` scanned **1429 backups / 33,409,275 bytes** and found **169 duplicate files**, but their duplicate content represented only **95,960 bytes (0.2872%)** of recoverable storage. The gate requires at least **1 MiB** and **10%** potential savings, so a blob-store/dedup layer would add complexity without meaningful storage benefit and is intentionally not implemented. The same report's 2000-file synthetic retention case removed 1500 files (1000 by age and 500 by quota) and finished at **500 files / 1,024,000 bytes** with no cleanup errors.
+
+---
+
+## Phase F3 — Artifact & Durable-Job History Retention
+
+F3 bounds the two remaining disk-backed output histories without changing live execution semantics. `.agent_state/artifacts` now uses age, count, and byte retention with defaults of **168 hours (7 days)**, **512 files**, and **512 MiB**. Artifact cleanup is coalesced/background, runs on runtime startup and after artifact creation, explicitly protects the artifact currently being returned plus the newest artifact, and ignores non-artifact files. Existing finalized-artifact cache entries already verify that the referenced file still exists, so a retained cache key whose old file has expired simply recreates a fresh snapshot on the next delivery request.
+
+Durable-job retention is terminal-only. `succeeded`, `failed`, `cancelled`, `timed_out`, and `interrupted` history is bounded by **30 days**, **1,000 terminal rows**, and **1 GiB** of associated job output by default; `queued`, `running`, and `orphaned` jobs are never eligible. Cleanup runs from lifecycle maintenance rather than independent durable workers, preserving the Phase-E ownership model. `job_output` now takes the same keyed stdout/stderr locks used by cleanup, closing the row-read/output-delete race. For crash consistency, retention deletes an eligible terminal DB row transactionally before removing its output directory; if the process dies or directory deletion fails after the row commit, the leftover 32-hex job directory is an orphan and a later pass removes it only after rechecking that no DB row exists. The newest terminal result is retained as a safety floor even when it alone exceeds a configured quota. Once a terminal row ages out, its old idempotency key is no longer retained, so reusing that key after history expiry may create a new job.
+
+The canonical F3 benchmark on commit `a2900da` first measured the real local corpus at **22 artifacts / 6,600,000 bytes** and **4 terminal jobs / 539 output bytes**. In the synthetic scale cases, the artifact cleanup pass scanned **5,000** files, removed **4,375** by age/count/quota, and completed in **1,121.777 ms**, leaving **625 files / 640,000 bytes** with zero errors. The job-history pass scanned **2,000 terminal rows**, removed **1,750** rows (1,000 by age, 500 by count, 250 by byte quota), completed in **1,732.422 ms**, left **250 terminal rows / 512,000 output bytes**, and preserved all **3/3 queued/running/orphaned rows**. The initial per-row SQLite deletion design measured roughly 14.9 seconds at this scale; batching cleanup into 100-job lock/transaction groups reduced that cleanup cost by about eightfold while preserving the same read/delete locking semantics.
+
+---
+
+## Phase F4 — Versioned Memory, Provenance & Optimistic Revisions
+
+F4 upgrades compact project memory from section-level `list[str]` data to **schema v2** records while keeping the existing four sections and the **128 KiB** per-project ceiling. Each record now carries a stable `id`, immutable `text`, `source`, optional `source_ref`, `created_at`, optional `verified_at`, and an item-level `revision`; the project document carries its own monotonic `revision` and `updated_at`. New writes default to `source="manual"`, while callers can explicitly use `user`, `project_scan`, `manual`, or `tool`. Verification metadata is additive: re-verifying an already verified record is a no-op, while adding verification or changing provenance increments that record's revision and the project revision.
+
+Legacy memory remains readable without rewriting the source file. Old string items are normalized in memory with deterministic stable IDs, `source="legacy"`, `revision=1`, and the legacy document revision remains `0` until a semantic update occurs. The first successful update materializes schema v2 atomically. A real read-only migration check against `memory/psychology_atlas.json` preserved its exact SHA-256 while normalizing **115 records** (46 architecture decisions, 34 important paths, 6 user preferences, 29 previous fixes); materializing a copy expanded the file from **18,839** to **37,041 bytes**, still safely below the 128 KiB budget.
+
+`memory_update` now accepts `expected_revision`. A stale revision returns controlled `memory_conflict` guidance without writing, and destructive `replace=True` requires an explicit expected revision so a blind replace cannot silently overwrite newer memory. The check/merge/atomic-save sequence is serialized both by the existing process-local resource lock and by a cross-process lock stored under `.agent_state/memory_locks`, so two independent MCP processes racing from the same revision cannot both commit. In the cross-process acceptance test, exactly one revision-0 writer succeeded and the other received `memory_conflict`. Oversized structured updates fail with `memory_too_large` before replacement and preserve the previous file byte-for-byte. Memory remains data only; provenance or stored text does not grant tool authority or override runtime safety policy.
+
+---
+
+## Phase F5 — Central Resource Budgets & Runtime Health
+
+F5 consolidates long-running resource ceilings behind `Settings.resource_budgets()` while keeping each subsystem responsible for its own eviction/retention policy. Existing AST cache, search snapshot, durable-job admission, artifact, backup, job-history, and audit budgets remain the source of truth; their age/TTL settings are surfaced alongside count/byte ceilings. Browser lifetime control is strengthened with hard defaults of **20 logical sessions** and **6 browser pools** (`MCP_BROWSER_MAX_SESSIONS`, `MCP_BROWSER_MAX_POOLS`) in addition to the existing idle reclamation. Session creation reserves capacity before asynchronous context/navigation work begins, so concurrent opens cannot oversubscribe the configured logical-session limit.
+
+`server_health` now reports live `rss_mb`, AST cache entries/bytes, search snapshot count/bytes, browser sessions/pools/contexts, MCP-owned background processes, queued/running/orphaned jobs, job DB/output/storage bytes, artifact count/bytes, backup count/bytes, audit file count/bytes, and an overall `resource_pressure` classification. A separate `resource_usage` map exposes bounded resources as `{value, max, unit, usage_ratio}`, while `resource_budgets` exposes the configured ceilings/TTLs. Health collection is observational only: it does not evict caches, kill processes, prune storage, or override subsystem policy.
+
+The current host reports normal pressure with roughly **74 MiB RSS**, **22 artifacts / 6.6 MB**, about **35 MB of backups**, about **3.4 MB of audit data**, **4 terminal jobs**, and no active browser/background/durable-job work at measurement time. A 50-run resource-health timing gate measured **82.87 ms median**, **85.24 ms p95**, and **98.82 ms maximum** on the bounded state corpus. Because the control-plane health scan remains below 100 ms and all scanned storage domains are already bounded, the roadmap's optional incremental storage counters remain deferred rather than adding reconciliation complexity prematurely.
+
+---
+
+## Phase F6 — Long-Running Validation & Release
+
+F6 validates the completed Phase-F state model rather than adding another runtime feature. The release-candidate soak ran three complete cycles of the audit, backup, artifact, job-retention, memory, browser, and MCP-integration suites under Python `-X dev` with `ResourceWarning` promoted to an error. A separate restart/recovery pass covered durable workers, admission, lifecycle drain, operation recovery, supervisor restart, and launcher behavior. That pass exposed two validation-harness resource leaks—an unclosed crash-helper stderr pipe and unclosed HTTP error responses—which were fixed before repeating the suite warning-free.
+
+Fresh-process stability was checked with **20 independent MCP health startups**, all returning the full **60-tool** surface. A 20-cycle storage-growth soak repeatedly added backup, artifact, and terminal-job history data and verified convergence on the configured synthetic ceilings every cycle: backups and artifacts remained at or below **64 KiB**, job history at or below **50 KiB**, and all three queued/running/orphaned control rows survived every cleanup pass. Full-scale release benchmarks also revalidated **20,000 audit events**, **2,000 backups**, **5,000 artifacts**, and **2,000 terminal jobs** with zero retention errors or lost active state; the live backup corpus still fails the deduplication gate at only about **0.27%** potential savings.
 
 ---
 

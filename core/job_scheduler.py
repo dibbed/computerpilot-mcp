@@ -17,6 +17,26 @@ _SCHEDULERS: dict[str, JobScheduler] = {}
 _SCHEDULERS_LOCK = threading.Lock()
 
 
+def _reap_detached_worker(process: subprocess.Popen[bytes]) -> None:
+    """Wait only to release the parent process handle; the durable worker remains independently owned."""
+
+    try:
+        process.wait()
+    except Exception:
+        # Worker state is authoritative in SQLite; handle reaping must never
+        # influence durable execution or scheduler recovery.
+        pass
+
+
+def _start_worker_reaper(process: subprocess.Popen[bytes]) -> None:
+    threading.Thread(
+        target=_reap_detached_worker,
+        args=(process,),
+        name=f"job-worker-reaper-{process.pid}",
+        daemon=True,
+    ).start()
+
+
 def _scheduler_key(path: Path) -> str:
     return os.path.normcase(str(path.resolve()))
 
@@ -68,6 +88,7 @@ class JobScheduler:
                     creationflags=flags,
                     start_new_session=os.name != "nt",
                 )
+                _start_worker_reaper(process)
             try:
                 created = psutil.Process(process.pid).create_time()
             except psutil.NoSuchProcess:
