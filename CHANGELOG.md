@@ -19,14 +19,18 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Make the watchdog recovery fixture deterministic under load by keeping the recovered runtime heartbeat alive instead of relying on a one-shot heartbeat write.
 - Expand concurrency coverage with a 64-operation/16-thread same-resource exclusion stress case and a four-process durable-job reservation race proving that admission never exceeds `max_running=4`.
 - Close two pre-release validation gaps carried from the `v0.0.20` vision bridge: fix one Ruff line-length violation and restore the declared `str` type contract for text `read_file` calls after image-path detection.
+- Harden atomic filesystem publication against transient Windows `Access denied`, sharing-violation, and lock-violation failures with bounded exponential retry; persistent/non-transient failures still propagate unchanged.
 
 ### Validation
-- Full pytest regression suite: **341 passed**, zero failures/errors/skips/warnings on the stabilization branch before release packaging.
+- Full pytest regression suite: **343 passed**, zero failures/errors/skips/warnings on the final release candidate.
 - Recovery-focused suite: **21 passed** after the new restart and uncertainty cases.
 - Concurrency/isolation suite: **39 passed** across resource locks, durable-job scheduling, browser management, and project-memory concurrency.
+- Atomic-edit stress: **4,000 concurrent surgical edits** across 80 batches completed with zero failures after the Windows replace hardening; the same stress reproduced a real `WinError 5` before the fix.
 - Ruff: zero violations.
 - mypy: zero issues across **101 source files**.
 - compileall: passed for `core`, `tools`, `scripts`, `tests`, and both entry points.
+- Startup check reports version `0.1.0`, **61 tools**, and unique tool names; health smoke passes filesystem and terminal checks.
+- Full Doctor passes dependency imports, `pip check`, MCP filesystem/terminal smoke, browser imports, and a real disposable headless Chromium launch.
 
 ## [0.0.20] - 2026-09-16
 
