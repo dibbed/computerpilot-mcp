@@ -6,6 +6,11 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Fixed
+- Treat transient Windows process-table failures such as `WinError 1455` as degraded supervisor diagnostics instead of fatal runtime failures.
+- Keep runtime cleanup resilient when `psutil` process enumeration is unavailable: tracked children are cleaned best-effort and the original `Popen` handle forcibly releases the runtime root so ports such as `127.0.0.1:8080` are not stranded by a failed cleanup pass.
+- Make control-panel process snapshots tolerate `psutil`/OS inspection failures without breaking the panel request.
+
 ## [0.1.0] - 2026-09-16
 
 ### Milestone
