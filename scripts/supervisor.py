@@ -156,13 +156,19 @@ class Supervisor:
         if pid:
             try:
                 parent = psutil.Process(pid)
-                for process in [parent, *parent.children(recursive=True)]:
+                try:
+                    children = parent.children(recursive=True)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+                    self.event(f"Process-tree inspection degraded for pid={pid}: {type(exc).__name__}: {exc}")
+                    children = []
+                for process in [parent, *children]:
                     try:
                         processes.append({"pid": process.pid, "name": process.name(), "status": process.status()})
-                    except psutil.NoSuchProcess:
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
                         pass
-            except psutil.NoSuchProcess:
-                pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+                if not isinstance(exc, psutil.NoSuchProcess):
+                    self.event(f"Process inspection unavailable for pid={pid}: {type(exc).__name__}: {exc}")
         return {"active_processes": processes[:20], "process_count": len(processes)}
 
     def snapshot(self) -> dict[str, Any]:
@@ -338,38 +344,87 @@ class Supervisor:
     def remember_children(self, process: subprocess.Popen[bytes]) -> None:
         try:
             parent = psutil.Process(process.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+            if not isinstance(exc, psutil.NoSuchProcess):
+                self.event(f"Could not inspect runtime root pid={process.pid}: {type(exc).__name__}: {exc}")
+            return
+
+        # Track the root before any recursive inspection. If Windows process-table
+        # enumeration later fails under memory/pagefile pressure, cleanup can still
+        # terminate the runtime root instead of crashing the supervisor.
+        self.owned[parent.pid] = parent
+        try:
             children = parent.children(recursive=True)
-            excluded: set[int] = set()
-            for child in children:
-                try:
-                    if "scripts.job_worker" in child.cmdline():
-                        excluded.update([child.pid, *(p.pid for p in child.children(recursive=True))])
-                except psutil.NoSuchProcess:
-                    pass
-            for child in [parent, *children]:
-                if child.pid in excluded:
-                    self.owned.pop(child.pid, None)
-                    continue
-                self.owned[child.pid] = child
-        except psutil.NoSuchProcess:
-            pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+            if not isinstance(exc, psutil.NoSuchProcess):
+                self.event(f"Could not enumerate runtime children pid={process.pid}: {type(exc).__name__}: {exc}")
+            return
+
+        excluded: set[int] = set()
+        for child in children:
+            try:
+                if "scripts.job_worker" in child.cmdline():
+                    excluded.add(child.pid)
+                    try:
+                        excluded.update(p.pid for p in child.children(recursive=True))
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+                        if not isinstance(exc, psutil.NoSuchProcess):
+                            self.event(
+                                f"Could not enumerate durable-worker descendants pid={child.pid}: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+            except psutil.NoSuchProcess:
+                excluded.add(child.pid)
+            except (psutil.AccessDenied, OSError) as exc:
+                # Unknown children are deliberately left untracked rather than risking
+                # termination of a durable worker when process inspection is degraded.
+                excluded.add(child.pid)
+                self.event(f"Could not inspect runtime child pid={child.pid}: {type(exc).__name__}: {exc}")
+
+        for child in children:
+            if child.pid in excluded:
+                self.owned.pop(child.pid, None)
+                continue
+            self.owned[child.pid] = child
 
     def cleanup(self, process: subprocess.Popen[bytes]) -> None:
         self.remember_children(process)
-        # psutil Process objects check creation time before signalling, avoiding PID reuse.
-        for child in reversed(list(self.owned.values())):
+        tracked = list(self.owned.values())
+
+        # Kill known non-durable descendants first, then the root. Every psutil call is
+        # best-effort: diagnostics/cleanup must never take down the supervisor itself.
+        for child in reversed(tracked):
             try:
                 child.kill()
             except psutil.NoSuchProcess:
                 pass
             except psutil.AccessDenied:
                 self.event(f"Access denied cleaning up runtime pid={child.pid}")
-        psutil.wait_procs(list(self.owned.values()), timeout=5)
+            except OSError as exc:
+                self.event(f"OS error cleaning up runtime pid={child.pid}: {type(exc).__name__}: {exc}")
+
+        # If process-tree enumeration failed (for example WinError 1455 under transient
+        # commit/pagefile pressure), the subprocess handle still gives us a reliable
+        # way to terminate the runtime root and release ports such as 127.0.0.1:8080.
+        try:
+            if process.poll() is None:
+                process.kill()
+        except (ProcessLookupError, OSError) as exc:
+            self.event(f"Runtime root fallback kill failed pid={process.pid}: {type(exc).__name__}: {exc}")
+
+        if tracked:
+            try:
+                psutil.wait_procs(tracked, timeout=5)
+            except (psutil.Error, OSError) as exc:
+                self.event(f"Process cleanup wait degraded: {type(exc).__name__}: {exc}")
         self.owned.clear()
+
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.event("Runtime process did not exit after cleanup.")
+        except OSError as exc:
+            self.event(f"Runtime wait failed pid={process.pid}: {type(exc).__name__}: {exc}")
 
     def run(self) -> int:
         failures = 0

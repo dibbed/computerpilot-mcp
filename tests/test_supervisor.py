@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -26,6 +28,148 @@ def close_logger(supervisor: Supervisor) -> None:
 
 def test_restart_backoff() -> None:
     assert [restart_delay(i) for i in range(1, 7)] == [5, 10, 30, 60, 60, 60]
+
+
+def test_process_snapshot_tolerates_process_table_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    supervisor.set_state(pid=12345)
+
+    class BrokenParent:
+        pid = 12345
+
+        def children(self, *, recursive: bool = False) -> list[object]:
+            raise OSError(1455, "The paging file is too small for this operation to complete")
+
+        def name(self) -> str:
+            return "runtime.exe"
+
+        def status(self) -> str:
+            return "running"
+
+    monkeypatch.setattr(module.psutil, "Process", lambda pid: BrokenParent())
+    try:
+        snapshot = supervisor.process_snapshot()
+        assert snapshot == {
+            "active_processes": [{"pid": 12345, "name": "runtime.exe", "status": "running"}],
+            "process_count": 1,
+        }
+        assert any("Process-tree inspection degraded" in line for line in supervisor.state_snapshot()["logs"])
+    finally:
+        close_logger(supervisor)
+
+
+def test_cleanup_falls_back_to_popen_when_psutil_is_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+
+    class FakeProcess:
+        pid = 54321
+
+        def __init__(self) -> None:
+            self.alive = True
+            self.kill_calls = 0
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return None if self.alive else self.returncode
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            self.alive = False
+            self.returncode = 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.alive = False
+            self.returncode = 1
+            return 1
+
+    def broken_process(pid: int) -> object:
+        raise OSError(1455, "The paging file is too small for this operation to complete")
+
+    monkeypatch.setattr(module.psutil, "Process", broken_process)
+    process = FakeProcess()
+    try:
+        supervisor.cleanup(process)  # type: ignore[arg-type]
+        assert process.kill_calls == 1
+        assert process.poll() == 1
+        assert supervisor.owned == {}
+        assert any("Could not inspect runtime root" in line for line in supervisor.state_snapshot()["logs"])
+    finally:
+        close_logger(supervisor)
+
+
+def test_cleanup_fallback_releases_runtime_port(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    ready = tmp_path / "ready.txt"
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+
+    code = (
+        "import socket,time;from pathlib import Path;"
+        f"s=socket.socket();s.bind(('127.0.0.1',{port}));s.listen();"
+        f"Path({str(ready)!r}).write_text('ready');time.sleep(30)"
+    )
+    process = subprocess.Popen([sys.executable, "-c", code], cwd=tmp_path)
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.02)
+        assert ready.exists()
+
+        def broken_process(pid: int) -> object:
+            raise OSError(1455, "The paging file is too small for this operation to complete")
+
+        monkeypatch.setattr(module.psutil, "Process", broken_process)
+        supervisor.cleanup(process)
+        assert process.poll() is not None
+
+        with socket.socket() as rebound:
+            rebound.bind(("127.0.0.1", port))
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        close_logger(supervisor)
+
+
+def test_supervisor_survives_transient_children_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    original_children = module.psutil.Process.children
+    failures = 0
+
+    def flaky_children(self: object, recursive: bool = False) -> list[object]:
+        nonlocal failures
+        if failures == 0:
+            failures += 1
+            raise OSError(1455, "The paging file is too small for this operation to complete")
+        return original_children(self, recursive=recursive)
+
+    monkeypatch.setattr(module.psutil.Process, "children", flaky_children)
+    code = (
+        "import os,time;from pathlib import Path;"
+        "h=Path(os.environ['MCP_HEARTBEAT_FILE']);"
+        "h.write_text(str(os.getpid()));"
+        "time.sleep(30)"
+    )
+    supervisor = Supervisor([sys.executable, "-c", code], readiness_url=None, state_dir=tmp_path, grace=2, interval=0.03)
+    thread = threading.Thread(target=supervisor.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            snapshot = supervisor.snapshot()
+            if snapshot["state"] == "running":
+                break
+            time.sleep(0.03)
+        else:
+            raise AssertionError(supervisor.snapshot())
+        assert failures == 1
+        assert snapshot["restart_count"] == 0
+        assert any("Could not enumerate runtime children" in line for line in snapshot["logs"])
+    finally:
+        supervisor.stop.set()
+        thread.join(timeout=10)
+        close_logger(supervisor)
+    assert not thread.is_alive()
 
 
 def test_watchdog_recovers_hung_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
