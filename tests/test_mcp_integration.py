@@ -31,6 +31,7 @@ REQUIRED_TOOLS = {
     "replace_function",
     "replace_class",
     "safe_refactor",
+    "apply_patch",
     "run_process",
     "run_powershell",
     "run_cmd",
@@ -133,7 +134,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
-    assert len(names) == 62
+    assert len(names) == 63
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     for tool in tools:
@@ -196,6 +197,22 @@ def test_filesystem_round_trip_and_pagination(tmp_path: Path) -> None:
             )
             assert edited["diff"]["hunks"] == 1
             assert "return 42" in target.read_text(encoding="utf-8")
+            patched = _structured(
+                await client.call_tool(
+                    "apply_patch",
+                    {
+                        "root": str(tmp_path),
+                        "patch": (
+                            "diff --git a/sample.py b/sample.py\n"
+                            "--- a/sample.py\n+++ b/sample.py\n"
+                            "@@ -1,2 +1,2 @@\n def answer():\n-    return 42\n+    return 43\n"
+                        ),
+                        "backup": False,
+                    },
+                )
+            )
+            assert patched["file_count"] == 1
+            assert "return 43" in target.read_text(encoding="utf-8")
             refused_move = _structured(
                 await client.call_tool(
                     "move_file",

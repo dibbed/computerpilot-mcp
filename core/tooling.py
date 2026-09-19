@@ -43,6 +43,7 @@ MUTATING_TOOL_OPERATIONS = frozenset({
     "replace_function",
     "replace_class",
     "safe_refactor",
+    "apply_patch",
     "run_process",
     "run_powershell",
     "run_cmd",

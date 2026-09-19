@@ -21,6 +21,7 @@ from core.resource_locks import RESOURCE_LOCKS
 from core.response import ok, page
 from core.tooling import DESTRUCTIVE, MUTATING, READ_ONLY, PathArg, compact_errors
 from tools.filesystem import service
+from tools.filesystem.patches import PatchLimits, apply_patch_transaction
 from tools.filesystem.search_snapshots import SEARCH_SNAPSHOTS, search_fingerprint
 from tools.project.index import PYTHON_METADATA_CACHE
 
@@ -664,3 +665,57 @@ def register(mcp: MCPServer) -> None:
             _invalidate_if_changed(target, result)
             audit_action("safe_refactor", target=target, outcome="succeeded", details={"edit_count": len(edits)})
             return result
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("apply_patch")
+    def apply_patch(
+        root: PathArg,
+        patch: Annotated[str, Field(min_length=1, max_length=2_000_000)],
+        dry_run: bool = False,
+        expected_sha256: Annotated[dict[str, str] | None, Field(max_length=100)] = None,
+        backup: bool = True,
+        validation_command: Annotated[list[str] | None, Field(max_length=50)] = None,
+        validation_cwd: Annotated[str | None, Field(max_length=32_767)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=600)] = 60,
+        encoding: EncodingArg = "auto",
+        max_files: Annotated[int, Field(ge=1, le=1_000)] = 100,
+        max_hunks: Annotated[int, Field(ge=1, le=10_000)] = 1_000,
+    ) -> dict[str, Any]:
+        """Atomically apply an exact multi-file unified diff, with dry-run and rollback on failure."""
+
+        target = resolve_path(root)
+        details: dict[str, Any] = {
+            "patch_bytes": len(patch.encode("utf-8")),
+            "dry_run": dry_run,
+            "expected_hash_count": len(expected_sha256 or {}),
+            "has_validation": bool(validation_command),
+        }
+        if validation_command:
+            details.update(
+                {
+                    "validation_executable": validation_command[0],
+                    "validation_argument_count": len(validation_command) - 1,
+                    "validation_sha256": hashlib.sha256("\0".join(validation_command).encode("utf-8", errors="replace")).hexdigest(),
+                }
+            )
+        audit_action("apply_patch", target=target, details=details, durable=not dry_run)
+        result = apply_patch_transaction(
+            target,
+            patch,
+            dry_run=dry_run,
+            expected_sha256=expected_sha256,
+            backup=backup,
+            validation_command=validation_command,
+            validation_cwd=resolve_path(validation_cwd) if validation_cwd else target,
+            timeout_sec=timeout_sec,
+            encoding=encoding,
+            limits=PatchLimits(max_bytes=2_000_000, max_files=max_files, max_hunks=max_hunks),
+        )
+        audit_action(
+            "apply_patch",
+            target=target,
+            outcome="succeeded",
+            details={"file_count": result["file_count"], "hunk_count": result["hunk_count"], "dry_run": dry_run},
+            durable=not dry_run,
+        )
+        return result

@@ -34,6 +34,7 @@ from core.executor import run_bounded
 from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
 from core.registry import create_server
+from tools.filesystem.patches import PatchLimits, apply_patch_transaction
 from tools.filesystem.search_snapshots import SearchSnapshotStore, search_fingerprint
 from tools.filesystem.service import search_by_name, search_by_name_streaming
 from tools.project.context import lookup_code_context
@@ -377,6 +378,33 @@ def _context_lookup_once(root: Path, count: int) -> dict[str, Any]:
         "relationships": result["total"],
         "scan_truncated": bool(result["scan_truncated"]),
     }
+
+
+def _prepare_patch_fixture(root: Path, count: int) -> str:
+    root.mkdir(parents=True, exist_ok=True)
+    chunks: list[str] = []
+    for index in range(count):
+        name = f"file_{index:04d}.txt"
+        (root / name).write_text("before\n", encoding="utf-8")
+        chunks.append(
+            f"diff --git a/{name} b/{name}\n"
+            f"--- a/{name}\n+++ b/{name}\n"
+            "@@ -1 +1 @@\n-before\n+after\n"
+        )
+    return "".join(chunks)
+
+
+def _patch_dry_run_once(root: Path, patch: str, count: int) -> dict[str, Any]:
+    result = apply_patch_transaction(
+        root,
+        patch,
+        dry_run=True,
+        backup=False,
+        limits=PatchLimits(max_bytes=2_000_000, max_files=count, max_hunks=count),
+    )
+    if result["file_count"] != count:
+        raise RuntimeError(f"apply_patch dry-run correctness mismatch: {result['file_count']!r}")
+    return {"files": count, "hunks": result["hunk_count"], "dry_run": result["dry_run"]}
 
 def _prepare_search_fixture(root: Path, count: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
@@ -1247,6 +1275,16 @@ def run_benchmarks(
                 results.append(measure(f"ast_parse_{count}_files", partial(_parse_fixture, paths, count), runs))
                 results.append(measure(f"find_function_{count}_files", partial(_project_lookup_once, root, count), runs))
                 results.append(measure(f"code_context_{count}_files", partial(_context_lookup_once, root, count), runs))
+            patch_count = min(max_count, 100)
+            patch_root = root / "patch"
+            patch = _prepare_patch_fixture(patch_root, patch_count)
+            results.append(
+                measure(
+                    f"patch_dry_run_{patch_count}_files",
+                    partial(_patch_dry_run_once, patch_root, patch, patch_count),
+                    runs,
+                )
+            )
 
     if "search" in suites:
         max_count = max(limits["search_files"])
