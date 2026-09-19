@@ -47,6 +47,7 @@ REQUIRED_TOOLS = {
     "windows_services",
     "project_summary",
     "find_function",
+    "code_context",
     "find_class",
     "find_imports",
     "dependency_graph",

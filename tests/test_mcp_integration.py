@@ -50,6 +50,7 @@ REQUIRED_TOOLS = {
     "find_class",
     "find_imports",
     "dependency_graph",
+    "code_context",
     "run_pytest",
     "run_ruff",
     "run_mypy",
@@ -132,7 +133,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
-    assert len(names) == 61
+    assert len(names) == 62
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     for tool in tools:
@@ -322,6 +323,8 @@ def test_project_ast_tools(tmp_path: Path) -> None:
             )
             assert functions["total_count"] == 1
             assert functions["items"][0]["async"] is True
+            context = _structured(await client.call_tool("code_context", {"path": str(tmp_path), "symbol": "Service.run"}))
+            assert context["definitions"][0]["qualified_name"] == "app.Service.run"
             imports = _structured(
                 await client.call_tool("find_imports", {"path": str(tmp_path), "module_filter": "sqlalchemy"})
             )

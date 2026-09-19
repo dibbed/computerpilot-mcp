@@ -36,6 +36,7 @@ from core.jobs import JobStore, same_process
 from core.registry import create_server
 from tools.filesystem.search_snapshots import SearchSnapshotStore, search_fingerprint
 from tools.filesystem.service import search_by_name, search_by_name_streaming
+from tools.project.context import lookup_code_context
 from tools.project.service import parse_python
 
 MiB = 1_048_576
@@ -363,6 +364,18 @@ def _project_lookup_once(root: Path, count: int) -> dict[str, Any]:
         "files": count,
         "total_count": structured["total_count"],
         "scan_truncated": bool(structured.get("scan_truncated")),
+    }
+
+
+def _context_lookup_once(root: Path, count: int) -> dict[str, Any]:
+    result = lookup_code_context(root, "d0000.module_000000.value_0", max_files=count, include_source=False)
+    if len(result["definitions"]) != 1:
+        raise RuntimeError(f"code_context correctness mismatch: {len(result['definitions'])!r}")
+    return {
+        "files": count,
+        "definitions": len(result["definitions"]),
+        "relationships": result["total"],
+        "scan_truncated": bool(result["scan_truncated"]),
     }
 
 def _prepare_search_fixture(root: Path, count: int) -> None:
@@ -1233,6 +1246,7 @@ def run_benchmarks(
             for count in limits["ast_files"]:
                 results.append(measure(f"ast_parse_{count}_files", partial(_parse_fixture, paths, count), runs))
                 results.append(measure(f"find_function_{count}_files", partial(_project_lookup_once, root, count), runs))
+                results.append(measure(f"code_context_{count}_files", partial(_context_lookup_once, root, count), runs))
 
     if "search" in suites:
         max_count = max(limits["search_files"])

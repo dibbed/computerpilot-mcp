@@ -11,7 +11,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from core.config import SETTINGS
 from core.errors import ToolError
@@ -52,6 +52,22 @@ class ImportMetadata:
     source: str | None
     names: tuple[str, ...]
     level: int
+    bindings: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class NameReference:
+    name: str
+    line: int
+    column: int
+    context: Literal["load", "store"]
+
+
+@dataclass(frozen=True, slots=True)
+class CallMetadata:
+    name: str
+    line: int
+    column: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +76,8 @@ class PythonFileMetadata:
     functions: tuple[FunctionMetadata, ...]
     classes: tuple[ClassMetadata, ...]
     imports: tuple[ImportMetadata, ...]
+    references: tuple[NameReference, ...]
+    calls: tuple[CallMetadata, ...]
     parse_error: str | None = None
 
 
@@ -84,6 +102,18 @@ def _walk_qualified(tree: ast.Module) -> list[tuple[str, ast.AST]]:
     return found
 
 
+def _dotted_name(node: ast.AST, *, max_parts: int = 32) -> str | None:
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute) and len(parts) < max_parts:
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
 def build_python_metadata(path: Path) -> PythonFileMetadata:
     """Parse one Python file into compact metadata instead of retaining its AST."""
 
@@ -96,6 +126,8 @@ def build_python_metadata(path: Path) -> PythonFileMetadata:
             functions=(),
             classes=(),
             imports=(),
+            references=(),
+            calls=(),
             parse_error=f"Cannot parse {path}: {exc}",
         )
 
@@ -137,23 +169,54 @@ def build_python_metadata(path: Path) -> PythonFileMetadata:
                     source=None,
                     names=tuple(alias.name for alias in node.names),
                     level=0,
+                    bindings=tuple((alias.asname or alias.name.split(".")[0], alias.name) for alias in node.names),
                 )
             )
         else:
+            source = node.module or ""
             imports.append(
                 ImportMetadata(
                     line=node.lineno,
                     source=node.module,
                     names=tuple(alias.name for alias in node.names),
                     level=node.level,
+                    bindings=tuple(
+                        (
+                            alias.asname or alias.name,
+                            ".".join(part for part in (source, alias.name) if part),
+                        )
+                        for alias in node.names
+                        if alias.name != "*"
+                    ),
                 )
             )
+
+    references: list[NameReference] = []
+    calls: list[CallMetadata] = []
+    seen_references: set[tuple[str, int, int, str]] = set()
+    seen_calls: set[tuple[str, int, int]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            context: Literal["load", "store"] = "store" if isinstance(node.ctx, (ast.Store, ast.Del)) else "load"
+            reference_key = (node.id, node.lineno, node.col_offset, context)
+            if reference_key not in seen_references:
+                seen_references.add(reference_key)
+                references.append(NameReference(name=node.id, line=node.lineno, column=node.col_offset, context=context))
+        elif isinstance(node, ast.Call):
+            name = _dotted_name(node.func)
+            if name is not None:
+                call_key = (name, node.lineno, node.col_offset)
+                if call_key not in seen_calls:
+                    seen_calls.add(call_key)
+                    calls.append(CallMetadata(name=name, line=node.lineno, column=node.col_offset))
 
     return PythonFileMetadata(
         path=str(path),
         functions=tuple(functions),
         classes=tuple(classes),
         imports=tuple(imports),
+        references=tuple(sorted(references, key=lambda item: (item.line, item.column, item.name, item.context))),
+        calls=tuple(sorted(calls, key=lambda item: (item.line, item.column, item.name))),
     )
 
 

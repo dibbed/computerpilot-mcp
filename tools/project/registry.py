@@ -12,6 +12,7 @@ from core.config import resolve_path
 from core.response import page
 from core.tooling import READ_ONLY, PathArg, compact_errors
 from tools.project import service
+from tools.project.context import lookup_code_context
 from tools.project.index import ClassMetadata, FunctionMetadata
 
 
@@ -255,3 +256,42 @@ def register(mcp: MCPServer) -> None:
             "parse_errors": parse_errors,
             **result,
         }
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("code_context")
+    def code_context(
+        path: PathArg,
+        symbol: Annotated[str, Field(min_length=1, max_length=500)],
+        match: Literal["exact", "contains"] = "exact",
+        file_filter: Annotated[str | None, Field(max_length=32_767)] = None,
+        include_source: bool = True,
+        include_callers: bool = True,
+        include_callees: bool = True,
+        include_references: bool = True,
+        include_imports: bool = True,
+        include_tests: bool = True,
+        max_depth: Annotated[int, Field(ge=1, le=2)] = 1,
+        max_files: Annotated[int, Field(ge=1, le=50_000)] = 5_000,
+        max_relationships: Annotated[int, Field(ge=1, le=1_000)] = 100,
+        source_max_chars: Annotated[int, Field(ge=0, le=200_000)] = 20_000,
+        offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0,
+    ) -> dict[str, Any]:
+        """Return a bounded definition, relationship, import, and test context for a Python symbol."""
+
+        return lookup_code_context(
+            resolve_path(path),
+            symbol,
+            match=match,
+            file_filter=file_filter,
+            include_source=include_source,
+            include_callers=include_callers,
+            include_callees=include_callees,
+            include_references=include_references,
+            include_imports=include_imports,
+            include_tests=include_tests,
+            max_depth=max_depth,
+            max_files=max_files,
+            max_relationships=max_relationships,
+            source_max_chars=source_max_chars,
+            offset=offset,
+        )
