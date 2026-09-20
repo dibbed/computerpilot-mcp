@@ -436,6 +436,114 @@ class WorkflowStore:
             "has_more": offset + len(items) < total,
         }
 
+    def get_operation(self, operation_id: str) -> dict[str, Any]:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT workflow_id FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+        if row is None:
+            raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+        operations = self.list_operations(str(row["workflow_id"]))["items"]
+        return next(item for item in operations if item["operation_id"] == operation_id)
+
+    def resolve_uncertain_operation(
+        self,
+        operation_id: str,
+        expected_version: int,
+        final_state: OperationState,
+        *,
+        evidence: dict[str, Any],
+        event_type: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically resolve one uncertain operation and its step/workflow aggregates."""
+        if final_state not in {
+            OperationState.SUCCEEDED, OperationState.FAILED, OperationState.UNCERTAIN,
+            OperationState.ACKNOWLEDGED, OperationState.UNRESOLVABLE,
+        }:
+            raise ToolError("invalid_operation_resolution", "Unsupported uncertain operation resolution.")
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            if int(operation["version"]) != expected_version:
+                raise ToolError("workflow_operation_version_conflict", "Operation changed; reload it before retrying.")
+            current_operation_state = OperationState(str(operation["state"]))
+            if current_operation_state is not OperationState.UNCERTAIN:
+                raise ToolError("workflow_operation_not_uncertain", "Only an uncertain operation can be resolved.")
+            workflow_id, step_index = str(operation["workflow_id"]), int(operation["step_index"])
+            workflow = connection.execute(
+                "SELECT state, current_step FROM workflows WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if workflow is None or str(workflow["state"]) != WorkflowState.UNCERTAIN.value:
+                raise ToolError("workflow_not_uncertain", "The operation aggregate is not in uncertain state.")
+
+            if final_state is OperationState.UNCERTAIN:
+                operation_version_increment = 1
+            else:
+                validate_operation_transition(current_operation_state, OperationState.RECONCILING)
+                validate_operation_transition(OperationState.RECONCILING, final_state)
+                operation_version_increment = 2
+
+            if final_state in {OperationState.SUCCEEDED, OperationState.ACKNOWLEDGED}:
+                step_state = "completed"
+                next_step = step_index + 1
+                step_count = int(connection.execute(
+                    "SELECT COUNT(*) FROM workflow_steps WHERE workflow_id = ?", (workflow_id,),
+                ).fetchone()[0])
+                workflow_state = WorkflowState.COMPLETED if next_step == step_count else WorkflowState.PAUSED
+                current_step = next_step
+            elif final_state in {OperationState.FAILED, OperationState.UNRESOLVABLE}:
+                step_state, workflow_state, current_step = "failed", WorkflowState.FAILED, step_index
+            else:
+                step_state, workflow_state, current_step = "uncertain", WorkflowState.UNCERTAIN, step_index
+
+            if workflow_state is not WorkflowState.UNCERTAIN:
+                validate_workflow_transition(WorkflowState.UNCERTAIN, WorkflowState.RECONCILING)
+                validate_workflow_transition(WorkflowState.RECONCILING, workflow_state)
+            redacted_evidence = redact_inputs(evidence)
+            connection.execute(
+                """
+                UPDATE workflow_operations SET state = ?, version = version + ?, evidence_json = ?,
+                    updated_at = ?, finished_at = CASE WHEN ? = 'uncertain' THEN finished_at ELSE ? END,
+                    error = CASE WHEN ? IN ('failed','unresolvable') THEN error ELSE NULL END
+                WHERE operation_id = ? AND version = ?
+                """,
+                (final_state.value, operation_version_increment, _canonical(redacted_evidence), now,
+                 final_state.value, now, final_state.value, operation_id, expected_version),
+            )
+            connection.execute(
+                """
+                UPDATE workflow_steps SET state = ?, evidence_json = ?,
+                    finished_at = CASE WHEN ? = 'uncertain' THEN finished_at ELSE ? END
+                WHERE workflow_id = ? AND step_index = ?
+                """,
+                (step_state, _canonical(redacted_evidence), step_state, now, workflow_id, step_index),
+            )
+            connection.execute(
+                """
+                UPDATE workflows SET state = ?, current_step = ?, version = version + ?, updated_at = ?,
+                    last_error = CASE WHEN ? = 'failed' THEN COALESCE(last_error, 'operation resolution failed') ELSE NULL END
+                WHERE workflow_id = ?
+                """,
+                (workflow_state.value, current_step, 1 if workflow_state is WorkflowState.UNCERTAIN else 2,
+                 now, workflow_state.value, workflow_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events(workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (workflow_id, step_index, operation_id, event_type, final_state.value,
+                 _canonical(redact_inputs(metadata or {})), now),
+            )
+            connection.commit()
+        return {"operation": self.get_operation(operation_id), "workflow": self.get(workflow_id)}
+
     def checkpoint_operation(
         self,
         operation_id: str,

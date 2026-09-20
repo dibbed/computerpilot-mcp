@@ -23,9 +23,9 @@ def _names(profile: str) -> set[str]:
 def test_full_is_default_and_preserves_complete_catalog() -> None:
     assert resolve_profile(None).name == "full"
     names = _names("full")
-    assert len(names) == 108
+    assert len(names) == 110
     assert {"read_file", "run_process", "ui_invoke", "reconcile_operation", "discover_tool_domains", "recommend_tools"} <= names
-    assert {"workflow_execute", "workflow_operations"} <= names
+    assert {"workflow_execute", "workflow_operations", "workflow_reconcile", "workflow_acknowledge_operation"} <= names
 
 
 def test_minimal_profile_does_not_register_workflow_tools() -> None:

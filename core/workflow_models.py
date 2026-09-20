@@ -155,7 +155,13 @@ OPERATION_TRANSITIONS: Mapping[OperationState, frozenset[OperationState]] = {
         }
     ),
     OperationState.RECONCILING: frozenset(
-        {OperationState.SUCCEEDED, OperationState.FAILED, OperationState.UNCERTAIN, OperationState.UNRESOLVABLE}
+        {
+            OperationState.SUCCEEDED,
+            OperationState.FAILED,
+            OperationState.UNCERTAIN,
+            OperationState.ACKNOWLEDGED,
+            OperationState.UNRESOLVABLE,
+        }
     ),
     OperationState.FAILED: frozenset({OperationState.RUNNING, OperationState.CANCELLED}),
     OperationState.SUCCEEDED: frozenset(),

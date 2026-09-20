@@ -14,6 +14,7 @@ from core.config import SETTINGS
 from core.errors import ToolError
 from core.tooling import MUTATING, READ_ONLY, compact_errors
 from core.workflow_models import OperationState
+from core.workflow_reconciliation import acknowledge_operation, reconcile_operation
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, workflow_store
 from tools.workflows.builtins import builtin_workflow
 
@@ -118,6 +119,36 @@ def register(mcp: MCPServer) -> None:
         )
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("workflow_reconcile")
+    def workflow_reconcile(
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+        expected_version: Annotated[int, Field(ge=1)],
+    ) -> dict[str, Any]:
+        """Reconcile an uncertain operation using only its persisted postcondition."""
+        result = reconcile_operation(
+            workflow_store(SETTINGS.workflow_db), operation_id, expected_version=expected_version,
+        )
+        audit_action("workflow_reconcile", target=operation_id, durable=True)
+        return result
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("workflow_acknowledge_operation")
+    def workflow_acknowledge_operation(
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+        expected_version: Annotated[int, Field(ge=1)],
+        resolution: Literal["resolved_completed", "resolved_failed", "remain_uncertain"],
+        reason: Annotated[str, Field(min_length=1, max_length=2_000)],
+        actor: Annotated[str, Field(min_length=1, max_length=200)],
+    ) -> dict[str, Any]:
+        """Record an audited operator assertion for one uncertain operation."""
+        result = acknowledge_operation(
+            workflow_store(SETTINGS.workflow_db), operation_id, expected_version=expected_version,
+            resolution=resolution, reason=reason, actor=actor,
+        )
+        audit_action("workflow_acknowledge_operation", target=operation_id, details={"actor": actor}, durable=True)
+        return result
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("workflow_resume")
     def workflow_resume(
         workflow_id: Annotated[str, Field(min_length=1, max_length=128)],
@@ -129,6 +160,11 @@ def register(mcp: MCPServer) -> None:
             raise ToolError("workflow_uncertain", "Reconcile the uncertain step before resume; it will not be replayed blindly.")
         if current["state"] not in {WorkflowState.PAUSED.value, WorkflowState.FAILED.value, WorkflowState.CREATED.value}:
             raise ToolError("workflow_not_resumable", f"Workflow state {current['state']!r} is not resumable.")
+        unresolved = workflow_store(SETTINGS.workflow_db).list_operations(
+            workflow_id, state=OperationState.UNCERTAIN,
+        )
+        if unresolved["total_count"]:
+            raise ToolError("workflow_uncertain", "Resolve every uncertain operation before resume.")
         audit_action("workflow_resume", target=workflow_id, durable=True)
         return workflow_store(SETTINGS.workflow_db).transition(workflow_id, expected_version, WorkflowState.QUEUED)
 
