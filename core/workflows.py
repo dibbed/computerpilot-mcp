@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -85,7 +86,7 @@ class WorkflowStore:
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS workflows (
@@ -133,7 +134,7 @@ class WorkflowStore:
         inputs_json = json.dumps(redact_inputs(inputs or {}), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         workflow_id = uuid.uuid4().hex
         now = _now()
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             if idempotency_key:
                 existing = connection.execute(
@@ -157,7 +158,7 @@ class WorkflowStore:
         return self.get(workflow_id)
 
     def get(self, workflow_id: str) -> dict[str, Any]:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             row = connection.execute("SELECT * FROM workflows WHERE workflow_id = ?", (workflow_id,)).fetchone()
             if row is None:
                 raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
@@ -203,7 +204,7 @@ class WorkflowStore:
             assignments.append("current_step = ?")
             parameters.append(current_step)
         parameters.extend([workflow_id, expected_version])
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection:
             cursor = connection.execute(
                 f"UPDATE workflows SET {', '.join(assignments)} WHERE workflow_id = ? AND version = ?", parameters,
             )
@@ -224,7 +225,7 @@ class WorkflowStore:
         increment_attempt: bool = False,
     ) -> None:
         now = _now()
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection:
             cursor = connection.execute(
                 """
                 UPDATE workflow_steps SET state = ?, attempts = attempts + ?,
@@ -244,7 +245,7 @@ class WorkflowStore:
 
     def recover_interrupted(self) -> int:
         now = _now()
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute("SELECT workflow_id, current_step FROM workflows WHERE state = 'running'").fetchall()
             for row in rows:
@@ -263,7 +264,7 @@ class WorkflowStore:
         return len(rows)
 
     def list(self, *, offset: int = 0, limit: int = 100) -> dict[str, Any]:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             total = int(connection.execute("SELECT COUNT(*) FROM workflows").fetchone()[0])
             rows = connection.execute(
                 """

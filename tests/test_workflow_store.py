@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -41,3 +42,11 @@ def test_restart_marks_running_step_uncertain(tmp_path: Path) -> None:
     assert recovered["state"] == "uncertain"
     assert recovered["steps"][0]["state"] == "uncertain"
 
+
+def test_store_releases_sqlite_handles_after_operations(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = WorkflowStore(root / "workflows.db")
+    workflow = store.create(_definition())
+    store.get(workflow["workflow_id"])
+    shutil.rmtree(root)
+    assert not root.exists()
