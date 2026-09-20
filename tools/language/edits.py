@@ -24,9 +24,22 @@ def prepare_workspace_edit(
     root: Path, workspace_edit: dict[str, Any], *, expected_sha256: dict[str, str] | None = None
 ) -> tuple[PlannedFile, ...]:
     root = root.resolve(strict=False)
-    changes = workspace_edit.get("changes")
-    if not isinstance(changes, dict):
-        raise ToolError("lsp_edit_unsupported", "Workspace edit has no supported changes map.")
+    changes: dict[str, list[dict[str, Any]]] = {}
+    raw_changes = workspace_edit.get("changes")
+    if isinstance(raw_changes, dict):
+        changes.update(raw_changes)
+    document_changes = workspace_edit.get("documentChanges")
+    if document_changes is not None:
+        if not isinstance(document_changes, list):
+            raise ToolError("lsp_edit_unsupported", "Workspace edit documentChanges must be a list.")
+        for operation in document_changes:
+            document = operation.get("textDocument") if isinstance(operation, dict) else None
+            edits = operation.get("edits") if isinstance(operation, dict) else None
+            if not isinstance(document, dict) or not isinstance(document.get("uri"), str) or not isinstance(edits, list):
+                raise ToolError("lsp_edit_unsupported", "Workspace resource operations are not supported.")
+            changes.setdefault(document["uri"], []).extend(edits)
+    if not changes:
+        raise ToolError("lsp_edit_unsupported", "Workspace edit has no supported text edits.")
     planned = []
     for uri, raw_edits in changes.items():
         path = uri_to_path(uri, root)

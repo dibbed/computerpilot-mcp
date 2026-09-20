@@ -43,3 +43,23 @@ def test_workspace_edit_rejects_overlap_stale_hash_and_external_path(tmp_path: P
         prepare_workspace_edit(tmp_path, overlap)
     with pytest.raises(ToolError, match="outside"):
         prepare_workspace_edit(tmp_path, {"changes": {(tmp_path.parent / "x.py").as_uri(): []}})
+
+
+def test_workspace_edit_accepts_text_document_edits_and_rejects_resource_operations(tmp_path: Path) -> None:
+    path = tmp_path / "a.py"
+    path.write_text("old\n", encoding="utf-8")
+    plan = prepare_workspace_edit(
+        tmp_path,
+        {
+            "documentChanges": [
+                {
+                    "textDocument": {"uri": path.as_uri(), "version": 1},
+                    "edits": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "new"}],
+                }
+            ]
+        },
+    )
+    apply_workspace_edit(plan)
+    assert path.read_text(encoding="utf-8") == "new\n"
+    with pytest.raises(ToolError, match="resource operations"):
+        prepare_workspace_edit(tmp_path, {"documentChanges": [{"kind": "create", "uri": (tmp_path / "b.py").as_uri()}]})
