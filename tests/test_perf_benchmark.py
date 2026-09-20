@@ -156,7 +156,7 @@ def test_catalog_benchmark_smoke() -> None:
     result = report["results"][0]
     assert result["name"] == "tool_catalog"
     assert result["status"] == "ok"
-    assert result["details"]["tool_count"] == 85
+    assert result["details"]["tool_count"] == 86
     assert result["details"]["catalog_json_bytes"] > 10_000
 
 

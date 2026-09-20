@@ -14,6 +14,7 @@ from core.audit import audit_action
 from core.config import PROJECT_ROOT, resolve_path
 from core.tooling import OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 from tools.testing import runners as _runners
+from tools.testing.diagnostics import merge_diagnostics
 from tools.testing.impact import select_affected_tests
 from tools.testing.runners import run_mypy_summary, run_pytest_summary, run_ruff_summary
 from tools.testing.verification import Check, verify_changed_repository
@@ -28,6 +29,48 @@ def _cwd(value: str | None) -> Path:
 
 
 def register(mcp: MCPServer) -> None:
+    @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
+    @compact_errors("collect_diagnostics")
+    def collect_diagnostics(
+        cwd: Annotated[str | None, Field(max_length=32_767)] = None,
+        backends: Annotated[list[Literal["ruff", "mypy", "pytest"]] | None, Field(max_length=3)] = None,
+        targets: Annotated[list[str] | None, Field(max_length=100)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=3_600)] = 600,
+        max_items: Annotated[int, Field(ge=1, le=1_000)] = 200,
+    ) -> dict[str, Any]:
+        """Run selected analyzers and return one stable, deduplicated diagnostic stream."""
+        working = _cwd(cwd)
+        selected = backends or ["ruff", "mypy", "pytest"]
+        stages: list[dict[str, Any]] = []
+        groups: list[list[dict[str, Any]]] = []
+        for backend in selected:
+            if backend == "ruff":
+                result = run_ruff_summary(working, targets=targets, timeout_sec=timeout_sec, diagnostic_cap=max_items)
+            elif backend == "mypy":
+                result = run_mypy_summary(working, targets=targets, timeout_sec=timeout_sec, diagnostic_cap=max_items)
+            else:
+                result = run_pytest_summary(working, targets=targets, timeout_sec=timeout_sec, diagnostic_cap=max_items)
+            groups.append(result.get("diagnostics", []))
+            stages.append(
+                {
+                    "backend": backend,
+                    "ok": bool(result.get("ok")),
+                    "unavailable": bool(result.get("unavailable")),
+                    "timed_out": bool(result.get("timed_out")),
+                    "diagnostic_count": len(result.get("diagnostics", [])),
+                }
+            )
+        diagnostics, truncated = merge_diagnostics(groups, cap=max_items)
+        required_unknown = any(stage["unavailable"] or stage["timed_out"] for stage in stages)
+        return {
+            "ok": all(stage["ok"] for stage in stages) and not required_unknown,
+            "diagnostics": diagnostics,
+            "count": len(diagnostics),
+            "truncated": truncated,
+            "stages": stages,
+            "required_unknown": required_unknown,
+        }
+
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("run_pytest")
     def run_pytest(

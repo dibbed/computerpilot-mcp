@@ -57,6 +57,7 @@ REQUIRED_TOOLS = {
     "run_mypy",
     "affected_tests",
     "verify_changes",
+    "collect_diagnostics",
     "symbol_definition",
     "symbol_references",
     "document_symbols",

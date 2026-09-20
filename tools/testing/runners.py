@@ -8,23 +8,14 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
 
 from core.artifacts import deliver_text
 from core.executor import run_bounded
 from core.response import bounded_text
+from tools.testing.diagnostics import Diagnostic
 
 SUMMARY_KEYS = ("passed", "failed", "skipped", "errors", "xfailed", "xpassed", "warnings")
-
-
-class Diagnostic(TypedDict, total=False):
-    file: str
-    line: int
-    column: int
-    severity: Literal["error", "warning", "note"]
-    code: str
-    message: str
-    source: Literal["python", "ruff", "mypy", "pytest"]
 
 
 def python_for(cwd: Path) -> str:
