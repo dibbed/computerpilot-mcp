@@ -213,6 +213,7 @@ Common settings:
 | --- | --- | --- |
 | `MCP_START_MODE` | Launcher mode: `tunnel` or `local-http` | `tunnel` |
 | `MCP_TUNNEL_PROFILE` | Secure Tunnel profile | auto-detected / `default` |
+| `MCP_TOOL_PROFILE` | Tool catalog profile (`minimal`, `coding`, `git`, `testing`, `desktop`, `browser`, `operations`, or `full`) | `full` |
 | `CONTROL_PLANE_API_KEY` | Tunnel control-plane credential | none |
 | `MCP_MAX_RUNNING_JOBS` | Maximum simultaneously active durable jobs | `4` |
 | `MCP_BROWSER_IDLE_SEC` | Idle browser-session lifetime | `900` |
@@ -230,6 +231,8 @@ Resource retention, cache, search-snapshot, audit, backup, artifact, and job-his
 ## Tool Capabilities
 
 The MCP catalog is grouped around development workflows rather than one large generic command tool.
+
+`full` remains the backward-compatible default catalog. Smaller profiles reduce tool-selection ambiguity for specialized agents. The always-available `discover_tool_domains` tool reports the active profile and `recommend_tools` ranks only tools registered in that profile, including concise guidance for overlapping editing, process, testing, and desktop actions.
 
 ### Filesystem and Editing
 

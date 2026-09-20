@@ -26,6 +26,7 @@ class Settings:
 
     server_name: str = "ali_windows_agent_mcp"
     version: str = "0.2.0"
+    tool_profile: str = os.getenv("MCP_TOOL_PROFILE", "full")
     default_list_limit: int = _env_int("MCP_DEFAULT_LIST_LIMIT", 50, 1, 500)
     max_list_limit: int = _env_int("MCP_MAX_LIST_LIMIT", 500, 10, 5_000)
     max_file_write_chars: int = _env_int("MCP_MAX_FILE_WRITE_CHARS", 2_000_000, 1_024, 20_000_000)
