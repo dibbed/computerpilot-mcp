@@ -39,6 +39,7 @@ from tools.filesystem.search_snapshots import SearchSnapshotStore, search_finger
 from tools.filesystem.service import search_by_name, search_by_name_streaming
 from tools.project.context import lookup_code_context
 from tools.project.service import parse_python
+from tools.testing.impact import select_affected_tests
 
 MiB = 1_048_576
 PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
@@ -405,6 +406,30 @@ def _patch_dry_run_once(root: Path, patch: str, count: int) -> dict[str, Any]:
     if result["file_count"] != count:
         raise RuntimeError(f"apply_patch dry-run correctness mismatch: {result['file_count']!r}")
     return {"files": count, "hunks": result["hunk_count"], "dry_run": result["dry_run"]}
+
+
+def _prepare_impact_fixture(root: Path, count: int) -> None:
+    app = root / "app"
+    tests = root / "tests"
+    app.mkdir(parents=True, exist_ok=True)
+    tests.mkdir(parents=True, exist_ok=True)
+    (app / "__init__.py").write_text("", encoding="utf-8")
+    for index in range(count):
+        previous = f"from app.module_{index - 1:04d} import value\n" if index else "value = 0\n"
+        (app / f"module_{index:04d}.py").write_text(previous, encoding="utf-8")
+    for index in range(max(count // 5, 1)):
+        target = min(index * 5, count - 1)
+        (tests / f"test_module_{target:04d}.py").write_text(
+            f"from app.module_{target:04d} import value\n\ndef test_value() -> None:\n    assert value >= 0\n",
+            encoding="utf-8",
+        )
+
+
+def _impact_once(root: Path, count: int) -> dict[str, Any]:
+    result = select_affected_tests(root, changed_paths=["app/module_0000.py"], max_files=count + count // 5 + 10, max_depth=20)
+    if result["decision"] not in {"focused", "focused_plus_full_recommended"}:
+        raise RuntimeError(f"affected_tests correctness mismatch: {result['decision']!r}")
+    return {"files": count, "tests": result["test_count"], "modules_traversed": result["modules_traversed"]}
 
 def _prepare_search_fixture(root: Path, count: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
@@ -1243,7 +1268,6 @@ def run_benchmarks(
                     runs,
                 )
             )
-
     if "retention" in suites:
         artifact_files = max(limits["artifact_files"])
         job_rows = max(limits["job_history_rows"])
@@ -1285,6 +1309,10 @@ def run_benchmarks(
                     runs,
                 )
             )
+            impact_count = 1_000
+            impact_root = root / "impact"
+            _prepare_impact_fixture(impact_root, impact_count)
+            results.append(measure("affected_tests_1000_modules", partial(_impact_once, impact_root, impact_count), runs))
 
     if "search" in suites:
         max_count = max(limits["search_files"])

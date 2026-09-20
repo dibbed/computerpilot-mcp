@@ -55,6 +55,7 @@ REQUIRED_TOOLS = {
     "run_pytest",
     "run_ruff",
     "run_mypy",
+    "affected_tests",
     "git_status",
     "git_diff_summary",
     "git_log_summary",
@@ -134,7 +135,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
-    assert len(names) == 63
+    assert len(names) == 64
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     for tool in tools:
@@ -367,6 +368,23 @@ def test_pytest_include_output_is_unlimited_by_default(tmp_path: Path) -> None:
             assert result["output"]["truncated"] is False
             assert result["output"]["total_chars"] > 50_000
             assert "z" * 1_000 in result["output"]["text"]
+
+    asyncio.run(scenario())
+
+
+def test_affected_tests_returns_structured_mcp_decision(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("docs", encoding="utf-8")
+
+    async def scenario() -> None:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            result = _structured(
+                await client.call_tool(
+                    "affected_tests",
+                    {"repo": str(tmp_path), "changed_paths": ["README.md"]},
+                )
+            )
+            assert result["decision"] == "none"
+            assert result["complete"] is True
 
     asyncio.run(scenario())
 

@@ -55,6 +55,7 @@ REQUIRED_TOOLS = {
     "run_pytest",
     "run_ruff",
     "run_mypy",
+    "affected_tests",
     "git_status",
     "git_diff_summary",
     "git_log_summary",

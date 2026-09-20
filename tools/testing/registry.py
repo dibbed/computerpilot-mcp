@@ -18,7 +18,8 @@ from core.audit import audit_action
 from core.config import PROJECT_ROOT, resolve_path
 from core.executor import run_bounded
 from core.response import bounded_text
-from core.tooling import OPEN_WORLD_WRITE, compact_errors
+from core.tooling import OPEN_WORLD_WRITE, READ_ONLY, compact_errors
+from tools.testing.impact import select_affected_tests
 
 SUMMARY_KEYS = ("passed", "failed", "skipped", "errors", "xfailed", "xpassed", "warnings")
 
@@ -266,3 +267,28 @@ def register(mcp: MCPServer) -> None:
         }
         audit_action("run_mypy", target=working, outcome="completed", details={"exit_code": result["exit_code"]})
         return response
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("affected_tests")
+    def affected_tests(
+        repo: Annotated[str | None, Field(max_length=32_767)] = None,
+        changed_paths: Annotated[list[str] | None, Field(max_length=1_000)] = None,
+        base: Annotated[str | None, Field(min_length=1, max_length=500)] = None,
+        max_files: Annotated[int, Field(ge=1, le=50_000)] = 5_000,
+        max_depth: Annotated[int, Field(ge=0, le=20)] = 5,
+        max_results: Annotated[int, Field(ge=1, le=5_000)] = 500,
+        include_changed_tests: bool = True,
+        fallback_policy: Literal["report", "select_full_suite"] = "report",
+    ) -> dict[str, Any]:
+        """Select tests affected by changed Python modules and report conservative full-suite fallbacks."""
+
+        return select_affected_tests(
+            _cwd(repo),
+            changed_paths=changed_paths,
+            base=base,
+            max_files=max_files,
+            max_depth=max_depth,
+            max_results=max_results,
+            include_changed_tests=include_changed_tests,
+            fallback_policy=fallback_policy,
+        )
