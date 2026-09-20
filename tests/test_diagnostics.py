@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from core.workflow_models import WorkflowState
+from core.workflows import StepDefinition, WorkflowDefinition, WorkflowStore
 from tools.testing.diagnostics import merge_diagnostics, normalize_diagnostic
 
 
@@ -28,3 +32,19 @@ def test_merge_is_deduplicated_stable_and_capped() -> None:
     )
     assert diagnostics[0]["file"] == "a.py"
     assert truncated is True
+
+
+def test_workflow_health_separates_aggregate_operations_and_leases(tmp_path: Path) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db")
+    workflow = store.create(
+        WorkflowDefinition("health", (StepDefinition("file", "check_file", {"path": "unused"}),)),
+        initial_state=WorkflowState.QUEUED,
+    )
+    store.acquire_lease(workflow["workflow_id"], "health-test", 30)
+
+    summary = store.health_summary()
+
+    assert summary["workflow_counts"] == {"queued": 1}
+    assert summary["operation_counts"] == {"created": 1}
+    assert summary["unresolved_operation_count"] == 0
+    assert summary["active_lease_count"] == 1

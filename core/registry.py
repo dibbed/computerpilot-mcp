@@ -18,6 +18,7 @@ from core.resource_health import collect_resource_metrics
 from core.timings import ToolRequestTimingMiddleware, install_sdk_timing_hooks
 from core.tool_profiles import ALL_DOMAINS, PREFERRED_USE, PROFILE_DOMAINS, resolve_profile
 from core.tooling import READ_ONLY, compact_errors
+from core.workflow_store import workflow_store
 from tools.browser import register as register_browser
 from tools.browser.manager import MANAGER as BROWSER_MANAGER
 from tools.desktop import register as register_desktop
@@ -149,6 +150,7 @@ def create_server() -> MCPServer:
             "semantic_desktop_available": os.name == "nt" and importlib.util.find_spec("uiautomation") is not None,
             "audit_log": str(SETTINGS.audit_log),
             "operation_recovery": OPERATION_RECOVERY.summary(),
+            "workflow_health": workflow_store(SETTINGS.workflow_db).health_summary(),
             "resource_budgets": SETTINGS.resource_budgets(),
             "resource_usage": resource_usage,
             **resources,

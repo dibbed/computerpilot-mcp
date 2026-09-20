@@ -64,6 +64,19 @@ def test_semantic_lookup_and_mutations_redact_values() -> None:
     assert backend.saved == [("invoke", "save"), ("value", "secret")]
 
 
+def test_semantic_patterns_use_control_identity_without_coordinate_fallback() -> None:
+    backend = FakeBackend()
+    service = UIAutomationService(backend)
+    window = WindowLocator(handle=10)
+
+    service.invoke(window, ElementLocator(automation_id="save", control_type="ButtonControl"))
+    service.set_value(window, ElementLocator(automation_id="name", control_type="EditControl"), "value")
+    service.select(window, ElementLocator(automation_id="save", control_type="ButtonControl"))
+
+    assert backend.saved == [("invoke", "save"), ("value", "value"), ("select", "save")]
+    assert not hasattr(backend, "click")
+
+
 def test_mutation_re_resolves_and_duplicate_match_fails_closed() -> None:
     backend = FakeBackend()
     service = UIAutomationService(backend)

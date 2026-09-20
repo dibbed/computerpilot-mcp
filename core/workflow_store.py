@@ -859,6 +859,43 @@ class WorkflowStore:
             "has_more": offset + len(rows) < total,
         }
 
+    def health_summary(self, *, sample_limit: int = 5) -> dict[str, Any]:
+        """Return bounded aggregate workflow, operation, and lease health."""
+        bounded = min(max(sample_limit, 1), 20)
+        with closing(self._connect()) as connection:
+            workflow_counts = {
+                str(row["state"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) AS count FROM workflows GROUP BY state ORDER BY state"
+                ).fetchall()
+            }
+            operation_counts = {
+                str(row["state"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) AS count FROM workflow_operations GROUP BY state ORDER BY state"
+                ).fetchall()
+            }
+            unresolved = connection.execute(
+                """
+                SELECT operation_id, workflow_id, step_index, action, state, updated_at
+                FROM workflow_operations
+                WHERE state IN ('uncertain','reconciling','unresolvable')
+                ORDER BY updated_at ASC LIMIT ?
+                """,
+                (bounded,),
+            ).fetchall()
+            lease_count = int(connection.execute("SELECT COUNT(*) FROM workflow_leases").fetchone()[0])
+        unresolved_total = sum(operation_counts.get(state, 0) for state in ("uncertain", "reconciling", "unresolvable"))
+        return {
+            "workflow_counts": workflow_counts,
+            "workflow_total": sum(workflow_counts.values()),
+            "operation_counts": operation_counts,
+            "unresolved_operation_count": unresolved_total,
+            "oldest_unresolved_operations": [dict(row) for row in unresolved],
+            "active_lease_count": lease_count,
+            "sample_limit": bounded,
+        }
+
 
 _STORE: WorkflowStore | None = None
 _STORE_PATH: Path | None = None

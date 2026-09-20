@@ -118,6 +118,10 @@ REQUIRED_TOOLS = {
     "workflow_plan",
     "workflow_start",
     "workflow_status",
+    "workflow_execute",
+    "workflow_operations",
+    "workflow_reconcile",
+    "workflow_acknowledge_operation",
     "workflow_resume",
     "workflow_cancel",
 }
@@ -150,6 +154,8 @@ async def run_checks() -> dict[str, Any]:
         if missing:
             raise RuntimeError(f"Missing required tools: {missing}")
         checks["tool_registration"] = len(names) == len(listing.tools)
+        health = _structured(await client.call_tool("server_health", {}), "server_health")
+        workflow_health = health["workflow_health"]
         with tempfile.TemporaryDirectory(prefix="ali-mcp-health-") as temp_dir:
             probe = Path(temp_dir) / "probe.txt"
             _structured(await client.call_tool("create_file", {"path": str(probe), "content": "alpha\n"}), "create_file")
@@ -182,7 +188,7 @@ async def run_checks() -> dict[str, Any]:
             _structured(await client.call_tool("delete_file", {"path": str(probe)}), "delete_file")
     if not all(checks.values()):
         raise RuntimeError(f"One or more checks failed: {checks}")
-    return {"ok": True, "checks": checks, "tool_count": len(names)}
+    return {"ok": True, "checks": checks, "tool_count": len(names), "workflow_health": workflow_health}
 
 
 def main() -> int:

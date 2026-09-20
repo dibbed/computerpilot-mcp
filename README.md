@@ -420,17 +420,21 @@ The eight legacy uncertain records observed before this release remain intact fo
 
 ## Durable Workflow Orchestration
 
-Workflow definitions are immutable ordered steps stored in SQLite. `workflow_plan`, `workflow_start`, `workflow_status`, `workflow_resume`, and `workflow_cancel` expose their lifecycle. Run queued workflows with:
+Workflow definitions are immutable ordered steps stored in SQLite. Use `workflow_plan` and `workflow_start` to validate and queue work, `workflow_execute` to claim and run it, and `workflow_status` plus `workflow_operations` to inspect aggregate and side-effect state. The standalone worker uses the same executor API:
 
 ```powershell
 .\.venv\Scripts\python.exe -m scripts.workflow_worker --once
 ```
 
-Only these typed actions are executable: `verify_changes`, `git_status`, `git_stage`, `git_commit`, `run_durable_job`, `check_file`, and `check_http`. Arbitrary shell text is rejected. Mutating steps require postconditions, inputs are redacted before persistence, transitions use optimistic version guards, retries are bounded to explicitly transient failures, and a runtime interruption during a running step becomes `uncertain` rather than being replayed.
+Executable actions are defined by a typed allowlist covering verification, patching, affected-test selection, guarded Git actions, durable jobs, file/HTTP checks, and semantic desktop/browser adapters. Arbitrary shell text is rejected. Mutating steps require supported postconditions, inputs are redacted before persistence, transitions use optimistic version guards, and retries are bounded to explicitly transient failures.
+
+Each step materializes a durable operation with its own version and idempotency key. Executors claim a time-bounded lease and checkpoint the operation before invoking its action. An interrupted side effect becomes `uncertain` and is never replayed blindly. Use `workflow_reconcile` to evaluate only the persisted postcondition. If automated evidence remains inconclusive, `workflow_acknowledge_operation` records an explicit operator assertion with actor and reason. Only resolved failed, paused, or newly created aggregates may be queued with `workflow_resume`.
+
+State ownership is intentionally separated: the workflow database owns definitions and aggregate/operation lifecycle; the job store owns process completion and output; the recovery journal owns legacy standalone mutation ambiguity; project memory is advisory and is never execution authority.
 
 Built-in plans are `implement_and_verify`, `safe_git_commit`, and `prepare_release`. They do not push, tag, or deploy. `deploy_and_healthcheck` requires an explicit project adapter and otherwise fails closed.
 
-`server_health` exposes the current runtime state, resource pressure, job counts, browser counts, storage usage, configured resource budgets, and operation-recovery summary.
+`server_health` exposes current runtime state, resource pressure, job and browser counts, storage budgets, the legacy operation-recovery summary, and bounded workflow/operation/lease health counts with the oldest unresolved operation samples.
 
 ## Local Control Panel
 

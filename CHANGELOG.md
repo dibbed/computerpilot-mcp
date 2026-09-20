@@ -6,6 +6,14 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Added - 2026-09-20
+- Add leased workflow execution with durable operation checkpoints, typed action validation, and MCP operation inspection.
+- Add side-effect-free postcondition reconciliation and audited operator acknowledgement for uncertain workflow operations.
+
+### Safety and observability - 2026-09-20
+- Prevent blind replay of interrupted side effects and require compare-and-swap versions for execution and resolution.
+- Separate bounded health reporting for workflow aggregates, unresolved operations, leases, jobs, and legacy recovery records.
+
 ## [0.2.4] - 2026-09-20
 
 ### Added
