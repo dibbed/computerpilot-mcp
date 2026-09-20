@@ -1235,7 +1235,6 @@ class WorkflowStore:
         }
 
     def health_summary(self, *, sample_limit: int = 5) -> dict[str, Any]:
-        """Return bounded aggregate workflow, operation, and lease health."""
         bounded = min(max(sample_limit, 1), 20)
         with closing(self._connect()) as connection:
             workflow_counts = {
@@ -1254,19 +1253,39 @@ class WorkflowStore:
                 """
                 SELECT operation_id, workflow_id, step_index, action, state, updated_at
                 FROM workflow_operations
-                WHERE state IN ('uncertain','reconciling')
+                WHERE state IN ('uncertain','reconciling','unresolvable')
                 ORDER BY updated_at ASC LIMIT ?
                 """,
                 (bounded,),
             ).fetchall()
-            lease_count = int(connection.execute(
-                "SELECT COUNT(*) FROM workflow_leases WHERE expires_at > ?", (_now(),),
-            ).fetchone()[0])
-        unresolved_total = sum(operation_counts.get(state, 0) for state in ("uncertain", "reconciling"))
+            lease_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM workflow_leases WHERE expires_at > ?",
+                    (_now(),),
+                ).fetchone()[0]
+            )
+            event_total = int(connection.execute("SELECT COUNT(*) FROM workflow_events").fetchone()[0])
+        db_bytes = 0
+        for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
+            try:
+                if path.is_file():
+                    db_bytes += path.stat().st_size
+            except OSError:
+                continue
+        unresolved_total = sum(
+            operation_counts.get(state, 0)
+            for state in ("uncertain", "reconciling", "unresolvable")
+        )
         return {
             "workflow_counts": workflow_counts,
             "workflow_total": sum(workflow_counts.values()),
             "operation_counts": operation_counts,
+            "operation_total": sum(operation_counts.values()),
+            "event_total": event_total,
+            "workflow_db_bytes": db_bytes,
+            "queued_workflows": workflow_counts.get("queued", 0),
+            "running_workflows": workflow_counts.get("running", 0) + workflow_counts.get("cancelling", 0),
+            "uncertain_workflows": workflow_counts.get("uncertain", 0) + workflow_counts.get("reconciling", 0),
             "unresolved_operation_count": unresolved_total,
             "oldest_unresolved_operations": [dict(row) for row in unresolved],
             "active_lease_count": lease_count,

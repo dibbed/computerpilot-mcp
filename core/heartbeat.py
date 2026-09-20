@@ -16,6 +16,7 @@ from core.config import SETTINGS
 from core.job_retention import schedule_job_history_retention
 from core.lifecycle import RUNTIME_LIFECYCLE
 from core.recovery import OPERATION_RECOVERY
+from core.workflow_retention import schedule_workflow_history_retention
 
 
 @asynccontextmanager
@@ -36,6 +37,7 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
         while True:
             schedule_artifact_retention(settings=SETTINGS)
             schedule_job_history_retention(settings=SETTINGS)
+            schedule_workflow_history_retention(settings=SETTINGS)
             await asyncio.sleep(interval)
 
     RUNTIME_LIFECYCLE.configure_from_env()

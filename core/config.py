@@ -25,7 +25,7 @@ class Settings:
     """Small immutable runtime configuration."""
 
     server_name: str = "ali_windows_agent_mcp"
-    version: str = "0.2.4"
+    version: str = "0.2.5"
     tool_profile: str = os.getenv("MCP_TOOL_PROFILE", "full")
     default_list_limit: int = _env_int("MCP_DEFAULT_LIST_LIMIT", 50, 1, 500)
     max_list_limit: int = _env_int("MCP_MAX_LIST_LIMIT", 500, 10, 5_000)
@@ -60,6 +60,10 @@ class Settings:
     job_history_max_count: int = _env_int("MCP_JOB_HISTORY_MAX_COUNT", 1_000, 0, 1_000_000)
     job_history_max_bytes: int = _env_int("MCP_JOB_HISTORY_MAX_BYTES", 1 * 1_024 * 1_024 * 1_024, 0, 100 * 1_024 * 1_024 * 1_024)
     job_history_cleanup_interval_sec: int = _env_int("MCP_JOB_HISTORY_CLEANUP_INTERVAL_SEC", 30, 1, 86_400)
+    workflow_history_max_count: int = _env_int("MCP_WORKFLOW_HISTORY_MAX_COUNT", 1_000, 0, 1_000_000)
+    workflow_history_max_age_days: int = _env_int("MCP_WORKFLOW_HISTORY_MAX_AGE_DAYS", 30, 0, 3_650)
+    workflow_db_warn_bytes: int = _env_int("MCP_WORKFLOW_DB_WARN_BYTES", 256 * 1_024 * 1_024, 1_024, 100 * 1_024 * 1_024 * 1_024)
+    workflow_cleanup_interval_sec: int = _env_int("MCP_WORKFLOW_CLEANUP_INTERVAL_SEC", 300, 1, 86_400)
     state_dir: Path = PROJECT_ROOT / ".agent_state"
     memory_dir: Path = PROJECT_ROOT / "memory"
 
@@ -106,6 +110,9 @@ class Settings:
             "job_history_max_count": self.job_history_max_count,
             "job_history_max_bytes": self.job_history_max_bytes,
             "job_history_max_age_days": self.job_history_max_age_days,
+            "workflow_history_max_count": self.workflow_history_max_count,
+            "workflow_history_max_age_days": self.workflow_history_max_age_days,
+            "workflow_db_warn_bytes": self.workflow_db_warn_bytes,
             "audit_max_file_bytes": self.audit_max_file_bytes,
             "audit_keep_files": self.audit_keep_files,
         }

@@ -135,6 +135,15 @@ def create_server() -> MCPServer:
         browser_stats = await BROWSER_MANAGER.stats()
         resources = collect_resource_metrics(browser_stats)
         resource_usage = resources.pop("budgets")
+        workflow_health = workflow_store(SETTINGS.workflow_db).health_summary()
+        degraded_reasons: list[str] = []
+        if int(workflow_health["unresolved_operation_count"]) > 0:
+            degraded_reasons.append("unresolved_uncertain_operations")
+        if int(workflow_health["workflow_db_bytes"]) >= SETTINGS.workflow_db_warn_bytes:
+            degraded_reasons.append("workflow_db_pressure")
+        if resources.get("resource_pressure") in {"warning", "critical"}:
+            degraded_reasons.append("resource_pressure")
+        health_status = "degraded" if degraded_reasons else "healthy"
         return {
             "ok": True,
             "server": SETTINGS.server_name,
@@ -150,7 +159,9 @@ def create_server() -> MCPServer:
             "semantic_desktop_available": os.name == "nt" and importlib.util.find_spec("uiautomation") is not None,
             "audit_log": str(SETTINGS.audit_log),
             "operation_recovery": OPERATION_RECOVERY.summary(),
-            "workflow_health": workflow_store(SETTINGS.workflow_db).health_summary(),
+            "health_status": health_status,
+            "degraded_reasons": degraded_reasons,
+            "workflow_health": workflow_health,
             "resource_budgets": SETTINGS.resource_budgets(),
             "resource_usage": resource_usage,
             **resources,
