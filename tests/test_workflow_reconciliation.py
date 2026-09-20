@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,7 +15,7 @@ def _uncertain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     postcondition: dict[str, object],
-) -> tuple[WorkflowStore, dict[str, object]]:
+) -> tuple[WorkflowStore, dict[str, Any]]:
     store = WorkflowStore(tmp_path / "workflows.db")
 
     def interrupted(arguments: dict[str, object], timeout: float) -> dict[str, object]:

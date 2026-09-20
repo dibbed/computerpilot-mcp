@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from core.errors import ToolError
 from core.reconcilers import evaluate_postcondition
@@ -11,7 +11,7 @@ from core.workflow_models import OperationState
 from core.workflow_store import WorkflowStore, redact_inputs
 
 
-def reconcile_operation(store: WorkflowStore, operation_id: str, *, expected_version: int) -> dict[str, object]:
+def reconcile_operation(store: WorkflowStore, operation_id: str, *, expected_version: int) -> dict[str, Any]:
     operation = store.get_operation(operation_id)
     if operation["version"] != expected_version:
         raise ToolError("workflow_operation_version_conflict", "Operation changed; reload it before retrying.")
@@ -42,7 +42,7 @@ def acknowledge_operation(
     resolution: Literal["resolved_completed", "resolved_failed", "remain_uncertain"],
     reason: str,
     actor: str,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     bounded_reason, bounded_actor = reason.strip()[:2_000], actor.strip()[:200]
     if not bounded_reason or not bounded_actor:
         raise ToolError("workflow_acknowledgement_required", "Acknowledgement requires non-empty reason and actor.")
