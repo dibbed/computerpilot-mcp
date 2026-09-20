@@ -6,19 +6,20 @@ import json
 import os
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from core.errors import ToolError
+from core.recovery_models import Evidence, OperationState, Postcondition
 
 JOURNAL_SCHEMA_VERSION = 1
 COMPACT_AFTER_RECORDS = 4_096
 _MAX_LINE_BYTES = 32_768
 _MAX_TARGET_CHARS = 1_000
 
-RecordType = Literal["begin", "result", "uncertain"]
+RecordType = Literal["begin", "result", "uncertain", "reconciliation", "acknowledged"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,7 +124,9 @@ class OperationRecoveryJournal:
         for record in records:
             operation_id = record.get("operation_id")
             record_type = record.get("type")
-            if not isinstance(operation_id, str) or record_type not in {"begin", "result", "uncertain"}:
+            if not isinstance(operation_id, str) or record_type not in {
+                "begin", "result", "uncertain", "reconciliation", "acknowledged",
+            }:
                 continue
             if record_type == "begin":
                 state[operation_id] = {"begin": record}
@@ -139,7 +142,13 @@ class OperationRecoveryJournal:
             records = self._load_locked()
         for operation_id, item in self._state(records).items():
             begin = item.get("begin")
-            if not begin or item.get("result") or item.get("uncertain"):
+            if (
+                not begin
+                or item.get("result")
+                or item.get("uncertain")
+                or item.get("reconciliation")
+                or item.get("acknowledged")
+            ):
                 continue
             if begin.get("runtime_id") == runtime_id:
                 continue
@@ -155,7 +164,7 @@ class OperationRecoveryJournal:
             })
 
     def _compact_locked(self) -> None:
-        """Drop completed history while preserving every pending/uncertain operation."""
+        """Drop ordinary completed history while preserving recovery evidence."""
         path = self._path
         if not self._enabled or path is None:
             return
@@ -165,10 +174,13 @@ class OperationRecoveryJournal:
             begin = item.get("begin")
             if begin is None or item.get("result") is not None:
                 continue
+            terminal = item.get("acknowledged") or item.get("reconciliation")
             retained.append(begin)
             uncertain = item.get("uncertain")
             if uncertain is not None:
                 retained.append(uncertain)
+            if terminal is not None:
+                retained.append(terminal)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         try:
             with temporary.open("wb", buffering=0) as handle:
@@ -206,6 +218,185 @@ class OperationRecoveryJournal:
             # already fsync'd, so never turn a known operation result into an
             # apparent failure that could encourage a duplicate retry.
             self._next_compact_at = self._record_count + COMPACT_AFTER_RECORDS
+
+    @staticmethod
+    def _pagination(offset: int, max_items: int) -> tuple[int, int]:
+        if offset < 0:
+            raise ToolError("invalid_offset", "offset must be zero or greater.")
+        if not 1 <= max_items <= 1_000:
+            raise ToolError("invalid_max_items", "max_items must be between 1 and 1000.")
+        return offset, max_items
+
+    @staticmethod
+    def _operation_view(operation_id: str, item: dict[str, Any]) -> dict[str, Any]:
+        begin = item["begin"]
+        result = item.get("result")
+        reconciliation = item.get("reconciliation")
+        acknowledgment = item.get("acknowledged")
+        if acknowledgment is not None:
+            state = str(acknowledgment.get("state") or OperationState.ACKNOWLEDGED.value)
+        elif reconciliation is not None:
+            state = str(reconciliation.get("state") or OperationState.UNRESOLVABLE.value)
+        elif result is not None:
+            state = (
+                OperationState.FAILED.value
+                if result.get("known_result") in {"raised", "returned_error"}
+                else OperationState.SUCCEEDED.value
+            )
+        elif item.get("uncertain") is not None:
+            state = OperationState.UNCERTAIN.value
+        else:
+            state = OperationState.RUNNING.value
+        evidence: list[dict[str, Any]] = []
+        for record in (reconciliation, acknowledgment):
+            if isinstance(record, dict) and isinstance(record.get("evidence"), dict):
+                evidence.append(record["evidence"])
+        view: dict[str, Any] = {
+            "operation_id": operation_id,
+            "operation_type": begin.get("operation_type"),
+            "state": state,
+            "target": begin.get("target"),
+            "started_at": begin.get("started_at"),
+            "runtime_id": begin.get("runtime_id"),
+            "evidence": evidence,
+        }
+        if reconciliation is not None and isinstance(reconciliation.get("postcondition"), dict):
+            view["postcondition"] = reconciliation["postcondition"]
+        return view
+
+    def list_operations(
+        self,
+        *,
+        state: OperationState | str | None = None,
+        offset: int = 0,
+        max_items: int = 100,
+    ) -> dict[str, Any]:
+        """List durable operations without exposing command payloads."""
+        offset, max_items = self._pagination(offset, max_items)
+        requested_state = state.value if isinstance(state, OperationState) else state
+        with self._lock:
+            items = [
+                self._operation_view(operation_id, item)
+                for operation_id, item in self._state(self._load_locked()).items()
+                if item.get("begin") is not None
+            ]
+        if requested_state is not None:
+            items = [item for item in items if item["state"] == requested_state]
+        items.sort(key=lambda item: str(item.get("started_at") or ""), reverse=True)
+        total_count = len(items)
+        page = items[offset:offset + max_items]
+        return {
+            "total_count": total_count,
+            "count": len(page),
+            "offset": offset,
+            "has_more": offset + len(page) < total_count,
+            "items": page,
+        }
+
+    def inspect(self, operation_id: str) -> dict[str, Any]:
+        with self._lock:
+            item = self._state(self._load_locked()).get(operation_id)
+            if item is None or item.get("begin") is None:
+                raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
+            return self._operation_view(operation_id, item)
+
+    def history(self, operation_id: str, offset: int = 0, max_items: int = 100) -> dict[str, Any]:
+        offset, max_items = self._pagination(offset, max_items)
+        with self._lock:
+            items = [record for record in self._load_locked() if record.get("operation_id") == operation_id]
+        if not items:
+            raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
+        total_count = len(items)
+        page = items[offset:offset + max_items]
+        return {
+            "total_count": total_count,
+            "count": len(page),
+            "offset": offset,
+            "has_more": offset + len(page) < total_count,
+            "items": page,
+        }
+
+    def acknowledge(
+        self,
+        operation_id: str,
+        state: OperationState,
+        evidence: Evidence | None,
+    ) -> dict[str, Any]:
+        if state not in {OperationState.ACKNOWLEDGED, OperationState.UNRESOLVABLE}:
+            raise ToolError("invalid_operation_state", "Acknowledgment state must be acknowledged or unresolvable.")
+        if evidence is None or not evidence.source.strip() or not evidence.data:
+            raise ToolError("evidence_required", "Acknowledgment requires non-empty evidence.")
+        with self._lock:
+            current = self._state(self._load_locked()).get(operation_id)
+            if current is None or current.get("begin") is None:
+                raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
+            existing = current.get("acknowledged")
+            serialized = asdict(evidence)
+            if existing is not None:
+                if existing.get("state") == state.value and existing.get("evidence") == serialized:
+                    return self._operation_view(operation_id, current)
+                raise ToolError("operation_already_acknowledged", "Operation already has a different acknowledgment.")
+            self._append_locked({
+                "schema_version": JOURNAL_SCHEMA_VERSION,
+                "type": "acknowledged",
+                "status": "completed",
+                "state": state.value,
+                "operation_id": operation_id,
+                "runtime_id": self._runtime_id,
+                "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "evidence": serialized,
+            })
+            self._maybe_compact_locked()
+            current["acknowledged"] = self._load_locked()[-1]
+            return self._operation_view(operation_id, current)
+
+    def record_reconciliation(
+        self,
+        operation_id: str,
+        state: OperationState,
+        postcondition: Postcondition,
+        evidence: Evidence,
+    ) -> dict[str, Any]:
+        if state not in {OperationState.SUCCEEDED, OperationState.FAILED, OperationState.UNRESOLVABLE}:
+            raise ToolError("invalid_operation_state", "Reconciliation must resolve to succeeded, failed, or unresolvable.")
+        if state in {OperationState.SUCCEEDED, OperationState.FAILED} and evidence.data.get("conclusive") is not True:
+            raise ToolError("conclusive_evidence_required", "A conclusive reconciliation requires evidence marked conclusive.")
+        with self._lock:
+            current = self._state(self._load_locked()).get(operation_id)
+            if current is None or current.get("begin") is None:
+                raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
+            if current.get("result") is not None:
+                raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
+            serialized_postcondition = asdict(postcondition)
+            serialized_evidence = asdict(evidence)
+            existing = current.get("reconciliation")
+            if existing is not None:
+                if (
+                    existing.get("state") == state.value
+                    and existing.get("postcondition") == serialized_postcondition
+                    and existing.get("evidence") == serialized_evidence
+                ):
+                    return self._operation_view(operation_id, current)
+                raise ToolError("operation_already_reconciled", "Operation already has different reconciliation evidence.")
+            record = {
+                "schema_version": JOURNAL_SCHEMA_VERSION,
+                "type": "reconciliation",
+                "status": "completed",
+                "state": state.value,
+                "operation_id": operation_id,
+                "runtime_id": self._runtime_id,
+                "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "postcondition": serialized_postcondition,
+                "evidence": serialized_evidence,
+            }
+            self._append_locked(record)
+            self._maybe_compact_locked()
+            current["reconciliation"] = record
+            return self._operation_view(operation_id, current)
+
+    def compact(self) -> None:
+        with self._lock:
+            self._compact_locked()
 
     def begin(self, operation_type: str, target: str | None = None) -> OperationHandle | None:
         with self._lock:
@@ -266,7 +457,12 @@ class OperationRecoveryJournal:
             pending_count = 0
             for operation_id, item in state.items():
                 begin = item.get("begin")
-                if not begin or item.get("result"):
+                if (
+                    not begin
+                    or item.get("result")
+                    or item.get("reconciliation")
+                    or item.get("acknowledged")
+                ):
                     continue
                 marker = item.get("uncertain")
                 if marker is None:
