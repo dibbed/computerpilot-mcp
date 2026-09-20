@@ -41,6 +41,14 @@ def test_workflow_lifecycle_tools_persist_and_cancel(tmp_path: Path, monkeypatch
     asyncio.run(scenario())
 
 
+def test_each_mcp_execution_attempt_has_a_distinct_lease_owner() -> None:
+    first = workflow_registry._mcp_owner_id()
+    second = workflow_registry._mcp_owner_id()
+
+    assert first != second
+    assert first.startswith("mcp-") and second.startswith("mcp-")
+
+
 def test_workflow_execute_and_operations_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     settings = replace(workflow_registry.SETTINGS, state_dir=tmp_path)
     monkeypatch.setattr(workflow_registry, "SETTINGS", settings)

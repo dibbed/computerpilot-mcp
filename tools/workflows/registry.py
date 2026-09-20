@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import asdict
 from typing import Annotated, Any, Literal
 
@@ -41,6 +42,10 @@ class WorkflowInput(BaseModel):
             tuple(StepDefinition(**step.model_dump()) for step in self.steps),
             self.description,
         )
+
+
+def _mcp_owner_id() -> str:
+    return f"mcp-{os.getpid()}-{uuid.uuid4().hex}"
 
 
 def register(mcp: MCPServer) -> None:
@@ -97,7 +102,7 @@ def register(mcp: MCPServer) -> None:
             raise ToolError("workflow_version_conflict", "Workflow version changed; reload status before execution.")
         result = WorkflowExecutor(store).execute(
             workflow_id,
-            owner_id=f"mcp-{os.getpid()}",
+            owner_id=_mcp_owner_id(),
             dry_run=dry_run,
             lease_ttl_sec=lease_ttl_sec,
         )
