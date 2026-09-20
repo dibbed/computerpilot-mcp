@@ -58,6 +58,7 @@ REQUIRED_TOOLS = {
     "affected_tests",
     "verify_changes",
     "collect_diagnostics",
+    "start_validation_watch",
     "symbol_definition",
     "symbol_references",
     "document_symbols",

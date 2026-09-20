@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -12,6 +13,8 @@ from pydantic import Field
 from core.artifacts import deliver_text
 from core.audit import audit_action
 from core.config import PROJECT_ROOT, resolve_path
+from core.job_scheduler import ensure_job_scheduler
+from core.jobs import JobStore
 from core.tooling import OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 from tools.testing import runners as _runners
 from tools.testing.diagnostics import merge_diagnostics
@@ -29,6 +32,47 @@ def _cwd(value: str | None) -> Path:
 
 
 def register(mcp: MCPServer) -> None:
+    watch_store = JobStore()
+    ensure_job_scheduler(watch_store)
+
+    @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
+    @compact_errors("start_validation_watch")
+    def start_validation_watch(
+        repo: Annotated[str | None, Field(max_length=32_767)] = None,
+        poll_sec: Annotated[float, Field(ge=0.1, le=60)] = 1.0,
+        debounce_sec: Annotated[float, Field(ge=0, le=60)] = 0.5,
+        max_runtime_sec: Annotated[float, Field(ge=1, le=86_400)] = 3_600,
+        max_files: Annotated[int, Field(ge=1, le=1_000_000)] = 50_000,
+        idempotency_key: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
+    ) -> dict[str, Any]:
+        """Start a durable, cancellable watch that verifies settled source changes."""
+        working = _cwd(repo).resolve()
+        args = [
+            "-m",
+            "scripts.validation_watch",
+            str(working),
+            "--poll-sec",
+            str(poll_sec),
+            "--debounce-sec",
+            str(debounce_sec),
+            "--max-runtime-sec",
+            str(max_runtime_sec),
+            "--max-files",
+            str(max_files),
+        ]
+        fingerprint = hashlib.sha256(json.dumps([str(working), poll_sec, debounce_sec, max_runtime_sec, max_files]).encode()).hexdigest()[
+            :24
+        ]
+        request_key = idempotency_key or f"validation-watch-{fingerprint}"
+        audit_action("start_validation_watch", target=working, details={"request_key": request_key})
+        return watch_store.submit(
+            [_runners.python_for(working), *args],
+            working,
+            max_runtime_sec + 120,
+            request_key,
+            queue_timeout_sec=300,
+        )
+
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("collect_diagnostics")
     def collect_diagnostics(

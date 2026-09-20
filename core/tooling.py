@@ -55,6 +55,7 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "run_mypy",
     "verify_changes",
     "collect_diagnostics",
+    "start_validation_watch",
         "rename_symbol",
         "apply_code_action",
         "git_create_branch",
