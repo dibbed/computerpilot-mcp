@@ -69,6 +69,17 @@ REQUIRED_TOOLS = {
     "git_status",
     "git_diff_summary",
     "git_log_summary",
+    "git_diff",
+    "git_show",
+    "git_blame",
+    "git_merge_base",
+    "git_changed_files",
+    "git_branch_list",
+    "git_conflicts",
+    "git_create_branch",
+    "git_stage",
+    "git_commit",
+    "git_restore_file",
     "browser_open_page",
     "browser_screenshot",
     "browser_click",
@@ -145,7 +156,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
-    assert len(names) == 74
+    assert len(names) == 85
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     for tool in tools:

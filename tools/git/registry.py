@@ -2,50 +2,22 @@
 
 from __future__ import annotations
 
-import shutil
-from pathlib import Path
+import re
 from typing import Annotated, Any
 
 from mcp.server import MCPServer
 from pydantic import Field
 
-from core.config import PROJECT_ROOT, resolve_path
+from core.audit import audit_action
 from core.errors import ToolError
-from core.executor import run_bounded
 from core.response import page
-from core.tooling import READ_ONLY, compact_errors
+from core.tooling import MUTATING, READ_ONLY, compact_errors
+from tools.git.service import repository as _repo
+from tools.git.service import run_git as _run_git
+from tools.git.service import validate_paths as safe_paths
+from tools.git.service import validate_revision
 
 GitRevision = Annotated[str | None, Field(min_length=1, max_length=500, pattern=r"^[^-]")]
-
-
-def _git() -> str:
-    executable = shutil.which("git")
-    if executable is None:
-        raise ToolError("git_not_found", "Git is not installed or not on PATH.")
-    return executable
-
-
-def _repo(value: str | None) -> Path:
-    path = resolve_path(value) if value else PROJECT_ROOT
-    if not path.is_dir():
-        raise NotADirectoryError(f"Repository directory not found: {path}")
-    return path
-
-
-def _run_git(repo: Path, args: list[str], timeout_sec: float = 30) -> dict[str, Any]:
-    result = run_bounded(
-        [_git(), "-c", "core.quotepath=false", *args],
-        cwd=repo,
-        timeout_sec=timeout_sec,
-        stdout_limit=None,
-        stderr_limit=None,
-        output_mode="head",
-        encoding="utf-8",
-    )
-    if result["exit_code"] != 0:
-        message = result["stderr"]["text"].strip() or result["stdout"]["text"].strip()
-        raise ToolError("git_failed", message or f"Git exited {result['exit_code']}.")
-    return result
 
 
 def register(mcp: MCPServer) -> None:
@@ -191,3 +163,141 @@ def register(mcp: MCPServer) -> None:
             "next_offset": skip + len(commits) if has_more else None,
             "truncated": has_more,
         }
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("git_diff")
+    def git_diff(
+        path: str | None = None,
+        staged: bool = False,
+        base: GitRevision = None,
+        paths: Annotated[list[str] | None, Field(max_length=100)] = None,
+        max_chars: Annotated[int, Field(ge=1, le=2_000_000)] = 200_000,
+    ) -> dict[str, Any]:
+        """Return a bounded unified diff for explicit repository state."""
+        repo = _repo(path)
+        args = ["diff", "--no-ext-diff"]
+        if staged:
+            args.append("--cached")
+        if base:
+            args.append(base)
+        if paths:
+            args.extend(["--", *safe_paths(paths)])
+        result = _run_git(repo, args)
+        patch = result["stdout"]["text"]
+        return {"ok": True, "repo": str(repo), "patch": patch[:max_chars], "truncated": len(patch) > max_chars}
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("git_show")
+    def git_show(
+        path: str | None = None, ref: GitRevision = "HEAD", max_chars: Annotated[int, Field(ge=1, le=2_000_000)] = 200_000
+    ) -> dict[str, Any]:
+        """Return bounded commit metadata and patch."""
+        repo = _repo(path)
+        text = _run_git(repo, ["show", "--no-ext-diff", "--format=fuller", ref or "HEAD"])["stdout"]["text"]
+        return {"ok": True, "repo": str(repo), "text": text[:max_chars], "truncated": len(text) > max_chars}
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("git_blame")
+    def git_blame(
+        path: str | None, file: str, start_line: Annotated[int, Field(ge=1)] = 1, end_line: Annotated[int, Field(ge=1)] = 200
+    ) -> dict[str, Any]:
+        """Return porcelain blame records for a bounded line range."""
+        repo = _repo(path)
+        safe_paths([file])
+        text = _run_git(repo, ["blame", "--line-porcelain", f"-L{start_line},{end_line}", "--", file])["stdout"]["text"]
+        return {"ok": True, "repo": str(repo), "text": text}
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("git_merge_base")
+    def git_merge_base(path: str | None = None, first: str = "HEAD", second: str = "main") -> dict[str, Any]:
+        """Return the best common ancestor of two revisions."""
+        validate_revision(first)
+        validate_revision(second)
+        repo = _repo(path)
+        value = _run_git(repo, ["merge-base", first, second])["stdout"]["text"].strip()
+        return {"ok": True, "repo": str(repo), "merge_base": value}
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("git_changed_files")
+    def git_changed_files(path: str | None = None, base: GitRevision = None) -> dict[str, Any]:
+        """Return changed file statuses from a base or the working tree."""
+        repo = _repo(path)
+        args = ["diff", "--name-status"] + ([base] if base else [])
+        rows = []
+        for line in _run_git(repo, args)["stdout"]["text"].splitlines():
+            parts = line.split("\t")
+            rows.append({"status": parts[0], "path": parts[-1], "original_path": parts[1] if len(parts) > 2 else None})
+        return {"ok": True, "repo": str(repo), "items": rows, "count": len(rows)}
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("git_branch_list")
+    def git_branch_list(path: str | None = None) -> dict[str, Any]:
+        """List local branches with current and upstream metadata."""
+        repo = _repo(path)
+        text = _run_git(repo, ["for-each-ref", "--format=%(refname:short)%09%(HEAD)%09%(upstream:short)", "refs/heads"])["stdout"]["text"]
+        rows = [
+            {"name": p[0], "current": p[1] == "*", "upstream": p[2] or None}
+            for line in text.splitlines()
+            if len(p := line.split("\t")) == 3
+        ]
+        return {"ok": True, "repo": str(repo), "items": rows, "count": len(rows)}
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("git_conflicts")
+    def git_conflicts(path: str | None = None) -> dict[str, Any]:
+        """List unresolved index conflicts."""
+        repo = _repo(path)
+        rows = [
+            line.split("\t", 1)[-1] for line in _run_git(repo, ["diff", "--name-only", "--diff-filter=U"])["stdout"]["text"].splitlines()
+        ]
+        return {"ok": True, "repo": str(repo), "items": rows, "count": len(rows)}
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("git_create_branch")
+    def git_create_branch(
+        path: str | None, name: Annotated[str, Field(min_length=1, max_length=200)], start_point: GitRevision = None
+    ) -> dict[str, Any]:
+        """Create and switch to a new branch without force."""
+        if name.startswith("-") or not re.fullmatch(r"[A-Za-z0-9._/-]+", name):
+            raise ToolError("invalid_branch_name", "Invalid Git branch name.")
+        repo = _repo(path)
+        _run_git(repo, ["switch", "-c", name, *([start_point] if start_point else [])])
+        audit_action("git_create_branch", target=repo, details={"branch": name})
+        return {"ok": True, "repo": str(repo), "branch": name}
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("git_stage")
+    def git_stage(path: str | None, paths: Annotated[list[str], Field(min_length=1, max_length=500)]) -> dict[str, Any]:
+        """Stage only explicitly named paths."""
+        repo = _repo(path)
+        selected = safe_paths(paths)
+        _run_git(repo, ["add", "--", *selected])
+        audit_action("git_stage", target=repo, details={"path_count": len(selected)})
+        return {"ok": True, "repo": str(repo), "paths": selected}
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("git_commit")
+    def git_commit(path: str | None, message: Annotated[str, Field(min_length=1, max_length=10_000)]) -> dict[str, Any]:
+        """Commit the currently staged index without pushing or rewriting history."""
+        repo = _repo(path)
+        if not _run_git(repo, ["diff", "--cached", "--name-only"])["stdout"]["text"].strip():
+            raise ToolError("empty_git_index", "No staged changes to commit.")
+        _run_git(repo, ["commit", "-m", message], 120)
+        full = _run_git(repo, ["rev-parse", "HEAD"])["stdout"]["text"].strip()
+        audit_action("git_commit", target=repo, details={"message_chars": len(message)})
+        return {"ok": True, "repo": str(repo), "hash": full, "subject": message.splitlines()[0]}
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("git_restore_file")
+    def git_restore_file(
+        path: str | None,
+        source: Annotated[str, Field(min_length=1, max_length=500)],
+        paths: Annotated[list[str], Field(min_length=1, max_length=500)],
+    ) -> dict[str, Any]:
+        """Restore explicitly named tracked paths from an explicit revision."""
+        validate_revision(source)
+        repo = _repo(path)
+        selected = safe_paths(paths)
+        _run_git(repo, ["restore", "--source", source, "--", *selected])
+        audit_action("git_restore_file", target=repo, details={"path_count": len(selected), "source": source})
+        return {"ok": True, "repo": str(repo), "paths": selected, "source": source}
