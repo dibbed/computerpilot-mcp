@@ -801,6 +801,25 @@ class WorkflowStore:
             )
             connection.commit()
 
+    def release_lease_if_current(self, workflow_id: str, lease_token: str) -> bool:
+        """Release only this exact lease token and never disturb a replacement owner."""
+
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT lease_token FROM workflow_leases WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+            if row is None or str(row["lease_token"]) != lease_token:
+                connection.commit()
+                return False
+            deleted = connection.execute(
+                "DELETE FROM workflow_leases WHERE workflow_id = ? AND lease_token = ?",
+                (workflow_id, lease_token),
+            ).rowcount
+            connection.commit()
+            return deleted == 1
+
     def transition(
         self,
         workflow_id: str,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from typing import Any
@@ -12,6 +13,48 @@ from core.recovery_models import Postcondition
 from core.workflow_actions import SideEffectUncertain, TransientActionError, execute_action, get_action_descriptor
 from core.workflow_models import OperationState, StepDefinition, WorkflowState
 from core.workflow_store import WorkflowStore
+
+
+class _LeaseLostDuringAction(RuntimeError):
+    pass
+
+
+class _LeaseHeartbeat:
+    def __init__(self, store: WorkflowStore, workflow_id: str, lease_token: str, ttl_sec: float) -> None:
+        self.store = store
+        self.workflow_id = workflow_id
+        self.lease_token = lease_token
+        self.ttl_sec = ttl_sec
+        self.interval_sec = min(max(ttl_sec / 3.0, 1.0), 10.0)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.error: Exception | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name=f"workflow-lease-{self.workflow_id[:8]}", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_sec):
+            try:
+                self.store.renew_lease(self.workflow_id, self.lease_token, self.ttl_sec)
+            except Exception as exc:  # lease loss is handled by the owning executor
+                self.error = exc
+                self._stop.set()
+                return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def ensure_current(self) -> None:
+        if self.error is not None:
+            raise _LeaseLostDuringAction("Workflow lease heartbeat failed.") from self.error
+        try:
+            self.store.require_lease(self.workflow_id, self.lease_token)
+        except ToolError as exc:
+            raise _LeaseLostDuringAction("Workflow lease was lost while the action was running.") from exc
 
 
 class WorkflowExecutor:
@@ -39,6 +82,37 @@ class WorkflowExecutor:
                     "job_id": result.get("job_id")}
         evidence = evaluate_postcondition(Postcondition(kind, expected))
         return {"source": evidence.source, **evidence.data}
+
+    def _run_step_with_heartbeat(
+        self,
+        workflow_id: str,
+        lease_token: str,
+        lease_ttl_sec: float,
+        step: StepDefinition,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        heartbeat = _LeaseHeartbeat(self.store, workflow_id, lease_token, lease_ttl_sec)
+        descriptor = get_action_descriptor(step.action)
+        result: dict[str, Any] | None = None
+        evidence: dict[str, Any] | None = None
+        error: Exception | None = None
+        heartbeat.start()
+        try:
+            try:
+                result = execute_action(step.action, step.arguments, step.timeout_sec)
+                evidence = self._postcondition(step, result)
+            except Exception as exc:
+                error = exc
+        finally:
+            heartbeat.stop()
+        try:
+            heartbeat.ensure_current()
+        except _LeaseLostDuringAction as exc:
+            detail = "Workflow lease was lost while a mutating action was running." if descriptor.mutates else str(exc)
+            raise _LeaseLostDuringAction(detail) from exc
+        if error is not None:
+            raise error
+        assert result is not None and evidence is not None
+        return result, evidence
 
     def execute(
         self,
@@ -77,8 +151,9 @@ class WorkflowExecutor:
                         workflow_id, index, "running", increment_attempt=True, lease_token=lease.lease_token,
                     )
                     try:
-                        result = execute_action(step.action, step.arguments, step.timeout_sec)
-                        evidence = self._postcondition(step, result)
+                        result, evidence = self._run_step_with_heartbeat(
+                            workflow_id, lease.lease_token, lease_ttl_sec, step,
+                        )
                         if evidence.get("conclusive") is not True:
                             raise SideEffectUncertain("Postcondition could not be evaluated conclusively.")
                         if evidence.get("satisfied") is not True:
@@ -105,6 +180,8 @@ class WorkflowExecutor:
                                 lease_token=lease.lease_token,
                             )
                         break
+                    except _LeaseLostDuringAction as exc:
+                        raise ToolError("workflow_lease_lost", str(exc)) from exc
                     except TransientActionError as exc:
                         self.store.checkpoint_operation(
                             operation["operation_id"], OperationState.FAILED,
@@ -130,7 +207,7 @@ class WorkflowExecutor:
                 lease = self.store.renew_lease(workflow_id, lease.lease_token, lease_ttl_sec)
             return current
         finally:
-            self.store.release_lease(workflow_id, lease.lease_token)
+            self.store.release_lease_if_current(workflow_id, lease.lease_token)
 
     def _fail(self, workflow_id: str, index: int, lease_token: str, error: str, *, uncertain: bool) -> dict[str, Any]:
         step_state = "uncertain" if uncertain else "failed"
