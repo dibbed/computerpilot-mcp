@@ -37,10 +37,15 @@ from core.registry import create_server
 from tools.filesystem.patches import PatchLimits, apply_patch_transaction
 from tools.filesystem.search_snapshots import SearchSnapshotStore, search_fingerprint
 from tools.filesystem.service import search_by_name, search_by_name_streaming
+from tools.git.service import run_git
+from tools.language.edits import prepare_workspace_edit
+from tools.language.lsp import _frame, _parse_frames
 from tools.project.context import lookup_code_context
 from tools.project.service import parse_python
+from tools.testing.diagnostics import merge_diagnostics
 from tools.testing.impact import select_affected_tests
 from tools.testing.verification import build_verification_plan
+from tools.testing.watch import snapshot
 
 MiB = 1_048_576
 PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
@@ -434,6 +439,48 @@ def _verification_plan_once(root: Path) -> dict[str, Any]:
     if result["mode"] not in {"focused", "full"}:
         raise RuntimeError(f"verification plan correctness mismatch: {result['mode']!r}")
     return {"mode": result["mode"], "tests": result["affected"]["test_count"]}
+
+
+def _lsp_protocol_once() -> dict[str, Any]:
+    payload = {"jsonrpc": "2.0", "id": 1, "result": {"items": list(range(100))}}
+    framed = _frame(payload)
+    parsed = _parse_frames(framed, 1_000_000)
+    if parsed != [payload]:
+        raise RuntimeError("LSP framing correctness mismatch.")
+    return {"bytes": len(framed), "messages": len(parsed)}
+
+
+def _workspace_edit_plan_once(root: Path) -> dict[str, Any]:
+    path = root / "semantic.py"
+    path.write_text("old\n", encoding="utf-8")
+    edit = {
+        "changes": {
+            path.as_uri(): [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "new"}]
+        }
+    }
+    plan = prepare_workspace_edit(root, edit)
+    return {"files": len(plan), "output_bytes": len(plan[0].after)}
+
+
+def _git_read_once(root: Path) -> dict[str, Any]:
+    result = run_git(root, ["rev-parse", "--verify", "HEAD"])
+    return {"hash_chars": len(result["stdout"]["text"].strip())}
+
+
+def _diagnostic_merge_once() -> dict[str, Any]:
+    groups = [
+        [
+            {"file": f"module_{index}.py", "line": index + 1, "severity": "error", "message": "failure", "source": "ruff"}
+            for index in range(1_000)
+        ]
+    ]
+    diagnostics, truncated = merge_diagnostics(groups, cap=1_000)
+    return {"diagnostics": len(diagnostics), "truncated": truncated}
+
+
+def _watch_snapshot_once(root: Path) -> dict[str, Any]:
+    files, truncated = snapshot(root, max_files=100_000)
+    return {"files": len(files), "truncated": truncated}
 
 
 def _prepare_search_fixture(root: Path, count: int) -> None:
@@ -1320,6 +1367,11 @@ def run_benchmarks(
             _prepare_impact_fixture(impact_root, impact_count)
             results.append(measure("affected_tests_1000_modules", partial(_impact_once, impact_root, impact_count), runs))
             results.append(measure("verification_plan_1000_modules", partial(_verification_plan_once, impact_root), runs))
+            results.append(measure("lsp_protocol_roundtrip", _lsp_protocol_once, runs))
+            results.append(measure("workspace_edit_plan", partial(_workspace_edit_plan_once, root), runs))
+            results.append(measure("git_read", partial(_git_read_once, PROJECT_ROOT), runs))
+            results.append(measure("diagnostic_merge_1000", _diagnostic_merge_once, runs))
+            results.append(measure("watch_snapshot", partial(_watch_snapshot_once, root), runs))
 
     if "search" in suites:
         max_count = max(limits["search_files"])

@@ -250,6 +250,10 @@ Filesystem read-modify-write operations use keyed path locks inside the runtime.
 - Cached per-file Python metadata with bounded LRU storage.
 - Fast file and content search with pagination.
 - Optional search snapshots for stable multi-page traversal.
+- Language Server Protocol discovery for definitions, references, symbols, hover, call hierarchy, and diagnostics.
+- Transactional symbol rename and code-action edits with workspace boundaries, overlap checks, hash preconditions, and rollback.
+
+Language-server tools accept an explicit server command; the MCP does not silently install or select a language server. Workspace edits support `changes` and versioned text edits in `documentChanges`. LSP create, rename, and delete resource operations are rejected.
 
 ### Processes and Terminal Commands
 
@@ -317,7 +321,7 @@ Desktop screenshots can also be captured from the Windows desktop. Oversized `au
 
 ### Git and Testing
 
-Git tools provide compact repository status, diff summaries, and commit history without dumping large patches by default.
+Git tools provide status, bounded patches and commit inspection, blame, merge-base lookup, changed-file and conflict discovery, and branch metadata. Guarded mutation tools can create a branch, stage explicit paths, commit the current index, and restore explicit files from an explicit revision. They do not expose force, reset, clean, or push operations, and pathspecs cannot be interpreted as command options.
 
 Testing tools integrate:
 
@@ -326,10 +330,14 @@ Testing tools integrate:
 - mypy
 - affected-test selection from changed paths or a Git base
 - one-call change-aware verification (`verify_changes`)
+- merged diagnostics from selected Ruff, mypy, and pytest backends (`collect_diagnostics`)
+- durable incremental verification watches (`start_validation_watch`)
 
 They return structured counts and bounded diagnostic samples suitable for agent workflows. `verify_changes` syntax-checks changed
 Python files, then runs Ruff, mypy, and the narrowest sound pytest scope. Repository-wide configuration and shared-fixture changes
 fall back to the full suite. A timed-out or unavailable required verifier always makes the aggregate result fail; Ruff fixes are opt-in.
+
+`collect_diagnostics` emits one stable schema with `file`, range, severity, code, message, and source fields, plus per-backend status and a `required_unknown` flag. `start_validation_watch` submits a persistent job that snapshots the repository, debounces bursts, verifies settled changes, and writes one JSONL record per generation. Use the normal `job_status`, `job_output`, `job_wait`, and `cancel_job` tools to manage its lifecycle.
 
 ### Windows and System Diagnostics
 
