@@ -426,7 +426,7 @@ def _prepare_workflow_history_fixture(
                 now,
             )
         )
-    with sqlite3.connect(database, timeout=30) as connection:
+    with closing(sqlite3.connect(database, timeout=30)) as connection, connection:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.executemany(
             """
@@ -504,7 +504,7 @@ def _workflow_health_once(store: WorkflowStore) -> dict[str, Any]:
 
 
 def _workflow_db_density_once(store: WorkflowStore, rows: int) -> dict[str, Any]:
-    with sqlite3.connect(store.path, timeout=30) as connection:
+    with closing(sqlite3.connect(store.path, timeout=30)) as connection, connection:
         connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
     total_bytes = 0
     for path in (store.path, Path(f"{store.path}-wal"), Path(f"{store.path}-shm")):
