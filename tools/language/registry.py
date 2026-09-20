@@ -16,15 +16,15 @@ from tools.language.edits import apply_workspace_edit, prepare_workspace_edit
 from tools.language.lsp import LspClient
 
 
-def _command(command: list[str] | None) -> list[str]:
-    if command:
-        return command
+def _command() -> list[str]:
+    """Return the trusted/discovered language-server command exposed by MCP."""
+
     discovered = shutil.which("pyright-langserver")
     return [discovered or "pyright-langserver", "--stdio"]
 
 
-def _request(root: str, command: list[str] | None, timeout_sec: float, method: str, params: dict[str, Any]) -> Any:
-    return LspClient(_command(command), resolve_path(root), timeout_sec=timeout_sec).request(method, params)
+def _request(root: str, timeout_sec: float, method: str, params: dict[str, Any]) -> Any:
+    return LspClient(_command(), resolve_path(root), timeout_sec=timeout_sec).request(method, params)
 
 
 def register(mcp: MCPServer) -> None:
@@ -34,11 +34,10 @@ def register(mcp: MCPServer) -> None:
         def tool(
             root: Annotated[str, Field(min_length=1, max_length=32_767)],
             params: Annotated[dict[str, Any], Field(max_length=100)],
-            command: Annotated[list[str] | None, Field(max_length=20)] = None,
             timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
         ) -> dict[str, Any]:
-            """Run one bounded language-server intelligence request and return its structured result."""
-            return {"ok": True, "method": method, "result": _request(root, command, timeout_sec, method, params)}
+            """Run one bounded request through the trusted discovered language server."""
+            return {"ok": True, "method": method, "result": _request(root, timeout_sec, method, params)}
 
         return tool
 
@@ -58,7 +57,6 @@ def register(mcp: MCPServer) -> None:
         line: Annotated[int, Field(ge=0)],
         character: Annotated[int, Field(ge=0)],
         new_name: Annotated[str, Field(min_length=1, max_length=500)],
-        command: Annotated[list[str] | None, Field(max_length=20)] = None,
         expected_sha256: Annotated[dict[str, str] | None, Field(max_length=500)] = None,
         dry_run: bool = False,
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
@@ -67,7 +65,6 @@ def register(mcp: MCPServer) -> None:
         workspace = resolve_path(root)
         edit = _request(
             workspace.as_posix(),
-            command,
             timeout_sec,
             "textDocument/rename",
             {
