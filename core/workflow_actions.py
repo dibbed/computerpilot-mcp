@@ -120,6 +120,7 @@ class ActionDescriptor:
     allowed_postconditions: frozenset[str]
     secret_fields: frozenset[str] = frozenset()
     cancel_mode: Literal["immediate", "cooperative", "deferred"] = "deferred"
+    availability: Literal["available", "disabled", "adapter_required", "platform_unavailable"] = "available"
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,10 +368,12 @@ ACTION_DESCRIPTORS: dict[str, ActionDescriptor] = {
     "check_file": ActionDescriptor("check_file", CheckFileInput, _check_file, False, "never", frozenset()),
     "check_http": ActionDescriptor("check_http", CheckHttpInput, _check_http, False, "transient", frozenset()),
     "desktop_semantic_action": ActionDescriptor(
-        "desktop_semantic_action", SemanticActionInput, _adapter_required, True, "never", frozenset({"ui_element_state"})
+        "desktop_semantic_action", SemanticActionInput, _adapter_required, True, "never",
+        frozenset({"ui_element_state"}), availability="adapter_required",
     ),
     "browser_action": ActionDescriptor(
-        "browser_action", BrowserActionInput, _adapter_required, True, "never", frozenset({"browser_state"})
+        "browser_action", BrowserActionInput, _adapter_required, True, "never",
+        frozenset({"browser_state"}), availability="adapter_required",
     ),
 }
 
@@ -392,6 +395,11 @@ def validate_operation(
     postcondition: dict[str, Any] | None,
 ) -> tuple[ActionDescriptor, dict[str, Any]]:
     descriptor = get_action_descriptor(name)
+    if descriptor.availability != "available":
+        raise ToolError(
+            "workflow_action_unavailable",
+            f"Workflow action {name!r} is {descriptor.availability} and cannot be planned or executed.",
+        )
     try:
         validated = descriptor.input_model.model_validate(arguments).model_dump()
     except ValidationError as exc:

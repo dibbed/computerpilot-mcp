@@ -14,8 +14,10 @@ from core.audit import audit_action
 from core.config import SETTINGS
 from core.errors import ToolError
 from core.tooling import MUTATING, READ_ONLY, compact_errors
+from core.workflow_actions import get_action_descriptor, validate_workflow_definition
 from core.workflow_models import OperationState
 from core.workflow_reconciliation import acknowledge_operation, reconcile_operation
+from core.workflow_store import redact_inputs
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, workflow_store
 from tools.workflows.builtins import builtin_workflow
 
@@ -48,6 +50,34 @@ def _mcp_owner_id() -> str:
     return f"mcp-{os.getpid()}-{uuid.uuid4().hex}"
 
 
+def _validated_plan(definition: WorkflowDefinition) -> dict[str, Any]:
+    validate_workflow_definition(definition)
+    mutating = 0
+    required_postconditions: list[dict[str, Any]] = []
+    for index, step in enumerate(definition.steps):
+        descriptor = get_action_descriptor(step.action)
+        if descriptor.mutates:
+            mutating += 1
+            required_postconditions.append(
+                {
+                    "step_index": index,
+                    "action": step.action,
+                    "kind": str((step.postcondition or {}).get("kind", "")),
+                }
+            )
+    return {
+        "ok": True,
+        "definition": redact_inputs(asdict(definition)),
+        "mutating_step_count": mutating,
+        "unavailable_actions": [],
+        "required_postconditions": required_postconditions,
+        "estimated_max_runtime_sec": sum(
+            float(step.timeout_sec) * (int(step.max_retries) + 1)
+            for step in definition.steps
+        ),
+    }
+
+
 def register(mcp: MCPServer) -> None:
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("workflow_plan")
@@ -60,7 +90,7 @@ def register(mcp: MCPServer) -> None:
         if (definition is None) == (builtin is None):
             raise ToolError("workflow_definition_required", "Provide exactly one of definition or builtin.")
         planned = definition.definition() if definition else builtin_workflow(str(builtin), parameters or {})
-        return {"ok": True, "definition": asdict(planned)}
+        return _validated_plan(planned)
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("workflow_start")
@@ -75,6 +105,7 @@ def register(mcp: MCPServer) -> None:
         if (definition is None) == (builtin is None):
             raise ToolError("workflow_definition_required", "Provide exactly one of definition or builtin.")
         planned = definition.definition() if definition else builtin_workflow(str(builtin), parameters or {})
+        validate_workflow_definition(planned)
         result = workflow_store(SETTINGS.workflow_db).create(
             planned, inputs, idempotency_key=idempotency_key, initial_state=WorkflowState.QUEUED,
         )
@@ -100,10 +131,22 @@ def register(mcp: MCPServer) -> None:
         current = store.get(workflow_id)
         if current["version"] != expected_version:
             raise ToolError("workflow_version_conflict", "Workflow version changed; reload status before execution.")
+        if dry_run:
+            planned = store.execution_definition(workflow_id)
+            summary = _validated_plan(planned)
+            return {
+                **current,
+                "dry_run": True,
+                "would_execute": summary["definition"]["steps"],
+                "mutating_step_count": summary["mutating_step_count"],
+                "unavailable_actions": summary["unavailable_actions"],
+                "required_postconditions": summary["required_postconditions"],
+                "estimated_max_runtime_sec": summary["estimated_max_runtime_sec"],
+            }
         result = WorkflowExecutor(store).execute(
             workflow_id,
             owner_id=_mcp_owner_id(),
-            dry_run=dry_run,
+            dry_run=False,
             lease_ttl_sec=lease_ttl_sec,
         )
         if not dry_run:
