@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from core.workflow_models import WorkflowState
@@ -48,3 +49,10 @@ def test_workflow_health_separates_aggregate_operations_and_leases(tmp_path: Pat
     assert summary["operation_counts"] == {"created": 1}
     assert summary["unresolved_operation_count"] == 0
     assert summary["active_lease_count"] == 1
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE workflow_leases SET expires_at = '2000-01-01T00:00:00.000+00:00' WHERE workflow_id = ?",
+            (workflow["workflow_id"],),
+        )
+    assert store.health_summary()["active_lease_count"] == 0

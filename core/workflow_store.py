@@ -903,13 +903,15 @@ class WorkflowStore:
                 """
                 SELECT operation_id, workflow_id, step_index, action, state, updated_at
                 FROM workflow_operations
-                WHERE state IN ('uncertain','reconciling','unresolvable')
+                WHERE state IN ('uncertain','reconciling')
                 ORDER BY updated_at ASC LIMIT ?
                 """,
                 (bounded,),
             ).fetchall()
-            lease_count = int(connection.execute("SELECT COUNT(*) FROM workflow_leases").fetchone()[0])
-        unresolved_total = sum(operation_counts.get(state, 0) for state in ("uncertain", "reconciling", "unresolvable"))
+            lease_count = int(connection.execute(
+                "SELECT COUNT(*) FROM workflow_leases WHERE expires_at > ?", (_now(),),
+            ).fetchone()[0])
+        unresolved_total = sum(operation_counts.get(state, 0) for state in ("uncertain", "reconciling"))
         return {
             "workflow_counts": workflow_counts,
             "workflow_total": sum(workflow_counts.values()),
