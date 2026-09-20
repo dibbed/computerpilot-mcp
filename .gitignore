@@ -40,6 +40,7 @@ memory/*.json
 
 # Local development workflows and temporary documentation
 docs/superpowers/
+docs/roadmap/
 tunnel-client-runtime*
 
 # Local SQLite databases and write-ahead logs
