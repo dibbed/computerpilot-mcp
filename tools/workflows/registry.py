@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,6 +13,7 @@ from core.config import SETTINGS
 from core.errors import ToolError
 from core.tooling import MUTATING, READ_ONLY, compact_errors
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowState, workflow_store
+from tools.workflows.builtins import builtin_workflow
 
 
 class StepInput(BaseModel):
@@ -42,23 +43,34 @@ class WorkflowInput(BaseModel):
 def register(mcp: MCPServer) -> None:
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("workflow_plan")
-    def workflow_plan(definition: WorkflowInput) -> dict[str, Any]:
+    def workflow_plan(
+        definition: WorkflowInput | None = None,
+        builtin: Literal["implement_and_verify", "safe_git_commit", "prepare_release", "deploy_and_healthcheck"] | None = None,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Validate and return an immutable workflow plan without starting it."""
-        planned = definition.definition()
+        if (definition is None) == (builtin is None):
+            raise ToolError("workflow_definition_required", "Provide exactly one of definition or builtin.")
+        planned = definition.definition() if definition else builtin_workflow(str(builtin), parameters or {})
         return {"ok": True, "definition": asdict(planned)}
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("workflow_start")
     def workflow_start(
-        definition: WorkflowInput,
+        definition: WorkflowInput | None = None,
+        builtin: Literal["implement_and_verify", "safe_git_commit", "prepare_release", "deploy_and_healthcheck"] | None = None,
+        parameters: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
         idempotency_key: Annotated[str | None, Field(max_length=200)] = None,
     ) -> dict[str, Any]:
         """Persist a queued workflow exactly once; execution uses allowlisted actions."""
+        if (definition is None) == (builtin is None):
+            raise ToolError("workflow_definition_required", "Provide exactly one of definition or builtin.")
+        planned = definition.definition() if definition else builtin_workflow(str(builtin), parameters or {})
         result = workflow_store(SETTINGS.workflow_db).create(
-            definition.definition(), inputs, idempotency_key=idempotency_key, initial_state=WorkflowState.QUEUED,
+            planned, inputs, idempotency_key=idempotency_key, initial_state=WorkflowState.QUEUED,
         )
-        audit_action("workflow_start", target=result["workflow_id"], details={"name": definition.name}, durable=True)
+        audit_action("workflow_start", target=result["workflow_id"], details={"name": planned.name}, durable=True)
         return result
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)

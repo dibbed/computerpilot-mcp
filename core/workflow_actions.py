@@ -65,7 +65,18 @@ def _verify_changes(arguments: dict[str, Any], timeout_sec: float) -> dict[str, 
 
 
 def _git_status(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
-    return _run_git(arguments, timeout_sec, "status", "--short", "--branch")
+    result = _run_git(arguments, timeout_sec, "status", "--short", "--branch")
+    lines = result["stdout"].splitlines()
+    dirty = any(line and not line.startswith("##") for line in lines)
+    if arguments.get("require_clean") is True and dirty:
+        raise ToolError("workflow_git_dirty", "Repository must be clean for this workflow.")
+    tag = arguments.get("tag_must_not_exist")
+    if isinstance(tag, str) and tag:
+        tag_result = _run_git(arguments, timeout_sec, "tag", "--list", tag)
+        if tag_result["stdout"].strip():
+            raise ToolError("workflow_tag_exists", f"Git tag {tag!r} already exists.")
+    result["dirty"] = dirty
+    return result
 
 
 def _git_stage(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
@@ -125,7 +136,13 @@ def _check_file(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]
     expected = bool(arguments.get("exists", True))
     if exists != expected:
         raise ToolError("workflow_file_check_failed", f"File existence was {exists}, expected {expected}.")
-    return {"path": str(path), "exists": exists}
+    contains = arguments.get("contains")
+    if contains is not None:
+        if not isinstance(contains, str) or not path.is_file():
+            raise ToolError("invalid_workflow_action", "check_file contains requires an existing text file.")
+        if contains not in path.read_text(encoding="utf-8", errors="replace"):
+            raise ToolError("workflow_file_check_failed", "Expected text was not found in the file.")
+    return {"path": str(path), "exists": exists, "contains_matched": contains is not None}
 
 
 def _check_http(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
