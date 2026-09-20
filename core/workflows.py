@@ -10,7 +10,6 @@ import uuid
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -18,19 +17,7 @@ from core.errors import ToolError
 from core.reconcilers import evaluate_postcondition
 from core.recovery_models import Postcondition
 from core.workflow_actions import SideEffectUncertain, TransientActionError, execute_action
-
-
-class WorkflowState(str, Enum):
-    CREATED = "created"
-    QUEUED = "queued"
-    RUNNING = "running"
-    WAITING = "waiting"
-    PAUSED = "paused"
-    FAILED = "failed"
-    UNCERTAIN = "uncertain"
-    RECONCILING = "reconciling"
-    COMPLETED = "completed"
-    CANCELLED = "cancelled"
+from core.workflow_models import WorkflowState, validate_workflow_transition
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,20 +185,54 @@ class WorkflowStore:
         current_step: int | None = None,
         last_error: str | None = None,
     ) -> dict[str, Any]:
-        assignments = ["state = ?", "version = version + 1", "updated_at = ?", "last_error = ?"]
-        parameters: list[Any] = [state.value, _now(), last_error[:2_000] if last_error else None]
-        if current_step is not None:
-            assignments.append("current_step = ?")
-            parameters.append(current_step)
-        parameters.extend([workflow_id, expected_version])
         with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT state, version FROM workflows WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if current is None:
+                raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
+            if int(current["version"]) != expected_version:
+                raise ToolError("workflow_version_conflict", "Workflow changed; reload status before retrying.")
+            validate_workflow_transition(WorkflowState(str(current["state"])), state)
+            assignments = ["state = ?", "version = version + 1", "updated_at = ?", "last_error = ?"]
+            parameters: list[Any] = [state.value, _now(), last_error[:2_000] if last_error else None]
+            if current_step is not None:
+                assignments.append("current_step = ?")
+                parameters.append(current_step)
+            parameters.extend([workflow_id, expected_version])
             cursor = connection.execute(
                 f"UPDATE workflows SET {', '.join(assignments)} WHERE workflow_id = ? AND version = ?", parameters,
             )
             if cursor.rowcount != 1:
-                if connection.execute("SELECT 1 FROM workflows WHERE workflow_id = ?", (workflow_id,)).fetchone() is None:
-                    raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
                 raise ToolError("workflow_version_conflict", "Workflow changed; reload status before retrying.")
+            connection.commit()
+        return self.get(workflow_id)
+
+    def advance_running(self, workflow_id: str, expected_version: int, *, current_step: int) -> dict[str, Any]:
+        if current_step < 0:
+            raise ToolError("invalid_workflow_step", "current_step must be non-negative.")
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state, version FROM workflows WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
+            if int(row["version"]) != expected_version:
+                raise ToolError("workflow_version_conflict", "Workflow changed; reload status before retrying.")
+            if row["state"] != WorkflowState.RUNNING.value:
+                raise ToolError("workflow_not_running", "Only a running workflow can advance its current step.")
+            cursor = connection.execute(
+                """
+                UPDATE workflows SET current_step = ?, version = version + 1, updated_at = ?
+                WHERE workflow_id = ? AND version = ? AND state = 'running'
+                """,
+                (current_step, _now(), workflow_id, expected_version),
+            )
+            if cursor.rowcount != 1:
+                raise ToolError("workflow_version_conflict", "Workflow changed; reload status before retrying.")
+            connection.commit()
         return self.get(workflow_id)
 
     def checkpoint_step(
@@ -365,10 +386,14 @@ class WorkflowExecutor:
                     )
                     latest = self.store.get(workflow_id)
                     next_index = index + 1
-                    state = WorkflowState.COMPLETED if next_index == len(definition.steps) else WorkflowState.RUNNING
-                    current = self.store.transition(
-                        workflow_id, latest["version"], state, current_step=next_index,
-                    )
+                    if next_index == len(definition.steps):
+                        current = self.store.transition(
+                            workflow_id, latest["version"], WorkflowState.COMPLETED, current_step=next_index,
+                        )
+                    else:
+                        current = self.store.advance_running(
+                            workflow_id, latest["version"], current_step=next_index,
+                        )
                     break
                 except TransientActionError as exc:
                     if attempts <= step.max_retries:

@@ -34,7 +34,8 @@ def test_restart_marks_running_step_uncertain(tmp_path: Path) -> None:
     path = tmp_path / "workflows.db"
     store = WorkflowStore(path)
     workflow = store.create(_definition())
-    running = store.transition(workflow["workflow_id"], 1, WorkflowState.RUNNING)
+    queued = store.transition(workflow["workflow_id"], 1, WorkflowState.QUEUED)
+    running = store.transition(workflow["workflow_id"], queued["version"], WorkflowState.RUNNING)
     store.checkpoint_step(workflow["workflow_id"], 0, "running", increment_attempt=True)
     assert running["state"] == "running"
 
