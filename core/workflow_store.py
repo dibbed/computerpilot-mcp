@@ -19,6 +19,7 @@ from core.workflow_models import (
     WorkflowDefinition,
     WorkflowLease,
     WorkflowState,
+    validate_operation_transition,
     validate_workflow_transition,
 )
 
@@ -434,6 +435,51 @@ class WorkflowStore:
             "offset": offset,
             "has_more": offset + len(items) < total,
         }
+
+    def checkpoint_operation(
+        self,
+        operation_id: str,
+        state: OperationState,
+        *,
+        lease_token: str,
+        result: dict[str, Any] | None = None,
+        evidence: dict[str, Any] | None = None,
+        error: str | None = None,
+        increment_attempt: bool = False,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT workflow_id, state FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            validate_operation_transition(OperationState(str(operation["state"])), state)
+            workflow_id = str(operation["workflow_id"])
+            lease = connection.execute(
+                "SELECT lease_token, expires_at FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if lease is None or str(lease["lease_token"]) != lease_token:
+                raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+            if str(lease["expires_at"]) <= now:
+                raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
+            connection.execute(
+                """
+                UPDATE workflow_operations SET state = ?, attempts = attempts + ?, version = version + 1,
+                    result_json = ?, evidence_json = ?, error = ?, updated_at = ?,
+                    started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
+                    finished_at = CASE WHEN ? IN ('succeeded','failed','uncertain','cancelled') THEN ? ELSE finished_at END
+                WHERE operation_id = ?
+                """,
+                (
+                    state.value, int(increment_attempt), _canonical(redact_inputs(result)) if result else None,
+                    _canonical(redact_inputs(evidence)) if evidence else None, error[:2_000] if error else None,
+                    now, state.value, now, state.value, now, operation_id,
+                ),
+            )
+            connection.commit()
+        return next(item for item in self.list_operations(workflow_id)["items"] if item["operation_id"] == operation_id)
 
     def acquire_lease(self, workflow_id: str, owner_id: str, ttl_sec: float) -> WorkflowLease:
         owner_id = owner_id.strip()
