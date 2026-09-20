@@ -12,7 +12,7 @@ from core.workflow_store import WorkflowStore, redact_inputs
 
 
 def reconcile_operation(store: WorkflowStore, operation_id: str, *, expected_version: int) -> dict[str, Any]:
-    operation = store.get_operation(operation_id)
+    operation = store.get_operation_for_reconciliation(operation_id)
     if operation["version"] != expected_version:
         raise ToolError("workflow_operation_version_conflict", "Operation changed; reload it before retrying.")
     postcondition = operation.get("postcondition")

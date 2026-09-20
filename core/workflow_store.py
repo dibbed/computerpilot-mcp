@@ -23,7 +23,7 @@ from core.workflow_models import (
     validate_workflow_transition,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _SECRET_MARKERS = (
     "password",
     "secret",
@@ -162,6 +162,9 @@ class WorkflowStore:
                 version = 2
             if version < 3:
                 self._migrate_v3(connection)
+                version = 3
+            if version < 4:
+                self._migrate_v4(connection)
             connection.execute("BEGIN IMMEDIATE")
             self._redact_stored_definitions(connection)
             self._materialize_all(connection)
@@ -247,6 +250,21 @@ class WorkflowStore:
             ALTER TABLE workflows ADD COLUMN cancel_requested_at TEXT;
             ALTER TABLE workflows ADD COLUMN cancel_reason TEXT;
             PRAGMA user_version = 3;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v4(connection: sqlite3.Connection) -> None:
+        """Separate operation intent, external identity, and reconciliation evidence."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflow_operations ADD COLUMN intent_evidence_json TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN external_ref_json TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN reconciliation_evidence_json TEXT;
+            PRAGMA user_version = 4;
             COMMIT;
             """
         )
@@ -550,7 +568,10 @@ class WorkflowStore:
         items = []
         for row in rows:
             item = dict(row)
-            for key in ("postcondition_json", "result_json", "evidence_json"):
+            for key in (
+                "postcondition_json", "result_json", "evidence_json",
+                "intent_evidence_json", "external_ref_json", "reconciliation_evidence_json",
+            ):
                 raw = item.pop(key)
                 item[key.removesuffix("_json")] = json.loads(raw) if raw else None
             items.append(item)
@@ -571,6 +592,78 @@ class WorkflowStore:
             raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
         operations = self.list_operations(str(row["workflow_id"]))["items"]
         return next(item for item in operations if item["operation_id"] == operation_id)
+
+    def get_operation_for_reconciliation(self, operation_id: str) -> dict[str, Any]:
+        """Return exact durable recovery fields for one operation."""
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        if row is None:
+            raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+        item = dict(row)
+        for key in (
+            "postcondition_json", "result_json", "evidence_json",
+            "intent_evidence_json", "external_ref_json", "reconciliation_evidence_json",
+        ):
+            raw = item.pop(key)
+            item[key.removesuffix("_json")] = json.loads(raw) if raw else None
+        return item
+
+    def update_operation_context(
+        self,
+        operation_id: str,
+        *,
+        lease_token: str,
+        intent_evidence: dict[str, Any] | None = None,
+        external_ref: dict[str, Any] | None = None,
+        postcondition: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist recovery identity while an operation is running."""
+
+        if intent_evidence is None and external_ref is None and postcondition is None:
+            return self.get_operation(operation_id)
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT workflow_id, state FROM workflow_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(row["workflow_id"])
+            if str(row["state"]) not in {OperationState.RUNNING.value, OperationState.WAITING.value}:
+                raise ToolError("workflow_operation_not_active", "Recovery context can only be updated for an active operation.")
+            lease = connection.execute(
+                "SELECT lease_token, expires_at FROM workflow_leases WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+            if lease is None or str(lease["lease_token"]) != lease_token:
+                raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+            if str(lease["expires_at"]) <= now:
+                raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
+            connection.execute(
+                """
+                UPDATE workflow_operations
+                SET intent_evidence_json = COALESCE(?, intent_evidence_json),
+                    external_ref_json = COALESCE(?, external_ref_json),
+                    postcondition_json = COALESCE(?, postcondition_json),
+                    updated_at = ?, version = version + 1
+                WHERE operation_id = ?
+                """,
+                (
+                    _canonical(intent_evidence) if intent_evidence else None,
+                    _canonical(external_ref) if external_ref else None,
+                    _canonical(postcondition) if postcondition else None,
+                    now,
+                    operation_id,
+                ),
+            )
+            connection.commit()
+        return self.get_operation(operation_id)
 
     def resolve_uncertain_operation(
         self,
@@ -635,12 +728,13 @@ class WorkflowStore:
             connection.execute(
                 """
                 UPDATE workflow_operations SET state = ?, version = version + ?, evidence_json = ?,
-                    updated_at = ?, finished_at = CASE WHEN ? = 'uncertain' THEN finished_at ELSE ? END,
+                    reconciliation_evidence_json = ?, updated_at = ?, finished_at = CASE WHEN ? = 'uncertain' THEN finished_at ELSE ? END,
                     error = CASE WHEN ? IN ('failed','unresolvable') THEN error ELSE NULL END
                 WHERE operation_id = ? AND version = ?
                 """,
-                (final_state.value, operation_version_increment, _canonical(redacted_evidence), now,
-                 final_state.value, now, final_state.value, operation_id, expected_version),
+                (final_state.value, operation_version_increment, _canonical(redacted_evidence),
+                 _canonical(redacted_evidence), now, final_state.value, now, final_state.value,
+                 operation_id, expected_version),
             )
             connection.execute(
                 """
@@ -678,6 +772,9 @@ class WorkflowStore:
         lease_token: str,
         result: dict[str, Any] | None = None,
         evidence: dict[str, Any] | None = None,
+        intent_evidence: dict[str, Any] | None = None,
+        external_ref: dict[str, Any] | None = None,
+        postcondition: dict[str, Any] | None = None,
         error: str | None = None,
         increment_attempt: bool = False,
     ) -> dict[str, Any]:
@@ -701,15 +798,30 @@ class WorkflowStore:
             connection.execute(
                 """
                 UPDATE workflow_operations SET state = ?, attempts = attempts + ?, version = version + 1,
-                    result_json = ?, evidence_json = ?, error = ?, updated_at = ?,
+                    result_json = ?, evidence_json = ?,
+                    intent_evidence_json = COALESCE(?, intent_evidence_json),
+                    external_ref_json = COALESCE(?, external_ref_json),
+                    postcondition_json = COALESCE(?, postcondition_json),
+                    error = ?, updated_at = ?,
                     started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
                     finished_at = CASE WHEN ? IN ('succeeded','failed','uncertain','cancelled') THEN ? ELSE finished_at END
                 WHERE operation_id = ?
                 """,
                 (
-                    state.value, int(increment_attempt), _canonical(redact_inputs(result)) if result else None,
-                    _canonical(redact_inputs(evidence)) if evidence else None, error[:2_000] if error else None,
-                    now, state.value, now, state.value, now, operation_id,
+                    state.value,
+                    int(increment_attempt),
+                    _canonical(redact_inputs(result)) if result else None,
+                    _canonical(redact_inputs(evidence)) if evidence else None,
+                    _canonical(intent_evidence) if intent_evidence else None,
+                    _canonical(external_ref) if external_ref else None,
+                    _canonical(postcondition) if postcondition else None,
+                    error[:2_000] if error else None,
+                    now,
+                    state.value,
+                    now,
+                    state.value,
+                    now,
+                    operation_id,
                 ),
             )
             connection.commit()

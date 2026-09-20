@@ -17,6 +17,7 @@ from core.workflow_actions import (
     TransientActionError,
     execute_action,
     get_action_descriptor,
+    prepare_action_intent,
 )
 from core.workflow_models import OperationState, StepDefinition, WorkflowState
 from core.workflow_store import WorkflowStore
@@ -87,6 +88,16 @@ class WorkflowExecutor:
             return {"source": "durable_job", "conclusive": True,
                     "satisfied": result.get("status") == "succeeded" and result.get("exit_code") == 0,
                     "job_id": result.get("job_id")}
+        elif kind == "job_request_key_state" and result.get("status") in {
+            "succeeded", "failed", "cancelled", "timed_out", "interrupted"
+        }:
+            return {
+                "source": "durable_job",
+                "conclusive": True,
+                "satisfied": result.get("status") == expected.get("status", "succeeded") and result.get("exit_code") == 0,
+                "job_id": result.get("job_id"),
+                "request_key": expected.get("request_key"),
+            }
         evidence = evaluate_postcondition(Postcondition(kind, expected))
         return {"source": evidence.source, **evidence.data}
 
@@ -104,8 +115,12 @@ class WorkflowExecutor:
             workflow_id=workflow_id,
             operation_id=operation_id,
             is_cancel_requested=lambda: self.store.cancel_requested(workflow_id),
-            persist_external_ref=lambda value: None,
-            persist_intent_evidence=lambda value: None,
+            persist_external_ref=lambda value: self.store.update_operation_context(
+                operation_id, lease_token=lease_token, external_ref=value,
+            ),
+            persist_intent_evidence=lambda value: self.store.update_operation_context(
+                operation_id, lease_token=lease_token, intent_evidence=value,
+            ),
         )
         result: dict[str, Any] | None = None
         evidence: dict[str, Any] | None = None
@@ -197,16 +212,53 @@ class WorkflowExecutor:
                 attempts = int(operation["attempts"])
                 while True:
                     attempts += 1
+                    try:
+                        canonical_postcondition, intent_evidence = prepare_action_intent(
+                            step.action, step.arguments, step.postcondition,
+                        )
+                    except Exception as exc:
+                        self.store.checkpoint_operation(
+                            operation["operation_id"],
+                            OperationState.RUNNING,
+                            lease_token=lease.lease_token,
+                            increment_attempt=True,
+                        )
+                        self.store.checkpoint_step(
+                            workflow_id, index, "running", increment_attempt=True, lease_token=lease.lease_token,
+                        )
+                        self.store.checkpoint_operation(
+                            operation["operation_id"],
+                            OperationState.FAILED,
+                            lease_token=lease.lease_token,
+                            error=str(exc),
+                        )
+                        return self._fail(workflow_id, index, lease.lease_token, str(exc), uncertain=False)
+                    execution_step = StepDefinition(
+                        step.name,
+                        step.action,
+                        step.arguments,
+                        step.timeout_sec,
+                        step.max_retries,
+                        canonical_postcondition,
+                    )
                     self.store.checkpoint_operation(
-                        operation["operation_id"], OperationState.RUNNING,
-                        lease_token=lease.lease_token, increment_attempt=True,
+                        operation["operation_id"],
+                        OperationState.RUNNING,
+                        lease_token=lease.lease_token,
+                        increment_attempt=True,
+                        intent_evidence=intent_evidence,
+                        postcondition=canonical_postcondition,
                     )
                     self.store.checkpoint_step(
                         workflow_id, index, "running", increment_attempt=True, lease_token=lease.lease_token,
                     )
                     try:
                         result, evidence = self._run_step_with_heartbeat(
-                            workflow_id, operation["operation_id"], lease.lease_token, lease_ttl_sec, step,
+                            workflow_id,
+                            operation["operation_id"],
+                            lease.lease_token,
+                            lease_ttl_sec,
+                            execution_step,
                         )
                         if evidence.get("conclusive") is not True:
                             raise SideEffectUncertain("Postcondition could not be evaluated conclusively.")

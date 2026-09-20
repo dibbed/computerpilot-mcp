@@ -89,6 +89,103 @@ def _git_head(expected: dict[str, Any]) -> Evidence:
     )
 
 
+def _git_commit_effect(expected: dict[str, Any]) -> Evidence:
+    repo = resolve_path(_required_string(expected, "repo"))
+    before_head = _required_string(expected, "before_head")
+    staged_tree = _required_string(expected, "staged_tree")
+    message_sha256 = _required_string(expected, "message_sha256").casefold()
+
+    def run(*args: str) -> tuple[int, str]:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return completed.returncode, completed.stdout.strip()
+
+    code, head = run("rev-parse", "HEAD")
+    if code:
+        return Evidence("git", {"conclusive": False, "satisfied": False, "reason": "git_head_unavailable"})
+    if head.casefold() == before_head.casefold():
+        return Evidence(
+            "git",
+            {"conclusive": True, "satisfied": False, "repo": str(repo), "head": head, "reason": "head_unchanged"},
+        )
+    parent_code, parent = run("rev-parse", "HEAD^")
+    tree_code, tree = run("rev-parse", "HEAD^{tree}")
+    message_code, message = run("log", "-1", "--format=%B")
+    if parent_code or tree_code or message_code:
+        return Evidence("git", {"conclusive": False, "satisfied": False, "reason": "git_commit_metadata_unavailable"})
+    actual_message_hash = hashlib.sha256(message.strip().encode("utf-8")).hexdigest()
+    matched = (
+        parent.casefold() == before_head.casefold()
+        and tree.casefold() == staged_tree.casefold()
+        and actual_message_hash == message_sha256
+    )
+    if not matched:
+        return Evidence(
+            "git",
+            {
+                "conclusive": False,
+                "satisfied": False,
+                "repo": str(repo),
+                "head": head,
+                "reason": "head_diverged_from_expected_commit",
+            },
+        )
+    return Evidence(
+        "git",
+        {
+            "conclusive": True,
+            "satisfied": True,
+            "repo": str(repo),
+            "head": head,
+            "parent": parent,
+            "tree": tree,
+            "message_sha256": actual_message_hash,
+        },
+    )
+
+
+def _job_request_key_state(expected: dict[str, Any]) -> Evidence:
+    request_key = _required_string(expected, "request_key")
+    wanted = str(expected.get("status", "succeeded"))
+    try:
+        job = JobStore().get_by_request_key(request_key)
+    except ToolError as exc:
+        if exc.code == "job_request_key_not_found":
+            return Evidence(
+                "durable_job",
+                {"conclusive": False, "satisfied": False, "request_key": request_key, "reason": exc.code},
+            )
+        raise
+    status = str(job["status"])
+    if status in {"queued", "running", "orphaned"}:
+        return Evidence(
+            "durable_job",
+            {
+                "conclusive": False,
+                "satisfied": False,
+                "request_key": request_key,
+                "job_id": job["id"],
+                "status": status,
+            },
+        )
+    return Evidence(
+        "durable_job",
+        {
+            "conclusive": True,
+            "satisfied": status == wanted,
+            "request_key": request_key,
+            "job_id": job["id"],
+            "status": status,
+        },
+    )
+
+
 def _process_identity(expected: dict[str, Any]) -> Evidence:
     pid = expected.get("pid")
     create_time = expected.get("create_time")
@@ -242,9 +339,11 @@ _DESCRIPTORS = {
         PostconditionDescriptor("file_sha256", _file_sha256, "filesystem"),
         PostconditionDescriptor("git_head", _git_head, "git"),
         PostconditionDescriptor("git_index_contains", _git_index_contains, "git"),
+        PostconditionDescriptor("git_commit_effect", _git_commit_effect, "git"),
         PostconditionDescriptor("process_identity", _process_identity, "process"),
         PostconditionDescriptor("process_exited", _process_exited, "process"),
         PostconditionDescriptor("job_state", _job_state, "durable_job"),
+        PostconditionDescriptor("job_request_key_state", _job_request_key_state, "durable_job"),
         PostconditionDescriptor("package_version", _package_version, "package"),
         PostconditionDescriptor("http_response", _http_response, "http"),
         PostconditionDescriptor("ui_element_state", _ui_element_state, "uia"),

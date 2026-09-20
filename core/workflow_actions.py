@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import subprocess
 import time
@@ -414,6 +415,45 @@ def validate_operation(
 def validate_workflow_definition(definition: WorkflowDefinition) -> None:
     for step in definition.steps:
         validate_operation(step.action, step.arguments, step.postcondition)
+
+
+def prepare_action_intent(
+    name: str,
+    arguments: dict[str, Any],
+    postcondition: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Materialize result-independent recovery intent before a side effect begins."""
+
+    descriptor, validated = validate_operation(name, arguments, postcondition)
+    if not descriptor.mutates:
+        return postcondition, None
+    if name == "git_stage":
+        canonical = {
+            "kind": "git_index_contains",
+            "expected": {
+                "repo": str(resolve_path(str(validated["repo"]))),
+                "paths": list(validated["paths"]),
+            },
+        }
+        return canonical, {"requested_paths": list(validated["paths"])}
+    if name == "git_commit":
+        repo = str(resolve_path(str(validated["repo"])))
+        git_args = {"repo": repo}
+        before_head = _run_git(git_args, 10, "rev-parse", "HEAD")["stdout"].strip()
+        staged_tree = _run_git(git_args, 10, "write-tree")["stdout"].strip()
+        message_hash = hashlib.sha256(str(validated["message"]).strip().encode("utf-8")).hexdigest()
+        expected = {
+            "repo": repo,
+            "before_head": before_head,
+            "staged_tree": staged_tree,
+            "message_sha256": message_hash,
+        }
+        return {"kind": "git_commit_effect", "expected": expected}, expected
+    if name == "run_durable_job":
+        request_key = str(validated["idempotency_key"])
+        expected = {"request_key": request_key, "status": "succeeded"}
+        return {"kind": "job_request_key_state", "expected": expected}, {"request_key": request_key}
+    return postcondition, None
 
 
 def execute_action(

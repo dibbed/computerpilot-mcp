@@ -471,6 +471,18 @@ class JobStore:
     def get(self, job_id: str) -> dict[str, Any]:
         return self._public(self._reconcile([self._status_raw(job_id)])[0])
 
+    def get_by_request_key(self, request_key: str) -> dict[str, Any]:
+        """Read the authoritative job state by durable idempotency identity."""
+
+        with closing(self.connect()) as db:
+            row = db.execute(
+                f"SELECT {JOB_STATUS_COLUMNS} FROM jobs WHERE request_key=?",
+                (request_key,),
+            ).fetchone()
+        if row is None:
+            raise ToolError("job_request_key_not_found", "No retained job exists for this request key.")
+        return self._public(self._reconcile([dict(row)])[0])
+
     def wait(self, job_id: str, after_version: int, timeout: float) -> dict[str, Any]:
         """Long-poll one job until its authoritative version advances or timeout expires."""
         if after_version < 0:
