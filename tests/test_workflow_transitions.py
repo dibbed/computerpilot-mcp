@@ -99,7 +99,7 @@ def test_terminal_operation_states_have_no_outgoing_transitions(state: Operation
 
 def test_store_validates_transition_against_persisted_state(tmp_path: Path) -> None:
     store = WorkflowStore(tmp_path / "workflows.db")
-    workflow = store.create(WorkflowDefinition("check", (StepDefinition("file", "check_file"),)))
+    workflow = store.create(WorkflowDefinition("check", (StepDefinition("file", "check_file", {"path": "x"}),)))
 
     with pytest.raises(ToolError, match="Cannot transition workflow"):
         store.transition(workflow["workflow_id"], workflow["version"], WorkflowState.RUNNING)
@@ -115,8 +115,8 @@ def test_running_workflow_advances_without_same_state_transition(tmp_path: Path)
         WorkflowDefinition(
             "checks",
             (
-                StepDefinition("first", "check_file"),
-                StepDefinition("second", "check_file"),
+                StepDefinition("first", "check_file", {"path": "one"}),
+                StepDefinition("second", "check_file", {"path": "two"}),
             ),
         ),
         initial_state=WorkflowState.QUEUED,

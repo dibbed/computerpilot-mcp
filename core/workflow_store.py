@@ -23,7 +23,15 @@ from core.workflow_models import (
 )
 
 SCHEMA_VERSION = 1
-_SECRET_MARKERS = ("password", "secret", "token", "api_key", "credential", "authorization")
+_SECRET_MARKERS = (
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "credential",
+    "authorization",
+    "idempotency_key",
+)
 _STEP_OPERATION_STATES = {
     "created": "created",
     "running": "uncertain",
@@ -326,6 +334,9 @@ class WorkflowStore:
     ) -> dict[str, Any]:
         if not definition.steps:
             raise ToolError("empty_workflow", "A workflow must contain at least one step.")
+        from core.workflow_actions import validate_workflow_definition
+
+        validate_workflow_definition(definition)
         definition_json = self._definition_json(definition)
         inputs_json = _canonical(redact_inputs(inputs or {}))
         workflow_id = uuid.uuid4().hex

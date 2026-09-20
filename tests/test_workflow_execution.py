@@ -52,7 +52,7 @@ def test_transient_retry_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setitem(ACTION_HANDLERS, "check_file", flaky)
     store = WorkflowStore(tmp_path / "workflows.db")
     workflow = store.create(
-        WorkflowDefinition("retry", (StepDefinition("check", "check_file", {}, max_retries=1),)),
+        WorkflowDefinition("retry", (StepDefinition("check", "check_file", {"path": "unused"}, max_retries=1),)),
         initial_state=WorkflowState.QUEUED,
     )
     result = WorkflowExecutor(store).run(workflow["workflow_id"])
@@ -69,7 +69,14 @@ def test_uncertain_side_effect_is_never_advanced(tmp_path: Path, monkeypatch: py
     workflow = store.create(
         WorkflowDefinition(
             "uncertain",
-            (StepDefinition("job", "run_durable_job", {}, postcondition={"kind": "file_exists", "expected": {"path": "x"}}),),
+            (
+                StepDefinition(
+                    "job",
+                    "run_durable_job",
+                    {"executable": "python", "idempotency_key": "test-job"},
+                    postcondition={"kind": "job_succeeded_from_result"},
+                ),
+            ),
         ),
         initial_state=WorkflowState.QUEUED,
     )

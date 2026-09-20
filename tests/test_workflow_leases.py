@@ -13,7 +13,7 @@ from core.workflows import StepDefinition, WorkflowDefinition, WorkflowState, Wo
 
 
 def _workflow(store: WorkflowStore) -> dict[str, object]:
-    return store.create(WorkflowDefinition("lease", (StepDefinition("check", "check_file"),)))
+    return store.create(_workflow_definition())
 
 
 def test_only_one_owner_can_acquire_a_live_lease(tmp_path: Path) -> None:
@@ -164,4 +164,4 @@ def test_lease_ttl_is_bounded(tmp_path: Path, ttl_sec: float) -> None:
 
 
 def _workflow_definition() -> WorkflowDefinition:
-    return WorkflowDefinition("lease", (StepDefinition("check", "check_file"),))
+    return WorkflowDefinition("lease", (StepDefinition("check", "check_file", {"path": "unused"}),))

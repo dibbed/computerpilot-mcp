@@ -14,8 +14,18 @@ def _definition() -> WorkflowDefinition:
     return WorkflowDefinition(
         "operations",
         (
-            StepDefinition("first", "check_file", {"path": "one", "api_token": "secret"}),
-            StepDefinition("second", "check_file", {"path": "two"}),
+            StepDefinition(
+                "first",
+                "run_durable_job",
+                {"executable": "python", "idempotency_key": "secret-one"},
+                postcondition={"kind": "job_succeeded_from_result"},
+            ),
+            StepDefinition(
+                "second",
+                "run_durable_job",
+                {"executable": "python", "idempotency_key": "secret-two"},
+                postcondition={"kind": "job_succeeded_from_result"},
+            ),
         ),
     )
 

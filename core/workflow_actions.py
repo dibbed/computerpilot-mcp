@@ -7,15 +7,116 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from core.config import resolve_path
 from core.errors import ToolError
 from core.job_scheduler import ensure_job_scheduler
 from core.jobs import JobStore
+from core.workflow_models import WorkflowDefinition
+from tools.filesystem.patches import apply_patch_transaction
+from tools.testing.impact import select_affected_tests
 from tools.testing.verification import verify_changed_repository
 
 ActionHandler = Callable[[dict[str, Any], float], dict[str, Any]]
+
+
+class _ActionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class VerifyChangesInput(_ActionInput):
+    cwd: str = "."
+    changed_paths: list[str] | None = None
+    base: str | None = None
+    checks: list[str] | None = None
+    affected_only: bool = True
+    fallback_policy: str = "select_full_suite"
+    fail_fast: bool = False
+    maxfail: int = 1
+    stage_timeout_sec: float = 300
+    total_timeout_sec: float = 1800
+    ruff_fix: bool = False
+    diagnostic_cap: int = 20
+
+
+class GitStatusInput(_ActionInput):
+    repo: str = "."
+    require_clean: bool = False
+    tag_must_not_exist: str | None = None
+
+
+class GitStageInput(_ActionInput):
+    repo: str = "."
+    paths: list[str] = Field(min_length=1)
+
+
+class GitCommitInput(_ActionInput):
+    repo: str = "."
+    message: str = Field(min_length=1, max_length=10_000)
+
+
+class DurableJobInput(_ActionInput):
+    executable: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1, max_length=500)
+    args: list[str] = Field(default_factory=list)
+    cwd: str = "."
+    encoding: str = "utf-8"
+
+
+class CheckFileInput(_ActionInput):
+    path: str = Field(min_length=1)
+    exists: bool = True
+    contains: str | None = None
+
+
+class CheckHttpInput(_ActionInput):
+    url: str = Field(pattern=r"^https?://")
+    status: int = Field(default=200, ge=100, le=599)
+
+
+class ApplyPatchInput(_ActionInput):
+    cwd: str = "."
+    patch: str = Field(min_length=1)
+    expected_sha256: dict[str, str] | None = None
+    backup: bool = True
+    encoding: str = "auto"
+
+
+class AffectedTestsInput(_ActionInput):
+    cwd: str = "."
+    changed_paths: list[str] | None = None
+    base: str | None = None
+    fallback_policy: Literal["report", "select_full_suite"] = "report"
+
+
+class SemanticActionInput(_ActionInput):
+    action: str = Field(min_length=1)
+    automation_id: str | None = None
+    control_type: str | None = None
+    name: str | None = None
+    value: str | None = None
+
+
+class BrowserActionInput(_ActionInput):
+    action: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    selector: str | None = None
+    value: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ActionDescriptor:
+    name: str
+    input_model: type[BaseModel]
+    handler: ActionHandler
+    mutates: bool
+    retry_policy: Literal["never", "transient"]
+    allowed_postconditions: frozenset[str]
+    secret_fields: frozenset[str] = frozenset()
 
 
 class TransientActionError(RuntimeError):
@@ -27,7 +128,10 @@ class SideEffectUncertain(RuntimeError):
 
 
 def _run_git(
-    arguments: dict[str, Any], timeout_sec: float, *command: str, uncertain_on_timeout: bool = False,
+    arguments: dict[str, Any],
+    timeout_sec: float,
+    *command: str,
+    uncertain_on_timeout: bool = False,
 ) -> dict[str, Any]:
     repo = resolve_path(str(arguments.get("repo", ".")))
     try:
@@ -52,9 +156,19 @@ def _verify_changes(arguments: dict[str, Any], timeout_sec: float) -> dict[str, 
     allowed = {
         key: value
         for key, value in arguments.items()
-        if key in {
-            "changed_paths", "base", "checks", "affected_only", "fallback_policy", "fail_fast", "maxfail",
-            "stage_timeout_sec", "total_timeout_sec", "ruff_fix", "diagnostic_cap",
+        if key
+        in {
+            "changed_paths",
+            "base",
+            "checks",
+            "affected_only",
+            "fallback_policy",
+            "fail_fast",
+            "maxfail",
+            "stage_timeout_sec",
+            "total_timeout_sec",
+            "ruff_fix",
+            "diagnostic_cap",
         }
     }
     allowed["total_timeout_sec"] = min(float(allowed.get("total_timeout_sec", timeout_sec)), timeout_sec)
@@ -161,7 +275,35 @@ def _check_http(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]
     return {"url": url, "status": status}
 
 
+def _apply_patch(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
+    return apply_patch_transaction(
+        resolve_path(str(arguments["cwd"])),
+        str(arguments["patch"]),
+        expected_sha256=arguments.get("expected_sha256"),
+        backup=bool(arguments["backup"]),
+        timeout_sec=timeout_sec,
+        encoding=str(arguments["encoding"]),
+    )
+
+
+def _affected_tests(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
+    del timeout_sec
+    return select_affected_tests(
+        resolve_path(str(arguments["cwd"])),
+        changed_paths=arguments.get("changed_paths"),
+        base=arguments.get("base"),
+        fallback_policy=arguments["fallback_policy"],
+    )
+
+
+def _adapter_required(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
+    del arguments, timeout_sec
+    raise ToolError("workflow_adapter_required", "This action requires an active semantic runtime adapter.")
+
+
 ACTION_HANDLERS: dict[str, ActionHandler] = {
+    "apply_patch": _apply_patch,
+    "affected_tests": _affected_tests,
     "verify_changes": _verify_changes,
     "git_status": _git_status,
     "git_stage": _git_stage,
@@ -169,15 +311,80 @@ ACTION_HANDLERS: dict[str, ActionHandler] = {
     "run_durable_job": _run_durable_job,
     "check_file": _check_file,
     "check_http": _check_http,
+    "desktop_semantic_action": _adapter_required,
+    "browser_action": _adapter_required,
+}
+
+ACTION_DESCRIPTORS: dict[str, ActionDescriptor] = {
+    "apply_patch": ActionDescriptor(
+        "apply_patch", ApplyPatchInput, _apply_patch, True, "never", frozenset({"file_exists", "file_absent", "file_sha256"})
+    ),
+    "affected_tests": ActionDescriptor("affected_tests", AffectedTestsInput, _affected_tests, False, "never", frozenset()),
+    "verify_changes": ActionDescriptor("verify_changes", VerifyChangesInput, _verify_changes, False, "never", frozenset()),
+    "git_status": ActionDescriptor("git_status", GitStatusInput, _git_status, False, "transient", frozenset()),
+    "git_stage": ActionDescriptor("git_stage", GitStageInput, _git_stage, True, "never", frozenset({"git_index_contains_from_result"})),
+    "git_commit": ActionDescriptor("git_commit", GitCommitInput, _git_commit, True, "never", frozenset({"git_head_from_result"})),
+    "run_durable_job": ActionDescriptor(
+        "run_durable_job",
+        DurableJobInput,
+        _run_durable_job,
+        True,
+        "never",
+        frozenset({"job_succeeded_from_result"}),
+        frozenset({"idempotency_key"}),
+    ),
+    "check_file": ActionDescriptor("check_file", CheckFileInput, _check_file, False, "never", frozenset()),
+    "check_http": ActionDescriptor("check_http", CheckHttpInput, _check_http, False, "transient", frozenset()),
+    "desktop_semantic_action": ActionDescriptor(
+        "desktop_semantic_action", SemanticActionInput, _adapter_required, True, "never", frozenset({"ui_element_state"})
+    ),
+    "browser_action": ActionDescriptor(
+        "browser_action", BrowserActionInput, _adapter_required, True, "never", frozenset({"browser_state"})
+    ),
 }
 
 
-def execute_action(name: str, arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
-    handler = ACTION_HANDLERS.get(name)
-    if handler is None:
+def get_action_descriptor(name: str) -> ActionDescriptor:
+    descriptor = ACTION_DESCRIPTORS.get(name)
+    if descriptor is None:
         raise ToolError(
             "workflow_action_not_allowed",
             f"Workflow action {name!r} is not allowlisted.",
-            hint=f"Use one of: {', '.join(sorted(ACTION_HANDLERS))}.",
+            hint=f"Use one of: {', '.join(sorted(ACTION_DESCRIPTORS))}.",
         )
-    return handler(arguments, timeout_sec)
+    return descriptor
+
+
+def validate_operation(
+    name: str,
+    arguments: dict[str, Any],
+    postcondition: dict[str, Any] | None,
+) -> tuple[ActionDescriptor, dict[str, Any]]:
+    descriptor = get_action_descriptor(name)
+    try:
+        validated = descriptor.input_model.model_validate(arguments).model_dump()
+    except ValidationError as exc:
+        raise ToolError("invalid_workflow_arguments", f"Invalid {name} arguments: {exc.errors(include_url=False)}") from exc
+    if descriptor.mutates:
+        kind = str((postcondition or {}).get("kind", ""))
+        if kind not in descriptor.allowed_postconditions:
+            raise ToolError(
+                "workflow_postcondition_required",
+                f"Mutating action {name!r} requires a supported postcondition.",
+            )
+    return descriptor, validated
+
+
+def validate_workflow_definition(definition: WorkflowDefinition) -> None:
+    for step in definition.steps:
+        validate_operation(step.action, step.arguments, step.postcondition)
+
+
+def execute_action(name: str, arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
+    descriptor = get_action_descriptor(name)
+    try:
+        validated = descriptor.input_model.model_validate(arguments).model_dump()
+    except ValidationError as exc:
+        raise ToolError("invalid_workflow_arguments", f"Invalid {name} arguments: {exc.errors(include_url=False)}") from exc
+    handler = ACTION_HANDLERS[name]
+    return handler(validated, timeout_sec)
