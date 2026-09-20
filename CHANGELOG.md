@@ -15,6 +15,12 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Add guarded operational Git inspection and narrowly scoped branch, stage, commit, and restore workflows.
 - Add unified Ruff, mypy, and pytest diagnostics plus durable, cancellable incremental validation watches.
 
+#### Validation
+- Full pytest suite: 399 tests passed.
+- Ruff: zero violations; mypy: zero issues across 122 source files.
+- Compile, startup, and MCP health checks passed with 87 unique tools.
+- Quick benchmark: 25 cases passed, zero errors, with the optional jobs and browser suites skipped unless explicitly enabled.
+
 #### Fixed
 - Treat transient Windows process-table failures such as `WinError 1455` as degraded supervisor diagnostics instead of fatal runtime failures.
 - Keep runtime cleanup resilient when `psutil` process enumeration is unavailable: tracked children are cleaned best-effort and the original `Popen` handle forcibly releases the runtime root so ports such as `127.0.0.1:8080` are not stranded by a failed cleanup pass.
