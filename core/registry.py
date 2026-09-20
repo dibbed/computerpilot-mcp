@@ -92,6 +92,7 @@ def create_server() -> MCPServer:
             "platform": platform.platform(),
             "windows": os.name == "nt",
             "browser_optional_installed": importlib.util.find_spec("playwright") is not None,
+            "semantic_desktop_available": os.name == "nt" and importlib.util.find_spec("uiautomation") is not None,
             "audit_log": str(SETTINGS.audit_log),
             "operation_recovery": OPERATION_RECOVERY.summary(),
             "resource_budgets": SETTINGS.resource_budgets(),

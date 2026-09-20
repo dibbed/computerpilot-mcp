@@ -75,6 +75,9 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "cancel_job",
         "reconcile_operation",
         "acknowledge_uncertain_operation",
+        "ui_invoke",
+        "ui_set_value",
+        "ui_select",
     }
 )
 
