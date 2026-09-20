@@ -37,6 +37,9 @@ memory/*.json
 !memory/*.example.json
 
 # Local unversioned/experimental tunnel runtime downloads
+
+# Local development workflows and temporary documentation
+docs/superpowers/
 tunnel-client-runtime*
 
 # Local SQLite databases and write-ahead logs
