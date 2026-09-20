@@ -57,6 +57,13 @@ REQUIRED_TOOLS = {
     "run_mypy",
     "affected_tests",
     "verify_changes",
+    "symbol_definition",
+    "symbol_references",
+    "document_symbols",
+    "workspace_symbols",
+    "symbol_hover",
+    "call_hierarchy",
+    "language_diagnostics",
     "git_status",
     "git_diff_summary",
     "git_log_summary",
@@ -136,7 +143,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
-    assert len(names) == 65
+    assert len(names) == 72
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     for tool in tools:

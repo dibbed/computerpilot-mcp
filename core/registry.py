@@ -23,6 +23,7 @@ from tools.desktop import register as register_desktop
 from tools.filesystem import register as register_filesystem
 from tools.git import register as register_git
 from tools.jobs import register as register_jobs
+from tools.language import register as register_language
 from tools.memory import register as register_memory
 from tools.process import register as register_process
 from tools.project import register as register_project
@@ -36,6 +37,7 @@ REGISTRARS = (
     register_process,
     register_windows,
     register_project,
+    register_language,
     register_testing,
     register_git,
     register_browser,
