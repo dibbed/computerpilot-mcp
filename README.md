@@ -2,6 +2,8 @@
 
 A local Windows developer-agent backend built on the Model Context Protocol (MCP). It exposes filesystem, code intelligence, process execution, durable jobs, browser automation, desktop interaction, Git, testing, system diagnostics, project memory, and image delivery through one MCP server designed for long-running local use.
 
+Current MCP release: **v0.2.0**. This project version is independent from the bundled upstream tunnel-client binary version.
+
 The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only Streamable HTTP server.
 
 > Release history belongs in [CHANGELOG.md](CHANGELOG.md). Binary provenance and hashes are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
@@ -11,10 +13,10 @@ The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only S
 - Full local Windows filesystem access with atomic writes, backups, exact edits, anchored edits, and AST-aware Python refactoring.
 - PowerShell, CMD, and native process execution with bounded output delivery and background process support.
 - Durable SQLite-backed jobs that survive MCP runtime restarts and support idempotent submission, cancellation, output retrieval, and version-aware waiting.
-- Python codebase intelligence for functions, classes, imports, dependency graphs, and project summaries.
+- Python codebase intelligence plus explicit Language Server Protocol queries and transactional semantic edits.
 - Fast file search with exact counting, bounded scans, and optional immutable snapshot pagination.
-- Git status, diff summaries, and commit history tools.
-- Integrated pytest, Ruff, and mypy execution with compact structured results.
+- Guarded Git inspection, branch creation, staging, committing, conflict discovery, and explicit file restoration.
+- Integrated pytest, Ruff, and mypy execution with unified diagnostics, affected-test selection, change-aware verification, and durable incremental watches.
 - Optional Playwright browser automation with shared browser pools and isolated sessions.
 - Desktop screenshots and model-visible PNG/JPEG/WebP delivery.
 - Windows system diagnostics for processes, CPU, memory, disks, services, installed programs, and environment metadata.
