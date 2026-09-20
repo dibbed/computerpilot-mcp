@@ -9,12 +9,18 @@ import threading
 import uuid
 from contextlib import closing
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from core.errors import ToolError
-from core.workflow_models import OperationState, WorkflowDefinition, WorkflowState, validate_workflow_transition
+from core.workflow_models import (
+    OperationState,
+    WorkflowDefinition,
+    WorkflowLease,
+    WorkflowState,
+    validate_workflow_transition,
+)
 
 SCHEMA_VERSION = 1
 _SECRET_MARKERS = ("password", "secret", "token", "api_key", "credential", "authorization")
@@ -52,6 +58,28 @@ def _canonical(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _lease_times(ttl_sec: float) -> tuple[str, str]:
+    if not 5 <= ttl_sec <= 300:
+        raise ToolError("invalid_lease_ttl", "Lease TTL must be between 5 and 300 seconds.")
+    now = datetime.now(timezone.utc)
+    return (
+        now.isoformat(timespec="milliseconds"),
+        (now + timedelta(seconds=ttl_sec)).isoformat(timespec="milliseconds"),
+    )
+
+
+def _lease_from_row(row: sqlite3.Row) -> WorkflowLease:
+    return WorkflowLease(
+        workflow_id=str(row["workflow_id"]),
+        owner_id=str(row["owner_id"]),
+        lease_token=str(row["lease_token"]),
+        acquired_at=str(row["acquired_at"]),
+        heartbeat_at=str(row["heartbeat_at"]),
+        expires_at=str(row["expires_at"]),
+        version=int(row["version"]),
+    )
 
 
 class WorkflowStore:
@@ -389,6 +417,111 @@ class WorkflowStore:
             "offset": offset,
             "has_more": offset + len(items) < total,
         }
+
+    def acquire_lease(self, workflow_id: str, owner_id: str, ttl_sec: float) -> WorkflowLease:
+        owner_id = owner_id.strip()
+        if not owner_id or len(owner_id) > 200:
+            raise ToolError("invalid_lease_owner", "Lease owner must contain between 1 and 200 characters.")
+        now, expires_at = _lease_times(ttl_sec)
+        token = uuid.uuid4().hex
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("SELECT 1 FROM workflows WHERE workflow_id = ?", (workflow_id,)).fetchone() is None:
+                raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
+            current = connection.execute(
+                "SELECT * FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if current is None:
+                connection.execute(
+                    """
+                    INSERT INTO workflow_leases(
+                        workflow_id, owner_id, lease_token, acquired_at, heartbeat_at, expires_at, version
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                    """,
+                    (workflow_id, owner_id, token, now, now, expires_at),
+                )
+            elif str(current["expires_at"]) > now:
+                if str(current["owner_id"]) != owner_id:
+                    raise ToolError("workflow_already_claimed", "Workflow is already claimed by another executor.")
+                connection.commit()
+                return _lease_from_row(current)
+            else:
+                connection.execute(
+                    """
+                    UPDATE workflow_leases
+                    SET owner_id = ?, lease_token = ?, acquired_at = ?, heartbeat_at = ?,
+                        expires_at = ?, version = version + 1
+                    WHERE workflow_id = ?
+                    """,
+                    (owner_id, token, now, now, expires_at, workflow_id),
+                )
+            row = connection.execute(
+                "SELECT * FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            connection.commit()
+        if row is None:  # pragma: no cover - guarded by the transaction above
+            raise ToolError("workflow_lease_missing", "Workflow lease could not be persisted.")
+        return _lease_from_row(row)
+
+    def renew_lease(self, workflow_id: str, lease_token: str, ttl_sec: float) -> WorkflowLease:
+        now, expires_at = _lease_times(ttl_sec)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if current is None:
+                raise ToolError("workflow_lease_missing", "Workflow has no active lease.")
+            if str(current["lease_token"]) != lease_token:
+                raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+            if str(current["expires_at"]) <= now:
+                raise ToolError("workflow_lease_expired", "Workflow lease has expired and cannot be renewed.")
+            connection.execute(
+                """
+                UPDATE workflow_leases
+                SET heartbeat_at = ?, expires_at = ?, version = version + 1
+                WHERE workflow_id = ? AND lease_token = ?
+                """,
+                (now, expires_at, workflow_id, lease_token),
+            )
+            row = connection.execute(
+                "SELECT * FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            connection.commit()
+        if row is None:  # pragma: no cover - guarded by the transaction above
+            raise ToolError("workflow_lease_missing", "Workflow lease disappeared during renewal.")
+        return _lease_from_row(row)
+
+    def require_lease(self, workflow_id: str, lease_token: str) -> WorkflowLease:
+        now = _now()
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+        if row is None:
+            raise ToolError("workflow_lease_missing", "Workflow has no active lease.")
+        if str(row["lease_token"]) != lease_token:
+            raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+        if str(row["expires_at"]) <= now:
+            raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
+        return _lease_from_row(row)
+
+    def release_lease(self, workflow_id: str, lease_token: str) -> None:
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT lease_token FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return
+            if str(row["lease_token"]) != lease_token:
+                raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+            connection.execute(
+                "DELETE FROM workflow_leases WHERE workflow_id = ? AND lease_token = ?",
+                (workflow_id, lease_token),
+            )
+            connection.commit()
 
     def transition(
         self,

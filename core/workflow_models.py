@@ -64,6 +64,17 @@ class WorkflowDefinition:
     description: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class WorkflowLease:
+    workflow_id: str
+    owner_id: str
+    lease_token: str
+    acquired_at: str
+    heartbeat_at: str
+    expires_at: str
+    version: int
+
+
 WORKFLOW_TRANSITIONS: Mapping[WorkflowState, frozenset[WorkflowState]] = {
     WorkflowState.CREATED: frozenset({WorkflowState.QUEUED, WorkflowState.CANCELLED}),
     WorkflowState.QUEUED: frozenset({WorkflowState.RUNNING, WorkflowState.CANCELLED}),
