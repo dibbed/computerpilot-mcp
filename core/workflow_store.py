@@ -1156,10 +1156,11 @@ class WorkflowStore:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """
-                SELECT workflows.workflow_id, workflows.current_step
+                SELECT workflows.workflow_id, workflows.current_step, workflows.state,
+                       workflows.cancel_requested_at
                 FROM workflows
                 LEFT JOIN workflow_leases ON workflow_leases.workflow_id = workflows.workflow_id
-                WHERE workflows.state = 'running'
+                WHERE workflows.state IN ('running','cancelling')
                   AND (workflow_leases.workflow_id IS NULL OR workflow_leases.expires_at <= ?)
                 """,
                 (now,),
@@ -1167,27 +1168,138 @@ class WorkflowStore:
             for row in rows:
                 workflow_id = str(row["workflow_id"])
                 step_index = int(row["current_step"])
-                connection.execute(
+                workflow_state = str(row["state"])
+                operation = connection.execute(
                     """
-                    UPDATE workflows SET state = 'uncertain', version = version + 1,
-                        updated_at = ?, last_error = ? WHERE workflow_id = ?
+                    SELECT operation_id, state, evidence_json, error
+                    FROM workflow_operations
+                    WHERE workflow_id = ? AND step_index = ? AND operation_index = 0
                     """,
-                    (now, "runtime_ended_during_step", workflow_id),
+                    (workflow_id, step_index),
+                ).fetchone()
+                step_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM workflow_steps WHERE workflow_id = ?",
+                        (workflow_id,),
+                    ).fetchone()[0]
+                )
+
+                if operation is not None and str(operation["state"]) == OperationState.SUCCEEDED.value:
+                    next_step = step_index + 1
+                    target = (
+                        WorkflowState.CANCELLED.value
+                        if workflow_state == WorkflowState.CANCELLING.value or row["cancel_requested_at"] is not None
+                        else WorkflowState.COMPLETED.value if next_step >= step_count
+                        else WorkflowState.PAUSED.value
+                    )
+                    connection.execute(
+                        """
+                        UPDATE workflow_steps
+                        SET state = 'completed', finished_at = COALESCE(finished_at, ?),
+                            evidence_json = COALESCE(evidence_json, ?), error = NULL
+                        WHERE workflow_id = ? AND step_index = ?
+                        """,
+                        (now, operation["evidence_json"], workflow_id, step_index),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE workflows
+                        SET state = ?, current_step = ?, version = version + 1,
+                            updated_at = ?, last_error = NULL
+                        WHERE workflow_id = ?
+                        """,
+                        (target, next_step, now, workflow_id),
+                    )
+                elif operation is not None and str(operation["state"]) in {
+                    OperationState.FAILED.value,
+                    OperationState.UNRESOLVABLE.value,
+                }:
+                    error = str(operation["error"] or "operation_failed_before_aggregate_checkpoint")
+                    connection.execute(
+                        """
+                        UPDATE workflow_steps
+                        SET state = 'failed', finished_at = COALESCE(finished_at, ?),
+                            error = COALESCE(error, ?)
+                        WHERE workflow_id = ? AND step_index = ?
+                        """,
+                        (now, error[:2_000], workflow_id, step_index),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE workflows
+                        SET state = 'failed', version = version + 1, updated_at = ?,
+                            last_error = ?
+                        WHERE workflow_id = ?
+                        """,
+                        (now, error[:2_000], workflow_id),
+                    )
+                elif operation is not None and str(operation["state"]) == OperationState.CANCELLED.value:
+                    connection.execute(
+                        """
+                        UPDATE workflow_steps
+                        SET state = 'cancelled', finished_at = COALESCE(finished_at, ?),
+                            error = COALESCE(error, 'workflow cancellation requested')
+                        WHERE workflow_id = ? AND step_index = ?
+                        """,
+                        (now, workflow_id, step_index),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE workflows
+                        SET state = 'cancelled', version = version + 1, updated_at = ?
+                        WHERE workflow_id = ?
+                        """,
+                        (now, workflow_id),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE workflows SET state = 'uncertain', version = version + 1,
+                            updated_at = ?, last_error = ? WHERE workflow_id = ?
+                        """,
+                        (now, "runtime_ended_during_step", workflow_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE workflow_steps SET state = 'uncertain', finished_at = ?, error = ?
+                        WHERE workflow_id = ? AND step_index = ?
+                          AND state IN ('created','running','waiting')
+                        """,
+                        (now, "runtime_ended_without_checkpoint", workflow_id, step_index),
+                    )
+                    if operation is not None and str(operation["state"]) in {
+                        OperationState.CREATED.value,
+                        OperationState.RUNNING.value,
+                        OperationState.WAITING.value,
+                    }:
+                        connection.execute(
+                            """
+                            UPDATE workflow_operations SET state = 'uncertain', version = version + 1,
+                                updated_at = ?, finished_at = ?, error = ?
+                            WHERE operation_id = ?
+                            """,
+                            (now, now, "runtime_ended_without_checkpoint", operation["operation_id"]),
+                        )
+
+                connection.execute(
+                    "DELETE FROM workflow_leases WHERE workflow_id = ? AND expires_at <= ?",
+                    (workflow_id, now),
                 )
                 connection.execute(
                     """
-                    UPDATE workflow_steps SET state = 'uncertain', finished_at = ?, error = ?
-                    WHERE workflow_id = ? AND step_index = ? AND state = 'running'
+                    INSERT INTO workflow_events(
+                        workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at
+                    ) VALUES (?, ?, ?, 'workflow_restart_recovered',
+                              (SELECT state FROM workflows WHERE workflow_id = ?), ?, ?)
                     """,
-                    (now, "runtime_ended_without_checkpoint", workflow_id, step_index),
-                )
-                connection.execute(
-                    """
-                    UPDATE workflow_operations SET state = 'uncertain', version = version + 1,
-                        updated_at = ?, finished_at = ?, error = ?
-                    WHERE workflow_id = ? AND step_index = ? AND state IN ('created','running','waiting')
-                    """,
-                    (now, now, "runtime_ended_without_checkpoint", workflow_id, step_index),
+                    (
+                        workflow_id,
+                        step_index,
+                        operation["operation_id"] if operation is not None else None,
+                        workflow_id,
+                        _canonical({"previous_state": workflow_state}),
+                        now,
+                    ),
                 )
             connection.commit()
         return len(rows)

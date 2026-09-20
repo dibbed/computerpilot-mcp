@@ -60,6 +60,52 @@ def _file_sha256(expected: dict[str, Any]) -> Evidence:
     )
 
 
+def _files_all_sha256(expected: dict[str, Any]) -> Evidence:
+    files = expected.get("files")
+    if not isinstance(files, list) or not files or len(files) > 200:
+        raise ToolError("invalid_postcondition", "files_all_sha256 requires a non-empty bounded files list.")
+    observations: list[dict[str, Any]] = []
+    satisfied = True
+    for item in files:
+        if not isinstance(item, dict):
+            raise ToolError("invalid_postcondition", "files_all_sha256 entries must be objects.")
+        path = resolve_path(_required_string(item, "path"))
+        if item.get("absent") is True:
+            exists = path.exists()
+            observations.append({"path": str(path), "absent": not exists})
+            satisfied = satisfied and not exists
+            continue
+        wanted = _required_string(item, "sha256").casefold()
+        if len(wanted) != 64 or any(character not in "0123456789abcdef" for character in wanted):
+            raise ToolError("invalid_postcondition", "files_all_sha256 sha256 values must be hexadecimal digests.")
+        if not path.is_file():
+            observations.append({"path": str(path), "exists": path.exists(), "sha256": None})
+            satisfied = False
+            continue
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            return Evidence(
+                "filesystem",
+                {
+                    "conclusive": False,
+                    "satisfied": False,
+                    "reason": type(exc).__name__,
+                    "path": str(path),
+                },
+            )
+        observations.append({"path": str(path), "sha256": digest})
+        satisfied = satisfied and digest == wanted
+    return Evidence(
+        "filesystem",
+        {
+            "conclusive": True,
+            "satisfied": satisfied,
+            "files": observations,
+        },
+    )
+
+
 def _git_head(expected: dict[str, Any]) -> Evidence:
     repo = resolve_path(_required_string(expected, "repo"))
     wanted = _required_string(expected, "commit")
@@ -337,6 +383,7 @@ _DESCRIPTORS = {
         PostconditionDescriptor("file_exists", _file_exists, "filesystem"),
         PostconditionDescriptor("file_absent", _file_absent, "filesystem"),
         PostconditionDescriptor("file_sha256", _file_sha256, "filesystem"),
+        PostconditionDescriptor("files_all_sha256", _files_all_sha256, "filesystem"),
         PostconditionDescriptor("git_head", _git_head, "git"),
         PostconditionDescriptor("git_index_contains", _git_index_contains, "git"),
         PostconditionDescriptor("git_commit_effect", _git_commit_effect, "git"),

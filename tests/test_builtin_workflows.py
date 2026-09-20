@@ -19,8 +19,8 @@ def test_safe_git_commit_uses_explicit_paths_and_postconditions() -> None:
         "safe_git_commit", {"repo": "C:/repo", "paths": ["core/a.py"], "message": "feat: update a"},
     )
     assert definition.steps[2].arguments["paths"] == ["core/a.py"]
-    assert definition.steps[2].postcondition == {"kind": "git_index_contains_from_result"}
-    assert definition.steps[3].postcondition == {"kind": "git_head_from_result"}
+    assert definition.steps[2].postcondition == {"kind": "git_stage_intent"}
+    assert definition.steps[3].postcondition == {"kind": "git_commit_intent"}
     validate_workflow_definition(definition)
 
 

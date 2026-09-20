@@ -348,20 +348,20 @@ ACTION_HANDLERS: dict[str, ActionHandler] = {
 
 ACTION_DESCRIPTORS: dict[str, ActionDescriptor] = {
     "apply_patch": ActionDescriptor(
-        "apply_patch", ApplyPatchInput, _apply_patch, True, "never", frozenset({"file_exists", "file_absent", "file_sha256"})
+        "apply_patch", ApplyPatchInput, _apply_patch, True, "never", frozenset({"patch_effect_intent"})
     ),
     "affected_tests": ActionDescriptor("affected_tests", AffectedTestsInput, _affected_tests, False, "never", frozenset()),
     "verify_changes": ActionDescriptor("verify_changes", VerifyChangesInput, _verify_changes, False, "never", frozenset()),
     "git_status": ActionDescriptor("git_status", GitStatusInput, _git_status, False, "transient", frozenset()),
-    "git_stage": ActionDescriptor("git_stage", GitStageInput, _git_stage, True, "never", frozenset({"git_index_contains_from_result"})),
-    "git_commit": ActionDescriptor("git_commit", GitCommitInput, _git_commit, True, "never", frozenset({"git_head_from_result"})),
+    "git_stage": ActionDescriptor("git_stage", GitStageInput, _git_stage, True, "never", frozenset({"git_stage_intent"})),
+    "git_commit": ActionDescriptor("git_commit", GitCommitInput, _git_commit, True, "never", frozenset({"git_commit_intent"})),
     "run_durable_job": ActionDescriptor(
         "run_durable_job",
         DurableJobInput,
         _run_durable_job,
         True,
         "never",
-        frozenset({"job_succeeded_from_result"}),
+        frozenset({"job_request_key_intent"}),
         frozenset(),
         "cooperative",
     ),
@@ -404,6 +404,14 @@ def validate_operation(
         validated = descriptor.input_model.model_validate(arguments).model_dump()
     except ValidationError as exc:
         raise ToolError("invalid_workflow_arguments", f"Invalid {name} arguments: {exc.errors(include_url=False)}") from exc
+    for field in descriptor.secret_fields:
+        value = validated.get(field)
+        if value is not None:
+            raise ToolError(
+                "workflow_secret_literal_not_supported",
+                f"Durable workflow action {name!r} cannot persist literal secret field {field!r}.",
+                hint="Use a future opaque secret-reference contract instead of embedding credentials in workflow JSON.",
+            )
     if descriptor.mutates:
         kind = str((postcondition or {}).get("kind", ""))
         if kind not in descriptor.allowed_postconditions:
@@ -429,6 +437,37 @@ def prepare_action_intent(
     descriptor, validated = validate_operation(name, arguments, postcondition)
     if not descriptor.mutates:
         return postcondition, None
+    if name == "apply_patch":
+        root = resolve_path(str(validated["cwd"]))
+        planned = apply_patch_transaction(
+            root,
+            str(validated["patch"]),
+            dry_run=True,
+            expected_sha256=validated.get("expected_sha256"),
+            backup=False,
+            timeout_sec=60,
+            encoding=str(validated["encoding"]),
+        )
+        files: list[dict[str, Any]] = []
+        for item in planned["files"]:
+            operation = str(item["operation"])
+            old_path = item.get("old_path")
+            new_path = item.get("new_path")
+            if operation in {"delete", "rename"} and isinstance(old_path, str):
+                files.append({"path": str((root / old_path).resolve(strict=False)), "absent": True})
+            if operation != "delete":
+                target = new_path or old_path
+                digest = item.get("sha256_after")
+                if isinstance(target, str) and isinstance(digest, str):
+                    files.append({
+                        "path": str((root / target).resolve(strict=False)),
+                        "sha256": digest,
+                    })
+        patch_expected: dict[str, Any] = {"files": files}
+        return {"kind": "files_all_sha256", "expected": patch_expected}, {
+            "file_count": len(planned["files"]),
+            "files": files,
+        }
     if name == "git_stage":
         canonical = {
             "kind": "git_index_contains",
@@ -444,17 +483,17 @@ def prepare_action_intent(
         before_head = _run_git(git_args, 10, "rev-parse", "HEAD")["stdout"].strip()
         staged_tree = _run_git(git_args, 10, "write-tree")["stdout"].strip()
         message_hash = hashlib.sha256(str(validated["message"]).strip().encode("utf-8")).hexdigest()
-        expected = {
+        commit_expected: dict[str, Any] = {
             "repo": repo,
             "before_head": before_head,
             "staged_tree": staged_tree,
             "message_sha256": message_hash,
         }
-        return {"kind": "git_commit_effect", "expected": expected}, expected
+        return {"kind": "git_commit_effect", "expected": commit_expected}, commit_expected
     if name == "run_durable_job":
         request_key = str(validated["idempotency_key"])
-        expected = {"request_key": request_key, "status": "succeeded"}
-        return {"kind": "job_request_key_state", "expected": expected}, {"request_key": request_key}
+        job_expected: dict[str, Any] = {"request_key": request_key, "status": "succeeded"}
+        return {"kind": "job_request_key_state", "expected": job_expected}, {"request_key": request_key}
     return postcondition, None
 
 

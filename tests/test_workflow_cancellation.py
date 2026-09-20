@@ -71,7 +71,7 @@ def test_action_context_propagates_cooperative_cancellation(
                     "job",
                     "run_durable_job",
                     {"executable": "python", "idempotency_key": "cancel-job"},
-                    postcondition={"kind": "job_succeeded_from_result"},
+                    postcondition={"kind": "job_request_key_intent"},
                 ),
             ),
         ),

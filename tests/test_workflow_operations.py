@@ -18,13 +18,13 @@ def _definition() -> WorkflowDefinition:
                 "first",
                 "run_durable_job",
                 {"executable": "python", "idempotency_key": "secret-one"},
-                postcondition={"kind": "job_succeeded_from_result"},
+                postcondition={"kind": "job_request_key_intent"},
             ),
             StepDefinition(
                 "second",
                 "run_durable_job",
                 {"executable": "python", "idempotency_key": "secret-two"},
-                postcondition={"kind": "job_succeeded_from_result"},
+                postcondition={"kind": "job_request_key_intent"},
             ),
         ),
     )

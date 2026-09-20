@@ -42,11 +42,11 @@ def builtin_workflow(name: str, parameters: dict[str, Any]) -> WorkflowDefinitio
                 StepDefinition("verify changed code", "verify_changes", verify_arguments, timeout_sec=1_800),
                 StepDefinition(
                     "stage explicit paths", "git_stage", {"repo": repo, "paths": paths},
-                    postcondition={"kind": "git_index_contains_from_result"},
+                    postcondition={"kind": "git_stage_intent"},
                 ),
                 StepDefinition(
                     "create commit", "git_commit", {"repo": repo, "message": message},
-                    postcondition={"kind": "git_head_from_result"},
+                    postcondition={"kind": "git_commit_intent"},
                 ),
             ),
             "Verify, explicitly stage, and commit without pushing.",

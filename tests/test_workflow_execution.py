@@ -74,7 +74,7 @@ def test_uncertain_side_effect_is_never_advanced(tmp_path: Path, monkeypatch: py
                     "job",
                     "run_durable_job",
                     {"executable": "python", "idempotency_key": "test-job"},
-                    postcondition={"kind": "job_succeeded_from_result"},
+                    postcondition={"kind": "job_request_key_intent"},
                 ),
             ),
         ),

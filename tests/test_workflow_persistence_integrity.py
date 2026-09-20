@@ -32,7 +32,7 @@ def test_execution_payload_is_not_redacted_or_truncated(tmp_path: Path, monkeypa
                         "idempotency_key": request_key,
                         "args": [long_arg],
                     },
-                    postcondition={"kind": "job_succeeded_from_result"},
+                    postcondition={"kind": "job_request_key_intent"},
                 ),
             ),
         ),
@@ -66,7 +66,7 @@ def test_independent_durable_job_keys_remain_distinct_after_reload(
                     "job",
                     "run_durable_job",
                     {"executable": "python", "idempotency_key": f"request-{suffix}"},
-                    postcondition={"kind": "job_succeeded_from_result"},
+                    postcondition={"kind": "job_request_key_intent"},
                 ),
             ),
         )

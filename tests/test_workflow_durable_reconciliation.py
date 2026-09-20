@@ -42,7 +42,7 @@ def test_git_commit_reconciliation_uses_pre_effect_identity(tmp_path: Path) -> N
     postcondition, intent = prepare_action_intent(
         "git_commit",
         {"repo": str(repo), "message": "feat: recoverable commit"},
-        {"kind": "git_head_from_result"},
+        {"kind": "git_commit_intent"},
     )
 
     assert postcondition is not None
@@ -68,7 +68,7 @@ def test_git_commit_reconciliation_is_inconclusive_after_unrelated_head_move(tmp
     postcondition, _ = prepare_action_intent(
         "git_commit",
         {"repo": str(repo), "message": "expected commit"},
-        {"kind": "git_head_from_result"},
+        {"kind": "git_commit_intent"},
     )
     assert postcondition is not None
 
@@ -79,6 +79,73 @@ def test_git_commit_reconciliation_is_inconclusive_after_unrelated_head_move(tmp
 
     assert evidence.data["conclusive"] is False
     assert evidence.data["satisfied"] is False
+
+
+def test_lost_patch_result_reconciles_from_precomputed_file_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "one.txt"
+    target.write_text("old\n", encoding="utf-8")
+    patch = """diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1 +1 @@
+-old
++new
+diff --git a/two.txt b/two.txt
+new file mode 100644
+--- /dev/null
++++ b/two.txt
+@@ -0,0 +1 @@
++created
+"""
+    original = ACTION_HANDLERS["apply_patch"]
+    calls = 0
+
+    def result_lost(arguments: dict[str, object], timeout: float) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        original(arguments, timeout)
+        raise SideEffectUncertain("result lost after patch publication")
+
+    monkeypatch.setitem(ACTION_HANDLERS, "apply_patch", result_lost)
+    store = WorkflowStore(tmp_path / "workflows.db")
+    workflow = store.create(
+        WorkflowDefinition(
+            "patch-recovery",
+            (
+                StepDefinition(
+                    "patch",
+                    "apply_patch",
+                    {"cwd": str(tmp_path), "patch": patch, "backup": False},
+                    postcondition={"kind": "patch_effect_intent"},
+                ),
+            ),
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+
+    result = WorkflowExecutor(store).execute(str(workflow["workflow_id"]), owner_id="worker-a")
+    assert result["state"] == "uncertain"
+    assert calls == 1
+    operation = store.get_operation_for_reconciliation(
+        store.list_operations(str(workflow["workflow_id"]))["items"][0]["operation_id"]
+    )
+    assert operation["postcondition"]["kind"] == "files_all_sha256"
+    assert operation["intent_evidence"]["file_count"] == 2
+    assert len(operation["intent_evidence"]["files"]) == 2
+    assert target.read_text(encoding="utf-8") == "new\n"
+    assert (tmp_path / "two.txt").read_text(encoding="utf-8") == "created\n"
+
+    reconciled = reconcile_operation(
+        store,
+        operation["operation_id"],
+        expected_version=operation["version"],
+    )
+
+    assert reconciled["operation"]["state"] == "succeeded"
+    assert reconciled["workflow"]["state"] == "completed"
+    assert calls == 1
 
 
 def test_lost_durable_job_result_reconciles_by_request_key(
@@ -94,7 +161,7 @@ def test_lost_durable_job_result_reconciles_by_request_key(
                     "job",
                     "run_durable_job",
                     {"executable": "python", "idempotency_key": request_key, "cwd": str(tmp_path)},
-                    postcondition={"kind": "job_succeeded_from_result"},
+                    postcondition={"kind": "job_request_key_intent"},
                 ),
             ),
         ),

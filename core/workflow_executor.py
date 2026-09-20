@@ -78,17 +78,7 @@ class WorkflowExecutor:
             raise ToolError("workflow_postcondition_required", f"Mutating action {step.action!r} requires a postcondition.")
         kind = str(step.postcondition.get("kind", ""))
         expected = dict(step.postcondition.get("expected", {}))
-        if kind == "git_head_from_result":
-            kind, expected = "git_head", {"repo": result.get("repo"), "commit": result.get("head")}
-        elif kind == "git_index_contains_from_result":
-            requested, staged = set(result.get("requested_paths", [])), set(result.get("staged_paths", []))
-            return {"source": "git", "conclusive": True, "satisfied": bool(requested) and requested <= staged,
-                    "staged_paths": sorted(staged)}
-        elif kind == "job_succeeded_from_result":
-            return {"source": "durable_job", "conclusive": True,
-                    "satisfied": result.get("status") == "succeeded" and result.get("exit_code") == 0,
-                    "job_id": result.get("job_id")}
-        elif kind == "job_request_key_state" and result.get("status") in {
+        if kind == "job_request_key_state" and result.get("status") in {
             "succeeded", "failed", "cancelled", "timed_out", "interrupted"
         }:
             return {
