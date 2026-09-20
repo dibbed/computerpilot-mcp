@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import subprocess
+import urllib.error
+import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +16,7 @@ import psutil
 
 from core.config import resolve_path
 from core.errors import ToolError
+from core.jobs import JobStore
 from core.recovery_models import Evidence, Postcondition
 
 
@@ -121,23 +126,111 @@ def _process_identity(expected: dict[str, Any]) -> Evidence:
     )
 
 
-_EVALUATORS: dict[str, Callable[[dict[str, Any]], Evidence]] = {
-    "file_exists": _file_exists,
-    "file_absent": _file_absent,
-    "file_sha256": _file_sha256,
-    "git_head": _git_head,
-    "process_identity": _process_identity,
+def _process_exited(expected: dict[str, Any]) -> Evidence:
+    pid = expected.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        raise ToolError("invalid_postcondition", "process_exited requires a positive pid.")
+    exists = psutil.pid_exists(pid)
+    return Evidence("process", {"conclusive": True, "satisfied": not exists, "pid": pid, "pid_exists": exists})
+
+
+def _package_version(expected: dict[str, Any]) -> Evidence:
+    name = _required_string(expected, "name")
+    wanted = expected.get("version")
+    try:
+        actual = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return Evidence("package", {"conclusive": True, "satisfied": False, "name": name, "installed": False})
+    satisfied = wanted is None or actual == wanted
+    return Evidence("package", {"conclusive": True, "satisfied": satisfied, "name": name, "version": actual})
+
+
+def _git_index_contains(expected: dict[str, Any]) -> Evidence:
+    repo = resolve_path(_required_string(expected, "repo"))
+    paths = expected.get("paths")
+    if not isinstance(paths, list) or not all(isinstance(item, str) for item in paths):
+        raise ToolError("invalid_postcondition", "git_index_contains requires a paths list.")
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode:
+        return Evidence("git", {"conclusive": False, "satisfied": False, "reason": "git_index_unavailable"})
+    staged = set(completed.stdout.splitlines())
+    return Evidence("git", {"conclusive": True, "satisfied": set(paths) <= staged, "staged_paths": sorted(staged)})
+
+
+def _job_state(expected: dict[str, Any]) -> Evidence:
+    job_id = _required_string(expected, "job_id")
+    wanted = str(expected.get("status", "succeeded"))
+    try:
+        job = JobStore().get(job_id)
+    except Exception as exc:
+        return Evidence("durable_job", {"conclusive": False, "satisfied": False, "reason": type(exc).__name__})
+    return Evidence("durable_job", {"conclusive": True, "satisfied": job["status"] == wanted, "job_id": job_id, "status": job["status"]})
+
+
+def _http_response(expected: dict[str, Any]) -> Evidence:
+    url = _required_string(expected, "url")
+    wanted_status = int(expected.get("status", 200))
+    try:
+        with urllib.request.urlopen(url, timeout=float(expected.get("timeout_sec", 10))) as response:
+            body = response.read(1_048_577)
+            status = int(response.status)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return Evidence("http", {"conclusive": False, "satisfied": False, "reason": type(exc).__name__})
+    wanted_hash = expected.get("sha256")
+    actual_hash = hashlib.sha256(body).hexdigest()
+    satisfied = status == wanted_status and (wanted_hash is None or actual_hash == wanted_hash)
+    return Evidence("http", {"conclusive": True, "satisfied": satisfied, "status": status, "sha256": actual_hash})
+
+
+def _semantic_runtime_unavailable(expected: dict[str, Any]) -> Evidence:
+    return Evidence(
+        "semantic_runtime",
+        {"conclusive": False, "satisfied": False, "runtime_id": expected.get("runtime_id"), "reason": "runtime_adapter_unavailable"},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PostconditionDescriptor:
+    kind: str
+    evaluator: Callable[[dict[str, Any]], Evidence]
+    source: str
+    safe_for_reconciliation: bool = True
+
+
+_DESCRIPTORS = {
+    item.kind: item
+    for item in (
+        PostconditionDescriptor("file_exists", _file_exists, "filesystem"),
+        PostconditionDescriptor("file_absent", _file_absent, "filesystem"),
+        PostconditionDescriptor("file_sha256", _file_sha256, "filesystem"),
+        PostconditionDescriptor("git_head", _git_head, "git"),
+        PostconditionDescriptor("git_index_contains", _git_index_contains, "git"),
+        PostconditionDescriptor("process_identity", _process_identity, "process"),
+        PostconditionDescriptor("process_exited", _process_exited, "process"),
+        PostconditionDescriptor("job_state", _job_state, "durable_job"),
+        PostconditionDescriptor("package_version", _package_version, "package"),
+        PostconditionDescriptor("http_response", _http_response, "http"),
+        PostconditionDescriptor("ui_element_state", _semantic_runtime_unavailable, "uia"),
+        PostconditionDescriptor("browser_state", _semantic_runtime_unavailable, "browser"),
+    )
 }
+
+
+def get_postcondition_descriptor(kind: str) -> PostconditionDescriptor:
+    descriptor = _DESCRIPTORS.get(kind)
+    if descriptor is None:
+        raise ToolError("unsupported_postcondition", f"Unsupported postcondition {kind!r}.")
+    return descriptor
 
 
 def evaluate_postcondition(postcondition: Postcondition) -> Evidence:
     """Evaluate one allowlisted postcondition without replaying its operation."""
 
-    evaluator = _EVALUATORS.get(postcondition.kind)
-    if evaluator is None:
-        raise ToolError(
-            "unsupported_postcondition",
-            f"Unsupported postcondition {postcondition.kind!r}.",
-            hint=f"Use one of: {', '.join(sorted(_EVALUATORS))}.",
-        )
-    return evaluator(postcondition.expected)
+    return get_postcondition_descriptor(postcondition.kind).evaluator(postcondition.expected)
