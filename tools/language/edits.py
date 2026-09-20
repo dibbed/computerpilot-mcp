@@ -21,7 +21,11 @@ class PlannedFile:
 
 
 def prepare_workspace_edit(
-    root: Path, workspace_edit: dict[str, Any], *, expected_sha256: dict[str, str] | None = None
+    root: Path,
+    workspace_edit: dict[str, Any],
+    *,
+    expected_sha256: dict[str, str] | None = None,
+    require_expected_sha256: bool = False,
 ) -> tuple[PlannedFile, ...]:
     root = root.resolve(strict=False)
     changes: dict[str, list[dict[str, Any]]] = {}
@@ -47,6 +51,11 @@ def prepare_workspace_edit(
         text = before.decode("utf-8")
         relative = path.relative_to(root).as_posix()
         wanted = (expected_sha256 or {}).get(relative)
+        if require_expected_sha256 and not wanted:
+            raise ToolError(
+                "lsp_edit_precondition_required",
+                f"Workspace edit requires expected_sha256 for {relative}.",
+            )
         if wanted and hashlib.sha256(before).hexdigest().casefold() != wanted.casefold():
             raise ToolError("hash_conflict", f"Workspace edit precondition failed for {relative}.")
         edits = []

@@ -92,7 +92,12 @@ def register(mcp: MCPServer) -> None:
         edit = action.get("edit")
         if not isinstance(edit, dict):
             return {"ok": False, "applied": False, "command_ignored": bool(action.get("command")), "reason": "no_workspace_edit"}
-        plan = prepare_workspace_edit(workspace, edit, expected_sha256=expected_sha256)
+        plan = prepare_workspace_edit(
+            workspace,
+            edit,
+            expected_sha256=expected_sha256,
+            require_expected_sha256=True,
+        )
         if dry_run:
             return {"ok": True, "dry_run": True, "file_count": len(plan), "command_ignored": bool(action.get("command"))}
         return {**apply_workspace_edit(plan), "dry_run": False, "command_ignored": bool(action.get("command"))}
