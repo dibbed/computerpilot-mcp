@@ -196,6 +196,36 @@ def _semantic_runtime_unavailable(expected: dict[str, Any]) -> Evidence:
     )
 
 
+def _ui_element_state(expected: dict[str, Any]) -> Evidence:
+    from tools.desktop.uia import UI_AUTOMATION, ElementLocator, WindowLocator
+
+    try:
+        element = UI_AUTOMATION.get_element(
+            WindowLocator(**dict(expected.get("window", {}))),
+            ElementLocator(**dict(expected.get("element", {}))),
+        )
+    except (ToolError, OSError) as exc:
+        return Evidence(
+            "uia", {"conclusive": False, "satisfied": False, "reason": exc.code if isinstance(exc, ToolError) else type(exc).__name__}
+        )
+    wanted = dict(expected.get("properties", {}))
+    return Evidence(
+        "uia", {"conclusive": True, "satisfied": all(element.get(key) == value for key, value in wanted.items()), "element": element}
+    )
+
+
+def _browser_state(expected: dict[str, Any]) -> Evidence:
+    from tools.browser.manager import MANAGER
+
+    session_id = expected.get("session_id")
+    session = MANAGER._sessions.get(session_id) if isinstance(session_id, str) else None
+    if session is None or not MANAGER._session_usable(session):
+        return Evidence("browser", {"conclusive": False, "satisfied": False, "reason": "session_unavailable"})
+    wanted_url = expected.get("url")
+    actual_url = str(session.page.url)
+    return Evidence("browser", {"conclusive": True, "satisfied": wanted_url is None or actual_url == wanted_url, "url": actual_url})
+
+
 @dataclass(frozen=True, slots=True)
 class PostconditionDescriptor:
     kind: str
@@ -217,8 +247,8 @@ _DESCRIPTORS = {
         PostconditionDescriptor("job_state", _job_state, "durable_job"),
         PostconditionDescriptor("package_version", _package_version, "package"),
         PostconditionDescriptor("http_response", _http_response, "http"),
-        PostconditionDescriptor("ui_element_state", _semantic_runtime_unavailable, "uia"),
-        PostconditionDescriptor("browser_state", _semantic_runtime_unavailable, "browser"),
+        PostconditionDescriptor("ui_element_state", _ui_element_state, "uia"),
+        PostconditionDescriptor("browser_state", _browser_state, "browser"),
     )
 }
 
