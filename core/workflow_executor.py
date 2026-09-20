@@ -111,16 +111,27 @@ class WorkflowExecutor:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         heartbeat = _LeaseHeartbeat(self.store, workflow_id, lease_token, lease_ttl_sec)
         descriptor = get_action_descriptor(step.action)
+
+        def persist_external_ref(value: dict[str, Any]) -> None:
+            self.store.update_operation_context(
+                operation_id,
+                lease_token=lease_token,
+                external_ref=value,
+            )
+
+        def persist_intent_evidence(value: dict[str, Any]) -> None:
+            self.store.update_operation_context(
+                operation_id,
+                lease_token=lease_token,
+                intent_evidence=value,
+            )
+
         context = ActionContext(
             workflow_id=workflow_id,
             operation_id=operation_id,
             is_cancel_requested=lambda: self.store.cancel_requested(workflow_id),
-            persist_external_ref=lambda value: self.store.update_operation_context(
-                operation_id, lease_token=lease_token, external_ref=value,
-            ),
-            persist_intent_evidence=lambda value: self.store.update_operation_context(
-                operation_id, lease_token=lease_token, intent_evidence=value,
-            ),
+            persist_external_ref=persist_external_ref,
+            persist_intent_evidence=persist_intent_evidence,
         )
         result: dict[str, Any] | None = None
         evidence: dict[str, Any] | None = None
