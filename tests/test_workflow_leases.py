@@ -80,8 +80,11 @@ def test_stale_owner_cannot_require_or_release_another_lease(tmp_path: Path) -> 
         store.require_lease(workflow_id, "stale-token")
     with pytest.raises(ToolError, match="token"):
         store.release_lease(workflow_id, "stale-token")
+    with pytest.raises(ToolError, match="token"):
+        store.checkpoint_step(workflow_id, 0, "running", lease_token="stale-token")
 
     assert store.require_lease(workflow_id, lease.lease_token) == lease
+    store.checkpoint_step(workflow_id, 0, "running", lease_token=lease.lease_token)
 
 
 def test_expired_lease_can_be_replaced(tmp_path: Path) -> None:

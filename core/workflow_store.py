@@ -597,9 +597,25 @@ class WorkflowStore:
         evidence: dict[str, Any] | None = None,
         error: str | None = None,
         increment_attempt: bool = False,
+        lease_token: str | None = None,
     ) -> None:
         now = _now()
         with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if lease_token is not None:
+                lease = connection.execute(
+                    "SELECT lease_token, expires_at FROM workflow_leases WHERE workflow_id = ?",
+                    (workflow_id,),
+                ).fetchone()
+                if lease is None:
+                    raise ToolError("workflow_lease_missing", "Workflow has no active lease.")
+                if str(lease["lease_token"]) != lease_token:
+                    raise ToolError(
+                        "workflow_lease_token_mismatch",
+                        "Workflow lease token does not match the current owner.",
+                    )
+                if str(lease["expires_at"]) <= now:
+                    raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
             cursor = connection.execute(
                 """
                 UPDATE workflow_steps SET state = ?, attempts = attempts + ?,
@@ -616,6 +632,7 @@ class WorkflowStore:
             )
             if cursor.rowcount != 1:
                 raise ToolError("workflow_step_not_found", "Workflow step was not found.")
+            connection.commit()
 
     def recover_interrupted(self) -> int:
         now = _now()
