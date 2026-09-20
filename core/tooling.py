@@ -73,6 +73,8 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "memory_update",
         "submit_job",
         "cancel_job",
+        "reconcile_operation",
+        "acknowledge_uncertain_operation",
     }
 )
 
