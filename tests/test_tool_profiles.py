@@ -23,7 +23,7 @@ def _names(profile: str) -> set[str]:
 def test_full_is_default_and_preserves_complete_catalog() -> None:
     assert resolve_profile(None).name == "full"
     names = _names("full")
-    assert len(names) == 101
+    assert len(names) == 106
     assert {"read_file", "run_process", "ui_invoke", "reconcile_operation", "discover_tool_domains", "recommend_tools"} <= names
 
 
@@ -54,4 +54,3 @@ def test_discovery_reports_active_profile_and_recommends_registered_tools() -> N
         asyncio.run(scenario())
     finally:
         registry.SETTINGS = original
-

@@ -78,6 +78,9 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "ui_invoke",
         "ui_set_value",
         "ui_select",
+        "workflow_start",
+        "workflow_resume",
+        "workflow_cancel",
     }
 )
 

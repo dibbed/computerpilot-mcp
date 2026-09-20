@@ -79,6 +79,10 @@ class Settings:
     def search_snapshot_dir(self) -> Path:
         return self.state_dir / "search_snapshots"
 
+    @property
+    def workflow_db(self) -> Path:
+        return self.state_dir / "workflows.sqlite3"
+
     def resource_budgets(self) -> dict[str, int]:
         """Expose configured resource ceilings from one immutable source of truth."""
 

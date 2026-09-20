@@ -32,6 +32,7 @@ from tools.recovery import register as register_recovery
 from tools.terminal import register as register_terminal
 from tools.testing import register as register_testing
 from tools.windows import register as register_windows
+from tools.workflows import register as register_workflows
 
 REGISTRARS = {
     "filesystem": register_filesystem,
@@ -47,6 +48,7 @@ REGISTRARS = {
     "memory": register_memory,
     "jobs": register_jobs,
     "recovery": register_recovery,
+    "workflows": register_workflows,
 }
 
 
