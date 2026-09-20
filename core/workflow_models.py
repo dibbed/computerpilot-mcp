@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from core.errors import ToolError
 
@@ -44,6 +45,23 @@ class OperationState(str, Enum):
     ACKNOWLEDGED = "acknowledged"
     UNRESOLVABLE = "unresolvable"
     CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class StepDefinition:
+    name: str
+    action: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+    timeout_sec: float = 300
+    max_retries: int = 0
+    postcondition: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowDefinition:
+    name: str
+    steps: tuple[StepDefinition, ...]
+    description: str = ""
 
 
 WORKFLOW_TRANSITIONS: Mapping[WorkflowState, frozenset[WorkflowState]] = {
