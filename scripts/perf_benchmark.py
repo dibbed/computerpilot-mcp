@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import shutil
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -35,7 +36,7 @@ from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
 from core.recovery import OperationRecoveryJournal
 from core.registry import create_server
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowState, WorkflowStore
+from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 from tools.desktop.uia import ElementLocator, UIAutomationService, WindowLocator
 from tools.filesystem.patches import PatchLimits, apply_patch_transaction
 from tools.filesystem.search_snapshots import SearchSnapshotStore, search_fingerprint
@@ -75,7 +76,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "job_history_rows": [2_000],
     },
 }
-SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "backups", "retention", "resilience")
+SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "backups", "retention", "resilience", "workflow")
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
 
@@ -330,6 +331,226 @@ def _workflow_checkpoint_once(root: Path, steps: int = 100) -> dict[str, Any]:
     store.transition(workflow["workflow_id"], running["version"], WorkflowState.COMPLETED, current_step=steps)
     recovered = WorkflowStore(database).get(workflow["workflow_id"])
     return {"steps": steps, "state": recovered["state"], "db_bytes": database.stat().st_size}
+
+
+def _prepare_workflow_history_fixture(
+    root: Path,
+    *,
+    rows: int = 10_000,
+    queued: int = 100,
+) -> tuple[WorkflowStore, str]:
+    root.mkdir(parents=True, exist_ok=True)
+    database = root / "workflows.sqlite3"
+    for path in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
+        path.unlink(missing_ok=True)
+    store = WorkflowStore(database)
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    definition = {
+        "name": "history-benchmark",
+        "steps": [
+            {
+                "name": "check",
+                "action": "check_file",
+                "arguments": {"path": "unused"},
+                "timeout_sec": 300,
+                "max_retries": 0,
+                "postcondition": None,
+            }
+        ],
+        "description": "",
+    }
+    definition_json = json.dumps(definition, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    definition_hash = hashlib.sha256(definition_json.encode("utf-8")).hexdigest()
+    workflow_rows: list[tuple[Any, ...]] = []
+    step_rows: list[tuple[Any, ...]] = []
+    operation_rows: list[tuple[Any, ...]] = []
+    event_rows: list[tuple[Any, ...]] = []
+    for index in range(rows):
+        workflow_id = f"{index + 1:032x}"
+        is_queued = index < queued
+        state = "queued" if is_queued else "completed"
+        step_state = "created" if is_queued else "completed"
+        operation_state = "created" if is_queued else "succeeded"
+        current_step = 0 if is_queued else 1
+        workflow_rows.append(
+            (
+                workflow_id,
+                definition_json,
+                "{}",
+                state,
+                current_step,
+                1,
+                now,
+                now,
+                definition_json,
+                definition_hash,
+                1,
+            )
+        )
+        step_rows.append(
+            (
+                workflow_id,
+                0,
+                step_state,
+                0 if is_queued else 1,
+                None if is_queued else now,
+                None if is_queued else now,
+                None,
+                None,
+            )
+        )
+        operation_id = f"{index + rows + 1:032x}"
+        operation_rows.append(
+            (
+                operation_id,
+                workflow_id,
+                0,
+                "check_file",
+                definition_hash,
+                f"benchmark-operation-{index}",
+                operation_state,
+                0 if is_queued else 1,
+                definition_hash,
+                now,
+                None if is_queued else now,
+            )
+        )
+        event_rows.append(
+            (
+                workflow_id,
+                0,
+                operation_id,
+                "benchmark_fixture",
+                operation_state,
+                "{}",
+                now,
+            )
+        )
+    with sqlite3.connect(database, timeout=30) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.executemany(
+            """
+            INSERT INTO workflows(
+                workflow_id, definition_json, inputs_json, state, current_step,
+                version, created_at, updated_at, execution_definition_json,
+                execution_definition_hash, execution_compatible
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            workflow_rows,
+        )
+        connection.executemany(
+            """
+            INSERT INTO workflow_steps(
+                workflow_id, step_index, state, attempts, started_at,
+                finished_at, evidence_json, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            step_rows,
+        )
+        connection.executemany(
+            """
+            INSERT INTO workflow_operations(
+                operation_id, workflow_id, step_index, operation_index, action,
+                definition_hash, idempotency_key, state, attempts,
+                arguments_fingerprint, updated_at, finished_at
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            operation_rows,
+        )
+        connection.executemany(
+            """
+            INSERT INTO workflow_events(
+                workflow_id, step_index, operation_id, event_type, state,
+                metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            event_rows,
+        )
+        connection.commit()
+    return store, f"{rows:032x}"
+
+
+def _workflow_start_once(store: WorkflowStore) -> dict[str, Any]:
+    definition = WorkflowDefinition(
+        "benchmark-start",
+        (StepDefinition("check", "check_file", {"path": "unused"}),),
+    )
+    created = store.create(definition, initial_state=WorkflowState.QUEUED)
+    return {"workflow_id": created["workflow_id"], "state": created["state"]}
+
+
+def _workflow_status_once(store: WorkflowStore, workflow_id: str) -> dict[str, Any]:
+    result = store.get(workflow_id)
+    return {"workflow_id": workflow_id, "state": result["state"], "step_count": len(result["steps"])}
+
+
+def _workflow_queue_once(store: WorkflowStore) -> dict[str, Any]:
+    result = store.list_queued(limit=100)
+    return {
+        "count": result["count"],
+        "total_count": result["total_count"],
+        "has_more": result["has_more"],
+    }
+
+
+def _workflow_health_once(store: WorkflowStore) -> dict[str, Any]:
+    result = store.health_summary()
+    return {
+        "workflow_total": result["workflow_total"],
+        "operation_total": result["operation_total"],
+        "event_total": result["event_total"],
+        "workflow_db_bytes": result["workflow_db_bytes"],
+    }
+
+
+def _workflow_db_density_once(store: WorkflowStore, rows: int) -> dict[str, Any]:
+    with sqlite3.connect(store.path, timeout=30) as connection:
+        connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    total_bytes = 0
+    for path in (store.path, Path(f"{store.path}-wal"), Path(f"{store.path}-shm")):
+        if path.is_file():
+            total_bytes += path.stat().st_size
+    return {
+        "workflows": rows,
+        "db_bytes": total_bytes,
+        "bytes_per_workflow": round(total_bytes / max(rows, 1), 3),
+    }
+
+
+def _workflow_execute_read_once(store: WorkflowStore, target: Path) -> dict[str, Any]:
+    target.write_text("ready\n", encoding="utf-8")
+    workflow = store.create(
+        WorkflowDefinition(
+            "benchmark-execute",
+            (StepDefinition("check", "check_file", {"path": str(target)}),),
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+    result = WorkflowExecutor(store).execute(
+        str(workflow["workflow_id"]),
+        owner_id=f"benchmark-{workflow['workflow_id']}",
+    )
+    return {"state": result["state"]}
+
+
+def _workflow_lease_renew_once(store: WorkflowStore) -> dict[str, Any]:
+    workflow = store.create(
+        WorkflowDefinition(
+            "benchmark-lease",
+            (StepDefinition("check", "check_file", {"path": "unused"}),),
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+    workflow_id = str(workflow["workflow_id"])
+    lease = store.acquire_lease(workflow_id, "benchmark-heartbeat", 30)
+    renewed = store.renew_lease(workflow_id, lease.lease_token, 30)
+    store.release_lease_if_current(workflow_id, lease.lease_token)
+    interval_sec = min(max(30 / 3.0, 1.0), 10.0)
+    return {
+        "lease_version": renewed.version,
+        "heartbeat_interval_sec": interval_sec,
+        "configured_writes_per_minute": round(60 / interval_sec, 3),
+    }
 
 
 def _launcher_validation_once() -> dict[str, Any]:
@@ -1365,6 +1586,50 @@ def run_benchmarks(
             results.append(measure("recovery_pagination_1000", partial(_recovery_pagination_once, root / "recovery"), runs))
             results.append(measure("uia_traversal_1000", _uia_traversal_once, runs))
             results.append(measure("workflow_checkpoints_100", partial(_workflow_checkpoint_once, root / "workflow"), runs))
+    if "workflow" in suites:
+        with _temporary_root("workflow-scale") as temporary:
+            root = Path(temporary)
+            history_rows = 10_000
+            workflow_store_bench, status_target = _prepare_workflow_history_fixture(
+                root / "history",
+                rows=history_rows,
+                queued=100,
+            )
+            results.append(measure(
+                "workflow_start_10000_history",
+                partial(_workflow_start_once, workflow_store_bench),
+                runs,
+            ))
+            results.append(measure(
+                "workflow_status_10000_history",
+                partial(_workflow_status_once, workflow_store_bench, status_target),
+                runs,
+            ))
+            results.append(measure(
+                "workflow_execute_read_10000_history",
+                partial(_workflow_execute_read_once, workflow_store_bench, root / "ready.txt"),
+                runs,
+            ))
+            results.append(measure(
+                "workflow_lease_renew_30s_ttl",
+                partial(_workflow_lease_renew_once, workflow_store_bench),
+                runs,
+            ))
+            results.append(measure(
+                "workflow_queue_select_10000_history",
+                partial(_workflow_queue_once, workflow_store_bench),
+                runs,
+            ))
+            results.append(measure(
+                "workflow_health_10000_history",
+                partial(_workflow_health_once, workflow_store_bench),
+                runs,
+            ))
+            results.append(measure(
+                "workflow_db_density_10000_history",
+                partial(_workflow_db_density_once, workflow_store_bench, history_rows),
+                1,
+            ))
     if "startup" in suites:
         results.append(measure("startup_launcher_validation", _launcher_validation_once, runs))
         results.append(measure("startup_server_cold", _server_cold_start_once, runs))
@@ -1491,24 +1756,26 @@ def run_benchmarks(
                 )
 
     if "jobs" in suites:
+        with _temporary_root("job-wait") as temporary:
+            wait_store = JobStore(Path(temporary) / "jobs.sqlite3")
+            results.append(measure("job_wait_change", partial(_job_wait_change_once, wait_store, 1), runs))
+            results.append(measure("job_wait_timeout", partial(_job_wait_timeout_once, wait_store), runs))
+            if profile == "full":
+                results.append(measure("job_wait_50_waiters", partial(_job_wait_change_once, wait_store, 50), runs))
         if not include_jobs:
             results.append({"name": "jobs", "status": "skipped", "reason": "Pass --include-jobs to launch benchmark workers."})
         else:
             with _temporary_root("jobs") as temporary:
-                store = JobStore(Path(temporary) / "jobs.sqlite3")
+                job_store_bench = JobStore(Path(temporary) / "jobs.sqlite3")
                 sequence = 0
                 for count in limits["job_counts"]:
 
                     def job_case(count: int = count) -> dict[str, Any]:
                         nonlocal sequence
                         sequence += 1
-                        return _job_batch_once(store, count, sequence)
+                        return _job_batch_once(job_store_bench, count, sequence)
 
                     results.append(measure(f"jobs_{count}_concurrent", job_case, runs))
-                results.append(measure("job_wait_change", partial(_job_wait_change_once, store, 1), runs))
-                results.append(measure("job_wait_timeout", partial(_job_wait_timeout_once, store), runs))
-                if profile == "full":
-                    results.append(measure("job_wait_50_waiters", partial(_job_wait_change_once, store, 50), runs))
 
     if "browser" in suites:
         if not include_browser:
@@ -1559,7 +1826,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "resilience"))
+    suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "resilience", "workflow"))
     report = run_benchmarks(
         profile=args.profile,
         runs=args.runs,

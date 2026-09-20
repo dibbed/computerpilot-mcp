@@ -33,11 +33,19 @@ from scripts.perf_benchmark import (
     _launcher_validation_once,
     _output_once,
     _prepare_python_fixture,
+    _prepare_workflow_history_fixture,
     _project_lookup_once,
     _recovery_pagination_once,
     _stats,
     _uia_traversal_once,
     _workflow_checkpoint_once,
+    _workflow_db_density_once,
+    _workflow_execute_read_once,
+    _workflow_health_once,
+    _workflow_lease_renew_once,
+    _workflow_queue_once,
+    _workflow_start_once,
+    _workflow_status_once,
     measure,
     run_benchmarks,
 )
@@ -185,6 +193,30 @@ def test_resilience_benchmarks_cover_recovery_uia_and_workflow(tmp_path: Path) -
     assert recovery["total_count"] == 20
     assert uia == {"nodes": 20, "matches": 20, "page_count": 20}
     assert workflow["state"] == "completed"
+
+
+def test_workflow_scale_benchmark_helpers_cover_release_gates(tmp_path: Path) -> None:
+    store, target = _prepare_workflow_history_fixture(tmp_path / "history", rows=100, queued=10)
+
+    started = _workflow_start_once(store)
+    status = _workflow_status_once(store, target)
+    queue = _workflow_queue_once(store)
+    health = _workflow_health_once(store)
+    executed = _workflow_execute_read_once(store, tmp_path / "ready.txt")
+    lease = _workflow_lease_renew_once(store)
+    density = _workflow_db_density_once(store, 100)
+
+    assert started["state"] == "queued"
+    assert status["state"] == "completed"
+    assert status["step_count"] == 1
+    assert queue["total_count"] >= 10
+    assert health["workflow_total"] >= 100
+    assert health["operation_total"] >= 100
+    assert health["event_total"] >= 100
+    assert executed["state"] == "completed"
+    assert lease["heartbeat_interval_sec"] == 10.0
+    assert lease["configured_writes_per_minute"] == 6.0
+    assert density["bytes_per_workflow"] > 0
 
 
 def test_output_benchmark_measures_current_default_inline_behavior() -> None:
