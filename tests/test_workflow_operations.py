@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -20,7 +21,8 @@ def _definition() -> WorkflowDefinition:
 
 
 def test_create_materializes_one_operation_per_legacy_step(tmp_path: Path) -> None:
-    store = WorkflowStore(tmp_path / "workflows.db")
+    path = tmp_path / "workflows.db"
+    store = WorkflowStore(path)
     workflow = store.create(_definition())
 
     result = store.list_operations(workflow["workflow_id"])
@@ -31,6 +33,9 @@ def test_create_materializes_one_operation_per_legacy_step(tmp_path: Path) -> No
     assert all(item["state"] == "created" for item in result["items"])
     assert all(len(item["definition_hash"]) == 64 for item in result["items"])
     assert all(len(item["arguments_fingerprint"]) == 64 for item in result["items"])
+    with sqlite3.connect(path) as connection:
+        metadata = [json.loads(row[0]) for row in connection.execute("SELECT metadata_json FROM workflow_events")]
+    assert all(item == {"legacy": False} for item in metadata)
 
 
 def test_operation_listing_is_paginated_and_redacted(tmp_path: Path) -> None:

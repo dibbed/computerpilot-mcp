@@ -136,6 +136,7 @@ def test_reopen_recovers_running_workflow_after_lease_expiry(tmp_path: Path) -> 
     assert running["state"] == "running"
     assert reopened["state"] == "uncertain"
     assert reopened["steps"][0]["state"] == "uncertain"
+    assert store.list_operations(workflow["workflow_id"])["items"][0]["state"] == "uncertain"
 
 
 def test_release_is_idempotent_for_current_token(tmp_path: Path) -> None:

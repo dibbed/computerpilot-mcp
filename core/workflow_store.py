@@ -226,7 +226,13 @@ class WorkflowStore:
         return payload, _digest(payload), arguments_fingerprint
 
     @classmethod
-    def _materialize_workflow(cls, connection: sqlite3.Connection, workflow_id: str) -> None:
+    def _materialize_workflow(
+        cls,
+        connection: sqlite3.Connection,
+        workflow_id: str,
+        *,
+        legacy: bool,
+    ) -> None:
         workflow = connection.execute(
             "SELECT definition_json, updated_at FROM workflows WHERE workflow_id = ?", (workflow_id,),
         ).fetchone()
@@ -295,18 +301,18 @@ class WorkflowStore:
                     workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at
                 ) VALUES (?, ?, ?, 'operation_materialized', ?, ?, ?)
                 """,
-                (workflow_id, step_index, operation_id, state, _canonical({"legacy": True}), _now()),
+                (workflow_id, step_index, operation_id, state, _canonical({"legacy": legacy}), _now()),
             )
 
     @classmethod
     def _materialize_all(cls, connection: sqlite3.Connection) -> None:
         for row in connection.execute("SELECT workflow_id FROM workflows ORDER BY created_at").fetchall():
-            cls._materialize_workflow(connection, str(row["workflow_id"]))
+            cls._materialize_workflow(connection, str(row["workflow_id"]), legacy=True)
 
     def materialize_operations(self, workflow_id: str) -> dict[str, Any]:
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self._materialize_workflow(connection, workflow_id)
+            self._materialize_workflow(connection, workflow_id, legacy=True)
             connection.commit()
         return self.list_operations(workflow_id)
 
@@ -343,7 +349,7 @@ class WorkflowStore:
                 "INSERT INTO workflow_steps(workflow_id, step_index, state) VALUES (?, ?, 'created')",
                 [(workflow_id, index) for index in range(len(definition.steps))],
             )
-            self._materialize_workflow(connection, workflow_id)
+            self._materialize_workflow(connection, workflow_id, legacy=False)
             connection.commit()
         return self.get(workflow_id)
 
@@ -646,7 +652,7 @@ class WorkflowStore:
                     """
                     UPDATE workflow_operations SET state = 'uncertain', version = version + 1,
                         updated_at = ?, finished_at = ?, error = ?
-                    WHERE workflow_id = ? AND step_index = ? AND state = 'running'
+                    WHERE workflow_id = ? AND step_index = ? AND state IN ('created','running','waiting')
                     """,
                     (now, now, "runtime_ended_without_checkpoint", workflow_id, step_index),
                 )
