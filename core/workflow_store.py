@@ -702,6 +702,7 @@ class WorkflowStore:
         *,
         current_step: int | None = None,
         last_error: str | None = None,
+        lease_token: str | None = None,
     ) -> dict[str, Any]:
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -712,6 +713,14 @@ class WorkflowStore:
                 raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
             if int(current["version"]) != expected_version:
                 raise ToolError("workflow_version_conflict", "Workflow changed; reload status before retrying.")
+            if lease_token is not None:
+                lease = connection.execute(
+                    "SELECT lease_token, expires_at FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+                ).fetchone()
+                if lease is None or str(lease["lease_token"]) != lease_token:
+                    raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+                if str(lease["expires_at"]) <= _now():
+                    raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
             validate_workflow_transition(WorkflowState(str(current["state"])), state)
             assignments = ["state = ?", "version = version + 1", "updated_at = ?", "last_error = ?"]
             parameters: list[Any] = [state.value, _now(), last_error[:2_000] if last_error else None]
@@ -727,7 +736,14 @@ class WorkflowStore:
             connection.commit()
         return self.get(workflow_id)
 
-    def advance_running(self, workflow_id: str, expected_version: int, *, current_step: int) -> dict[str, Any]:
+    def advance_running(
+        self,
+        workflow_id: str,
+        expected_version: int,
+        *,
+        current_step: int,
+        lease_token: str | None = None,
+    ) -> dict[str, Any]:
         if current_step < 0:
             raise ToolError("invalid_workflow_step", "current_step must be non-negative.")
         with self._lock, closing(self._connect()) as connection:
@@ -739,6 +755,14 @@ class WorkflowStore:
                 raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
             if int(row["version"]) != expected_version:
                 raise ToolError("workflow_version_conflict", "Workflow changed; reload status before retrying.")
+            if lease_token is not None:
+                lease = connection.execute(
+                    "SELECT lease_token, expires_at FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+                ).fetchone()
+                if lease is None or str(lease["lease_token"]) != lease_token:
+                    raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+                if str(lease["expires_at"]) <= _now():
+                    raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
             if row["state"] != WorkflowState.RUNNING.value:
                 raise ToolError("workflow_not_running", "Only a running workflow can advance its current step.")
             cursor = connection.execute(

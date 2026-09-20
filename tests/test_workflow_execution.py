@@ -83,3 +83,37 @@ def test_uncertain_side_effect_is_never_advanced(tmp_path: Path, monkeypatch: py
     result = WorkflowExecutor(store).run(workflow["workflow_id"])
     assert result["state"] == "uncertain"
     assert result["current_step"] == 0
+
+
+def test_cancellation_during_action_stops_before_next_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db")
+    workflow = store.create(
+        WorkflowDefinition(
+            "cancel",
+            (
+                StepDefinition("first", "check_file", {"path": "unused"}),
+                StepDefinition("second", "check_file", {"path": "unused"}),
+            ),
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+    calls = 0
+
+    def cancel(arguments, timeout):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        del arguments, timeout
+        calls += 1
+        current = store.get(workflow["workflow_id"])
+        store.transition(workflow["workflow_id"], current["version"], WorkflowState.CANCELLED)
+        return {"ok": True}
+
+    monkeypatch.setitem(ACTION_HANDLERS, "check_file", cancel)
+
+    result = WorkflowExecutor(store).execute(workflow["workflow_id"], owner_id="worker-a")
+
+    assert result["state"] == "cancelled"
+    assert calls == 1
+    assert store.list_operations(workflow["workflow_id"])["items"][0]["state"] == "succeeded"
+    assert store.list_operations(workflow["workflow_id"])["items"][1]["state"] == "created"

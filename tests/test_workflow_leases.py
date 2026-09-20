@@ -154,6 +154,17 @@ def test_release_is_idempotent_for_current_token(tmp_path: Path) -> None:
         store.require_lease(workflow_id, lease.lease_token)
 
 
+def test_executor_transition_rejects_wrong_lease_token(tmp_path: Path) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db")
+    workflow = store.create(_workflow_definition(), initial_state=WorkflowState.QUEUED)
+    store.acquire_lease(workflow["workflow_id"], "worker-a", 30)
+
+    with pytest.raises(ToolError, match="lease token"):
+        store.transition(
+            workflow["workflow_id"], workflow["version"], WorkflowState.RUNNING, lease_token="wrong",
+        )
+
+
 @pytest.mark.parametrize("ttl_sec", [0, 4.99, 300.01, 3_600])
 def test_lease_ttl_is_bounded(tmp_path: Path, ttl_sec: float) -> None:
     store = WorkflowStore(tmp_path / "workflows.db")

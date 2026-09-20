@@ -57,7 +57,9 @@ class WorkflowExecutor:
             return {**current, "dry_run": True, "would_execute": current["definition"]["steps"]}
         lease = self.store.acquire_lease(workflow_id, owner_id, lease_ttl_sec)
         try:
-            current = self.store.transition(workflow_id, current["version"], WorkflowState.RUNNING)
+            current = self.store.transition(
+                workflow_id, current["version"], WorkflowState.RUNNING, lease_token=lease.lease_token,
+            )
             definition = WorkflowDefinition(
                 current["definition"]["name"],
                 tuple(StepDefinition(**step) for step in current["definition"]["steps"]),
@@ -94,13 +96,17 @@ class WorkflowExecutor:
                             evidence={"action": result, "postcondition": evidence}, lease_token=lease.lease_token,
                         )
                         latest, next_index = self.store.get(workflow_id), index + 1
+                        if latest["state"] == WorkflowState.CANCELLED.value:
+                            return latest
                         if next_index == len(definition.steps):
                             current = self.store.transition(
-                                workflow_id, latest["version"], WorkflowState.COMPLETED, current_step=next_index,
+                                workflow_id, latest["version"], WorkflowState.COMPLETED,
+                                current_step=next_index, lease_token=lease.lease_token,
                             )
                         else:
                             current = self.store.advance_running(
                                 workflow_id, latest["version"], current_step=next_index,
+                                lease_token=lease.lease_token,
                             )
                         break
                     except TransientActionError as exc:
@@ -135,7 +141,9 @@ class WorkflowExecutor:
         workflow_state = WorkflowState.UNCERTAIN if uncertain else WorkflowState.FAILED
         self.store.checkpoint_step(workflow_id, index, step_state, error=error, lease_token=lease_token)
         latest = self.store.get(workflow_id)
-        return self.store.transition(workflow_id, latest["version"], workflow_state, last_error=error)
+        return self.store.transition(
+            workflow_id, latest["version"], workflow_state, last_error=error, lease_token=lease_token,
+        )
 
     def run(self, workflow_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         return self.execute(workflow_id, owner_id=f"legacy-{uuid.uuid4().hex}", dry_run=dry_run)
