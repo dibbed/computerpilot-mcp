@@ -146,6 +146,7 @@ class WorkflowStore:
                     PRIMARY KEY (workflow_id, step_index)
                 );
                 CREATE INDEX IF NOT EXISTS idx_workflows_state ON workflows(state, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_workflows_queue ON workflows(state, created_at);
                 """
             )
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -1207,6 +1208,30 @@ class WorkflowStore:
             "total_count": total,
             "offset": offset,
             "has_more": offset + len(rows) < total,
+        }
+
+    def list_queued(self, *, limit: int = 100) -> dict[str, Any]:
+        if limit < 1 or limit > 500:
+            raise ToolError("invalid_pagination", "limit must be between 1 and 500.")
+        with closing(self._connect()) as connection:
+            total = int(connection.execute(
+                "SELECT COUNT(*) FROM workflows WHERE state = 'queued'"
+            ).fetchone()[0])
+            rows = connection.execute(
+                """
+                SELECT workflow_id, state, current_step, version, created_at, updated_at
+                FROM workflows
+                WHERE state = 'queued'
+                ORDER BY created_at ASC, workflow_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "count": len(rows),
+            "total_count": total,
+            "has_more": len(rows) < total,
         }
 
     def health_summary(self, *, sample_limit: int = 5) -> dict[str, Any]:

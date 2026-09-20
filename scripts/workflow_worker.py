@@ -20,14 +20,20 @@ def main() -> int:
     store = workflow_store(SETTINGS.workflow_db)
     executor = WorkflowExecutor(store)
     owner_id = f"worker-{socket.gethostname()}-{os.getpid()}"
+    fatal_codes = {"workflow_schema_too_new"}
     while True:
-        queued = [item for item in store.list(limit=100)["items"] if item["state"] == "queued"]
-        for item in reversed(queued):
+        queued = store.list_queued(limit=100)["items"]
+        for item in queued:
             try:
                 executor.execute(str(item["workflow_id"]), owner_id=owner_id)
             except ToolError as exc:
-                if exc.code != "workflow_already_claimed":
+                if exc.code == "workflow_already_claimed":
+                    continue
+                if exc.code in fatal_codes:
                     raise
+                # A deterministic failure of one workflow must not starve the rest
+                # of the queue. Executor-owned failures are persisted when possible.
+                continue
         if args.once:
             return 0
         time.sleep(max(args.poll_sec, 0.1))

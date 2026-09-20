@@ -254,8 +254,8 @@ def _run_durable_job(
         context.persist_external_ref({"job_id": job_id, "request_key": idempotency_key})
     deadline = time.monotonic() + timeout_sec
     terminal = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
+    status = job
     while True:
-        status = store.get(job_id)
         if status["status"] in terminal:
             if status["status"] == "cancelled" and context is not None and context.is_cancel_requested():
                 raise ActionCancelled("Durable job was cancelled with its workflow.")
@@ -263,20 +263,14 @@ def _run_durable_job(
                 raise ToolError("workflow_job_failed", f"Durable job ended as {status['status']}.")
             return {"job_id": status["id"], "status": status["status"], "exit_code": status.get("exit_code")}
         if context is not None and context.is_cancel_requested():
-            store.cancel(job_id)
-            while time.monotonic() < deadline:
-                settled = store.get(job_id)
-                if settled["status"] in terminal:
-                    if settled["status"] == "cancelled":
-                        raise ActionCancelled("Durable job was cancelled with its workflow.")
-                    raise SideEffectUncertain(
-                        f"Durable job cancellation settled as {settled['status']} rather than cancelled."
-                    )
-                time.sleep(0.1)
-            raise SideEffectUncertain("Durable job cancellation did not reach a terminal state before the workflow deadline.")
-        if time.monotonic() >= deadline:
+            status = store.cancel(job_id)
+            if status["status"] == "cancelled":
+                raise ActionCancelled("Durable job was cancelled with its workflow.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise SideEffectUncertain("Durable job did not reach a terminal state before the workflow deadline.")
-        time.sleep(0.1)
+        waited = store.wait(job_id, int(status["version"]), min(remaining, 1.0))
+        status = waited
 
 
 def _check_file(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:

@@ -110,7 +110,7 @@ def test_durable_job_handler_requests_underlying_job_cancellation(monkeypatch: p
 
         def submit(self, command: list[str], cwd: Path, timeout: float, request_key: str, encoding: str) -> dict[str, Any]:
             del command, cwd, timeout, request_key, encoding
-            return {"id": "a" * 32, "version": 1}
+            return {"id": "a" * 32, "status": "running", "version": 1, "exit_code": None}
 
         def get(self, job_id: str) -> dict[str, Any]:
             del job_id
@@ -125,6 +125,10 @@ def test_durable_job_handler_requests_underlying_job_cancellation(monkeypatch: p
             calls.append(job_id)
             self.cancelled = True
             return self.get(job_id)
+
+        def wait(self, job_id: str, after_version: int, timeout: float) -> dict[str, Any]:
+            del after_version, timeout
+            return {"changed": False, "timed_out": True, **self.get(job_id)}
 
     monkeypatch.setattr("core.workflow_actions.JobStore", FakeJobStore)
     monkeypatch.setattr("core.workflow_actions.ensure_job_scheduler", lambda store: None)
