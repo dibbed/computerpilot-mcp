@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict
 from typing import Annotated, Any, Literal
 
@@ -12,7 +13,8 @@ from core.audit import audit_action
 from core.config import SETTINGS
 from core.errors import ToolError
 from core.tooling import MUTATING, READ_ONLY, compact_errors
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowState, workflow_store
+from core.workflow_models import OperationState
+from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, workflow_store
 from tools.workflows.builtins import builtin_workflow
 
 
@@ -78,6 +80,42 @@ def register(mcp: MCPServer) -> None:
     def workflow_status(workflow_id: Annotated[str, Field(min_length=1, max_length=128)]) -> dict[str, Any]:
         """Return durable workflow state, redacted inputs, and step checkpoints."""
         return workflow_store(SETTINGS.workflow_db).get(workflow_id)
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("workflow_execute")
+    def workflow_execute(
+        workflow_id: Annotated[str, Field(min_length=1, max_length=128)],
+        expected_version: Annotated[int, Field(ge=1)],
+        dry_run: bool = False,
+        lease_ttl_sec: Annotated[float, Field(ge=5, le=300)] = 30,
+    ) -> dict[str, Any]:
+        """Execute one queued workflow under a durable lease and operation checkpoints."""
+        store = workflow_store(SETTINGS.workflow_db)
+        current = store.get(workflow_id)
+        if current["version"] != expected_version:
+            raise ToolError("workflow_version_conflict", "Workflow version changed; reload status before execution.")
+        result = WorkflowExecutor(store).execute(
+            workflow_id,
+            owner_id=f"mcp-{os.getpid()}",
+            dry_run=dry_run,
+            lease_ttl_sec=lease_ttl_sec,
+        )
+        if not dry_run:
+            audit_action("workflow_execute", target=workflow_id, details={"state": result["state"]}, durable=True)
+        return result
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("workflow_operations")
+    def workflow_operations(
+        workflow_id: Annotated[str, Field(min_length=1, max_length=128)],
+        offset: Annotated[int, Field(ge=0)] = 0,
+        limit: Annotated[int, Field(ge=1, le=500)] = 100,
+        state: OperationState | None = None,
+    ) -> dict[str, Any]:
+        """List bounded, redacted operation checkpoints for a workflow."""
+        return workflow_store(SETTINGS.workflow_db).list_operations(
+            workflow_id, offset=offset, limit=limit, state=state,
+        )
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("workflow_resume")
