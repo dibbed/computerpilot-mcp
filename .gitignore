@@ -17,6 +17,7 @@ ENV/
 
 # Runtime caches and test artifacts
 .pytest_cache/
+.pytest-tmp/
 .mypy_cache/
 .ruff_cache/
 .coverage
