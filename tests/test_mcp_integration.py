@@ -64,6 +64,8 @@ REQUIRED_TOOLS = {
     "symbol_hover",
     "call_hierarchy",
     "language_diagnostics",
+    "rename_symbol",
+    "apply_code_action",
     "git_status",
     "git_diff_summary",
     "git_log_summary",
@@ -143,7 +145,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
-    assert len(names) == 72
+    assert len(names) == 74
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     for tool in tools:

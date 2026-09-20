@@ -64,6 +64,8 @@ REQUIRED_TOOLS = {
     "symbol_hover",
     "call_hierarchy",
     "language_diagnostics",
+    "rename_symbol",
+    "apply_code_action",
     "git_status",
     "git_diff_summary",
     "git_log_summary",
