@@ -9,7 +9,7 @@ import pytest
 
 from core.errors import ToolError
 from core.workflow_models import WorkflowLease
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowStore
+from core.workflows import StepDefinition, WorkflowDefinition, WorkflowState, WorkflowStore
 
 
 def _workflow(store: WorkflowStore) -> dict[str, object]:
@@ -103,6 +103,41 @@ def test_expired_lease_can_be_replaced(tmp_path: Path) -> None:
         store.require_lease(workflow_id, stale.lease_token)
 
 
+def test_reopen_does_not_recover_running_workflow_with_live_lease(tmp_path: Path) -> None:
+    path = tmp_path / "workflows.db"
+    store = WorkflowStore(path)
+    workflow = store.create(_workflow_definition(), initial_state=WorkflowState.QUEUED)
+    running = store.transition(workflow["workflow_id"], workflow["version"], WorkflowState.RUNNING)
+    store.checkpoint_step(workflow["workflow_id"], 0, "running", increment_attempt=True)
+    store.acquire_lease(workflow["workflow_id"], "worker-a", 30)
+
+    reopened = WorkflowStore(path).get(workflow["workflow_id"])
+
+    assert running["state"] == "running"
+    assert reopened["state"] == "running"
+    assert reopened["steps"][0]["state"] == "running"
+
+
+def test_reopen_recovers_running_workflow_after_lease_expiry(tmp_path: Path) -> None:
+    path = tmp_path / "workflows.db"
+    store = WorkflowStore(path)
+    workflow = store.create(_workflow_definition(), initial_state=WorkflowState.QUEUED)
+    running = store.transition(workflow["workflow_id"], workflow["version"], WorkflowState.RUNNING)
+    store.checkpoint_step(workflow["workflow_id"], 0, "running", increment_attempt=True)
+    store.acquire_lease(workflow["workflow_id"], "worker-a", 30)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE workflow_leases SET expires_at = '2000-01-01T00:00:00.000+00:00' WHERE workflow_id = ?",
+            (workflow["workflow_id"],),
+        )
+
+    reopened = WorkflowStore(path).get(workflow["workflow_id"])
+
+    assert running["state"] == "running"
+    assert reopened["state"] == "uncertain"
+    assert reopened["steps"][0]["state"] == "uncertain"
+
+
 def test_release_is_idempotent_for_current_token(tmp_path: Path) -> None:
     store = WorkflowStore(tmp_path / "workflows.db")
     workflow_id = str(_workflow(store)["workflow_id"])
@@ -122,3 +157,7 @@ def test_lease_ttl_is_bounded(tmp_path: Path, ttl_sec: float) -> None:
 
     with pytest.raises(ToolError, match="between 5 and 300"):
         store.acquire_lease(workflow_id, "worker-a", ttl_sec)
+
+
+def _workflow_definition() -> WorkflowDefinition:
+    return WorkflowDefinition("lease", (StepDefinition("check", "check_file"),))

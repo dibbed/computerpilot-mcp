@@ -615,7 +615,16 @@ class WorkflowStore:
         now = _now()
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            rows = connection.execute("SELECT workflow_id, current_step FROM workflows WHERE state = 'running'").fetchall()
+            rows = connection.execute(
+                """
+                SELECT workflows.workflow_id, workflows.current_step
+                FROM workflows
+                LEFT JOIN workflow_leases ON workflow_leases.workflow_id = workflows.workflow_id
+                WHERE workflows.state = 'running'
+                  AND (workflow_leases.workflow_id IS NULL OR workflow_leases.expires_at <= ?)
+                """,
+                (now,),
+            ).fetchall()
             for row in rows:
                 workflow_id = str(row["workflow_id"])
                 step_index = int(row["current_step"])
