@@ -6,6 +6,28 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-09-20
+
+### Added
+- Add evidence-based recovery tools with paginated history, explicit acknowledgment, and conclusive filesystem, Git, and process-identity postconditions.
+- Add semantic Windows UI Automation with bounded locator traversal and fail-closed invoke, value, select, and wait operations.
+- Add eight tool-catalog profiles plus progressive domain discovery and preferred-use recommendations while retaining `full` as the compatible default.
+- Add SQLite-backed workflow state, optimistic version guards, restart recovery, allowlisted actions, bounded retry handling, and guarded built-in development workflows.
+- Add resilience benchmarks for 1,000-operation recovery pagination, 1,000-node UIA traversal, and 100 durable workflow checkpoints.
+
+### Safety and compatibility
+- Never replay uncertain mutations or workflow steps automatically; interrupted side effects remain `uncertain` until reconciled or acknowledged with evidence.
+- Require PID, creation time, and executable identity for process reconciliation to prevent PID-reuse false positives.
+- Preserve the coordinate desktop tools and all previously published tool names; semantic UIA and smaller catalog profiles are additive.
+- Reject arbitrary workflow commands and blind deployment; deployment requires an explicit project adapter.
+
+### Validation
+- Full pytest regression suite: **430 passed**.
+- Ruff: zero violations; mypy: zero issues across **144 source files**.
+- Compileall, startup, and MCP health checks passed with **106 unique tools** on version `0.2.4`.
+- Quick benchmark: **28 cases passed**, zero errors; durable-job and browser launch cases were the two intentional opt-in skips.
+- Real read-only Windows UI Automation smoke enumerated 13 top-level windows without mutation.
+
 ## [0.2.0] - 2026-09-20
 
 ### Added

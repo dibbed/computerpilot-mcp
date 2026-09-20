@@ -33,7 +33,10 @@ from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
 from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
+from core.recovery import OperationRecoveryJournal
 from core.registry import create_server
+from core.workflows import StepDefinition, WorkflowDefinition, WorkflowState, WorkflowStore
+from tools.desktop.uia import ElementLocator, UIAutomationService, WindowLocator
 from tools.filesystem.patches import PatchLimits, apply_patch_transaction
 from tools.filesystem.search_snapshots import SearchSnapshotStore, search_fingerprint
 from tools.filesystem.service import search_by_name, search_by_name_streaming
@@ -72,7 +75,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "job_history_rows": [2_000],
     },
 }
-SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "backups", "retention")
+SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "backups", "retention", "resilience")
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
 
@@ -253,6 +256,80 @@ def _catalog_once() -> dict[str, Any]:
         "catalog_json_bytes": len(payload),
         "serialization_ms": round(serialization_ms, 3),
     }
+
+
+def _recovery_pagination_once(root: Path, count: int = 1_000) -> dict[str, Any]:
+    path = root / "recovery.jsonl"
+    path.unlink(missing_ok=True)
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "runtime-a")
+    handles = [journal.begin("run_process", f"cwd=C:/repo/{index}") for index in range(count)]
+    journal.configure(path, "runtime-b")
+    page_result = journal.list_operations(state="uncertain", offset=max(count - 50, 0), max_items=50)
+    journal.compact()
+    return {
+        "operations": count,
+        "page_count": page_result["count"],
+        "total_count": page_result["total_count"],
+        "journal_bytes": path.stat().st_size,
+        "handles_created": sum(handle is not None for handle in handles),
+    }
+
+
+class _BenchmarkNode:
+    def __init__(self, name: str, children: list[Any] | None = None) -> None:
+        self.name = name
+        self.children = children or []
+
+
+class _BenchmarkUIABackend:
+    def __init__(self, nodes: int) -> None:
+        self.root = _BenchmarkNode("Benchmark", [_BenchmarkNode(f"Node {index}") for index in range(nodes)])
+
+    def windows(self) -> list[Any]:
+        return [self.root]
+
+    def children(self, element: Any) -> list[Any]:
+        return list(element.children)
+
+    def properties(self, element: Any) -> dict[str, Any]:
+        return {"name": element.name, "control_type": "WindowControl" if element is self.root else "TextControl", "pid": 1, "handle": 1}
+
+    def invoke(self, element: Any) -> None:
+        del element
+
+    def set_value(self, element: Any, value: str) -> None:
+        del element, value
+
+    def select(self, element: Any) -> None:
+        del element
+
+
+def _uia_traversal_once(nodes: int = 1_000) -> dict[str, Any]:
+    service = UIAutomationService(_BenchmarkUIABackend(nodes))
+    result = service.find_elements(
+        WindowLocator(title="Benchmark"), ElementLocator(control_type="TextControl"), limit=50, max_nodes=nodes + 1,
+    )
+    return {"nodes": nodes, "matches": result["total_count"], "page_count": result["count"]}
+
+
+def _workflow_checkpoint_once(root: Path, steps: int = 100) -> dict[str, Any]:
+    database = root / "workflows.sqlite3"
+    database.unlink(missing_ok=True)
+    database.with_name(f"{database.name}-wal").unlink(missing_ok=True)
+    database.with_name(f"{database.name}-shm").unlink(missing_ok=True)
+    store = WorkflowStore(database)
+    definition = WorkflowDefinition(
+        "benchmark", tuple(StepDefinition(f"step-{index}", "check_file", {"path": "x"}) for index in range(steps)),
+    )
+    workflow = store.create(definition, initial_state=WorkflowState.QUEUED)
+    running = store.transition(workflow["workflow_id"], workflow["version"], WorkflowState.RUNNING)
+    for index in range(steps):
+        store.checkpoint_step(workflow["workflow_id"], index, "running", increment_attempt=True)
+        store.checkpoint_step(workflow["workflow_id"], index, "completed", evidence={"conclusive": True})
+    store.transition(workflow["workflow_id"], running["version"], WorkflowState.COMPLETED, current_step=steps)
+    recovered = WorkflowStore(database).get(workflow["workflow_id"])
+    return {"steps": steps, "state": recovered["state"], "db_bytes": database.stat().st_size}
 
 
 def _launcher_validation_once() -> dict[str, Any]:
@@ -1282,6 +1359,12 @@ def run_benchmarks(
 
     if "catalog" in suites:
         results.append(measure("tool_catalog", _catalog_once, runs))
+    if "resilience" in suites:
+        with _temporary_root("resilience") as temporary:
+            root = Path(temporary)
+            results.append(measure("recovery_pagination_1000", partial(_recovery_pagination_once, root / "recovery"), runs))
+            results.append(measure("uia_traversal_1000", _uia_traversal_once, runs))
+            results.append(measure("workflow_checkpoints_100", partial(_workflow_checkpoint_once, root / "workflow"), runs))
     if "startup" in suites:
         results.append(measure("startup_launcher_validation", _launcher_validation_once, runs))
         results.append(measure("startup_server_cold", _server_cold_start_once, runs))
@@ -1476,7 +1559,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit"))
+    suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "resilience"))
     report = run_benchmarks(
         profile=args.profile,
         runs=args.runs,

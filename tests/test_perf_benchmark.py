@@ -34,7 +34,10 @@ from scripts.perf_benchmark import (
     _output_once,
     _prepare_python_fixture,
     _project_lookup_once,
+    _recovery_pagination_once,
     _stats,
+    _uia_traversal_once,
+    _workflow_checkpoint_once,
     measure,
     run_benchmarks,
 )
@@ -173,6 +176,15 @@ def test_catalog_benchmark_uses_complete_wire_tool_models() -> None:
     wire_catalog = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
     expected = len(json.dumps(wire_catalog, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     assert result["details"]["catalog_json_bytes"] == expected
+
+
+def test_resilience_benchmarks_cover_recovery_uia_and_workflow(tmp_path: Path) -> None:
+    recovery = _recovery_pagination_once(tmp_path / "recovery", count=20)
+    uia = _uia_traversal_once(nodes=20)
+    workflow = _workflow_checkpoint_once(tmp_path / "workflow", steps=5)
+    assert recovery["total_count"] == 20
+    assert uia == {"nodes": 20, "matches": 20, "page_count": 20}
+    assert workflow["state"] == "completed"
 
 
 def test_output_benchmark_measures_current_default_inline_behavior() -> None:

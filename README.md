@@ -2,7 +2,7 @@
 
 A local Windows developer-agent backend built on the Model Context Protocol (MCP). It exposes filesystem, code intelligence, process execution, durable jobs, browser automation, desktop interaction, Git, testing, system diagnostics, project memory, and image delivery through one MCP server designed for long-running local use.
 
-Current MCP release: **v0.2.0**. This project version is independent from the bundled upstream tunnel-client binary version.
+Current MCP release: **v0.2.4**. This project version is independent from the bundled upstream tunnel-client binary version.
 
 The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only Streamable HTTP server.
 
@@ -324,6 +324,17 @@ MCP image content / model vision
 
 Desktop screenshots can also be captured from the Windows desktop. Oversized `auto` image deliveries are converted to bounded JPEG previews while the original file remains on disk.
 
+### Semantic Windows UI Automation
+
+For standard Windows applications, prefer semantic UI Automation over coordinates:
+
+- `ui_list_windows` scopes work by title, PID, or native handle.
+- `ui_find_elements` and `ui_get_element` locate controls by name, Automation ID, control type, or class.
+- `ui_invoke`, `ui_set_value`, and `ui_select` re-resolve the locator immediately before mutation and require exactly one match.
+- `ui_wait_for_element` provides a bounded wait for dynamic interfaces.
+
+Traversal is breadth-first with explicit depth/node limits. Duplicate matches, stale elements, missing UIA patterns, and timeouts fail closed. Audit events contain locator metadata and character counts, never the value typed into a control. Coordinate tools remain available as a fallback for canvas, game, remote-desktop, or otherwise non-UIA surfaces.
+
 ### Git and Testing
 
 Git tools provide status, bounded patches and commit inspection, blame, merge-base lookup, changed-file and conflict discovery, and branch metadata. Guarded mutation tools can create a branch, stage explicit paths, commit the current index, and restore explicit files from an explicit revision. They do not expose force, reset, clean, or push operations, and pathspecs cannot be interpreted as command options.
@@ -396,6 +407,29 @@ Key behaviors:
 
 If a mutation began but the runtime disappeared before a known completion result was recorded, the operation is marked `uncertain`. It is not automatically replayed. This avoids duplicate side effects.
 
+Recovery tools provide a complete, paginated view instead of the five-item health summary:
+
+- `list_uncertain_operations` and `inspect_uncertain_operation`
+- `get_operation_history`
+- `reconcile_operation` using `file_exists`, `file_absent`, `file_sha256`, `git_head`, or `process_identity`
+- `acknowledge_uncertain_operation` with explicit operator evidence
+
+A process match requires PID, creation time, and executable identity so PID reuse cannot produce false evidence. Conclusive postconditions may resolve an operation as succeeded or failed; inconclusive checks do not change durable state. Legacy schema-v1 records remain readable and are migrated incrementally through appended evidence events.
+
+The eight legacy uncertain records observed before this release remain intact for operator review: six were `run_process`, one was `run_pytest`, and one was `delete_file`. Five involved Python/backend work or long-running services and three invoked `gh`; they are historical ambiguity, not proof of plugin failure. No record is replayed automatically.
+
+## Durable Workflow Orchestration
+
+Workflow definitions are immutable ordered steps stored in SQLite. `workflow_plan`, `workflow_start`, `workflow_status`, `workflow_resume`, and `workflow_cancel` expose their lifecycle. Run queued workflows with:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.workflow_worker --once
+```
+
+Only these typed actions are executable: `verify_changes`, `git_status`, `git_stage`, `git_commit`, `run_durable_job`, `check_file`, and `check_http`. Arbitrary shell text is rejected. Mutating steps require postconditions, inputs are redacted before persistence, transitions use optimistic version guards, retries are bounded to explicitly transient failures, and a runtime interruption during a running step becomes `uncertain` rather than being replayed.
+
+Built-in plans are `implement_and_verify`, `safe_git_commit`, and `prepare_release`. They do not push, tag, or deploy. `deploy_and_healthcheck` requires an explicit project adapter and otherwise fails closed.
+
 `server_health` exposes the current runtime state, resource pressure, job counts, browser counts, storage usage, configured resource budgets, and operation-recovery summary.
 
 ## Local Control Panel
@@ -434,6 +468,7 @@ Important paths include:
 | `.agent_state/search_snapshots/` | Immutable search pagination snapshots |
 | `.agent_state/audit.jsonl` | Metadata-only audit trail |
 | `.agent_state/operation-recovery.jsonl` | Mutation recovery metadata |
+| `.agent_state/workflows.sqlite3` | Durable workflow definitions, states, and step evidence |
 | `.agent_state/runtime_lifecycle/` | Supervisor / runtime generation control state |
 | `.agent_state/supervisor.log*` | Rotating supervisor logs |
 
