@@ -10,7 +10,7 @@ from core.errors import ToolError
 from core.reconcilers import evaluate_postcondition
 from core.recovery_models import Postcondition
 from core.workflow_actions import SideEffectUncertain, TransientActionError, execute_action, get_action_descriptor
-from core.workflow_models import OperationState, StepDefinition, WorkflowDefinition, WorkflowState
+from core.workflow_models import OperationState, StepDefinition, WorkflowState
 from core.workflow_store import WorkflowStore
 
 
@@ -60,11 +60,7 @@ class WorkflowExecutor:
             current = self.store.transition(
                 workflow_id, current["version"], WorkflowState.RUNNING, lease_token=lease.lease_token,
             )
-            definition = WorkflowDefinition(
-                current["definition"]["name"],
-                tuple(StepDefinition(**step) for step in current["definition"]["steps"]),
-                current["definition"].get("description", ""),
-            )
+            definition = self.store.execution_definition(workflow_id)
             operations = self.store.list_operations(workflow_id)["items"]
             for index in range(int(current["current_step"]), len(definition.steps)):
                 step, operation = definition.steps[index], operations[index]

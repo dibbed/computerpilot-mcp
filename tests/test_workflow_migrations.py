@@ -4,6 +4,9 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
+from core.errors import ToolError
 from core.workflow_store import SCHEMA_VERSION
 from core.workflows import WorkflowStore
 
@@ -104,6 +107,25 @@ def test_existing_database_is_migrated_without_data_loss(tmp_path: Path) -> None
         ).fetchone()[0]
         assert "legacy-secret" not in stored_definition
         assert "<redacted>" in stored_definition
+
+
+def test_nonterminal_legacy_workflow_fails_closed_without_exact_execution_payload(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _seed_v024_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE workflows SET state = 'queued', current_step = 0 WHERE workflow_id = 'legacy-workflow'"
+        )
+        connection.execute(
+            "UPDATE workflow_steps SET state = 'created', attempts = 0 WHERE workflow_id = 'legacy-workflow'"
+        )
+
+    store = WorkflowStore(path)
+    migrated = store.get("legacy-workflow")
+
+    assert migrated["execution_compatible"] is False
+    with pytest.raises(ToolError, match="exact durable execution definition"):
+        store.execution_definition("legacy-workflow")
 
 
 def test_migration_reopen_is_idempotent(tmp_path: Path) -> None:

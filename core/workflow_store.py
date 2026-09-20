@@ -23,7 +23,7 @@ from core.workflow_models import (
     validate_workflow_transition,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SECRET_MARKERS = (
     "password",
     "secret",
@@ -31,7 +31,6 @@ _SECRET_MARKERS = (
     "api_key",
     "credential",
     "authorization",
-    "idempotency_key",
 )
 _STEP_OPERATION_STATES = {
     "created": "created",
@@ -55,6 +54,18 @@ def redact_inputs(value: Any, key: str = "") -> Any:
     if isinstance(value, str):
         return value[:2_000]
     return value
+
+
+def canonical_execution_definition(definition: WorkflowDefinition) -> str:
+    """Serialize the exact durable payload that the executor is allowed to run."""
+
+    return _canonical(asdict(definition))
+
+
+def public_workflow_projection(value: Any) -> Any:
+    """Return the bounded/redacted representation exposed through status APIs."""
+
+    return redact_inputs(value)
 
 
 def _now() -> str:
@@ -145,6 +156,9 @@ class WorkflowStore:
                 )
             if version < 1:
                 self._migrate_v1(connection)
+                version = 1
+            if version < 2:
+                self._migrate_v2(connection)
             connection.execute("BEGIN IMMEDIATE")
             self._redact_stored_definitions(connection)
             self._materialize_all(connection)
@@ -206,8 +220,23 @@ class WorkflowStore:
         )
 
     @staticmethod
+    def _migrate_v2(connection: sqlite3.Connection) -> None:
+        """Add exact execution payload storage while marking legacy rows unsafe to execute."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflows ADD COLUMN execution_definition_json TEXT;
+            ALTER TABLE workflows ADD COLUMN execution_definition_hash TEXT;
+            ALTER TABLE workflows ADD COLUMN execution_compatible INTEGER NOT NULL DEFAULT 0;
+            PRAGMA user_version = 2;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
     def _definition_json(definition: WorkflowDefinition) -> str:
-        return _canonical(redact_inputs(asdict(definition)))
+        return _canonical(public_workflow_projection(asdict(definition)))
 
     @staticmethod
     def _redact_stored_definitions(connection: sqlite3.Connection) -> None:
@@ -223,14 +252,14 @@ class WorkflowStore:
 
     @staticmethod
     def _operation_payload(step: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
-        arguments_fingerprint = _digest(redact_inputs(dict(step.get("arguments", {}))))
+        arguments_fingerprint = _digest(dict(step.get("arguments", {})))
         payload = {
             "name": str(step.get("name", "")),
             "action": str(step.get("action", "")),
             "arguments_fingerprint": arguments_fingerprint,
             "timeout_sec": float(step.get("timeout_sec", 300)),
             "max_retries": int(step.get("max_retries", 0)),
-            "postcondition": redact_inputs(step.get("postcondition")),
+            "postcondition": step.get("postcondition"),
         }
         return payload, _digest(payload), arguments_fingerprint
 
@@ -243,11 +272,20 @@ class WorkflowStore:
         legacy: bool,
     ) -> None:
         workflow = connection.execute(
-            "SELECT definition_json, updated_at FROM workflows WHERE workflow_id = ?", (workflow_id,),
+            """
+            SELECT definition_json, execution_definition_json, execution_compatible, updated_at
+            FROM workflows WHERE workflow_id = ?
+            """,
+            (workflow_id,),
         ).fetchone()
         if workflow is None:
             raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
-        definition = json.loads(str(workflow["definition_json"]))
+        raw_definition = (
+            workflow["execution_definition_json"]
+            if int(workflow["execution_compatible"] or 0) and workflow["execution_definition_json"]
+            else workflow["definition_json"]
+        )
+        definition = json.loads(str(raw_definition))
         steps = connection.execute(
             "SELECT * FROM workflow_steps WHERE workflow_id = ? ORDER BY step_index", (workflow_id,),
         ).fetchall()
@@ -339,6 +377,8 @@ class WorkflowStore:
 
         validate_workflow_definition(definition)
         definition_json = self._definition_json(definition)
+        execution_definition_json = canonical_execution_definition(definition)
+        execution_definition_hash = hashlib.sha256(execution_definition_json.encode("utf-8")).hexdigest()
         inputs_json = _canonical(redact_inputs(inputs or {}))
         workflow_id = uuid.uuid4().hex
         now = _now()
@@ -346,16 +386,54 @@ class WorkflowStore:
             connection.execute("BEGIN IMMEDIATE")
             if idempotency_key:
                 existing = connection.execute(
-                    "SELECT workflow_id, definition_json FROM workflows WHERE idempotency_key = ?", (idempotency_key,),
+                    """
+                    SELECT workflow_id, state, execution_definition_json,
+                           execution_definition_hash, execution_compatible
+                    FROM workflows WHERE idempotency_key = ?
+                    """,
+                    (idempotency_key,),
                 ).fetchone()
                 if existing is not None:
-                    if existing["definition_json"] != definition_json:
-                        raise ToolError("idempotency_conflict", "Idempotency key already refers to a different workflow definition.")
+                    if int(existing["execution_compatible"] or 0) != 1:
+                        if str(existing["state"]) not in {
+                            WorkflowState.COMPLETED.value,
+                            WorkflowState.CANCELLED.value,
+                        }:
+                            raise ToolError(
+                                "workflow_legacy_definition_unrecoverable",
+                                "The idempotent workflow was created by a legacy schema whose exact execution payload is unavailable.",
+                            )
+                        connection.commit()
+                        return self.get(str(existing["workflow_id"]))
+                    if (
+                        existing["execution_definition_hash"] != execution_definition_hash
+                        or existing["execution_definition_json"] != execution_definition_json
+                    ):
+                        raise ToolError(
+                            "idempotency_conflict",
+                            "Idempotency key already refers to a different workflow definition.",
+                        )
                     connection.commit()
                     return self.get(str(existing["workflow_id"]))
             connection.execute(
-                "INSERT INTO workflows VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?, NULL)",
-                (workflow_id, idempotency_key, definition_json, inputs_json, initial_state.value, now, now),
+                """
+                INSERT INTO workflows(
+                    workflow_id, idempotency_key, definition_json, inputs_json, state,
+                    current_step, version, created_at, updated_at, last_error,
+                    execution_definition_json, execution_definition_hash, execution_compatible
+                ) VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?, ?, 1)
+                """,
+                (
+                    workflow_id,
+                    idempotency_key,
+                    definition_json,
+                    inputs_json,
+                    initial_state.value,
+                    now,
+                    now,
+                    execution_definition_json,
+                    execution_definition_hash,
+                ),
             )
             connection.executemany(
                 "INSERT INTO workflow_steps(workflow_id, step_index, state) VALUES (?, ?, 'created')",
@@ -380,6 +458,8 @@ class WorkflowStore:
             "version": row["version"],
             "definition": json.loads(row["definition_json"]),
             "inputs": json.loads(row["inputs_json"]),
+            "execution_compatible": bool(row["execution_compatible"]),
+            "execution_definition_hash": row["execution_definition_hash"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "last_error": row["last_error"],
@@ -396,6 +476,33 @@ class WorkflowStore:
                 for step in steps
             ],
         }
+
+    def execution_definition(self, workflow_id: str) -> WorkflowDefinition:
+        """Return the exact durable definition or fail closed for legacy rows."""
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT execution_definition_json, execution_compatible
+                FROM workflows WHERE workflow_id = ?
+                """,
+                (workflow_id,),
+            ).fetchone()
+        if row is None:
+            raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
+        if int(row["execution_compatible"] or 0) != 1 or not row["execution_definition_json"]:
+            raise ToolError(
+                "workflow_legacy_definition_unrecoverable",
+                "This legacy workflow has no exact durable execution definition and cannot be executed or resumed.",
+            )
+        from core.workflow_models import StepDefinition
+
+        raw = json.loads(str(row["execution_definition_json"]))
+        return WorkflowDefinition(
+            str(raw["name"]),
+            tuple(StepDefinition(**step) for step in raw["steps"]),
+            str(raw.get("description", "")),
+        )
 
     def list_operations(
         self,

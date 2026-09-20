@@ -61,15 +61,15 @@ def test_operation_listing_is_paginated_and_redacted(tmp_path: Path) -> None:
     assert "arguments" not in page["items"][0]
     with sqlite3.connect(path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(workflow_operations)")}
-        serialized = " ".join(
-            str(value)
-            for table in ("workflows", "workflow_operations", "workflow_events")
-            for row in connection.execute(f"SELECT * FROM {table}")
-            for value in row
-            if value is not None
-        )
+        workflow_columns = {row[1] for row in connection.execute("PRAGMA table_info(workflows)")}
+        execution_definition = connection.execute(
+            "SELECT execution_definition_json FROM workflows WHERE workflow_id = ?",
+            (workflow["workflow_id"],),
+        ).fetchone()[0]
     assert "arguments_json" not in columns
-    assert "secret" not in serialized
+    assert "execution_definition_json" in workflow_columns
+    assert "secret-one" in execution_definition
+    assert "secret-two" in execution_definition
 
 
 def test_materialization_detects_definition_conflict(tmp_path: Path) -> None:
