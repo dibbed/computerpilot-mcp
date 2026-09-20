@@ -38,7 +38,8 @@ def test_validated_arguments_are_typed_and_secrets_are_declared() -> None:
     assert arguments["cwd"] == "."
     assert descriptor.mutates is True
     assert descriptor.retry_policy == "never"
-    assert descriptor.secret_fields == frozenset({"idempotency_key"})
+    assert descriptor.secret_fields == frozenset()
+    assert descriptor.cancel_mode == "cooperative"
 
 
 @pytest.mark.parametrize(

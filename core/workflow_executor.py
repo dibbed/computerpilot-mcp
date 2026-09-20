@@ -10,7 +10,14 @@ from typing import Any
 from core.errors import ToolError
 from core.reconcilers import evaluate_postcondition
 from core.recovery_models import Postcondition
-from core.workflow_actions import SideEffectUncertain, TransientActionError, execute_action, get_action_descriptor
+from core.workflow_actions import (
+    ActionCancelled,
+    ActionContext,
+    SideEffectUncertain,
+    TransientActionError,
+    execute_action,
+    get_action_descriptor,
+)
 from core.workflow_models import OperationState, StepDefinition, WorkflowState
 from core.workflow_store import WorkflowStore
 
@@ -86,19 +93,27 @@ class WorkflowExecutor:
     def _run_step_with_heartbeat(
         self,
         workflow_id: str,
+        operation_id: str,
         lease_token: str,
         lease_ttl_sec: float,
         step: StepDefinition,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         heartbeat = _LeaseHeartbeat(self.store, workflow_id, lease_token, lease_ttl_sec)
         descriptor = get_action_descriptor(step.action)
+        context = ActionContext(
+            workflow_id=workflow_id,
+            operation_id=operation_id,
+            is_cancel_requested=lambda: self.store.cancel_requested(workflow_id),
+            persist_external_ref=lambda value: None,
+            persist_intent_evidence=lambda value: None,
+        )
         result: dict[str, Any] | None = None
         evidence: dict[str, Any] | None = None
         error: Exception | None = None
         heartbeat.start()
         try:
             try:
-                result = execute_action(step.action, step.arguments, step.timeout_sec)
+                result = execute_action(step.action, step.arguments, step.timeout_sec, context)
                 evidence = self._postcondition(step, result)
             except Exception as exc:
                 error = exc
@@ -113,6 +128,41 @@ class WorkflowExecutor:
             raise error
         assert result is not None and evidence is not None
         return result, evidence
+
+    def _cancel_operation(
+        self,
+        workflow_id: str,
+        index: int,
+        operation_id: str,
+        lease_token: str,
+        *,
+        error: str = "workflow cancellation requested",
+    ) -> dict[str, Any]:
+        operation = self.store.get_operation(operation_id)
+        if operation["state"] != OperationState.CANCELLED.value:
+            self.store.checkpoint_operation(
+                operation_id,
+                OperationState.CANCELLED,
+                lease_token=lease_token,
+                error=error,
+            )
+        self.store.checkpoint_step(
+            workflow_id,
+            index,
+            "cancelled",
+            error=error,
+            lease_token=lease_token,
+        )
+        latest = self.store.get(workflow_id)
+        if latest["state"] in {WorkflowState.CANCELLING.value, WorkflowState.RUNNING.value}:
+            return self.store.transition(
+                workflow_id,
+                latest["version"],
+                WorkflowState.CANCELLED,
+                current_step=index,
+                lease_token=lease_token,
+            )
+        return latest
 
     def execute(
         self,
@@ -140,6 +190,10 @@ class WorkflowExecutor:
                 step, operation = definition.steps[index], operations[index]
                 if operation["state"] == OperationState.SUCCEEDED.value:
                     continue
+                if self.store.cancel_requested(workflow_id):
+                    return self._cancel_operation(
+                        workflow_id, index, operation["operation_id"], lease.lease_token,
+                    )
                 attempts = int(operation["attempts"])
                 while True:
                     attempts += 1
@@ -152,7 +206,7 @@ class WorkflowExecutor:
                     )
                     try:
                         result, evidence = self._run_step_with_heartbeat(
-                            workflow_id, lease.lease_token, lease_ttl_sec, step,
+                            workflow_id, operation["operation_id"], lease.lease_token, lease_ttl_sec, step,
                         )
                         if evidence.get("conclusive") is not True:
                             raise SideEffectUncertain("Postcondition could not be evaluated conclusively.")
@@ -169,6 +223,11 @@ class WorkflowExecutor:
                         latest, next_index = self.store.get(workflow_id), index + 1
                         if latest["state"] == WorkflowState.CANCELLED.value:
                             return latest
+                        if latest["state"] == WorkflowState.CANCELLING.value:
+                            return self.store.transition(
+                                workflow_id, latest["version"], WorkflowState.CANCELLED,
+                                current_step=next_index, lease_token=lease.lease_token,
+                            )
                         if next_index == len(definition.steps):
                             current = self.store.transition(
                                 workflow_id, latest["version"], WorkflowState.COMPLETED,
@@ -182,11 +241,19 @@ class WorkflowExecutor:
                         break
                     except _LeaseLostDuringAction as exc:
                         raise ToolError("workflow_lease_lost", str(exc)) from exc
+                    except ActionCancelled as exc:
+                        return self._cancel_operation(
+                            workflow_id, index, operation["operation_id"], lease.lease_token, error=str(exc),
+                        )
                     except TransientActionError as exc:
                         self.store.checkpoint_operation(
                             operation["operation_id"], OperationState.FAILED,
                             lease_token=lease.lease_token, error=str(exc),
                         )
+                        if self.store.cancel_requested(workflow_id):
+                            return self._cancel_operation(
+                                workflow_id, index, operation["operation_id"], lease.lease_token, error=str(exc),
+                            )
                         if attempts <= step.max_retries:
                             lease = self.store.renew_lease(workflow_id, lease.lease_token, lease_ttl_sec)
                             time.sleep(min(2 ** (attempts - 1), 5))

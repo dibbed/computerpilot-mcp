@@ -23,7 +23,7 @@ from core.workflow_models import (
     validate_workflow_transition,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SECRET_MARKERS = (
     "password",
     "secret",
@@ -159,6 +159,9 @@ class WorkflowStore:
                 version = 1
             if version < 2:
                 self._migrate_v2(connection)
+                version = 2
+            if version < 3:
+                self._migrate_v3(connection)
             connection.execute("BEGIN IMMEDIATE")
             self._redact_stored_definitions(connection)
             self._materialize_all(connection)
@@ -230,6 +233,20 @@ class WorkflowStore:
             ALTER TABLE workflows ADD COLUMN execution_definition_hash TEXT;
             ALTER TABLE workflows ADD COLUMN execution_compatible INTEGER NOT NULL DEFAULT 0;
             PRAGMA user_version = 2;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v3(connection: sqlite3.Connection) -> None:
+        """Persist cooperative workflow cancellation requests."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflows ADD COLUMN cancel_requested_at TEXT;
+            ALTER TABLE workflows ADD COLUMN cancel_reason TEXT;
+            PRAGMA user_version = 3;
             COMMIT;
             """
         )
@@ -460,6 +477,8 @@ class WorkflowStore:
             "inputs": json.loads(row["inputs_json"]),
             "execution_compatible": bool(row["execution_compatible"]),
             "execution_definition_hash": row["execution_definition_hash"],
+            "cancel_requested_at": row["cancel_requested_at"],
+            "cancel_reason": row["cancel_reason"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "last_error": row["last_error"],
@@ -819,6 +838,75 @@ class WorkflowStore:
             ).rowcount
             connection.commit()
             return deleted == 1
+
+    def cancel_requested(self, workflow_id: str) -> bool:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT state, cancel_requested_at FROM workflows WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+        if row is None:
+            raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
+        return bool(row["cancel_requested_at"]) or str(row["state"]) in {
+            WorkflowState.CANCELLING.value,
+            WorkflowState.CANCELLED.value,
+        }
+
+    def request_cancel(
+        self,
+        workflow_id: str,
+        expected_version: int,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a cooperative cancellation request without lying about an in-flight side effect."""
+
+        bounded_reason = reason.strip()[:2_000] if isinstance(reason, str) and reason.strip() else None
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state, version FROM workflows WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
+            if int(row["version"]) != expected_version:
+                raise ToolError("workflow_version_conflict", "Workflow changed; reload status before retrying.")
+            current = WorkflowState(str(row["state"]))
+            if current in {WorkflowState.COMPLETED, WorkflowState.CANCELLED}:
+                connection.commit()
+                return self.get(workflow_id)
+            if current is WorkflowState.CANCELLING:
+                connection.commit()
+                return self.get(workflow_id)
+            target = WorkflowState.CANCELLING if current is WorkflowState.RUNNING else WorkflowState.CANCELLED
+            validate_workflow_transition(current, target)
+            cursor = connection.execute(
+                """
+                UPDATE workflows
+                SET state = ?, cancel_requested_at = COALESCE(cancel_requested_at, ?),
+                    cancel_reason = COALESCE(?, cancel_reason), updated_at = ?, version = version + 1
+                WHERE workflow_id = ? AND version = ?
+                """,
+                (target.value, now, bounded_reason, now, workflow_id, expected_version),
+            )
+            if cursor.rowcount != 1:
+                raise ToolError("workflow_version_conflict", "Workflow changed; reload status before retrying.")
+            connection.execute(
+                """
+                INSERT INTO workflow_events(workflow_id, event_type, state, metadata_json, created_at)
+                VALUES (?, 'workflow_cancel_requested', ?, ?, ?)
+                """,
+                (
+                    workflow_id,
+                    target.value,
+                    _canonical(redact_inputs({"reason": bounded_reason})) if bounded_reason else None,
+                    now,
+                ),
+            )
+            connection.commit()
+        return self.get(workflow_id)
 
     def transition(
         self,

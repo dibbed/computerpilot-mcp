@@ -178,10 +178,12 @@ def register(mcp: MCPServer) -> None:
     def workflow_cancel(
         workflow_id: Annotated[str, Field(min_length=1, max_length=128)],
         expected_version: Annotated[int, Field(ge=1)],
+        reason: Annotated[str | None, Field(max_length=2_000)] = None,
     ) -> dict[str, Any]:
-        """Cancel a non-terminal workflow with a compare-and-swap version guard."""
-        current = workflow_store(SETTINGS.workflow_db).get(workflow_id)
+        """Request cooperative cancellation; in-flight effects are not misreported as already stopped."""
+        store = workflow_store(SETTINGS.workflow_db)
+        current = store.get(workflow_id)
         if current["state"] in {WorkflowState.COMPLETED.value, WorkflowState.CANCELLED.value}:
             return current
-        audit_action("workflow_cancel", target=workflow_id, durable=True)
-        return workflow_store(SETTINGS.workflow_db).transition(workflow_id, expected_version, WorkflowState.CANCELLED)
+        audit_action("workflow_cancel", target=workflow_id, details={"reason_supplied": bool(reason)}, durable=True)
+        return store.request_cancel(workflow_id, expected_version, reason=reason)

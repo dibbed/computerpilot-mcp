@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import subprocess
 import time
 import urllib.error
@@ -21,7 +22,7 @@ from tools.filesystem.patches import apply_patch_transaction
 from tools.testing.impact import select_affected_tests
 from tools.testing.verification import verify_changed_repository
 
-ActionHandler = Callable[[dict[str, Any], float], dict[str, Any]]
+ActionHandler = Callable[..., dict[str, Any]]
 
 
 class _ActionInput(BaseModel):
@@ -117,6 +118,20 @@ class ActionDescriptor:
     retry_policy: Literal["never", "transient"]
     allowed_postconditions: frozenset[str]
     secret_fields: frozenset[str] = frozenset()
+    cancel_mode: Literal["immediate", "cooperative", "deferred"] = "deferred"
+
+
+@dataclass(frozen=True, slots=True)
+class ActionContext:
+    workflow_id: str
+    operation_id: str
+    is_cancel_requested: Callable[[], bool]
+    persist_external_ref: Callable[[dict[str, Any]], None]
+    persist_intent_evidence: Callable[[dict[str, Any]], None]
+
+
+class ActionCancelled(RuntimeError):
+    pass
 
 
 class TransientActionError(RuntimeError):
@@ -214,7 +229,9 @@ def _git_commit(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]
     return result
 
 
-def _run_durable_job(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
+def _run_durable_job(
+    arguments: dict[str, Any], timeout_sec: float, context: ActionContext | None = None
+) -> dict[str, Any]:
     executable = arguments.get("executable")
     idempotency_key = arguments.get("idempotency_key")
     if not isinstance(executable, str) or not executable or not isinstance(idempotency_key, str) or not idempotency_key:
@@ -231,13 +248,31 @@ def _run_durable_job(arguments: dict[str, Any], timeout_sec: float) -> dict[str,
         idempotency_key,
         str(arguments.get("encoding", "utf-8")),
     )
+    job_id = str(job["id"])
+    if context is not None:
+        context.persist_external_ref({"job_id": job_id, "request_key": idempotency_key})
     deadline = time.monotonic() + timeout_sec
+    terminal = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
     while True:
-        status = store.get(str(job["id"]))
-        if status["status"] in {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}:
+        status = store.get(job_id)
+        if status["status"] in terminal:
+            if status["status"] == "cancelled" and context is not None and context.is_cancel_requested():
+                raise ActionCancelled("Durable job was cancelled with its workflow.")
             if status["status"] != "succeeded":
                 raise ToolError("workflow_job_failed", f"Durable job ended as {status['status']}.")
             return {"job_id": status["id"], "status": status["status"], "exit_code": status.get("exit_code")}
+        if context is not None and context.is_cancel_requested():
+            store.cancel(job_id)
+            while time.monotonic() < deadline:
+                settled = store.get(job_id)
+                if settled["status"] in terminal:
+                    if settled["status"] == "cancelled":
+                        raise ActionCancelled("Durable job was cancelled with its workflow.")
+                    raise SideEffectUncertain(
+                        f"Durable job cancellation settled as {settled['status']} rather than cancelled."
+                    )
+                time.sleep(0.1)
+            raise SideEffectUncertain("Durable job cancellation did not reach a terminal state before the workflow deadline.")
         if time.monotonic() >= deadline:
             raise SideEffectUncertain("Durable job did not reach a terminal state before the workflow deadline.")
         time.sleep(0.1)
@@ -331,7 +366,8 @@ ACTION_DESCRIPTORS: dict[str, ActionDescriptor] = {
         True,
         "never",
         frozenset({"job_succeeded_from_result"}),
-        frozenset({"idempotency_key"}),
+        frozenset(),
+        "cooperative",
     ),
     "check_file": ActionDescriptor("check_file", CheckFileInput, _check_file, False, "never", frozenset()),
     "check_http": ActionDescriptor("check_http", CheckHttpInput, _check_http, False, "transient", frozenset()),
@@ -380,11 +416,18 @@ def validate_workflow_definition(definition: WorkflowDefinition) -> None:
         validate_operation(step.action, step.arguments, step.postcondition)
 
 
-def execute_action(name: str, arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
+def execute_action(
+    name: str,
+    arguments: dict[str, Any],
+    timeout_sec: float,
+    context: ActionContext | None = None,
+) -> dict[str, Any]:
     descriptor = get_action_descriptor(name)
     try:
         validated = descriptor.input_model.model_validate(arguments).model_dump()
     except ValidationError as exc:
         raise ToolError("invalid_workflow_arguments", f"Invalid {name} arguments: {exc.errors(include_url=False)}") from exc
     handler = ACTION_HANDLERS[name]
+    if context is not None and "context" in inspect.signature(handler).parameters:
+        return handler(validated, timeout_sec, context)
     return handler(validated, timeout_sec)

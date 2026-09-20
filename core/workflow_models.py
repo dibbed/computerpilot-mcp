@@ -14,6 +14,7 @@ class WorkflowState(str, Enum):
     CREATED = "created"
     QUEUED = "queued"
     RUNNING = "running"
+    CANCELLING = "cancelling"
     WAITING = "waiting"
     PAUSED = "paused"
     FAILED = "failed"
@@ -81,12 +82,16 @@ WORKFLOW_TRANSITIONS: Mapping[WorkflowState, frozenset[WorkflowState]] = {
     WorkflowState.RUNNING: frozenset(
         {
             WorkflowState.WAITING,
+            WorkflowState.CANCELLING,
             WorkflowState.PAUSED,
             WorkflowState.FAILED,
             WorkflowState.UNCERTAIN,
             WorkflowState.COMPLETED,
             WorkflowState.CANCELLED,
         }
+    ),
+    WorkflowState.CANCELLING: frozenset(
+        {WorkflowState.CANCELLED, WorkflowState.FAILED, WorkflowState.UNCERTAIN}
     ),
     WorkflowState.WAITING: frozenset(
         {
