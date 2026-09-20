@@ -52,6 +52,7 @@ MUTATING_TOOL_OPERATIONS = frozenset({
     "run_pytest",
     "run_ruff",
     "run_mypy",
+    "verify_changes",
     "browser_click",
     "browser_fill",
     "browser_screenshot",

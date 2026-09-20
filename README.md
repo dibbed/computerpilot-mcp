@@ -324,8 +324,12 @@ Testing tools integrate:
 - pytest
 - Ruff
 - mypy
+- affected-test selection from changed paths or a Git base
+- one-call change-aware verification (`verify_changes`)
 
-They return structured counts and bounded diagnostic samples suitable for agent workflows.
+They return structured counts and bounded diagnostic samples suitable for agent workflows. `verify_changes` syntax-checks changed
+Python files, then runs Ruff, mypy, and the narrowest sound pytest scope. Repository-wide configuration and shared-fixture changes
+fall back to the full suite. A timed-out or unavailable required verifier always makes the aggregate result fail; Ruff fixes are opt-in.
 
 ### Windows and System Diagnostics
 

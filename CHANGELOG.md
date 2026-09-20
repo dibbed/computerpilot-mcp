@@ -6,6 +6,10 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Added
+- Add consolidated code-context lookup, transactional unified patches, conservative affected-test selection, and change-aware verification workflows for faster coding iterations on large repositories.
+- Report normalized bounded diagnostics across syntax, Ruff, mypy, and pytest stages, with explicit full-suite fallbacks and fail-closed timeout or unavailable-tool outcomes.
+
 ### Fixed
 - Treat transient Windows process-table failures such as `WinError 1455` as degraded supervisor diagnostics instead of fatal runtime failures.
 - Keep runtime cleanup resilient when `psutil` process enumeration is unavailable: tracked children are cleaned best-effort and the original `Popen` handle forcibly releases the runtime root so ports such as `127.0.0.1:8080` are not stranded by a failed cleanup pass.

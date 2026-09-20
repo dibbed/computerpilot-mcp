@@ -56,6 +56,7 @@ REQUIRED_TOOLS = {
     "run_ruff",
     "run_mypy",
     "affected_tests",
+    "verify_changes",
     "git_status",
     "git_diff_summary",
     "git_log_summary",

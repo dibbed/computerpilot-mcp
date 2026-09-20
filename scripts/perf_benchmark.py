@@ -40,6 +40,7 @@ from tools.filesystem.service import search_by_name, search_by_name_streaming
 from tools.project.context import lookup_code_context
 from tools.project.service import parse_python
 from tools.testing.impact import select_affected_tests
+from tools.testing.verification import build_verification_plan
 
 MiB = 1_048_576
 PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
@@ -387,11 +388,7 @@ def _prepare_patch_fixture(root: Path, count: int) -> str:
     for index in range(count):
         name = f"file_{index:04d}.txt"
         (root / name).write_text("before\n", encoding="utf-8")
-        chunks.append(
-            f"diff --git a/{name} b/{name}\n"
-            f"--- a/{name}\n+++ b/{name}\n"
-            "@@ -1 +1 @@\n-before\n+after\n"
-        )
+        chunks.append(f"diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -1 +1 @@\n-before\n+after\n")
     return "".join(chunks)
 
 
@@ -430,6 +427,14 @@ def _impact_once(root: Path, count: int) -> dict[str, Any]:
     if result["decision"] not in {"focused", "focused_plus_full_recommended"}:
         raise RuntimeError(f"affected_tests correctness mismatch: {result['decision']!r}")
     return {"files": count, "tests": result["test_count"], "modules_traversed": result["modules_traversed"]}
+
+
+def _verification_plan_once(root: Path) -> dict[str, Any]:
+    result = build_verification_plan(root, changed_paths=["app/module_0000.py"])
+    if result["mode"] not in {"focused", "full"}:
+        raise RuntimeError(f"verification plan correctness mismatch: {result['mode']!r}")
+    return {"mode": result["mode"], "tests": result["affected"]["test_count"]}
+
 
 def _prepare_search_fixture(root: Path, count: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
@@ -880,7 +885,6 @@ def _browser_idle_eviction_once() -> dict[str, Any]:
     return asyncio.run(scenario())
 
 
-
 def _audit_payload() -> bytes:
     return (
         json.dumps(
@@ -989,6 +993,7 @@ def _audit_batched_once(path: Path, events: int, threads: int) -> dict[str, Any]
         "flush_interval_ms": round(policy.flush_interval_sec * 1_000, 3),
         "queue_max": policy.queue_max,
     }
+
 
 def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -1202,6 +1207,7 @@ def _cleanup_stale_temp_roots(
         removed += 1
     return removed
 
+
 def _temporary_root(name: str) -> tempfile.TemporaryDirectory[str]:
     parent = SETTINGS.state_dir / "benchmarks" / "tmp"
     parent.mkdir(parents=True, exist_ok=True)
@@ -1313,6 +1319,7 @@ def run_benchmarks(
             impact_root = root / "impact"
             _prepare_impact_fixture(impact_root, impact_count)
             results.append(measure("affected_tests_1000_modules", partial(_impact_once, impact_root, impact_count), runs))
+            results.append(measure("verification_plan_1000_modules", partial(_verification_plan_once, impact_root), runs))
 
     if "search" in suites:
         max_count = max(limits["search_files"])
@@ -1356,6 +1363,7 @@ def run_benchmarks(
                 store = JobStore(Path(temporary) / "jobs.sqlite3")
                 sequence = 0
                 for count in limits["job_counts"]:
+
                     def job_case(count: int = count) -> dict[str, Any]:
                         nonlocal sequence
                         sequence += 1

@@ -56,6 +56,7 @@ REQUIRED_TOOLS = {
     "run_ruff",
     "run_mypy",
     "affected_tests",
+    "verify_changes",
     "git_status",
     "git_diff_summary",
     "git_log_summary",
@@ -135,7 +136,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
-    assert len(names) == 64
+    assert len(names) == 65
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     for tool in tools:
@@ -223,9 +224,7 @@ def test_filesystem_round_trip_and_pagination(tmp_path: Path) -> None:
             assert refused_move["ok"] is False
             assert refused_move["error"] == "same_path"
             assert target.is_file()
-            listing = _structured(
-                await client.call_tool("list_directory", {"path": str(tmp_path), "max_items": 1})
-            )
+            listing = _structured(await client.call_tool("list_directory", {"path": str(tmp_path), "max_items": 1}))
             assert listing["total_count"] == 1
             assert listing["items"][0]["name"] == "sample.py"
             deleted = _structured(await client.call_tool("delete_file", {"path": str(target)}))
@@ -295,11 +294,10 @@ def test_process_command_line_and_environment_values_are_complete(tmp_path: Path
     os.environ[variable_name] = variable_value
     process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", long_argument], cwd=tmp_path)
     try:
+
         async def scenario() -> None:
             async with Client(create_server(), raise_exceptions=True) as client:
-                info = _structured(
-                    await client.call_tool("process_info", {"pid": process.pid, "include_command_line": True})
-                )
+                info = _structured(await client.call_tool("process_info", {"pid": process.pid, "include_command_line": True}))
                 assert long_argument in info["command_line"]
                 assert info["command_line_truncated"] is False
                 environment = _structured(
@@ -336,16 +334,12 @@ def test_project_ast_tools(tmp_path: Path) -> None:
             assert "Python" in {item["name"] for item in summary["languages"]}
             assert "FastAPI" in summary["frameworks"]
             assert "SQLAlchemy" in summary["databases"]
-            functions = _structured(
-                await client.call_tool("find_function", {"path": str(tmp_path), "function_name": "Service.run"})
-            )
+            functions = _structured(await client.call_tool("find_function", {"path": str(tmp_path), "function_name": "Service.run"}))
             assert functions["total_count"] == 1
             assert functions["items"][0]["async"] is True
             context = _structured(await client.call_tool("code_context", {"path": str(tmp_path), "symbol": "Service.run"}))
             assert context["definitions"][0]["qualified_name"] == "app.Service.run"
-            imports = _structured(
-                await client.call_tool("find_imports", {"path": str(tmp_path), "module_filter": "sqlalchemy"})
-            )
+            imports = _structured(await client.call_tool("find_imports", {"path": str(tmp_path), "module_filter": "sqlalchemy"}))
             assert imports["total_count"] == 1
 
     asyncio.run(scenario())
@@ -385,6 +379,24 @@ def test_affected_tests_returns_structured_mcp_decision(tmp_path: Path) -> None:
             )
             assert result["decision"] == "none"
             assert result["complete"] is True
+
+    asyncio.run(scenario())
+
+
+def test_verify_changes_runs_a_bounded_syntax_plan_over_mcp(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("answer = 42\n", encoding="utf-8")
+
+    async def scenario() -> None:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            result = _structured(
+                await client.call_tool(
+                    "verify_changes",
+                    {"repo": str(tmp_path), "changed_paths": ["app.py"], "checks": ["syntax"]},
+                )
+            )
+            assert result["ok"] is True
+            assert result["stages"][0]["name"] == "syntax"
+            assert result["stages"][0]["status"] == "passed"
 
     asyncio.run(scenario())
 
