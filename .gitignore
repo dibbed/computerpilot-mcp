@@ -18,10 +18,17 @@ ENV/
 # Runtime caches and test artifacts
 .pytest_cache/
 .pytest-tmp/
+.pytest-tmp*/
+.hypothesis/
+.tox/
+.nox/
 .mypy_cache/
 .ruff_cache/
+.pytype/
+.pyre/
 .coverage
 .coverage.*
+coverage.xml
 htmlcov/
 playwright-report/
 test-results/
@@ -45,12 +52,27 @@ docs/roadmap/
 tunnel-client-runtime*
 
 # Local SQLite databases and write-ahead logs
+# Also ignore rollback-journal variants created by non-WAL SQLite connections.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+*.sqlite3-journal
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
+
+# Python / package-manager build artifacts
+build/
+dist/
+*.egg
+*.egg-info/
+node_modules/
+.pnpm-store/
 
 # Editor and OS artifacts
 .idea/

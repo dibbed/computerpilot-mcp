@@ -2,11 +2,11 @@
 
 A local Windows developer-agent backend built on the Model Context Protocol (MCP). It exposes filesystem, code intelligence, process execution, durable jobs, browser automation, desktop interaction, Git, testing, system diagnostics, project memory, and image delivery through one MCP server designed for long-running local use.
 
-Current MCP release: **v0.2.4**. This project version is independent from the bundled upstream tunnel-client binary version.
+Current MCP release: **v0.2.5**. This project version is independent from the bundled upstream tunnel-client binary version.
 
 The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only Streamable HTTP server.
 
-> Release history belongs in [CHANGELOG.md](CHANGELOG.md). Binary provenance and hashes are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
+> Release history belongs in [CHANGELOG.md](CHANGELOG.md). v0.2.5 release evidence is recorded in [docs/V0.2.5-VALIDATION.md](docs/V0.2.5-VALIDATION.md). Binary provenance and hashes are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
 
 ## What This Project Provides
 
@@ -22,7 +22,7 @@ The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only S
 - Windows system diagnostics for processes, CPU, memory, disks, services, installed programs, and environment metadata.
 - Versioned project memory with provenance and optimistic concurrency checks.
 - A supervised runtime with health monitoring, restart backoff, mutation-aware draining, recovery metadata, and a loopback control panel.
-- Bounded local state for audit logs, backups, artifacts, job history, browser sessions, caches, and search snapshots.
+- Bounded local state for audit logs, backups, artifacts, job history, workflow history, browser sessions, caches, and search snapshots.
 
 ## Architecture
 
@@ -216,6 +216,10 @@ Common settings:
 | `MCP_TOOL_PROFILE` | Tool catalog profile (`minimal`, `coding`, `git`, `testing`, `desktop`, `browser`, `operations`, or `full`) | `full` |
 | `CONTROL_PLANE_API_KEY` | Tunnel control-plane credential | none |
 | `MCP_MAX_RUNNING_JOBS` | Maximum simultaneously active durable jobs | `4` |
+| `MCP_WORKFLOW_HISTORY_MAX_COUNT` | Maximum retained safe terminal workflows | `1000` |
+| `MCP_WORKFLOW_HISTORY_MAX_AGE_DAYS` | Maximum age for safe terminal workflow history | `30` |
+| `MCP_WORKFLOW_DB_WARN_BYTES` | Workflow DB size that degrades health | `268435456` |
+| `MCP_WORKFLOW_CLEANUP_INTERVAL_SEC` | Minimum workflow-history cleanup interval | `300` |
 | `MCP_BROWSER_IDLE_SEC` | Idle browser-session lifetime | `900` |
 | `MCP_BROWSER_POOL_IDLE_SEC` | Empty browser-pool lifetime | `120` |
 | `MCP_BROWSER_MAX_SESSIONS` | Maximum logical browser sessions | `20` |
@@ -226,7 +230,7 @@ Common settings:
 | `MCP_SUPERVISOR_WATCHDOG_DRAIN_SEC` | Watchdog best-effort drain deadline | `2` |
 | `MCP_WINDOWS_JOB_OBJECTS` | Windows Job Object process ownership | enabled |
 
-Resource retention, cache, search-snapshot, audit, backup, artifact, and job-history limits are also configurable. See [.env.example](.env.example) rather than duplicating every tuning value here.
+Resource retention, cache, search-snapshot, audit, backup, artifact, job-history, and workflow-history limits are also configurable. See [.env.example](.env.example) rather than duplicating every tuning value here.
 
 ## Tool Capabilities
 
@@ -258,7 +262,7 @@ Filesystem read-modify-write operations use keyed path locks inside the runtime.
 - Language Server Protocol discovery for definitions, references, symbols, hover, call hierarchy, and diagnostics.
 - Transactional symbol rename and code-action edits with workspace boundaries, overlap checks, hash preconditions, and rollback.
 
-Language-server tools accept an explicit server command; the MCP does not silently install or select a language server. Workspace edits support `changes` and versioned text edits in `documentChanges`. LSP create, rename, and delete resource operations are rejected.
+Language-server MCP tools do not accept caller-supplied executable commands. They use the trusted discovered `pyright-langserver --stdio` command, which must already be installed and available on `PATH`; the MCP never installs it implicitly. One-shot requests follow `initialize -> initialized -> optional didOpen -> request -> didClose -> shutdown -> exit`, enforce bounded framed output before body accumulation, and keep document URIs inside the workspace. Workspace edits support `changes` and versioned text edits in `documentChanges`; resource operations are rejected, and externally supplied code-action edits require source SHA-256 guards for every edited file.
 
 ### Processes and Terminal Commands
 
@@ -287,7 +291,7 @@ Durable jobs provide:
 - Monotonic job versions.
 - `job_wait` for bounded version-aware waiting.
 
-Queued, running, and orphaned jobs are not removed by terminal-history retention.
+Queued, running, and orphaned jobs are not removed by terminal-history retention. Durable-job `idempotency_key` values are execution identities, not credentials; callers must never place secrets in them.
 
 ### Browser Automation
 
@@ -426,15 +430,15 @@ Workflow definitions are immutable ordered steps stored in SQLite. Use `workflow
 .\.venv\Scripts\python.exe -m scripts.workflow_worker --once
 ```
 
-Executable actions are defined by a typed allowlist covering verification, patching, affected-test selection, guarded Git actions, durable jobs, file/HTTP checks, and semantic desktop/browser adapters. Arbitrary shell text is rejected. Mutating steps require supported postconditions, inputs are redacted before persistence, transitions use optimistic version guards, and retries are bounded to explicitly transient failures.
+Executable actions are defined by a typed allowlist covering verification, patching, affected-test selection, guarded Git actions, durable jobs, and file/HTTP checks. Browser and desktop workflow actions remain unavailable until a concrete executor adapter exists and therefore fail fast during planning/start. Arbitrary shell text is rejected. Mutating steps require supported intent postconditions; exact execution definitions are persisted separately from bounded/redacted public projections, literal declared secret fields fail closed, transitions use optimistic version guards, and retries are bounded to explicitly transient failures.
 
-Each step materializes a durable operation with its own version and idempotency key. Executors claim a time-bounded lease and checkpoint the operation before invoking its action. An interrupted side effect becomes `uncertain` and is never replayed blindly. Use `workflow_reconcile` to evaluate only the persisted postcondition. If automated evidence remains inconclusive, `workflow_acknowledge_operation` records an explicit operator assertion with actor and reason. Only resolved failed, paused, or newly created aggregates may be queued with `workflow_resume`.
+Each step materializes a durable operation with its own version and idempotency key. Executors claim a fenced lease, renew it while the action is running, and persist canonical recovery intent before supported mutations. Cancellation is persistent and cooperative: a running workflow enters `cancelling`, cancellable durable jobs receive the request, and a side effect that already completed is recorded before the aggregate becomes `cancelled`. Interrupted non-terminal effects become `uncertain` and are never replayed blindly. Result-independent reconciliation uses persisted identities such as patch output hashes, Git parent/tree/message evidence, or durable-job request keys. If automated evidence remains inconclusive, `workflow_acknowledge_operation` records an explicit operator assertion with actor and reason. Crash recovery also repairs aggregates from already-persisted terminal operation truth instead of converting a known succeeded/failed operation back into ambiguity.
 
 State ownership is intentionally separated: the workflow database owns definitions and aggregate/operation lifecycle; the job store owns process completion and output; the recovery journal owns legacy standalone mutation ambiguity; project memory is advisory and is never execution authority.
 
 Built-in plans are `implement_and_verify`, `safe_git_commit`, and `prepare_release`. They do not push, tag, or deploy. `deploy_and_healthcheck` requires an explicit project adapter and otherwise fails closed.
 
-`server_health` exposes current runtime state, resource pressure, job and browser counts, storage budgets, the legacy operation-recovery summary, and bounded workflow/operation/lease health counts with the oldest unresolved operation samples.
+`server_health` exposes current runtime state, resource pressure, job and browser counts, storage budgets, the legacy operation-recovery summary, and bounded workflow/operation/event/lease health. Core workflow counts and pressure metrics are available both at top level and in `workflow_health`. `ok` remains the backward-compatible server-responsiveness flag; `health_status` and `degraded_reasons` separately expose unresolved workflow operations, workflow DB pressure, or broader resource pressure.
 
 ## Local Control Panel
 
@@ -472,7 +476,7 @@ Important paths include:
 | `.agent_state/search_snapshots/` | Immutable search pagination snapshots |
 | `.agent_state/audit.jsonl` | Metadata-only audit trail |
 | `.agent_state/operation-recovery.jsonl` | Mutation recovery metadata |
-| `.agent_state/workflows.sqlite3` | Durable workflow definitions, states, and step evidence |
+| `.agent_state/workflows.sqlite3` | Exact/public workflow definitions, cancellation state, operation intent/evidence, leases, events, and retained history |
 | `.agent_state/runtime_lifecycle/` | Supervisor / runtime generation control state |
 | `.agent_state/supervisor.log*` | Rotating supervisor logs |
 
@@ -503,6 +507,14 @@ This validates server construction and tool registration.
 ```
 
 This verifies imports, MCP startup, tool registration, filesystem behavior, and terminal execution.
+
+### Workflow Release Soak
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.workflow_soak --workflows 300 --failures 30 --uncertain 10 --restarts 3 --durable-jobs 5 --json
+```
+
+This deterministic release gate exercises hundreds of durable workflows, expected failures, interrupted-operation reconciliation, fresh-process database reopens, isolated MCP restart/startup checks, retention cleanup, durable jobs, lease/orphan leak checks, main DB/WAL/SHM growth, and RSS growth.
 
 ### Full Doctor
 

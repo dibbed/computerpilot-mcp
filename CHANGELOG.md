@@ -6,13 +6,38 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
-### Added - 2026-09-20
-- Add leased workflow execution with durable operation checkpoints, typed action validation, and MCP operation inspection.
-- Add side-effect-free postcondition reconciliation and audited operator acknowledgement for uncertain workflow operations.
+## [0.2.5] - 2026-09-20
 
-### Safety and observability - 2026-09-20
-- Prevent blind replay of interrupted side effects and require compare-and-swap versions for execution and resolution.
-- Separate bounded health reporting for workflow aggregates, unresolved operations, leases, jobs, and legacy recovery records.
+### Workflow correctness and durability
+- Separate exact durable execution definitions from bounded/redacted public workflow projections so display redaction and truncation never change what the executor runs.
+- Fail closed for non-terminal legacy workflows whose exact execution payload cannot be recovered.
+- Keep long-running workflow leases alive with heartbeat renewal and fencing; stale owners cannot publish checkpoints or remove a replacement owner's lease.
+- Add persistent cooperative cancellation with a cancelling state, durable-job cancellation propagation, and preservation of side effects that completed before cancellation settled.
+- Persist canonical reconciliation intent before supported mutations. Patch output hashes, Git index/commit identity, and durable-job request keys survive lost results without blind replay.
+- Repair aggregate workflow/step state after restart from already-persisted succeeded, failed, or cancelled operation truth instead of turning known outcomes back into ambiguity.
+- Replace fixed workflow durable-job status polling with version-aware waits and select queued workflows directly in oldest-first order.
+- Add bounded workflow-history retention that prunes only safe completed/cancelled history while protecting active leases and unresolved evidence.
+- Align workflow plan/start/dry-run contracts and fail fast for browser/desktop workflow actions that still require a runtime adapter.
+
+### Language and Windows test hardening
+- Remove caller-supplied executable commands from read-oriented MCP language tools; use the trusted discovered pyright language server command.
+- Follow bounded LSP initialize/initialized/didOpen/request/didClose/shutdown/exit sequencing and reject oversized framed output before body accumulation.
+- Require source SHA-256 guards before applying externally supplied LSP code-action edits.
+- Isolate pytest temporary state from live .agent_state with an ignored repository-local .pytest-tmp root.
+
+### Health and observability
+- Add top-level and nested workflow DB bytes, workflow/operation/event totals, queued/running/uncertain counts, active lease counts, unresolved-operation counts, health_status, and degraded_reasons.
+- Add configurable workflow history count/age limits, cleanup cadence, and workflow DB pressure threshold.
+- Add deterministic workflow crash/concurrency gates, a reusable workflow soak runner, and workflow-scale benchmark cases at 10,000 history rows.
+
+### Validation
+- Full pytest regression suite: **554 passed** in 151.96s on isolated implementation commit cca939a.
+- Ruff: zero violations; mypy: zero issues across **91 source files**; compileall passed.
+- MCP startup/health smoke passed with **110 unique tools**, filesystem/terminal probes, and zero unresolved workflow operations in the isolated validation state.
+- Complete quick benchmark: **38 passed**, **2 intentional opt-in skips**, **0 errors** across 40 result cases.
+- Workflow-scale benchmark at 10k history: start 11.523 ms, status 1.829 ms, store reopen/startup 632.583 ms, read-only execute 118.335 ms, queue selection 3.285 ms, health summary 9.511 ms, and 1,635.533 DB bytes per workflow in the synthetic fixture.
+- Workflow soak: 300 workflows, 270 completed, 30 expected deterministic failures, 10/10 uncertain operations reconciled, 3/3 fresh-process DB reopens, 3/3 isolated MCP restarts healthy with 110 tools, 5/5 durable jobs succeeded, zero leaked leases/orphan rows, WAL reduced from 280,192 bytes to 0 after checkpoint, and 3.266 MiB RSS growth.
+- Detailed release evidence is recorded in docs/V0.2.5-VALIDATION.md.
 
 ## [0.2.4] - 2026-09-20
 
