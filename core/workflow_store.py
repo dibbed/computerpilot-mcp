@@ -1388,19 +1388,25 @@ class WorkflowStore:
             operation_counts.get(state, 0)
             for state in ("uncertain", "reconciling", "unresolvable")
         )
+        operation_total = sum(operation_counts.values())
+        workflow_total = sum(workflow_counts.values())
         return {
             "workflow_counts": workflow_counts,
-            "workflow_total": sum(workflow_counts.values()),
+            "workflow_total": workflow_total,
             "operation_counts": operation_counts,
-            "operation_total": sum(operation_counts.values()),
+            "operation_total": operation_total,
+            "workflow_operation_total": operation_total,
             "event_total": event_total,
+            "workflow_event_total": event_total,
             "workflow_db_bytes": db_bytes,
             "queued_workflows": workflow_counts.get("queued", 0),
             "running_workflows": workflow_counts.get("running", 0) + workflow_counts.get("cancelling", 0),
             "uncertain_workflows": workflow_counts.get("uncertain", 0) + workflow_counts.get("reconciling", 0),
             "unresolved_operation_count": unresolved_total,
+            "unresolved_workflow_operations": unresolved_total,
             "oldest_unresolved_operations": [dict(row) for row in unresolved],
             "active_lease_count": lease_count,
+            "active_workflow_leases": lease_count,
             "sample_limit": bounded,
         }
 

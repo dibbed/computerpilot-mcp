@@ -33,6 +33,58 @@ def _init_repo(repo: Path) -> None:
     _git(repo, "commit", "-m", "initial")
 
 
+def test_lost_git_stage_result_reconciles_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "value.txt").write_text("two\n", encoding="utf-8")
+    original = ACTION_HANDLERS["git_stage"]
+    calls = 0
+
+    def result_lost(arguments: dict[str, object], timeout: float) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        original(arguments, timeout)
+        raise SideEffectUncertain("result lost after staging")
+
+    monkeypatch.setitem(ACTION_HANDLERS, "git_stage", result_lost)
+    store = WorkflowStore(tmp_path / "workflows.db")
+    workflow = store.create(
+        WorkflowDefinition(
+            "stage-recovery",
+            (
+                StepDefinition(
+                    "stage",
+                    "git_stage",
+                    {"repo": str(repo), "paths": ["value.txt"]},
+                    postcondition={"kind": "git_stage_intent"},
+                ),
+            ),
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+
+    result = WorkflowExecutor(store).execute(str(workflow["workflow_id"]), owner_id="worker-a")
+    assert result["state"] == "uncertain"
+    assert calls == 1
+    assert _git(repo, "diff", "--cached", "--name-only") == "value.txt"
+
+    operation = store.get_operation_for_reconciliation(
+        store.list_operations(str(workflow["workflow_id"]))["items"][0]["operation_id"]
+    )
+    assert operation["postcondition"]["kind"] == "git_index_contains"
+    reconciled = reconcile_operation(
+        store,
+        operation["operation_id"],
+        expected_version=operation["version"],
+    )
+
+    assert reconciled["operation"]["state"] == "succeeded"
+    assert reconciled["workflow"]["state"] == "completed"
+    assert calls == 1
+
+
 def test_git_commit_reconciliation_uses_pre_effect_identity(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)

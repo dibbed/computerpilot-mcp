@@ -59,6 +59,56 @@ def test_running_workflow_enters_cancelling_then_stops_after_completed_effect(
     assert store.get(workflow_id)["steps"][0]["state"] == "completed"
 
 
+def test_cancel_during_long_read_only_verification_preserves_result_then_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db")
+    workflow = store.create(
+        WorkflowDefinition(
+            "cancel-verification",
+            (
+                StepDefinition(
+                    "verify",
+                    "verify_changes",
+                    {"cwd": str(tmp_path), "checks": ["syntax"]},
+                ),
+                StepDefinition("after", "check_file", {"path": "unused"}),
+            ),
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def long_verification(arguments: dict[str, object], timeout: float) -> dict[str, object]:
+        nonlocal calls
+        del arguments, timeout
+        calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return {"ok": True, "stages": []}
+
+    monkeypatch.setitem(ACTION_HANDLERS, "verify_changes", long_verification)
+    workflow_id = str(workflow["workflow_id"])
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(WorkflowExecutor(store).execute, workflow_id, owner_id="worker-verify")
+        assert started.wait(timeout=5)
+        current = store.get(workflow_id)
+        requested = store.request_cancel(workflow_id, int(current["version"]), reason="stop verification")
+        assert requested["state"] == "cancelling"
+        release.set()
+        result = future.result(timeout=10)
+
+    assert result["state"] == "cancelled"
+    assert calls == 1
+    operations = store.list_operations(workflow_id)["items"]
+    assert operations[0]["state"] == "succeeded"
+    assert operations[1]["state"] == "created"
+    assert store.get(workflow_id)["steps"][0]["state"] == "completed"
+
+
 def test_action_context_propagates_cooperative_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

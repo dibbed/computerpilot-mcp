@@ -46,6 +46,7 @@ from scripts.perf_benchmark import (
     _workflow_queue_once,
     _workflow_start_once,
     _workflow_status_once,
+    _workflow_store_reopen_once,
     measure,
     run_benchmarks,
 )
@@ -200,6 +201,7 @@ def test_workflow_scale_benchmark_helpers_cover_release_gates(tmp_path: Path) ->
 
     started = _workflow_start_once(store)
     status = _workflow_status_once(store, target)
+    reopened = _workflow_store_reopen_once(store.path)
     queue = _workflow_queue_once(store)
     health = _workflow_health_once(store)
     executed = _workflow_execute_read_once(store, tmp_path / "ready.txt")
@@ -209,6 +211,10 @@ def test_workflow_scale_benchmark_helpers_cover_release_gates(tmp_path: Path) ->
     assert started["state"] == "queued"
     assert status["state"] == "completed"
     assert status["step_count"] == 1
+    assert reopened["workflow_total"] >= 100
+    assert reopened["operation_total"] >= 100
+    assert reopened["event_total"] >= 100
+    assert reopened["workflow_db_bytes"] > 0
     assert queue["total_count"] >= 10
     assert health["workflow_total"] >= 100
     assert health["operation_total"] >= 100
@@ -295,6 +301,9 @@ def test_job_wait_benchmark_covers_change_and_timeout_paths(tmp_path: Path) -> N
     assert changed["waiters"] == 4
     assert changed["observed_version"] == 2
     assert changed["wake_latency_ms"] >= 0
+    assert changed["wait_selects"] >= 1
+    assert changed["wait_window_ms"] > 0
+    assert changed["db_queries_per_minute"] > 0
     assert timed_out["observed_version"] == 1
     assert timed_out["elapsed_ms"] >= 40
 

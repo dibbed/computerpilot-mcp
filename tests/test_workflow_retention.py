@@ -67,11 +67,54 @@ def test_workflow_health_exposes_bounded_state_metrics(tmp_path: Path) -> None:
 
     assert health["workflow_total"] == 1
     assert health["operation_total"] == 1
+    assert health["workflow_operation_total"] == 1
     assert health["event_total"] >= 1
+    assert health["workflow_event_total"] == health["event_total"]
     assert health["queued_workflows"] == 1
     assert health["running_workflows"] == 0
+    assert health["unresolved_workflow_operations"] == health["unresolved_operation_count"] == 0
+    assert health["active_workflow_leases"] == health["active_lease_count"] == 0
     assert health["workflow_db_bytes"] > 0
     assert workflow["workflow_id"]
+
+
+def test_server_health_marks_critical_resource_pressure_unhealthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = replace(SETTINGS, state_dir=tmp_path, memory_dir=tmp_path / "memory")
+    monkeypatch.setattr(registry, "SETTINGS", settings)
+    monkeypatch.setattr(resource_health, "SETTINGS", settings)
+    monkeypatch.setattr(heartbeat, "SETTINGS", settings)
+
+    async def fake_stats() -> dict[str, object]:
+        return {
+            "sessions": 0,
+            "browser_instances": 0,
+            "contexts": 0,
+            "pools": [],
+        }
+
+    monkeypatch.setattr(registry.BROWSER_MANAGER, "stats", fake_stats)
+    monkeypatch.setattr(
+        registry,
+        "collect_resource_metrics",
+        lambda _: {
+            "resource_pressure": "critical",
+            "budgets": {},
+            "rss_mb": 1.0,
+        },
+    )
+
+    async def scenario() -> None:
+        async with Client(create_server()) as client:
+            response = await client.call_tool("server_health", {})
+            assert response.structured_content
+            health = response.structured_content
+            assert health["ok"] is True
+            assert health["health_status"] == "unhealthy"
+            assert "resource_pressure" in health["degraded_reasons"]
+
+    asyncio.run(scenario())
 
 
 def test_server_health_marks_unresolved_workflow_as_degraded(
@@ -98,6 +141,11 @@ def test_server_health_marks_unresolved_workflow_as_degraded(
             assert health["ok"] is True
             assert health["health_status"] == "degraded"
             assert "unresolved_uncertain_operations" in health["degraded_reasons"]
+            assert health["unresolved_workflow_operations"] == 1
+            assert health["workflow_total"] == health["workflow_health"]["workflow_total"]
+            assert health["workflow_operation_total"] == health["workflow_health"]["workflow_operation_total"]
+            assert health["workflow_event_total"] == health["workflow_health"]["workflow_event_total"]
+            assert health["active_workflow_leases"] == health["workflow_health"]["active_workflow_leases"]
             assert health["workflow_health"]["unresolved_operation_count"] == 1
 
     asyncio.run(scenario())

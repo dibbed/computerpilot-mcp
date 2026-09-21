@@ -141,9 +141,15 @@ def create_server() -> MCPServer:
             degraded_reasons.append("unresolved_uncertain_operations")
         if int(workflow_health["workflow_db_bytes"]) >= SETTINGS.workflow_db_warn_bytes:
             degraded_reasons.append("workflow_db_pressure")
-        if resources.get("resource_pressure") in {"warning", "critical"}:
+        resource_pressure = resources.get("resource_pressure")
+        if resource_pressure in {"warning", "critical"}:
             degraded_reasons.append("resource_pressure")
-        health_status = "degraded" if degraded_reasons else "healthy"
+        if resource_pressure == "critical":
+            health_status = "unhealthy"
+        elif degraded_reasons:
+            health_status = "degraded"
+        else:
+            health_status = "healthy"
         return {
             "ok": True,
             "server": SETTINGS.server_name,
@@ -161,6 +167,15 @@ def create_server() -> MCPServer:
             "operation_recovery": OPERATION_RECOVERY.summary(),
             "health_status": health_status,
             "degraded_reasons": degraded_reasons,
+            "workflow_total": workflow_health["workflow_total"],
+            "workflow_operation_total": workflow_health["workflow_operation_total"],
+            "workflow_event_total": workflow_health["workflow_event_total"],
+            "workflow_db_bytes": workflow_health["workflow_db_bytes"],
+            "active_workflow_leases": workflow_health["active_workflow_leases"],
+            "queued_workflows": workflow_health["queued_workflows"],
+            "running_workflows": workflow_health["running_workflows"],
+            "uncertain_workflows": workflow_health["uncertain_workflows"],
+            "unresolved_workflow_operations": workflow_health["unresolved_workflow_operations"],
             "workflow_health": workflow_health,
             "resource_budgets": SETTINGS.resource_budgets(),
             "resource_usage": resource_usage,

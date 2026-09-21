@@ -345,22 +345,24 @@ def _prepare_workflow_history_fixture(
         path.unlink(missing_ok=True)
     store = WorkflowStore(database)
     now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-    definition = {
+    step_definition: dict[str, Any] = {
+        "name": "check",
+        "action": "check_file",
+        "arguments": {"path": "unused"},
+        "timeout_sec": 300,
+        "max_retries": 0,
+        "postcondition": None,
+    }
+    definition: dict[str, Any] = {
         "name": "history-benchmark",
-        "steps": [
-            {
-                "name": "check",
-                "action": "check_file",
-                "arguments": {"path": "unused"},
-                "timeout_sec": 300,
-                "max_retries": 0,
-                "postcondition": None,
-            }
-        ],
+        "steps": [step_definition],
         "description": "",
     }
     definition_json = json.dumps(definition, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     definition_hash = hashlib.sha256(definition_json.encode("utf-8")).hexdigest()
+    _, operation_definition_hash, operation_arguments_fingerprint = WorkflowStore._operation_payload(
+        step_definition
+    )
     workflow_rows: list[tuple[Any, ...]] = []
     step_rows: list[tuple[Any, ...]] = []
     operation_rows: list[tuple[Any, ...]] = []
@@ -406,11 +408,11 @@ def _prepare_workflow_history_fixture(
                 workflow_id,
                 0,
                 "check_file",
-                definition_hash,
+                operation_definition_hash,
                 f"benchmark-operation-{index}",
                 operation_state,
                 0 if is_queued else 1,
-                definition_hash,
+                operation_arguments_fingerprint,
                 now,
                 None if is_queued else now,
             )
@@ -482,6 +484,17 @@ def _workflow_start_once(store: WorkflowStore) -> dict[str, Any]:
 def _workflow_status_once(store: WorkflowStore, workflow_id: str) -> dict[str, Any]:
     result = store.get(workflow_id)
     return {"workflow_id": workflow_id, "state": result["state"], "step_count": len(result["steps"])}
+
+
+def _workflow_store_reopen_once(database: Path) -> dict[str, Any]:
+    store = WorkflowStore(database)
+    health = store.health_summary()
+    return {
+        "workflow_total": health["workflow_total"],
+        "operation_total": health["operation_total"],
+        "event_total": health["event_total"],
+        "workflow_db_bytes": health["workflow_db_bytes"],
+    }
 
 
 def _workflow_queue_once(store: WorkflowStore) -> dict[str, Any]:
@@ -998,19 +1011,45 @@ def _job_wait_seed(store: JobStore) -> str:
 def _job_wait_change_once(store: JobStore, waiters: int = 1) -> dict[str, Any]:
     job_id = _job_wait_seed(store)
     barrier = threading.Barrier(waiters + 1)
+    original_connect = store.connect
+    counter_lock = threading.Lock()
+    wait_selects = 0
+
+    def traced_connect() -> sqlite3.Connection:
+        connection = original_connect()
+
+        def trace(statement: str) -> None:
+            nonlocal wait_selects
+            if (
+                threading.current_thread() is not threading.main_thread()
+                and statement.lstrip().upper().startswith("SELECT")
+                and " FROM JOBS WHERE ID=" in statement.upper()
+            ):
+                with counter_lock:
+                    wait_selects += 1
+
+        connection.set_trace_callback(trace)
+        return connection
+
+    store.connect = traced_connect  # type: ignore[method-assign]
 
     def wait_one() -> dict[str, Any]:
         barrier.wait(timeout=5)
         return store.wait(job_id, after_version=1, timeout=5)
 
-    with ThreadPoolExecutor(max_workers=waiters) as pool:
-        futures = [pool.submit(wait_one) for _ in range(waiters)]
-        barrier.wait(timeout=5)
-        time.sleep(0.1)
-        changed_at = time.perf_counter()
-        store.update(job_id, status="succeeded", exit_code=0)
-        results = [future.result(timeout=5) for future in futures]
-        wake_latency_ms = (time.perf_counter() - changed_at) * 1_000
+    started = time.perf_counter()
+    try:
+        with ThreadPoolExecutor(max_workers=waiters) as pool:
+            futures = [pool.submit(wait_one) for _ in range(waiters)]
+            barrier.wait(timeout=5)
+            time.sleep(0.1)
+            changed_at = time.perf_counter()
+            store.update(job_id, status="succeeded", exit_code=0)
+            results = [future.result(timeout=5) for future in futures]
+            wake_latency_ms = (time.perf_counter() - changed_at) * 1_000
+    finally:
+        store.connect = original_connect  # type: ignore[method-assign]
+    wait_window_sec = max(time.perf_counter() - started, 0.001)
     if not all(result["changed"] and not result["timed_out"] for result in results):
         raise RuntimeError("job_wait failed to observe the authoritative version change.")
     return {
@@ -1018,6 +1057,9 @@ def _job_wait_change_once(store: JobStore, waiters: int = 1) -> dict[str, Any]:
         "update_delay_ms": 100.0,
         "wake_latency_ms": round(wake_latency_ms, 3),
         "observed_version": int(results[0]["version"]),
+        "wait_selects": wait_selects,
+        "wait_window_ms": round(wait_window_sec * 1_000, 3),
+        "db_queries_per_minute": round(wait_selects / wait_window_sec * 60, 3),
     }
 
 
@@ -1603,6 +1645,11 @@ def run_benchmarks(
             results.append(measure(
                 "workflow_status_10000_history",
                 partial(_workflow_status_once, workflow_store_bench, status_target),
+                runs,
+            ))
+            results.append(measure(
+                "workflow_store_reopen_10000_history",
+                partial(_workflow_store_reopen_once, workflow_store_bench.path),
                 runs,
             ))
             results.append(measure(

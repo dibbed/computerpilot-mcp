@@ -31,7 +31,7 @@ def test_executor_renews_lease_while_action_is_running(tmp_path: Path, monkeypat
 
     def slow_action(arguments: dict[str, object], timeout: float) -> dict[str, object]:
         del arguments, timeout
-        time.sleep(2.0)
+        time.sleep(6.0)
         return {"ok": True}
 
     monkeypatch.setattr(store, "renew_lease", tracked_renew)
