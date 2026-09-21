@@ -26,6 +26,13 @@ def close_logger(supervisor: Supervisor) -> None:
         supervisor.logger.removeHandler(handler)
 
 
+def _file_text_is(path: Path, expected: str) -> bool:
+    try:
+        return path.is_file() and path.read_text(encoding="utf-8") == expected
+    except (OSError, UnicodeError):
+        return False
+
+
 def test_restart_backoff() -> None:
     assert [restart_delay(i) for i in range(1, 7)] == [5, 10, 30, 60, 60, 60]
 
@@ -123,8 +130,16 @@ def test_cleanup_fallback_releases_runtime_port(tmp_path: Path, monkeypatch: pyt
         supervisor.cleanup(process)
         assert process.poll() is not None
 
-        with socket.socket() as rebound:
-            rebound.bind(("127.0.0.1", port))
+        bind_deadline = time.monotonic() + 5
+        while True:
+            try:
+                with socket.socket() as rebound:
+                    rebound.bind(("127.0.0.1", port))
+                break
+            except OSError:
+                if time.monotonic() >= bind_deadline:
+                    raise
+                time.sleep(0.05)
     finally:
         if process.poll() is None:
             process.kill()
@@ -290,7 +305,7 @@ def test_runtime_restart_preserves_durable_job(tmp_path: Path) -> None:
             if state["state"] == "running" and not requested:
                 supervisor.restart.set()
                 requested = True
-            if state["state"] == "running" and state["restart_count"] == 1 and output.exists():
+            if state["state"] == "running" and state["restart_count"] == 1 and _file_text_is(output, "once"):
                 break
             time.sleep(0.05)
         else:
@@ -330,7 +345,7 @@ def test_consecutive_runtime_restarts_preserve_one_durable_job(tmp_path: Path) -
             if state["state"] == "running" and state["restart_count"] == requested_restarts and requested_restarts < 2:
                 supervisor.restart.set()
                 requested_restarts += 1
-            if state["state"] == "running" and state["restart_count"] == 2 and output.exists():
+            if state["state"] == "running" and state["restart_count"] == 2 and _file_text_is(output, "once"):
                 break
             time.sleep(0.05)
         else:

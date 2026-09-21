@@ -1,6 +1,6 @@
 [tool.pytest.ini_options]
 addopts = "-q --basetemp=.pytest-tmp"
-cache_dir = ".agent_state/pytest-cache"
+cache_dir = ".pytest_cache"
 testpaths = ["tests"]
 
 [tool.ruff]
