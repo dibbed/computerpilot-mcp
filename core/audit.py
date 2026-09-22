@@ -61,11 +61,10 @@ def _interprocess_lock(path: Path) -> Iterator[None]:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f".{path.name}.lock")
-    with lock_path.open("a+b") as handle:
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b"\0")
-            handle.flush()
+    # Windows byte-range locks work on an empty file. Do not seed byte 0
+    # before taking the lock: concurrent first-openers can otherwise race,
+    # and one process may flush into byte 0 while another already owns it.
+    with lock_path.open("a+b", buffering=0) as handle:
         handle.seek(0)
         if os.name == "nt":
             import msvcrt
