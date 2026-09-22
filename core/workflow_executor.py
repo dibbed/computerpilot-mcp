@@ -212,6 +212,10 @@ class WorkflowExecutor:
                     )
                 attempts = int(operation["attempts"])
                 while True:
+                    if self.store.cancel_requested(workflow_id):
+                        return self._cancel_operation(
+                            workflow_id, index, operation["operation_id"], lease.lease_token,
+                        )
                     attempts += 1
                     try:
                         canonical_postcondition, intent_evidence = prepare_action_intent(
@@ -309,7 +313,16 @@ class WorkflowExecutor:
                             )
                         if attempts <= step.max_retries:
                             lease = self.store.renew_lease(workflow_id, lease.lease_token, lease_ttl_sec)
-                            time.sleep(min(2 ** (attempts - 1), 5))
+                            heartbeat = _LeaseHeartbeat(self.store, workflow_id, lease.lease_token, lease_ttl_sec)
+                            heartbeat.start()
+                            try:
+                                time.sleep(min(2 ** (attempts - 1), 5))
+                            finally:
+                                heartbeat.stop()
+                            try:
+                                heartbeat.ensure_current()
+                            except _LeaseLostDuringAction as lost:
+                                raise ToolError("workflow_lease_lost", str(lost)) from lost
                             continue
                         return self._fail(workflow_id, index, lease.lease_token, str(exc), uncertain=False)
                     except SideEffectUncertain as exc:

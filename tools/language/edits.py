@@ -30,8 +30,13 @@ def prepare_workspace_edit(
     root = root.resolve(strict=False)
     changes: dict[str, list[dict[str, Any]]] = {}
     raw_changes = workspace_edit.get("changes")
-    if isinstance(raw_changes, dict):
-        changes.update(raw_changes)
+    if raw_changes is not None:
+        if not isinstance(raw_changes, dict):
+            raise ToolError("lsp_edit_unsupported", "Workspace edit changes must be an object.")
+        for uri, raw_edits in raw_changes.items():
+            if not isinstance(uri, str) or not isinstance(raw_edits, list):
+                raise ToolError("lsp_edit_unsupported", "Workspace text edits must be lists keyed by URI.")
+            changes[uri] = list(raw_edits)
     document_changes = workspace_edit.get("documentChanges")
     if document_changes is not None:
         if not isinstance(document_changes, list):
@@ -44,9 +49,12 @@ def prepare_workspace_edit(
             changes.setdefault(document["uri"], []).extend(edits)
     if not changes:
         raise ToolError("lsp_edit_unsupported", "Workspace edit has no supported text edits.")
-    planned = []
+    files: dict[Path, list[dict[str, Any]]] = {}
     for uri, raw_edits in changes.items():
         path = uri_to_path(uri, root)
+        files.setdefault(path, []).extend(raw_edits)
+    planned = []
+    for path, raw_edits in files.items():
         before = path.read_bytes()
         text = before.decode("utf-8")
         relative = path.relative_to(root).as_posix()
@@ -60,10 +68,19 @@ def prepare_workspace_edit(
             raise ToolError("hash_conflict", f"Workspace edit precondition failed for {relative}.")
         edits = []
         for edit in raw_edits:
-            start = position_to_offset(text, edit["range"]["start"])
-            end = position_to_offset(text, edit["range"]["end"])
-            edits.append((start, end, str(edit["newText"])))
-        edits.sort(reverse=True)
+            if (
+                not isinstance(edit, dict)
+                or not isinstance(edit.get("range"), dict)
+                or not isinstance(edit.get("newText"), str)
+            ):
+                raise ToolError("lsp_edit_unsupported", "Workspace edit requires a range and string newText.")
+            start = position_to_offset(text, edit["range"].get("start"))
+            end = position_to_offset(text, edit["range"].get("end"))
+            if end < start:
+                raise ToolError("lsp_position_invalid", "Workspace edit range ends before it starts.")
+            edits.append((start, end, edit["newText"]))
+        # Reverse equal-position inserts too, so the final text preserves input order.
+        edits = list(reversed(sorted(edits, key=lambda item: (item[0], item[1]))))
         for index in range(len(edits) - 1):
             if edits[index + 1][1] > edits[index][0]:
                 raise ToolError("lsp_edit_overlap", f"Workspace edits overlap in {relative}.")

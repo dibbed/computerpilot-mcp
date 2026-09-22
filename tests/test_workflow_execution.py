@@ -60,6 +60,37 @@ def test_transient_retry_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert calls == 2
 
 
+def test_cancellation_during_retry_backoff_prevents_next_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db")
+    workflow = store.create(
+        WorkflowDefinition("retry-cancel", (StepDefinition("http", "check_http", {"url": "http://localhost"}, max_retries=1),)),
+        initial_state=WorkflowState.QUEUED,
+    )
+    workflow_id = workflow["workflow_id"]
+    calls = 0
+
+    def flaky(arguments: dict[str, object], timeout: float) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TransientActionError("temporary")
+        return {"ok": True}
+
+    def cancel_during_backoff(seconds: float) -> None:
+        current = store.get(workflow_id)
+        store.request_cancel(workflow_id, current["version"])
+
+    monkeypatch.setitem(ACTION_HANDLERS, "check_http", flaky)
+    monkeypatch.setattr("core.workflow_executor.time.sleep", cancel_during_backoff)
+    result = WorkflowExecutor(store).run(workflow_id)
+
+    assert result["state"] == "cancelled"
+    assert calls == 1
+    operation = store.list_operations(workflow_id)["items"][0]
+    assert operation["state"] == "cancelled"
+    assert operation["attempts"] == 1
+
+
 def test_uncertain_side_effect_is_never_advanced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def uncertain(arguments, timeout):  # type: ignore[no-untyped-def]
         raise SideEffectUncertain("unknown result")

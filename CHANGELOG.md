@@ -6,6 +6,16 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Fixed - 2026-09-22
+- Keep durable workflow jobs on the public JobStore contract end to end: submit, wait, cancellation, persisted external refs, result storage, deduplication, and request-key reconciliation now consistently use `job_id`.
+- Preserve full-row job metadata such as output encoding when active rows are reconciled, while still letting authoritative concurrent terminal status win.
+- Compare HTTP workflow checks against the received status, including expected 4xx and 5xx responses, instead of treating HTTP responses as network failures.
+- Make HTTP reconciliation body hashing bounded: oversized bodies cannot falsely prove a SHA-256 postcondition, while status-only checks remain conclusive.
+- Reconcile staged Git paths using NUL-delimited raw path output so Unicode filenames are compared literally instead of against Git's quoted representation.
+- Validate and merge LSP workspace edits by canonical file path, preserve same-position insertion order, reject malformed/reversed/overlapping edits, and handle UTF-16 positions across empty/trailing lines, CRLF, surrogate pairs, and non-LSP Unicode line separators.
+- Honor workflow cancellation received during retry backoff before starting another attempt.
+- Keep workflow leases alive during retry backoff so short leases do not expire between attempts.
+
 ## [0.2.5] - 2026-09-20
 
 ### Workflow correctness and durability

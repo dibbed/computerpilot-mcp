@@ -216,7 +216,7 @@ def _job_request_key_state(expected: dict[str, Any]) -> Evidence:
                 "conclusive": False,
                 "satisfied": False,
                 "request_key": request_key,
-                "job_id": job["id"],
+                "job_id": job["job_id"],
                 "status": status,
             },
         )
@@ -226,7 +226,7 @@ def _job_request_key_state(expected: dict[str, Any]) -> Evidence:
             "conclusive": True,
             "satisfied": status == wanted,
             "request_key": request_key,
-            "job_id": job["id"],
+            "job_id": job["job_id"],
             "status": status,
         },
     )
@@ -294,16 +294,20 @@ def _git_index_contains(expected: dict[str, Any]) -> Evidence:
     if not isinstance(paths, list) or not all(isinstance(item, str) for item in paths):
         raise ToolError("invalid_postcondition", "git_index_contains requires a paths list.")
     completed = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+        ["git", "-C", str(repo), "-c", "core.quotepath=false", "diff", "--cached", "--name-only", "-z", "--"],
         capture_output=True,
-        text=True,
+        text=False,
         timeout=10,
         check=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if completed.returncode:
         return Evidence("git", {"conclusive": False, "satisfied": False, "reason": "git_index_unavailable"})
-    staged = set(completed.stdout.splitlines())
+    staged = {
+        item.decode("utf-8", errors="surrogateescape")
+        for item in completed.stdout.split(b"\0")
+        if item
+    }
     return Evidence("git", {"conclusive": True, "satisfied": set(paths) <= staged, "staged_paths": sorted(staged)})
 
 
@@ -320,16 +324,46 @@ def _job_state(expected: dict[str, Any]) -> Evidence:
 def _http_response(expected: dict[str, Any]) -> Evidence:
     url = _required_string(expected, "url")
     wanted_status = int(expected.get("status", 200))
+    body_limit = 1_048_576
     try:
         with urllib.request.urlopen(url, timeout=float(expected.get("timeout_sec", 10))) as response:
-            body = response.read(1_048_577)
+            body = response.read(body_limit + 1)
             status = int(response.status)
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read(body_limit + 1)
+            status = int(exc.code)
+        finally:
+            exc.close()
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return Evidence("http", {"conclusive": False, "satisfied": False, "reason": type(exc).__name__})
+
     wanted_hash = expected.get("sha256")
-    actual_hash = hashlib.sha256(body).hexdigest()
-    satisfied = status == wanted_status and (wanted_hash is None or actual_hash == wanted_hash)
-    return Evidence("http", {"conclusive": True, "satisfied": satisfied, "status": status, "sha256": actual_hash})
+    truncated = len(body) > body_limit
+    if truncated:
+        data: dict[str, Any] = {
+            "conclusive": wanted_hash is None,
+            "satisfied": wanted_hash is None and status == wanted_status,
+            "status": status,
+            "sha256": None,
+            "body_truncated": True,
+        }
+        if wanted_hash is not None:
+            data["reason"] = "response_body_exceeded_hash_limit"
+        return Evidence("http", data)
+
+    actual_hash = hashlib.sha256(body).hexdigest() if wanted_hash is not None else None
+    satisfied = status == wanted_status and (wanted_hash is None or actual_hash == str(wanted_hash).casefold())
+    return Evidence(
+        "http",
+        {
+            "conclusive": True,
+            "satisfied": satisfied,
+            "status": status,
+            "sha256": actual_hash,
+            "body_truncated": False,
+        },
+    )
 
 
 def _semantic_runtime_unavailable(expected: dict[str, Any]) -> Evidence:

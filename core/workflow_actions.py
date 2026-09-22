@@ -250,7 +250,7 @@ def _run_durable_job(
         idempotency_key,
         str(arguments.get("encoding", "utf-8")),
     )
-    job_id = str(job["id"])
+    job_id = str(job["job_id"])
     if context is not None:
         context.persist_external_ref({"job_id": job_id, "request_key": idempotency_key})
     deadline = time.monotonic() + timeout_sec
@@ -262,7 +262,7 @@ def _run_durable_job(
                 raise ActionCancelled("Durable job was cancelled with its workflow.")
             if status["status"] != "succeeded":
                 raise ToolError("workflow_job_failed", f"Durable job ended as {status['status']}.")
-            return {"job_id": status["id"], "status": status["status"], "exit_code": status.get("exit_code")}
+            return {"job_id": status["job_id"], "status": status["status"], "exit_code": status.get("exit_code")}
         if context is not None and context.is_cancel_requested():
             status = store.cancel(job_id)
             if status["status"] == "cancelled":
@@ -299,6 +299,9 @@ def _check_http(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]
     try:
         with urllib.request.urlopen(request, timeout=timeout_sec) as response:
             status = int(response.status)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        exc.close()
     except (urllib.error.URLError, TimeoutError) as exc:
         raise TransientActionError(str(exc)) from exc
     if status != expected:

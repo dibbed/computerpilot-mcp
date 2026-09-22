@@ -112,3 +112,54 @@ def test_output_reads_metadata_once(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(store, "raw", counted)
     assert store.output("0" * 32)["stdout"]["text"] == "complete"
     assert reads == ["0" * 32]
+
+
+@pytest.mark.parametrize(
+    "status,child_alive,expected",
+    [("running", False, "interrupted"), ("running", True, "orphaned"),
+     ("orphaned", False, "interrupted"), ("queued", False, "timed_out")],
+)
+def test_output_preserves_encoding_during_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, child_alive: bool, expected: str,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    seed(store, 1, status)
+    job_id = "0" * 32
+    with closing(store.connect()) as db, db:
+        db.execute("UPDATE jobs SET spec=?,pid=123,pid_created=1,queue_deadline=0 WHERE id=?",
+                   (json.dumps({"encoding": "utf-16-le"}), job_id))
+    directory = store.output_dir / job_id
+    directory.mkdir()
+    (directory / "stdout.bin").write_bytes("سلام".encode("utf-16-le"))
+    (directory / "stderr.bin").write_bytes("خطا".encode("utf-16-le"))
+    monkeypatch.setattr(jobs, "same_process", lambda pid, created: child_alive and pid == 123)
+
+    result = store.output(job_id)
+
+    assert result["status"] == expected
+    assert result["stdout"]["text"] == "سلام"
+    assert result["stderr"]["text"] == "خطا"
+    assert result["version"] == store.raw(job_id)["version"] == 2
+
+
+def test_output_reconciliation_keeps_concurrent_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    seed(store, 1, "running")
+    job_id = "0" * 32
+    directory = store.output_dir / job_id
+    directory.mkdir()
+    (directory / "stdout.bin").write_bytes(b"done")
+    (directory / "stderr.bin").touch()
+
+    def completed(pid: int | None, created: float | None) -> bool:
+        store.update(job_id, status="succeeded", exit_code=0)
+        return False
+
+    monkeypatch.setattr(jobs, "same_process", completed)
+    result = store.output(job_id)
+    assert result["status"] == "succeeded"
+    assert result["exit_code"] == 0
+    assert result["version"] == store.raw(job_id)["version"]
+    assert result["stdout"]["text"] == "done"

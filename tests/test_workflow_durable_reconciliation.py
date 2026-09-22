@@ -247,7 +247,7 @@ def test_lost_durable_job_result_reconciles_by_request_key(
         def get_by_request_key(self, key: str) -> dict[str, Any]:
             assert key == request_key
             return {
-                "id": "a" * 32,
+                "job_id": "a" * 32,
                 "status": "succeeded",
                 "version": 3,
                 "exit_code": 0,

@@ -21,20 +21,37 @@ _MAX_STDERR_BYTES = 64 * 1024
 
 
 def position_to_offset(text: str, position: dict[str, int]) -> int:
-    lines = text.splitlines(keepends=True)
-    line = position["line"]
-    if line < 0 or line >= len(lines):
+    line = position.get("line")
+    target = position.get("character")
+    if not isinstance(line, int) or not isinstance(target, int) or line < 0 or target < 0:
+        raise ToolError("lsp_position_invalid", "LSP line and character must be non-negative integers.")
+
+    # LSP line boundaries are LF or CRLF. Python str.splitlines() is broader
+    # (for example it treats U+2028 as a line break), which would corrupt LSP
+    # positions. Keep an explicit table of line content ranges instead.
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    index = 0
+    while index < len(text):
+        if text[index] == "\n":
+            end = index - 1 if index > start and text[index - 1] == "\r" else index
+            ranges.append((start, end))
+            start = index + 1
+        index += 1
+    ranges.append((start, len(text)))
+
+    if line >= len(ranges):
         raise ToolError("lsp_position_invalid", "LSP line is outside the document.")
-    target = position["character"]
+    start, end = ranges[line]
     units = 0
-    for index, character in enumerate(lines[line]):
-        if units >= target:
-            return sum(len(item) for item in lines[:line]) + index
-        units += len(character.encode("utf-16-le")) // 2
+    for offset in range(start, end):
+        if units == target:
+            return offset
+        units += len(text[offset].encode("utf-16-le")) // 2
         if units > target:
             raise ToolError("lsp_position_invalid", "LSP position splits a UTF-16 surrogate pair.")
     if units == target:
-        return sum(len(item) for item in lines[: line + 1])
+        return end
     raise ToolError("lsp_position_invalid", "LSP character is outside the line.")
 
 

@@ -160,12 +160,12 @@ def test_durable_job_handler_requests_underlying_job_cancellation(monkeypatch: p
 
         def submit(self, command: list[str], cwd: Path, timeout: float, request_key: str, encoding: str) -> dict[str, Any]:
             del command, cwd, timeout, request_key, encoding
-            return {"id": "a" * 32, "status": "running", "version": 1, "exit_code": None}
+            return {"job_id": "a" * 32, "status": "running", "version": 1, "exit_code": None}
 
         def get(self, job_id: str) -> dict[str, Any]:
             del job_id
             return {
-                "id": "a" * 32,
+                "job_id": "a" * 32,
                 "status": "cancelled" if self.cancelled else "running",
                 "version": 2 if self.cancelled else 1,
                 "exit_code": None,

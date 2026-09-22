@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from core.errors import ToolError
-from core.workflow_actions import ACTION_HANDLERS
+from core.workflow_actions import ACTION_HANDLERS, TransientActionError
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
@@ -45,6 +45,32 @@ def test_executor_renews_lease_while_action_is_running(tmp_path: Path, monkeypat
 
     assert result["state"] == "completed"
     assert renewals >= 1
+
+
+def test_retry_backoff_does_not_expire_short_lease(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db")
+    workflow = store.create(
+        WorkflowDefinition(
+            "retry-lease",
+            (StepDefinition("http", "check_http", {"url": "http://localhost"}, max_retries=4),),
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+    calls = 0
+
+    def flaky(arguments: dict[str, object], timeout: float) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls <= 4:
+            raise TransientActionError("temporary network failure")
+        return {"ok": True}
+
+    monkeypatch.setitem(ACTION_HANDLERS, "check_http", flaky)
+    result = WorkflowExecutor(store).execute(workflow["workflow_id"], owner_id="retry-owner", lease_ttl_sec=5)
+
+    assert result["state"] == "completed"
+    assert calls == 5
+    assert result["steps"][0]["attempts"] == 5
 
 
 def test_stale_release_does_not_delete_replacement_lease(tmp_path: Path) -> None:

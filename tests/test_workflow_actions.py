@@ -1,11 +1,39 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 
 import pytest
 
 from core.errors import ToolError
-from core.workflow_actions import ACTION_DESCRIPTORS, get_action_descriptor, validate_operation
+from core.workflow_actions import ACTION_DESCRIPTORS, execute_action, get_action_descriptor, validate_operation
+
+
+@pytest.mark.parametrize("status,expected", [(200, 200), (404, 404), (503, 503), (404, 200)])
+def test_http_check_compares_actual_response_status(status: int, expected: int) -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(status)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    with HTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}/"
+        try:
+            if status == expected:
+                assert execute_action("check_http", {"url": url, "status": expected}, 5)["status"] == status
+            else:
+                with pytest.raises(ToolError) as raised:
+                    execute_action("check_http", {"url": url, "status": expected}, 5)
+                assert raised.value.code == "workflow_http_check_failed"
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
 
 
 def test_descriptor_rejects_unknown_action() -> None:

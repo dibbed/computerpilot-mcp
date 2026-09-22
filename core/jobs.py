@@ -255,7 +255,9 @@ class JobStore:
                     refreshed.update({row["id"]: dict(row) for row in connection.execute(
                         f"SELECT {JOB_STATUS_COLUMNS} FROM jobs WHERE id IN ({placeholders})", batch,
                     )})
-            return [refreshed.get(row["id"], row) for row in rows]
+            # Keep metadata supplied by full-row callers (notably output's
+            # encoding spec), while authoritative status wins after races.
+            return [{**row, **refreshed.get(row["id"], {})} for row in rows]
 
         if db is not None:
             return apply(db)
