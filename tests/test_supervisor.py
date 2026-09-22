@@ -276,9 +276,11 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
             html = response.read().decode()
         token = re.search(r"const token='([^']+)'", html)
         assert token
-        assert "کنترل‌پنل Windows Agent MCP" in html
-        assert "رویدادهای اخیر" in html
-        assert "خطاهای Runtime" in html
+        assert '<html lang="en" dir="ltr">' in html
+        assert "Windows Agent MCP Control Panel" in html
+        assert "Recent Events" in html
+        assert "Runtime Errors" in html
+        assert re.search(r"[\u0600-\u06FF]", html) is None
         with urllib.request.urlopen(base + "/api/status") as response:
             status = json.load(response)
         assert status["state"] == "starting"
