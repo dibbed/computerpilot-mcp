@@ -40,6 +40,9 @@ LAUNCH_RESERVATION_STALE_SEC = 10.0
 ACTIVE_JOB_STATUSES = ("running", "orphaned")
 ClaimResult = Literal["claimed", "wait", "terminal"]
 MAX_JOB_WAIT_SEC = 300.0
+JOB_WAIT_HEARTBEAT_SEC = 5.0
+JOB_PROGRESS_CHUNK_BYTES = 16 * 1024
+MAX_JOB_PROGRESS_CHUNK_BYTES = 64 * 1024
 
 
 def _job_wait_poll_interval(elapsed: float) -> float:
@@ -484,6 +487,95 @@ class JobStore:
         if row is None:
             raise ToolError("job_request_key_not_found", "No retained job exists for this request key.")
         return self._public(self._reconcile([dict(row)])[0])
+
+    @staticmethod
+    def _progress_chunk(
+        path: Path,
+        *,
+        encoding: str,
+        offset: int,
+        max_bytes: int,
+        final: bool,
+    ) -> dict[str, Any]:
+        try:
+            source = path.open("rb")
+        except FileNotFoundError:
+            if offset:
+                raise ValueError("output cursor is non-zero but the output stream does not exist.") from None
+            return {
+                "text": "",
+                "bytes": 0,
+                "total_bytes": 0,
+                "since_byte": 0,
+                "next_byte": 0,
+                "has_more": False,
+                "final": final,
+                "encoding": encoding,
+                "missing": True,
+            }
+        with source:
+            total = source.seek(0, 2)
+            if offset < 0 or offset > total:
+                raise ValueError(f"output cursor must be between 0 and {total}.")
+            source.seek(offset)
+            payload = source.read(min(max_bytes, total - offset))
+        decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+        text = decoder.decode(payload, final=final and offset + len(payload) == total)
+        pending = decoder.getstate()[0]
+        consumed = len(payload) - len(pending)
+        next_byte = offset + consumed
+        return {
+            "text": text,
+            "bytes": consumed,
+            "total_bytes": total,
+            "since_byte": offset,
+            "next_byte": next_byte,
+            "has_more": next_byte < total,
+            "final": final,
+            "encoding": encoding,
+            "missing": False,
+        }
+
+    def progress(
+        self,
+        job_id: str,
+        *,
+        stdout_since_byte: int = 0,
+        stderr_since_byte: int = 0,
+        max_bytes: int = JOB_PROGRESS_CHUNK_BYTES,
+    ) -> dict[str, Any]:
+        """Return bounded incremental stdout/stderr chunks and resumable byte cursors."""
+
+        if stdout_since_byte < 0 or stderr_since_byte < 0:
+            raise ValueError("output cursors must be non-negative.")
+        if max_bytes < 16 or max_bytes > MAX_JOB_PROGRESS_CHUNK_BYTES:
+            raise ValueError(
+                f"max_bytes must be between 16 and {MAX_JOB_PROGRESS_CHUNK_BYTES}."
+            )
+        directory = self.output_dir / job_id
+        stdout = directory / "stdout.bin"
+        stderr = directory / "stderr.bin"
+        with RESOURCE_LOCKS.sync(stdout, stderr):
+            raw = self._reconcile([self.raw(job_id)])[0]
+            encoding = str(json.loads(raw["spec"])["encoding"])
+            status = str(raw["status"])
+            final = status not in {"queued", "running", "orphaned"}
+            return {
+                "stdout": self._progress_chunk(
+                    stdout,
+                    encoding=encoding,
+                    offset=stdout_since_byte,
+                    max_bytes=max_bytes,
+                    final=final,
+                ),
+                "stderr": self._progress_chunk(
+                    stderr,
+                    encoding=encoding,
+                    offset=stderr_since_byte,
+                    max_bytes=max_bytes,
+                    final=final,
+                ),
+            }
 
     def wait(self, job_id: str, after_version: int, timeout: float) -> dict[str, Any]:
         """Long-poll one job until its authoritative version advances or timeout expires."""

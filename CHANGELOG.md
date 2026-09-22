@@ -10,6 +10,7 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Redesign the loopback control panel at `http://127.0.0.1:8766/` with a responsive dashboard for Supervisor/runtime start times and uptime, lifecycle/drain state, process RAM/start times, job status totals, state-storage breakdown, structured event filtering/search, dedicated error history, and raw logs.
 - Extend the panel status API with structured recent events/errors, event/error counters, runtime generation and timing metadata, process memory/start metadata, job status counts, and cached storage-category totals.
 - Standardize the local control panel on an English-only, left-to-right interface, including labels, status text, filters, confirmations, empty states, dates, numbers, and runtime messages.
+- Make long-running durable jobs observable without long silent waits: `job_wait` now returns a default 5-second heartbeat plus bounded incremental stdout/stderr chunks and resumable byte cursors while preserving explicit short-timeout semantics.
 
 ### Fixed - 2026-09-22
 - Keep durable workflow jobs on the public JobStore contract end to end: submit, wait, cancellation, persisted external refs, result storage, deduplication, and request-key reconciliation now consistently use `job_id`.

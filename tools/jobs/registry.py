@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
@@ -11,7 +12,7 @@ from core.artifacts import default_delivery
 from core.audit import audit_action
 from core.config import resolve_path
 from core.job_scheduler import ensure_job_scheduler
-from core.jobs import MAX_JOB_WAIT_SEC, JobStore
+from core.jobs import JOB_PROGRESS_CHUNK_BYTES, JOB_WAIT_HEARTBEAT_SEC, MAX_JOB_PROGRESS_CHUNK_BYTES, MAX_JOB_WAIT_SEC, JobStore
 from core.tooling import DESTRUCTIVE, OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 
 JobId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
@@ -56,9 +57,49 @@ def register(mcp: MCPServer) -> None:
         job_id: JobId,
         after_version: Annotated[int, Field(ge=0)],
         timeout: Annotated[float, Field(ge=0, le=MAX_JOB_WAIT_SEC)] = 30,
+        heartbeat_sec: Annotated[float, Field(gt=0, le=30)] = JOB_WAIT_HEARTBEAT_SEC,
+        stdout_since_byte: Annotated[int, Field(ge=0)] = 0,
+        stderr_since_byte: Annotated[int, Field(ge=0)] = 0,
+        progress_bytes: Annotated[int, Field(ge=16, le=MAX_JOB_PROGRESS_CHUNK_BYTES)] = JOB_PROGRESS_CHUNK_BYTES,
     ) -> dict[str, Any]:
-        """Wait for a durable job version to advance; return unchanged state when the bounded timeout expires."""
-        return store.wait(job_id, after_version, timeout)
+        """Wait for job state with bounded silence, plus incremental stdout/stderr progress and resumable cursors."""
+        started = time.monotonic()
+        state = store.wait(job_id, after_version, 0)
+        progress = store.progress(
+            job_id,
+            stdout_since_byte=stdout_since_byte,
+            stderr_since_byte=stderr_since_byte,
+            max_bytes=progress_bytes,
+        )
+        progressed = (
+            int(progress["stdout"]["bytes"]) > 0
+            or int(progress["stderr"]["bytes"]) > 0
+        )
+        heartbeat = False
+        if not state["changed"] and not progressed and timeout > 0:
+            effective_timeout = min(timeout, heartbeat_sec)
+            state = store.wait(job_id, after_version, effective_timeout)
+            progress = store.progress(
+                job_id,
+                stdout_since_byte=stdout_since_byte,
+                stderr_since_byte=stderr_since_byte,
+                max_bytes=progress_bytes,
+            )
+            progressed = (
+                int(progress["stdout"]["bytes"]) > 0
+                or int(progress["stderr"]["bytes"]) > 0
+            )
+            heartbeat = bool(state["timed_out"] and timeout > effective_timeout and not progressed)
+
+        if state["timed_out"] and (heartbeat or progressed):
+            state = {**state, "timed_out": False}
+        return {
+            **state,
+            "heartbeat": heartbeat,
+            "progressed": progressed,
+            "waited_seconds": round(time.monotonic() - started, 3),
+            **progress,
+        }
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("list_jobs")

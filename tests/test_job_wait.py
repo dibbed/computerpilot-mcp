@@ -46,6 +46,49 @@ def _seed(
     return job_id
 
 
+def test_job_progress_returns_bounded_incremental_output(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id = _seed(store)
+    stdout = store.output_dir / job_id / "stdout.bin"
+    stderr = store.output_dir / job_id / "stderr.bin"
+    stdout.write_bytes(b"alpha\nbeta\ngamma\n")
+    stderr.write_bytes(b"warning\n")
+
+    first = store.progress(job_id, max_bytes=16)
+
+    assert first["stdout"]["text"] == "alpha\nbeta\ngamma"
+    assert first["stdout"]["next_byte"] == 16
+    assert first["stdout"]["has_more"] is True
+    assert first["stderr"]["text"] == "warning\n"
+    assert first["stderr"]["has_more"] is False
+
+    second = store.progress(
+        job_id,
+        stdout_since_byte=first["stdout"]["next_byte"],
+        stderr_since_byte=first["stderr"]["next_byte"],
+        max_bytes=16,
+    )
+    assert second["stdout"]["text"] == "\n"
+    assert second["stdout"]["has_more"] is False
+    assert second["stderr"]["text"] == ""
+
+
+def test_job_progress_missing_streams_return_empty_progress(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id = _seed(store)
+    (store.output_dir / job_id / "stdout.bin").unlink()
+    (store.output_dir / job_id / "stderr.bin").unlink()
+
+    progress = store.progress(job_id)
+
+    assert progress["stdout"]["missing"] is True
+    assert progress["stdout"]["text"] == ""
+    assert progress["stdout"]["next_byte"] == 0
+    assert progress["stderr"]["missing"] is True
+    with pytest.raises(ValueError, match="non-zero"):
+        store.progress(job_id, stdout_since_byte=1)
+
+
 def test_job_wait_returns_immediately_when_version_already_advanced(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
     job_id = _seed(store, version=4)
@@ -177,6 +220,116 @@ def test_job_wait_poll_interval_is_adaptive_and_bounded() -> None:
     assert _job_wait_poll_interval(1) == 0.1
     assert _job_wait_poll_interval(5) == 0.25
     assert _job_wait_poll_interval(30) == 0.5
+
+
+def test_mcp_job_wait_returns_existing_output_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id = _seed(store)
+    (store.output_dir / job_id / "stdout.bin").write_bytes(b"collecting 42 items\n")
+    monkeypatch.setattr(registry, "JobStore", lambda: store)
+    monkeypatch.setattr(registry, "ensure_job_scheduler", lambda _: None)
+
+    async def scenario() -> None:
+        server = MCPServer("jobs-progress")
+        registry.register(server)
+        async with Client(server) as client:
+            started = time.monotonic()
+            response = await client.call_tool(
+                "job_wait",
+                {
+                    "job_id": job_id,
+                    "after_version": 1,
+                    "timeout": 2,
+                    "heartbeat_sec": 0.08,
+                    "stdout_since_byte": 0,
+                    "stderr_since_byte": 0,
+                    "progress_bytes": 1024,
+                },
+            )
+            elapsed = time.monotonic() - started
+
+        assert response.structured_content
+        result = response.structured_content
+        assert elapsed < 0.5
+        assert result["changed"] is False
+        assert result["timed_out"] is False
+        assert result["heartbeat"] is False
+        assert result["progressed"] is True
+        assert result["stdout"]["text"] == "collecting 42 items\n"
+        assert result["stdout"]["next_byte"] == len(b"collecting 42 items\n")
+        assert result["stderr"]["text"] == ""
+        assert result["waited_seconds"] < 0.5
+
+    asyncio.run(scenario())
+
+
+def test_mcp_job_wait_returns_heartbeat_when_no_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id = _seed(store)
+    monkeypatch.setattr(registry, "JobStore", lambda: store)
+    monkeypatch.setattr(registry, "ensure_job_scheduler", lambda _: None)
+
+    async def scenario() -> None:
+        server = MCPServer("jobs-heartbeat")
+        registry.register(server)
+        async with Client(server) as client:
+            started = time.monotonic()
+            response = await client.call_tool(
+                "job_wait",
+                {
+                    "job_id": job_id,
+                    "after_version": 1,
+                    "timeout": 2,
+                    "heartbeat_sec": 0.08,
+                },
+            )
+            elapsed = time.monotonic() - started
+
+        assert response.structured_content
+        result = response.structured_content
+        assert 0.05 <= elapsed < 0.8
+        assert result["changed"] is False
+        assert result["timed_out"] is False
+        assert result["heartbeat"] is True
+        assert result["progressed"] is False
+
+    asyncio.run(scenario())
+
+
+def test_mcp_job_wait_preserves_explicit_short_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id = _seed(store)
+    monkeypatch.setattr(registry, "JobStore", lambda: store)
+    monkeypatch.setattr(registry, "ensure_job_scheduler", lambda _: None)
+
+    async def scenario() -> None:
+        server = MCPServer("jobs-timeout")
+        registry.register(server)
+        async with Client(server) as client:
+            response = await client.call_tool(
+                "job_wait",
+                {
+                    "job_id": job_id,
+                    "after_version": 1,
+                    "timeout": 0.06,
+                    "heartbeat_sec": 1,
+                },
+            )
+
+        assert response.structured_content
+        result = response.structured_content
+        assert result["changed"] is False
+        assert result["timed_out"] is True
+        assert result["heartbeat"] is False
+        assert result["progressed"] is False
+
+    asyncio.run(scenario())
 
 
 def test_mcp_job_wait_does_not_block_state_update(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

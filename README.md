@@ -289,7 +289,7 @@ Durable jobs provide:
 - Cancellation.
 - Incremental output retrieval.
 - Monotonic job versions.
-- `job_wait` for bounded version-aware waiting.
+- `job_wait` for bounded version-aware waiting with a 5-second progress heartbeat, bounded incremental stdout/stderr chunks, and resumable byte cursors.
 
 Queued, running, and orphaned jobs are not removed by terminal-history retention. Durable-job `idempotency_key` values are execution identities, not credentials; callers must never place secrets in them.
 
