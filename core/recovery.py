@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,8 +21,45 @@ JOURNAL_SCHEMA_VERSION = 1
 COMPACT_AFTER_RECORDS = 4_096
 _MAX_LINE_BYTES = 32_768
 _MAX_TARGET_CHARS = 1_000
+_JOURNAL_LOCK_WAIT_SEC = 10.0
 
 RecordType = Literal["begin", "result", "uncertain", "reconciliation", "acknowledged"]
+
+
+@contextmanager
+def _interprocess_journal_lock(path: Path) -> Iterator[None]:
+    """Serialize journal append and compaction across runtime processes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+b", buffering=0) as handle:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            deadline = time.monotonic() + _JOURNAL_LOCK_WAIT_SEC
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Timed out locking recovery journal {path}.") from None
+                    time.sleep(0.01)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,19 +115,20 @@ class OperationRecoveryJournal:
         if len(payload) > _MAX_LINE_BYTES:
             raise ToolError("operation_journal_record_too_large", "Recovery journal metadata exceeded its bounded record size.")
         try:
-            with path.open("a+b", buffering=0) as handle:
-                handle.seek(0, os.SEEK_END)
-                size = handle.tell()
-                if size:
-                    handle.seek(-1, os.SEEK_END)
-                    if handle.read(1) != b"\n":
-                        handle.seek(0, os.SEEK_END)
-                        handle.write(b"\n")
-                handle.seek(0, os.SEEK_END)
-                handle.write(payload)
-                os.fsync(handle.fileno())
+            with _interprocess_journal_lock(path):
+                with path.open("a+b", buffering=0) as handle:
+                    handle.seek(0, os.SEEK_END)
+                    size = handle.tell()
+                    if size:
+                        handle.seek(-1, os.SEEK_END)
+                        if handle.read(1) != b"\n":
+                            handle.seek(0, os.SEEK_END)
+                            handle.write(b"\n")
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(payload)
+                    os.fsync(handle.fileno())
             self._record_count += 1
-        except OSError as exc:
+        except (OSError, TimeoutError) as exc:
             raise ToolError(
                 "operation_journal_unavailable",
                 "Could not durably update the operation recovery journal.",
@@ -168,35 +209,36 @@ class OperationRecoveryJournal:
         path = self._path
         if not self._enabled or path is None:
             return
-        records = self._load_locked()
         retained: list[dict[str, Any]] = []
-        for item in self._state(records).values():
-            begin = item.get("begin")
-            if begin is None or item.get("result") is not None:
-                continue
-            terminal = item.get("acknowledged") or item.get("reconciliation")
-            retained.append(begin)
-            uncertain = item.get("uncertain")
-            if uncertain is not None:
-                retained.append(uncertain)
-            if terminal is not None:
-                retained.append(terminal)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         try:
-            with temporary.open("wb", buffering=0) as handle:
-                for record in retained:
-                    payload = (
-                        json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
-                    ).encode("utf-8")
-                    if len(payload) > _MAX_LINE_BYTES:
-                        raise ToolError(
-                            "operation_journal_record_too_large",
-                            "Recovery journal metadata exceeded its bounded record size.",
-                        )
-                    handle.write(payload)
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        except OSError as exc:
+            with _interprocess_journal_lock(path):
+                records = self._load_locked()
+                for item in self._state(records).values():
+                    begin = item.get("begin")
+                    if begin is None or item.get("result") is not None:
+                        continue
+                    terminal = item.get("acknowledged") or item.get("reconciliation")
+                    retained.append(begin)
+                    uncertain = item.get("uncertain")
+                    if uncertain is not None:
+                        retained.append(uncertain)
+                    if terminal is not None:
+                        retained.append(terminal)
+                with temporary.open("wb", buffering=0) as handle:
+                    for record in retained:
+                        payload = (
+                            json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+                        ).encode("utf-8")
+                        if len(payload) > _MAX_LINE_BYTES:
+                            raise ToolError(
+                                "operation_journal_record_too_large",
+                                "Recovery journal metadata exceeded its bounded record size.",
+                            )
+                        handle.write(payload)
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+        except (OSError, TimeoutError) as exc:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:

@@ -23,6 +23,7 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Include workflow and workflow-operation IDs in generic recovery-journal mutation targets.
 - Keep operator acknowledgment evidence stable in the immediate response even when the append triggers recovery-journal compaction.
 - Remove first-open races in the Windows audit and project-memory interprocess locks: zero-length lock files are locked directly instead of seeding byte 0 before ownership is acquired.
+- Serialize recovery-journal append and compaction across processes so concurrent runtime maintenance cannot lose pending or uncertain operation records.
 
 ## [0.2.5] - 2026-09-20
 

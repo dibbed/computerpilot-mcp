@@ -191,6 +191,72 @@ def test_acknowledge_response_keeps_evidence_when_append_triggers_compaction(
     assert acknowledged == journal.inspect(first.operation_id)
 
 
+def test_cross_process_compaction_preserves_all_pending_operations(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    path = tmp_path / "operations.jsonl"
+    go = tmp_path / "go"
+    helper = tmp_path / "recovery_compaction_child.py"
+    helper.write_text(
+        "\n".join(
+            [
+                "import sys, time",
+                "from pathlib import Path",
+                f"sys.path.insert(0, {str(repo)!r})",
+                "import core.recovery as recovery",
+                "recovery.COMPACT_AFTER_RECORDS = 50",
+                "path = Path(sys.argv[1])",
+                "go = Path(sys.argv[2])",
+                "ready = Path(sys.argv[3])",
+                "worker = sys.argv[4]",
+                "journal = recovery.OperationRecoveryJournal()",
+                "journal.configure(path, 'runtime-shared')",
+                "ready.write_text('ready', encoding='utf-8')",
+                "deadline = time.monotonic() + 10",
+                "while not go.exists():",
+                "    if time.monotonic() >= deadline: raise SystemExit(3)",
+                "    time.sleep(0.002)",
+                "for index in range(100):",
+                "    journal.begin('write_file', f'{worker}-{index}')",
+                "print('ok')",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    processes: list[subprocess.Popen[str]] = []
+    for index in range(4):
+        ready = tmp_path / f"ready-{index}"
+        processes.append(
+            subprocess.Popen(
+                [sys.executable, str(helper), str(path), str(go), str(ready), str(index)],
+                cwd=repo,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        )
+    deadline = time.monotonic() + 10
+    while len(list(tmp_path.glob("ready-*"))) < len(processes) and time.monotonic() < deadline:
+        time.sleep(0.002)
+    assert len(list(tmp_path.glob("ready-*"))) == len(processes)
+    go.write_text("go", encoding="utf-8")
+
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=60)
+        assert process.returncode == 0, stderr
+        assert stdout.strip() == "ok"
+
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "runtime-shared")
+    summary = journal.summary()
+
+    assert summary["pending_count"] == 400
+    assert summary["uncertain_count"] == 0
+    records = _records(path)
+    assert len(records) == 400
+    assert all(record["type"] == "begin" for record in records)
+
+
 def test_compaction_failure_never_turns_durable_result_into_retryable_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
