@@ -37,6 +37,43 @@ def test_restart_backoff() -> None:
     assert [restart_delay(i) for i in range(1, 7)] == [5, 10, 30, 60, 60, 60]
 
 
+def test_supervisor_snapshot_exposes_timing_events_and_errors(tmp_path: Path) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    try:
+        started_at = supervisor.state_snapshot()["supervisor_started_at"]
+        supervisor.event("Runtime started pid=123 restart_count=0")
+        supervisor.event(json.dumps({
+            "level": "ERROR",
+            "component": "runtime",
+            "msg": "startup failed",
+            "error": "boom",
+        }))
+        runtime_started_at = time.time() - 3
+        supervisor.set_state(
+            state="running",
+            runtime_started_at=runtime_started_at,
+            last_runtime_started_at=runtime_started_at,
+            runtime_generation=1,
+        )
+
+        snapshot = supervisor.state_snapshot()
+
+        assert snapshot["supervisor_started_at"] == started_at
+        assert snapshot["supervisor_uptime_seconds"] >= 0
+        assert snapshot["runtime_uptime_seconds"] >= 3
+        assert snapshot["last_state_change_at"] >= started_at
+        assert snapshot["last_event_at"] is not None
+        assert snapshot["event_count"] == 2
+        assert snapshot["error_count"] == 1
+        assert len(snapshot["recent_events"]) == 2
+        assert snapshot["recent_events"][-1]["level"] == "ERROR"
+        assert snapshot["recent_events"][-1]["component"] == "runtime"
+        assert snapshot["recent_errors"][-1]["message"].endswith("startup failed | boom")
+        assert snapshot["last_error"].endswith("startup failed | boom")
+    finally:
+        close_logger(supervisor)
+
+
 def test_process_snapshot_tolerates_process_table_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
     supervisor.set_state(pid=12345)
@@ -57,7 +94,7 @@ def test_process_snapshot_tolerates_process_table_oserror(tmp_path: Path, monkey
     try:
         snapshot = supervisor.process_snapshot()
         assert snapshot == {
-            "active_processes": [{"pid": 12345, "name": "runtime.exe", "status": "running"}],
+            "active_processes": [{"pid": 12345, "name": "runtime.exe", "status": "running", "role": "runtime"}],
             "process_count": 1,
         }
         assert any("Process-tree inspection degraded" in line for line in supervisor.state_snapshot()["logs"])
@@ -239,8 +276,23 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
             html = response.read().decode()
         token = re.search(r"const token='([^']+)'", html)
         assert token
+        assert "کنترل‌پنل Windows Agent MCP" in html
+        assert "رویدادهای اخیر" in html
+        assert "خطاهای Runtime" in html
         with urllib.request.urlopen(base + "/api/status") as response:
-            assert json.load(response)["state"] == "starting"
+            status = json.load(response)
+        assert status["state"] == "starting"
+        assert status["supervisor_started_at"] > 0
+        assert status["supervisor_uptime_seconds"] >= 0
+        assert status["runtime_uptime_seconds"] is None
+        assert status["event_count"] == 0
+        assert status["error_count"] == 0
+        assert status["recent_events"] == []
+        assert status["recent_errors"] == []
+        assert status["jobs"]["counts"] == {}
+        assert status["jobs"]["active_count"] == 0
+        assert status["jobs"]["problem_count"] == 0
+        assert status["storage_bytes"]["total"] >= 0
         for origin, key in [("https://evil.example", token[1]), (base, "wrong")]:
             request = urllib.request.Request(base + "/api/restart", data=b"", headers={"Origin": origin, "X-Control-Token": key})
             with pytest.raises(urllib.error.HTTPError) as error:

@@ -6,6 +6,10 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Improved - 2026-09-22
+- Redesign the loopback control panel at `http://127.0.0.1:8766/` with a responsive dashboard for Supervisor/runtime start times and uptime, lifecycle/drain state, process RAM/start times, job status totals, state-storage breakdown, structured event filtering/search, dedicated error history, and raw logs.
+- Extend the panel status API with structured recent events/errors, event/error counters, runtime generation and timing metadata, process memory/start metadata, job status counts, and cached storage-category totals.
+
 ### Fixed - 2026-09-22
 - Keep durable workflow jobs on the public JobStore contract end to end: submit, wait, cancellation, persisted external refs, result storage, deduplication, and request-key reconciliation now consistently use `job_id`.
 - Preserve full-row job metadata such as output encoding when active rows are reconciled, while still letting authoritative concurrent terminal status win.

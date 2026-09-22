@@ -17,6 +17,7 @@ import urllib.request
 import uuid
 from collections import deque
 from collections.abc import Callable
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -99,6 +100,7 @@ class Supervisor:
         self.stop = threading.Event()
         self.restart = threading.Event()
         self.lock = threading.Lock()
+        started_at = time.time()
         self.state: dict[str, Any] = {
             "state": "starting",
             "restart_count": 0,
@@ -109,8 +111,23 @@ class Supervisor:
             "runtime_lifecycle": None,
             "active_mutations": 0,
             "last_drain_result": None,
+            "supervisor_started_at": started_at,
+            "runtime_started_at": None,
+            "last_runtime_started_at": None,
+            "last_runtime_stopped_at": None,
+            "last_state_change_at": started_at,
+            "last_event_at": None,
+            "last_exit_code": None,
+            "last_exit_reason": None,
+            "next_retry_seconds": None,
+            "failed_probes": 0,
+            "runtime_generation": 0,
         }
         self.logs: deque[str] = deque(maxlen=100)
+        self.events: deque[dict[str, Any]] = deque(maxlen=200)
+        self.errors: deque[dict[str, Any]] = deque(maxlen=50)
+        self.event_count = 0
+        self.error_count = 0
         self.logger = logging.getLogger(f"mcp.supervisor.{uuid.uuid4().hex}")
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
@@ -121,33 +138,79 @@ class Supervisor:
         self.secret = os.environ.get("CONTROL_PLANE_API_KEY", "").strip()
         self.owned: dict[int, psutil.Process] = {}
 
+    @staticmethod
+    def _plain_event_level(message: str) -> str:
+        lowered = message.casefold()
+        if any(marker in lowered for marker in ("launch failed", "fallback kill failed", "fatal", "traceback")):
+            return "ERROR"
+        if any(marker in lowered for marker in (
+            "unhealthy", "degraded", "access denied", "os error", "did not exit",
+            "timed out", "timeout", "could not", "unavailable",
+        )):
+            return "WARN"
+        return "INFO"
+
     def event(self, message: str) -> None:
         if self.secret:
             message = message.replace(self.secret, "[redacted]")
         self.logger.info(message)
         display = message
-        is_error = False
+        level = self._plain_event_level(message)
+        component = "supervisor"
         try:
             entry = json.loads(message)
             if isinstance(entry, dict) and "msg" in entry:
-                if entry.get("level") == "INFO" and entry["msg"] in {
+                raw_level = str(entry.get("level", "INFO")).upper()
+                level = "WARN" if raw_level == "WARNING" else raw_level
+                component = str(entry.get("component") or "runtime")
+                if level == "INFO" and entry["msg"] in {
                     "run", "provided", "invoking", "OnStart hook executing", "OnStart hook executed",
                 }:
                     return  # Keep framework wiring noise in the rotated file, not the panel.
-                display = f"{entry.get('level', 'INFO')} {entry.get('component', '')}: {entry['msg']}"
+                display = f"{level} {component}: {entry['msg']}"
                 if entry.get("error"):
                     display += f" | {entry['error']}"
-                is_error = entry.get("level") in {"ERROR", "FATAL"}
         except (ValueError, TypeError):
             pass
+
+        occurred_at = time.time()
+        event = {
+            "timestamp": occurred_at,
+            "level": level,
+            "component": component,
+            "message": display,
+        }
         with self.lock:
             self.logs.append(display)
-            if is_error:
+            self.events.append(event)
+            self.event_count += 1
+            self.state["last_event_at"] = occurred_at
+            if level in {"ERROR", "FATAL"}:
+                self.errors.append(event)
+                self.error_count += 1
                 self.state["last_error"] = display
 
     def state_snapshot(self) -> dict[str, Any]:
+        now = time.time()
         with self.lock:
-            return {**self.state, "logs": list(self.logs)}
+            snapshot = {
+                **self.state,
+                "logs": list(self.logs),
+                "recent_events": [dict(item) for item in self.events],
+                "recent_errors": [dict(item) for item in self.errors],
+                "event_count": self.event_count,
+                "error_count": self.error_count,
+                "server_time": now,
+            }
+        supervisor_started_at = snapshot.get("supervisor_started_at")
+        runtime_started_at = snapshot.get("runtime_started_at")
+        snapshot["supervisor_uptime_seconds"] = (
+            max(now - float(supervisor_started_at), 0.0) if supervisor_started_at else 0.0
+        )
+        snapshot["runtime_uptime_seconds"] = (
+            max(now - float(runtime_started_at), 0.0) if runtime_started_at else None
+        )
+        return snapshot
 
     def process_snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -161,10 +224,21 @@ class Supervisor:
                 except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
                     self.event(f"Process-tree inspection degraded for pid={pid}: {type(exc).__name__}: {exc}")
                     children = []
-                for process in [parent, *children]:
+                for index, process in enumerate([parent, *children]):
                     try:
-                        processes.append({"pid": process.pid, "name": process.name(), "status": process.status()})
-                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                        item: dict[str, Any] = {
+                            "pid": process.pid,
+                            "name": process.name(),
+                            "status": process.status(),
+                        }
+                        try:
+                            item["role"] = "runtime" if index == 0 else "child"
+                            item["memory_mb"] = round(process.memory_info().rss / 1_048_576, 1)
+                            item["created_at"] = process.create_time()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, AttributeError):
+                            pass
+                        processes.append(item)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, AttributeError):
                         pass
             except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
                 if not isinstance(exc, psutil.NoSuchProcess):
@@ -178,6 +252,9 @@ class Supervisor:
 
     def set_state(self, **values: Any) -> None:
         with self.lock:
+            next_state = values.get("state")
+            if next_state is not None and next_state != self.state.get("state"):
+                values.setdefault("last_state_change_at", time.time())
             self.state.update(values)
 
     def _runtime_lifecycle_paths(self) -> tuple[Path, Path]:
@@ -449,6 +526,7 @@ class Supervisor:
                     process = subprocess.Popen(self.command, cwd=PROJECT_ROOT, env=env,
                                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                                creationflags=_creation_flags())
+                    runtime_started_at = time.time()
                     self.set_state(
                         state="starting",
                         pid=process.pid,
@@ -456,6 +534,10 @@ class Supervisor:
                         next_retry_seconds=None,
                         runtime_lifecycle=None,
                         active_mutations=0,
+                        failed_probes=0,
+                        runtime_started_at=runtime_started_at,
+                        last_runtime_started_at=runtime_started_at,
+                        runtime_generation=attempts + 1,
                     )
                     self.event(f"Runtime started pid={process.pid} restart_count={attempts}")
                     for pipe in (process.stdout, process.stderr):
@@ -469,7 +551,7 @@ class Supervisor:
                             self.remember_children(process)
                             if self.healthy():
                                 missed = 0
-                                self.set_state(state="running")
+                                self.set_state(state="running", failed_probes=0)
                             elif time.monotonic() - started > self.grace:
                                 missed += 1
                                 self.set_state(state="unhealthy", failed_probes=missed)
@@ -504,7 +586,11 @@ class Supervisor:
                 finally:
                     if process is not None:
                         self.cleanup(process)
-                        self.set_state(last_exit_code=process.returncode)
+                        self.set_state(
+                            last_exit_code=process.returncode,
+                            last_runtime_stopped_at=time.time(),
+                            runtime_started_at=None,
+                        )
                         self.event(f"Runtime cleanup completed pid={process.pid} exit_code={process.returncode}")
                     control_path.unlink(missing_ok=True)
                     status_path.unlink(missing_ok=True)
@@ -541,17 +627,54 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
     cache = PanelStatusCache()
 
     def storage_bytes() -> dict[str, int]:
-        storage: dict[str, int] = {}
-        for name in ("jobs", "artifacts"):
-            total = 0
-            for path in (supervisor.state_dir / name).rglob("*"):
-                try:
-                    if path.is_file():
-                        total += path.stat().st_size
-                except (FileNotFoundError, PermissionError):
-                    continue  # Concurrent finalization or cleanup may remove a path.
-            storage[name] = total
+        storage = {
+            "jobs": 0,
+            "artifacts": 0,
+            "databases": 0,
+            "logs": 0,
+            "other": 0,
+            "total": 0,
+        }
+        for path in supervisor.state_dir.rglob("*"):
+            try:
+                if not path.is_file():
+                    continue
+                size = path.stat().st_size
+                relative = path.relative_to(supervisor.state_dir)
+            except (FileNotFoundError, PermissionError, OSError):
+                continue  # Concurrent finalization or cleanup may remove a path.
+            storage["total"] += size
+            top = relative.parts[0] if relative.parts else ""
+            name = path.name.casefold()
+            if top == "jobs":
+                storage["jobs"] += size
+            elif top == "artifacts":
+                storage["artifacts"] += size
+            elif (
+                name.endswith((".sqlite", ".sqlite3", ".db", ".sqlite-wal", ".sqlite-shm", ".sqlite3-wal", ".sqlite3-shm"))
+                or ".sqlite3-" in name
+                or ".db-" in name
+            ):
+                storage["databases"] += size
+            elif name.startswith(("supervisor.log", "audit")) or path.suffix.casefold() in {".log", ".jsonl"}:
+                storage["logs"] += size
+            else:
+                storage["other"] += size
         return storage
+
+    def job_snapshot() -> dict[str, Any]:
+        result = store.list(0, 20)
+        counts: dict[str, int] = {}
+        try:
+            with closing(store.connect()) as connection:
+                for row in connection.execute("SELECT status,COUNT(*) AS count FROM jobs GROUP BY status"):
+                    counts[str(row["status"])] = int(row["count"])
+        except (OSError, ValueError):
+            counts = {}
+        result["counts"] = counts
+        result["active_count"] = sum(counts.get(status, 0) for status in ("queued", "running", "orphaned"))
+        result["problem_count"] = sum(counts.get(status, 0) for status in ("failed", "timed_out", "interrupted"))
+        return result
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -582,9 +705,9 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
             elif self.path == "/api/status":
                 snapshot = supervisor.state_snapshot()
                 snapshot.update(cache.get("processes", PANEL_PROCESS_TTL_SEC, supervisor.process_snapshot))
-                snapshot["jobs"] = cache.get("jobs", PANEL_JOBS_TTL_SEC, lambda: store.list(0, 20))
+                snapshot["jobs"] = cache.get("jobs", PANEL_JOBS_TTL_SEC, job_snapshot)
                 snapshot["storage_bytes"] = cache.get("storage", PANEL_STORAGE_TTL_SEC, storage_bytes)
-                self.send(json.dumps(snapshot).encode())
+                self.send(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
             else:
                 self.send(b'{}', status=404)
 

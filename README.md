@@ -139,7 +139,7 @@ When the supervisor is running:
 http://127.0.0.1:8766/
 ```
 
-The panel provides runtime health, process information, logs, and Restart / Stop controls.
+The panel provides a richer live dashboard: Supervisor/runtime start times and uptime, lifecycle/drain state, MCP and tunnel health, restart/probe counters, process RAM and start times, whole-database job status summaries plus the 20 latest jobs, `.agent_state` storage breakdown, searchable/filterable structured events, a dedicated recent-error view, raw logs, and guarded Restart / Stop controls.
 
 ### 4. Stop the Runtime
 
