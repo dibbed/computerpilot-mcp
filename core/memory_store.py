@@ -33,11 +33,10 @@ def memory_write_lock(path: Path) -> Iterator[None]:
     canonical = os.path.normcase(str(path.resolve(strict=False)))
     lock_key = hashlib.sha256(canonical.encode("utf-8", errors="replace")).hexdigest()
     lock_path = lock_dir / f"{lock_key}.lock"
-    with lock_path.open("a+b") as handle:
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b"\0")
-            handle.flush()
+    # Windows byte-range locks work on zero-length files. Seeding byte 0
+    # before taking ownership creates a first-open race between independent
+    # processes, so lock the empty file directly.
+    with lock_path.open("a+b", buffering=0) as handle:
         handle.seek(0)
         if os.name == "nt":
             import msvcrt

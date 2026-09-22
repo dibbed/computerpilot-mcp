@@ -329,6 +329,62 @@ def test_concurrent_updates_from_same_revision_never_silently_overwrite(
     assert read["items"][0]["text"] in {"left", "right"}
 
 
+def test_memory_write_lock_first_open_is_process_safe(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    state_dir = tmp_path / "state"
+    target = tmp_path / "shared.json"
+    go = tmp_path / "go"
+    helper = tmp_path / "memory_lock_child.py"
+    helper.write_text(
+        "\n".join(
+            [
+                "import sys, time",
+                "from dataclasses import replace",
+                "from pathlib import Path",
+                f"sys.path.insert(0, {str(repo)!r})",
+                "import core.memory_store as memory_store",
+                "state_dir = Path(sys.argv[1])",
+                "target = Path(sys.argv[2])",
+                "go = Path(sys.argv[3])",
+                "ready = Path(sys.argv[4])",
+                "memory_store.SETTINGS = replace(memory_store.SETTINGS, state_dir=state_dir)",
+                "ready.write_text('ready', encoding='utf-8')",
+                "deadline = time.monotonic() + 10",
+                "while not go.exists():",
+                "    if time.monotonic() >= deadline: raise SystemExit(3)",
+                "    time.sleep(0.005)",
+                "with memory_store.memory_write_lock(target):",
+                "    time.sleep(0.02)",
+                "print('ok')",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    processes: list[subprocess.Popen[str]] = []
+    for index in range(8):
+        ready = tmp_path / f"lock-ready-{index}"
+        processes.append(
+            subprocess.Popen(
+                [sys.executable, str(helper), str(state_dir), str(target), str(go), str(ready)],
+                cwd=repo,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        )
+    deadline = time.monotonic() + 10
+    while len(list(tmp_path.glob("lock-ready-*"))) < len(processes) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(list(tmp_path.glob("lock-ready-*"))) == len(processes)
+    go.write_text("go", encoding="utf-8")
+
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 0, stderr
+        assert stdout.strip() == "ok"
+
+
 def test_cross_process_expected_revision_allows_only_one_writer(tmp_path: Path) -> None:
     repo = Path(__file__).resolve().parents[1]
     memory_path = tmp_path / "shared.json"
