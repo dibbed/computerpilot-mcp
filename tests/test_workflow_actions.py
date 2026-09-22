@@ -36,6 +36,32 @@ def test_http_check_compares_actual_response_status(status: int, expected: int) 
             thread.join(timeout=5)
 
 
+def test_http_check_observes_redirect_status_without_following() -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/final")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    with HTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}/redirect"
+        try:
+            result = execute_action("check_http", {"url": url, "status": 302}, 5)
+            assert result["status"] == 302
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+
 def test_descriptor_rejects_unknown_action() -> None:
     with pytest.raises(ToolError, match="not allowlisted"):
         get_action_descriptor("shell")

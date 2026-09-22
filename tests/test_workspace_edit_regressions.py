@@ -45,6 +45,30 @@ def test_prepare_does_not_mutate_input(tmp_path):
     assert prepare_workspace_edit(tmp_path, payload) == plan
 
 
+def test_required_hashes_cover_every_file_in_workspace_edit(tmp_path):
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("alpha = 1\n", encoding="utf-8")
+    second.write_text("alpha = 2\n", encoding="utf-8")
+    payload = {
+        "changes": {
+            first.as_uri(): [edit(0, 5, "beta")],
+            second.as_uri(): [edit(0, 5, "beta")],
+        }
+    }
+    import hashlib
+
+    first_hash = hashlib.sha256(first.read_bytes()).hexdigest()
+    with pytest.raises(ToolError) as raised:
+        prepare_workspace_edit(
+            tmp_path,
+            payload,
+            expected_sha256={"first.py": first_hash},
+            require_expected_sha256=True,
+        )
+    assert raised.value.code == "lsp_edit_precondition_required"
+
+
 def test_same_position_insertions_keep_server_order(tmp_path):
     path = tmp_path / "sample.txt"
     path.write_bytes(b"ab")

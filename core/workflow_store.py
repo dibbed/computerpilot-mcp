@@ -23,7 +23,7 @@ from core.workflow_models import (
     validate_workflow_transition,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _SECRET_MARKERS = (
     "password",
     "secret",
@@ -166,6 +166,9 @@ class WorkflowStore:
                 version = 3
             if version < 4:
                 self._migrate_v4(connection)
+                version = 4
+            if version < 5:
+                self._migrate_v5(connection)
             connection.execute("BEGIN IMMEDIATE")
             self._redact_stored_definitions(connection)
             self._materialize_all(connection)
@@ -266,6 +269,19 @@ class WorkflowStore:
             ALTER TABLE workflow_operations ADD COLUMN external_ref_json TEXT;
             ALTER TABLE workflow_operations ADD COLUMN reconciliation_evidence_json TEXT;
             PRAGMA user_version = 4;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v5(connection: sqlite3.Connection) -> None:
+        """Persist exact workflow-input identity for new idempotent submissions."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflows ADD COLUMN inputs_hash TEXT;
+            PRAGMA user_version = 5;
             COMMIT;
             """
         )
@@ -415,7 +431,9 @@ class WorkflowStore:
         definition_json = self._definition_json(definition)
         execution_definition_json = canonical_execution_definition(definition)
         execution_definition_hash = hashlib.sha256(execution_definition_json.encode("utf-8")).hexdigest()
-        inputs_json = _canonical(redact_inputs(inputs or {}))
+        exact_inputs = inputs or {}
+        inputs_json = _canonical(redact_inputs(exact_inputs))
+        inputs_hash = _digest(exact_inputs)
         workflow_id = uuid.uuid4().hex
         now = _now()
         with self._lock, closing(self._connect()) as connection:
@@ -423,8 +441,8 @@ class WorkflowStore:
             if idempotency_key:
                 existing = connection.execute(
                     """
-                    SELECT workflow_id, state, execution_definition_json,
-                           execution_definition_hash, execution_compatible
+                    SELECT workflow_id, state, inputs_json, inputs_hash,
+                           execution_definition_json, execution_definition_hash, execution_compatible
                     FROM workflows WHERE idempotency_key = ?
                     """,
                     (idempotency_key,),
@@ -449,21 +467,33 @@ class WorkflowStore:
                             "idempotency_conflict",
                             "Idempotency key already refers to a different workflow definition.",
                         )
+                    existing_inputs_hash = existing["inputs_hash"]
+                    inputs_match = (
+                        str(existing_inputs_hash) == inputs_hash
+                        if existing_inputs_hash is not None
+                        else str(existing["inputs_json"]) == inputs_json
+                    )
+                    if not inputs_match:
+                        raise ToolError(
+                            "idempotency_conflict",
+                            "Idempotency key already refers to different workflow inputs.",
+                        )
                     connection.commit()
                     return self.get(str(existing["workflow_id"]))
             connection.execute(
                 """
                 INSERT INTO workflows(
-                    workflow_id, idempotency_key, definition_json, inputs_json, state,
+                    workflow_id, idempotency_key, definition_json, inputs_json, inputs_hash, state,
                     current_step, version, created_at, updated_at, last_error,
                     execution_definition_json, execution_definition_hash, execution_compatible
-                ) VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?, ?, 1)
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?, ?, 1)
                 """,
                 (
                     workflow_id,
                     idempotency_key,
                     definition_json,
                     inputs_json,
+                    inputs_hash,
                     initial_state.value,
                     now,
                     now,

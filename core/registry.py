@@ -136,7 +136,12 @@ def create_server() -> MCPServer:
         resources = collect_resource_metrics(browser_stats)
         resource_usage = resources.pop("budgets")
         workflow_health = workflow_store(SETTINGS.workflow_db).health_summary()
+        operation_recovery = OPERATION_RECOVERY.summary()
         degraded_reasons: list[str] = []
+        if int(operation_recovery["uncertain_count"]) > 0:
+            degraded_reasons.append("operation_recovery_uncertain")
+        if int(operation_recovery["pending_count"]) > 0:
+            degraded_reasons.append("operation_recovery_pending")
         if int(workflow_health["unresolved_operation_count"]) > 0:
             degraded_reasons.append("unresolved_uncertain_operations")
         if int(workflow_health["workflow_db_bytes"]) >= SETTINGS.workflow_db_warn_bytes:
@@ -164,7 +169,7 @@ def create_server() -> MCPServer:
             "browser_optional_installed": importlib.util.find_spec("playwright") is not None,
             "semantic_desktop_available": os.name == "nt" and importlib.util.find_spec("uiautomation") is not None,
             "audit_log": str(SETTINGS.audit_log),
-            "operation_recovery": OPERATION_RECOVERY.summary(),
+            "operation_recovery": operation_recovery,
             "health_status": health_status,
             "degraded_reasons": degraded_reasons,
             "workflow_total": workflow_health["workflow_total"],

@@ -18,3 +18,5 @@ def test_language_tool_schemas_do_not_expose_arbitrary_command() -> None:
         "rename_symbol",
     ):
         assert "command" not in tools[name].input_schema["properties"]
+
+    assert "expected_sha256" in tools["rename_symbol"].input_schema["required"]

@@ -95,6 +95,41 @@ def test_status_lookup_does_not_load_private_command_spec(tmp_path: Path, monkey
     assert "fingerprint" not in selects[0].casefold()
 
 
+def test_orphan_cancel_wins_race_with_interrupted_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    seed(store, 1, "orphaned")
+    job_id = "0" * 32
+    with closing(store.connect()) as db, db:
+        db.execute(
+            "UPDATE jobs SET pid=12345,pid_created=1 WHERE id=?",
+            (job_id,),
+        )
+
+    alive = True
+
+    def same_process(pid: int | None, created: float | None) -> bool:
+        return alive and pid == 12345 and created == 1
+
+    def terminate(pid: int, *, force: bool = True) -> dict[str, object]:
+        nonlocal alive
+        assert pid == 12345
+        assert force is True
+        alive = False
+        assert store.get(job_id)["status"] == "interrupted"
+        return {"targeted_pids": [pid], "terminated_pids": [pid], "alive_pids": []}
+
+    monkeypatch.setattr(jobs, "same_process", same_process)
+    monkeypatch.setattr("core.executor.terminate_process_tree", terminate)
+
+    result = store.cancel(job_id)
+
+    assert result["status"] == "cancelled"
+    assert result["cancel_requested"] == 1
+    assert store.raw(job_id)["status"] == "cancelled"
+
+
 def test_output_reads_metadata_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
     seed(store, 1)

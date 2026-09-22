@@ -57,11 +57,11 @@ def register(mcp: MCPServer) -> None:
         line: Annotated[int, Field(ge=0)],
         character: Annotated[int, Field(ge=0)],
         new_name: Annotated[str, Field(min_length=1, max_length=500)],
-        expected_sha256: Annotated[dict[str, str] | None, Field(max_length=500)] = None,
+        expected_sha256: Annotated[dict[str, str], Field(max_length=500)],
         dry_run: bool = False,
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
     ) -> dict[str, Any]:
-        """Rename a symbol through a language server and transactionally apply its workspace edit."""
+        """Rename a symbol with required per-file SHA-256 guards and transactionally apply its workspace edit."""
         workspace = resolve_path(root)
         edit = _request(
             workspace.as_posix(),
@@ -73,7 +73,12 @@ def register(mcp: MCPServer) -> None:
                 "newName": new_name,
             },
         )
-        plan = prepare_workspace_edit(workspace, edit, expected_sha256=expected_sha256)
+        plan = prepare_workspace_edit(
+            workspace,
+            edit,
+            expected_sha256=expected_sha256,
+            require_expected_sha256=True,
+        )
         audit_action("rename_symbol", target=workspace, details={"file_count": len(plan), "dry_run": dry_run})
         if dry_run:
             return {"ok": True, "dry_run": True, "file_count": len(plan), "files": [str(item.path) for item in plan]}

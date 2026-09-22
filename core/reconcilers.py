@@ -20,6 +20,20 @@ from core.jobs import JobStore
 from core.recovery_models import Evidence, Postcondition
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
 def _required_string(values: dict[str, Any], name: str) -> str:
     value = values.get(name)
     if not isinstance(value, str) or not value.strip():
@@ -325,8 +339,9 @@ def _http_response(expected: dict[str, Any]) -> Evidence:
     url = _required_string(expected, "url")
     wanted_status = int(expected.get("status", 200))
     body_limit = 1_048_576
+    opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
-        with urllib.request.urlopen(url, timeout=float(expected.get("timeout_sec", 10))) as response:
+        with opener.open(url, timeout=float(expected.get("timeout_sec", 10))) as response:
             body = response.read(body_limit + 1)
             status = int(response.status)
     except urllib.error.HTTPError as exc:

@@ -30,7 +30,7 @@ TimeoutArg = Annotated[float, Field(gt=0, le=3_600)]
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-_TARGET_FIELDS = ("path", "source", "destination", "cwd", "job_id", "pid", "session_id", "project_name")
+_TARGET_FIELDS = ("path", "source", "destination", "cwd", "job_id", "workflow_id", "operation_id", "pid", "session_id", "project_name")
 
 MUTATING_TOOL_OPERATIONS = frozenset(
     {

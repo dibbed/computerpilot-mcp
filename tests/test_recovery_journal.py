@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import subprocess
@@ -15,11 +16,26 @@ from mcp import Client
 from core import heartbeat, recovery
 from core.errors import ToolError
 from core.recovery import JOURNAL_SCHEMA_VERSION, OperationRecoveryJournal
+from core.recovery_models import Evidence, OperationState
 from core.registry import create_server
+from core.tooling import _mutation_target
 
 
 def _records(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_mutation_target_includes_workflow_and_operation_identity() -> None:
+    def operation(workflow_id: str, operation_id: str) -> None:
+        del workflow_id, operation_id
+
+    target = _mutation_target(
+        inspect.signature(operation),
+        (),
+        {"workflow_id": "workflow-123", "operation_id": "operation-456"},
+    )
+
+    assert target == "workflow_id=workflow-123;operation_id=operation-456"
 
 
 def test_previous_runtime_pending_operation_becomes_uncertain(tmp_path: Path) -> None:
@@ -147,6 +163,32 @@ def test_completed_history_compacts_but_uncertain_operations_survive(
     assert summary["uncertain_count"] == 1
     assert summary["pending_count"] == 0
     assert summary["uncertain"][0]["operation_id"] == pending.operation_id
+
+
+def test_acknowledge_response_keeps_evidence_when_append_triggers_compaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(recovery, "COMPACT_AFTER_RECORDS", 4)
+    path = tmp_path / "operations.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "runtime-a")
+    first = journal.begin("write_file", "path=C:/work/first.txt")
+    assert first is not None
+
+    journal.configure(path, "runtime-b")
+    second = journal.begin("write_file", "path=C:/work/second.txt")
+    assert second is not None
+    evidence = Evidence("operator", {"confirmed": True})
+
+    acknowledged = journal.acknowledge(
+        first.operation_id,
+        OperationState.ACKNOWLEDGED,
+        evidence,
+    )
+
+    assert acknowledged["state"] == "acknowledged"
+    assert acknowledged["evidence"] == [{"source": "operator", "data": {"confirmed": True}}]
+    assert acknowledged == journal.inspect(first.operation_id)
 
 
 def test_compaction_failure_never_turns_durable_result_into_retryable_failure(
@@ -298,5 +340,7 @@ def test_server_health_surfaces_recovered_uncertain_operation(
             assert summary["enabled"] is True
             assert summary["uncertain_count"] == 1
             assert summary["uncertain"][0]["operation_id"] == handle.operation_id
+            assert health.structured_content["health_status"] == "degraded"
+            assert "operation_recovery_uncertain" in health.structured_content["degraded_reasons"]
 
     asyncio.run(scenario())

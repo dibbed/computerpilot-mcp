@@ -13,12 +13,37 @@ def _definition() -> WorkflowDefinition:
     return WorkflowDefinition("verify", (StepDefinition("test", "verify_changes", {"cwd": "C:/repo"}),))
 
 
-def test_create_is_idempotent_and_redacts_inputs(tmp_path: Path) -> None:
+def test_create_is_idempotent_for_exact_inputs_and_redacts_public_projection(tmp_path: Path) -> None:
     store = WorkflowStore(tmp_path / "workflows.db")
-    first = store.create(_definition(), {"api_token": "secret", "branch": "main"}, idempotency_key="same")
-    second = store.create(_definition(), {"api_token": "different"}, idempotency_key="same")
+    inputs = {"api_token": "secret", "branch": "main"}
+    first = store.create(_definition(), inputs, idempotency_key="same")
+    second = store.create(_definition(), inputs, idempotency_key="same")
     assert first["workflow_id"] == second["workflow_id"]
     assert second["inputs"]["api_token"] == "<redacted>"
+    assert second["inputs"]["branch"] == "main"
+
+
+@pytest.mark.parametrize(
+    "changed_inputs",
+    [
+        {"api_token": "different", "branch": "main"},
+        {"api_token": "secret", "branch": "release"},
+    ],
+)
+def test_idempotency_key_rejects_different_workflow_inputs(
+    tmp_path: Path, changed_inputs: dict[str, str],
+) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db")
+    store.create(
+        _definition(),
+        {"api_token": "secret", "branch": "main"},
+        idempotency_key="same",
+    )
+
+    with pytest.raises(ToolError) as raised:
+        store.create(_definition(), changed_inputs, idempotency_key="same")
+
+    assert raised.value.code == "idempotency_conflict"
 
 
 def test_compare_and_swap_rejects_stale_version(tmp_path: Path) -> None:

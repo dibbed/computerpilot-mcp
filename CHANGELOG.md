@@ -15,6 +15,13 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Validate and merge LSP workspace edits by canonical file path, preserve same-position insertion order, reject malformed/reversed/overlapping edits, and handle UTF-16 positions across empty/trailing lines, CRLF, surrogate pairs, and non-LSP Unicode line separators.
 - Honor workflow cancellation received during retry backoff before starting another attempt.
 - Keep workflow leases alive during retry backoff so short leases do not expire between attempts.
+- Require per-file SHA-256 preconditions for LSP symbol renames so stale server ranges cannot be applied to concurrently changed files.
+- Observe HTTP redirect status codes directly instead of following redirects before workflow checks and reconciliation.
+- Make orphaned-job cancellation win a concurrent interrupted-state reconciliation once the cancellation request has already terminated the process.
+- Include exact workflow inputs in idempotency identity for new workflows, while retaining compatibility for migrated legacy rows whose exact historical inputs were never persisted.
+- Mark server health degraded when the standalone operation-recovery journal contains unresolved uncertain or pending mutations.
+- Include workflow and workflow-operation IDs in generic recovery-journal mutation targets.
+- Keep operator acknowledgment evidence stable in the immediate response even when the append triggers recovery-journal compaction.
 
 ## [0.2.5] - 2026-09-20
 

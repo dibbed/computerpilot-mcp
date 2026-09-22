@@ -186,6 +186,37 @@ def test_http_status_only_survives_body_limit(http_endpoint):
     assert evidence.get("sha256") is None
 
 
+def test_http_reconciler_observes_redirect_status_without_following():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/final")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        evidence = reconcilers._http_response({
+            "url": f"http://127.0.0.1:{server.server_port}/redirect",
+            "status": 302,
+        }).data
+        assert evidence["conclusive"] is True
+        assert evidence["satisfied"] is True
+        assert evidence["status"] == 302
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_git_index_unicode_literal_path(tmp_path):
     def git(*args):
         subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)

@@ -144,6 +144,20 @@ class SideEffectUncertain(RuntimeError):
     pass
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
 def _run_git(
     arguments: dict[str, Any],
     timeout_sec: float,
@@ -296,8 +310,9 @@ def _check_http(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]
         raise ToolError("invalid_workflow_action", "check_http requires an HTTP(S) URL.")
     expected = int(arguments.get("status", 200))
     request = urllib.request.Request(url, method="GET")
+    opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
-        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+        with opener.open(request, timeout=timeout_sec) as response:
             status = int(response.status)
     except urllib.error.HTTPError as exc:
         status = exc.code

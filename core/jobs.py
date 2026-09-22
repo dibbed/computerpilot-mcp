@@ -584,7 +584,7 @@ class JobStore:
             with closing(self.connect()) as db, db:
                 db.execute(
                     "UPDATE jobs SET status='cancelled',updated=?,version=version+1 "
-                    "WHERE id=? AND status='orphaned'",
+                    "WHERE id=? AND cancel_requested=1 AND status IN ('orphaned','interrupted')",
                     (time.time(), job_id),
                 )
         return {"ok": True, **self.get(job_id)}

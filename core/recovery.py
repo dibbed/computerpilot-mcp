@@ -336,7 +336,7 @@ class OperationRecoveryJournal:
                 if existing.get("state") == state.value and existing.get("evidence") == serialized:
                     return self._operation_view(operation_id, current)
                 raise ToolError("operation_already_acknowledged", "Operation already has a different acknowledgment.")
-            self._append_locked({
+            record = {
                 "schema_version": JOURNAL_SCHEMA_VERSION,
                 "type": "acknowledged",
                 "status": "completed",
@@ -345,9 +345,10 @@ class OperationRecoveryJournal:
                 "runtime_id": self._runtime_id,
                 "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "evidence": serialized,
-            })
+            }
+            self._append_locked(record)
             self._maybe_compact_locked()
-            current["acknowledged"] = self._load_locked()[-1]
+            current["acknowledged"] = record
             return self._operation_view(operation_id, current)
 
     def record_reconciliation(
