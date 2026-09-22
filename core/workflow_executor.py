@@ -22,6 +22,17 @@ from core.workflow_actions import (
 from core.workflow_models import OperationState, StepDefinition, WorkflowState
 from core.workflow_store import WorkflowStore
 
+LEASE_HEARTBEAT_MIN_SEC = 1.0
+LEASE_HEARTBEAT_MAX_SEC = 10.0
+
+
+def _lease_heartbeat_interval(ttl_sec: float) -> float:
+    return min(max(ttl_sec / 3.0, LEASE_HEARTBEAT_MIN_SEC), LEASE_HEARTBEAT_MAX_SEC)
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    return float(min(2 ** (attempt - 1), 5))
+
 
 class _LeaseLostDuringAction(RuntimeError):
     pass
@@ -33,7 +44,7 @@ class _LeaseHeartbeat:
         self.workflow_id = workflow_id
         self.lease_token = lease_token
         self.ttl_sec = ttl_sec
-        self.interval_sec = min(max(ttl_sec / 3.0, 1.0), 10.0)
+        self.interval_sec = _lease_heartbeat_interval(ttl_sec)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.error: Exception | None = None
@@ -316,7 +327,7 @@ class WorkflowExecutor:
                             heartbeat = _LeaseHeartbeat(self.store, workflow_id, lease.lease_token, lease_ttl_sec)
                             heartbeat.start()
                             try:
-                                time.sleep(min(2 ** (attempts - 1), 5))
+                                time.sleep(_retry_backoff_seconds(attempts))
                             finally:
                                 heartbeat.stop()
                             try:

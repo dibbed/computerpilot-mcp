@@ -340,7 +340,18 @@ def test_rotating_log_and_secret_masking(tmp_path: Path, monkeypatch: pytest.Mon
 def test_runtime_restart_preserves_durable_job(tmp_path: Path) -> None:
     database = tmp_path / "jobs.sqlite3"
     output = tmp_path / "completed"
-    job_code = f"import time;from pathlib import Path;time.sleep(3);Path({str(output)!r}).write_text('once')"
+    started = tmp_path / "job-started"
+    release = tmp_path / "job-release"
+    job_code = (
+        "import time;from pathlib import Path;"
+        f"started=Path({str(started)!r});release=Path({str(release)!r});output=Path({str(output)!r});"
+        "started.write_text('ready');"
+        "deadline=time.monotonic()+15;"
+        "exec(\"while not release.exists():\\n"
+        "    if time.monotonic() >= deadline: raise TimeoutError('release marker timeout')\\n"
+        "    time.sleep(0.02)\");"
+        "output.write_text('once')"
+    )
     code = (
         "import os,sys,time;from pathlib import Path;from core.jobs import JobStore;"
         f"s=JobStore(Path({str(database)!r}));"
@@ -356,9 +367,11 @@ def test_runtime_restart_preserves_durable_job(tmp_path: Path) -> None:
         requested = False
         while time.monotonic() < deadline:
             state = supervisor.snapshot()
-            if state["state"] == "running" and not requested:
+            if state["state"] == "running" and _file_text_is(started, "ready") and not requested:
                 supervisor.restart.set()
                 requested = True
+            if state["state"] == "running" and state["restart_count"] == 1:
+                release.write_text("go", encoding="ascii")
             if state["state"] == "running" and state["restart_count"] == 1 and _file_text_is(output, "once"):
                 break
             time.sleep(0.05)
@@ -369,13 +382,25 @@ def test_runtime_restart_preserves_durable_job(tmp_path: Path) -> None:
     finally:
         supervisor.stop.set()
         thread.join(timeout=10)
+        close_logger(supervisor)
     assert not thread.is_alive()
 
 
 def test_consecutive_runtime_restarts_preserve_one_durable_job(tmp_path: Path) -> None:
     database = tmp_path / "jobs.sqlite3"
     output = tmp_path / "completed-twice"
-    job_code = f"import time;from pathlib import Path;time.sleep(3);Path({str(output)!r}).write_text('once')"
+    started = tmp_path / "job-started-twice"
+    release = tmp_path / "job-release-twice"
+    job_code = (
+        "import time;from pathlib import Path;"
+        f"started=Path({str(started)!r});release=Path({str(release)!r});output=Path({str(output)!r});"
+        "started.write_text('ready');"
+        "deadline=time.monotonic()+15;"
+        "exec(\"while not release.exists():\\n"
+        "    if time.monotonic() >= deadline: raise TimeoutError('release marker timeout')\\n"
+        "    time.sleep(0.02)\");"
+        "output.write_text('once')"
+    )
     code = (
         "import os,sys,time;from pathlib import Path;from core.jobs import JobStore;"
         f"s=JobStore(Path({str(database)!r}));"
@@ -396,9 +421,16 @@ def test_consecutive_runtime_restarts_preserve_one_durable_job(tmp_path: Path) -
         requested_restarts = 0
         while time.monotonic() < deadline:
             state = supervisor.snapshot()
-            if state["state"] == "running" and state["restart_count"] == requested_restarts and requested_restarts < 2:
+            if (
+                state["state"] == "running"
+                and _file_text_is(started, "ready")
+                and state["restart_count"] == requested_restarts
+                and requested_restarts < 2
+            ):
                 supervisor.restart.set()
                 requested_restarts += 1
+            if state["state"] == "running" and state["restart_count"] == 2:
+                release.write_text("go", encoding="ascii")
             if state["state"] == "running" and state["restart_count"] == 2 and _file_text_is(output, "once"):
                 break
             time.sleep(0.05)
@@ -637,6 +669,7 @@ def test_watchdog_drain_is_bounded_when_mutation_does_not_finish(tmp_path: Path)
 def test_watchdog_restart_marks_inflight_mutation_uncertain_without_replay(tmp_path: Path) -> None:
     attempts = tmp_path / "attempts.txt"
     marker = tmp_path / "side-effect.txt"
+    second_ready = tmp_path / "second-runtime-ready.txt"
     journal_path = tmp_path / "operation-recovery.jsonl"
     script = tmp_path / "uncertain_runtime.py"
     script.write_text(
@@ -653,6 +686,7 @@ from core.recovery import OperationRecoveryJournal
 heartbeat = Path(os.environ["MCP_HEARTBEAT_FILE"])
 attempts = Path({str(attempts)!r})
 marker = Path({str(marker)!r})
+second_ready = Path({str(second_ready)!r})
 journal_path = Path({str(journal_path)!r})
 RUNTIME_LIFECYCLE.configure_from_env()
 journal = OperationRecoveryJournal()
@@ -677,6 +711,8 @@ if number == 1:
         while True:
             time.sleep(1)
 else:
+    heartbeat.write_text(str(os.getpid()), encoding="ascii")
+    second_ready.write_text("ready", encoding="ascii")
     while True:
         heartbeat.write_text(str(os.getpid()), encoding="ascii")
         time.sleep(0.03)
@@ -687,7 +723,7 @@ else:
         [sys.executable, str(script)],
         readiness_url=None,
         state_dir=tmp_path,
-        grace=0.12,
+        grace=0.2,
         interval=0.025,
         drain_timeout=1,
         watchdog_drain_timeout=0.12,
@@ -695,10 +731,14 @@ else:
     thread = threading.Thread(target=supervisor.run)
     thread.start()
     try:
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             state = supervisor.snapshot()
-            if state["restart_count"] >= 1 and state["state"] == "running":
+            if (
+                state["restart_count"] >= 1
+                and state["state"] == "running"
+                and _file_text_is(second_ready, "ready")
+            ):
                 break
             time.sleep(0.03)
         else:

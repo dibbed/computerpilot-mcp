@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import core.workflow_executor as executor_module
 from core.errors import ToolError
 from core.workflow_actions import ACTION_HANDLERS, TransientActionError
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
@@ -16,6 +17,12 @@ def _workflow(store: WorkflowStore) -> dict[str, object]:
         WorkflowDefinition("lease-heartbeat", (StepDefinition("check", "check_file", {"path": "unused"}),)),
         initial_state=WorkflowState.QUEUED,
     )
+
+
+def test_lease_heartbeat_interval_is_bounded() -> None:
+    assert executor_module._lease_heartbeat_interval(0.3) == 1.0
+    assert executor_module._lease_heartbeat_interval(9) == 3.0
+    assert executor_module._lease_heartbeat_interval(60) == 10.0
 
 
 def test_executor_renews_lease_while_action_is_running(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -31,10 +38,12 @@ def test_executor_renews_lease_while_action_is_running(tmp_path: Path, monkeypat
 
     def slow_action(arguments: dict[str, object], timeout: float) -> dict[str, object]:
         del arguments, timeout
-        time.sleep(6.0)
+        time.sleep(0.16)
         return {"ok": True}
 
     monkeypatch.setattr(store, "renew_lease", tracked_renew)
+    monkeypatch.setattr(executor_module, "LEASE_HEARTBEAT_MIN_SEC", 0.02)
+    monkeypatch.setattr(executor_module, "LEASE_HEARTBEAT_MAX_SEC", 0.04)
     monkeypatch.setitem(ACTION_HANDLERS, "check_file", slow_action)
 
     result = WorkflowExecutor(store).execute(
@@ -57,6 +66,13 @@ def test_retry_backoff_does_not_expire_short_lease(tmp_path: Path, monkeypatch: 
         initial_state=WorkflowState.QUEUED,
     )
     calls = 0
+    renewals = 0
+    original_renew = store.renew_lease
+
+    def tracked_renew(workflow_id: str, lease_token: str, ttl_sec: float):  # type: ignore[no-untyped-def]
+        nonlocal renewals
+        renewals += 1
+        return original_renew(workflow_id, lease_token, ttl_sec)
 
     def flaky(arguments: dict[str, object], timeout: float) -> dict[str, object]:
         nonlocal calls
@@ -66,10 +82,19 @@ def test_retry_backoff_does_not_expire_short_lease(tmp_path: Path, monkeypatch: 
         return {"ok": True}
 
     monkeypatch.setitem(ACTION_HANDLERS, "check_http", flaky)
-    result = WorkflowExecutor(store).execute(workflow["workflow_id"], owner_id="retry-owner", lease_ttl_sec=5)
+    monkeypatch.setattr(store, "renew_lease", tracked_renew)
+    monkeypatch.setattr(executor_module, "LEASE_HEARTBEAT_MIN_SEC", 0.01)
+    monkeypatch.setattr(executor_module, "LEASE_HEARTBEAT_MAX_SEC", 0.02)
+    monkeypatch.setattr(executor_module, "_retry_backoff_seconds", lambda attempt: 0.08)
+    result = WorkflowExecutor(store).execute(
+        workflow["workflow_id"],
+        owner_id="retry-owner",
+        lease_ttl_sec=5,
+    )
 
     assert result["state"] == "completed"
     assert calls == 5
+    assert renewals > 5
     assert result["steps"][0]["attempts"] == 5
 
 
