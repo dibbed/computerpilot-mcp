@@ -30,7 +30,7 @@ from core.executor import _creation_flags
 from core.jobs import JobStore
 from core.lifecycle import lifecycle_control_request
 from core.singleflight import SingleFlight
-from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile
+from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile, profile_run_args
 
 
 def restart_delay(failures: int) -> int:
@@ -761,7 +761,7 @@ def main() -> int:
         except TunnelRuntimeError as exc:
             print(f"ERROR tunnel runtime: {exc}", file=sys.stderr)
             return 16
-        command = [str(tunnel_runtime.path), "run", "--profile", args.profile]
+        command = [str(tunnel_runtime.path), "run", *profile_run_args(args.profile)]
         readiness_url = "http://127.0.0.1:8080/readyz"
         print(
             f"Tunnel runtime: v{tunnel_runtime.version} "
