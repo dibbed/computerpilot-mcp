@@ -13,7 +13,20 @@ ALL_DOMAINS = (
 
 PROFILE_DOMAINS: dict[str, tuple[str, ...]] = {
     "minimal": ("filesystem", "project", "recovery"),
-    "coding": ("filesystem", "terminal", "process", "system", "project", "language", "testing", "git", "memory", "jobs", "recovery", "workflows"),
+    "coding": (
+        "filesystem",
+        "terminal",
+        "process",
+        "system",
+        "project",
+        "language",
+        "testing",
+        "git",
+        "memory",
+        "jobs",
+        "recovery",
+        "workflows",
+    ),
     "git": ("filesystem", "project", "testing", "git", "recovery", "workflows"),
     "testing": ("terminal", "project", "language", "testing", "recovery", "workflows"),
     "desktop": ("process", "system", "windows", "desktop", "recovery", "workflows"),
