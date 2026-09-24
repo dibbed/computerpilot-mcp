@@ -6,6 +6,13 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+### Documentation
+- Rebuild the repository landing page around verifiable capabilities, platform boundaries, practical workflows, and a shorter first-run path.
+- Add public guides for installation, architecture, platform support, tooling, configuration, troubleshooting, and the guarded release process.
+- Update contribution, security, and third-party notices to match the cross-platform v0.3.0 runtime and the non-vendored managed tunnel distribution model.
+- Add GitHub bug, feature, documentation, and pull-request templates with platform/version/validation context and secret-redaction guidance.
+- Remove stale phase/version labels from `.env.example` so configuration comments describe current behavior rather than historical implementation phases.
+
 ## [0.3.0] - 2026-09-25
 
 ### Changed
