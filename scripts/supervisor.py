@@ -136,7 +136,7 @@ class Supervisor:
                                                        backupCount=3, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
         self.logger.addHandler(handler)
-        self.secret = os.environ.get("CONTROL_PLANE_API_KEY", "").strip()
+        self.secret = os.environ.get("CONTROL_PLANE_API_KEY", "").strip().lstrip("\ufeff")
         self.owned: dict[int, psutil.Process] = {}
 
     @staticmethod

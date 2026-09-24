@@ -221,8 +221,13 @@ def main() -> int:
                 profile = detect_profile()
             current_runtime(ROOT)
             secret = ROOT / ".secrets/control_plane_api_key.txt"
-            if not os.getenv("CONTROL_PLANE_API_KEY") and secret.is_file():
-                os.environ["CONTROL_PLANE_API_KEY"] = secret.read_text(encoding="utf-8").strip()
+            existing = os.getenv("CONTROL_PLANE_API_KEY", "").strip().lstrip("\ufeff")
+            if existing:
+                os.environ["CONTROL_PLANE_API_KEY"] = existing
+            elif secret.is_file():
+                os.environ["CONTROL_PLANE_API_KEY"] = (
+                    secret.read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
+                )
             if not os.getenv("CONTROL_PLANE_API_KEY"):
                 raise RuntimeError("CONTROL_PLANE_API_KEY or .secrets/control_plane_api_key.txt is required")
         if args.check:
