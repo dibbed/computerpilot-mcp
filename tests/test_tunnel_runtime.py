@@ -205,12 +205,19 @@ def test_install_release_verifies_both_release_digest_and_checksum_manifest(
     def fake_request(url: str, *, timeout: float = 30.0) -> bytes:
         return sums if url.endswith("SHA256SUMS.txt") else archive
 
+    legacy_dir = tmp_path / ".agent_state/tunnel-runtime/v0.0.14/windows-amd64"
+    legacy_dir.mkdir(parents=True)
+    legacy_client = legacy_dir / "tunnel-client.exe"
+    legacy_client.write_bytes(b"legacy-running-client")
+
     monkeypatch.setattr(module, "_request_bytes", fake_request)
     selection = module._install_release(tmp_path, release)
 
     assert selection.version == "0.0.14"
     assert selection.source == "managed"
     assert selection.path.is_file()
+    assert selection.path.parent.name == "tunnel-client-runtime-cloudflared"
+    assert legacy_client.read_bytes() == b"legacy-running-client"
     metadata = json.loads((tmp_path / ".agent_state/tunnel-runtime/current.json").read_text(encoding="utf-8"))
     assert metadata["version"] == "v0.0.14"
     assert metadata["runtime_flavor"] == "tunnel-client-runtime-cloudflared"

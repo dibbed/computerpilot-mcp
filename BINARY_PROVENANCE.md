@@ -25,7 +25,7 @@ When no compatible managed runtime is installed, `scripts/tunnel_runtime.py`:
 5. verifies the GitHub release asset SHA-256 digest;
 6. downloads and verifies upstream `SHA256SUMS.txt`;
 7. rejects archive path traversal and symbolic links;
-8. extracts into an immutable version/platform directory under `.agent_state/tunnel-runtime/`;
+8. extracts into an immutable flavor-specific version/platform directory under `.agent_state/tunnel-runtime/`, so migration does not replace a legacy executable that may still be running;
 9. executes the downloaded binary with `--version` and requires it to match the release tag;
 10. atomically records the selected path, platform, flavor, version, asset name, and archive hash in `current.json`.
 
