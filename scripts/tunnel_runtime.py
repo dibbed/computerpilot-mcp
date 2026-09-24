@@ -8,6 +8,8 @@ tracked binaries, then run that immutable managed copy.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -128,6 +130,33 @@ def _state_root(root: Path) -> Path:
 
 def _metadata_path(root: Path) -> Path:
     return _state_root(root) / "current.json"
+
+
+@contextmanager
+def _update_lock(root: Path) -> Iterator[None]:
+    """Serialize managed-runtime checks and publication across local processes."""
+    lock_path = _state_root(root) / ".update.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -473,51 +502,51 @@ def ensure_runtime(root: Path = PROJECT_ROOT) -> TunnelRuntimeSelection:
     if override is not None:
         return override
 
-    fallback: TunnelRuntimeSelection | None
-    try:
-        fallback = current_runtime(root)
-    except TunnelRuntimeError:
-        fallback = None
+    with _update_lock(root):
+        fallback: TunnelRuntimeSelection | None
+        try:
+            fallback = current_runtime(root)
+        except TunnelRuntimeError:
+            fallback = None
 
-    if not _bool_env("MCP_TUNNEL_AUTO_UPDATE", True):
-        if fallback is None:
-            raise TunnelRuntimeError("Tunnel auto-update is disabled and no local runtime is available.")
-        return fallback
-
-    try:
-        interval_hours = float(os.getenv("MCP_TUNNEL_UPDATE_INTERVAL_HOURS", str(DEFAULT_UPDATE_INTERVAL_HOURS)))
-    except ValueError as exc:
-        raise TunnelRuntimeError("MCP_TUNNEL_UPDATE_INTERVAL_HOURS must be numeric.") from exc
-    if interval_hours < 0:
-        raise TunnelRuntimeError("MCP_TUNNEL_UPDATE_INTERVAL_HOURS cannot be negative.")
-
-    pin_raw = os.getenv("MCP_TUNNEL_VERSION", "").strip()
-    pin = _normalize_tag(pin_raw) if pin_raw else None
-    if pin is None and fallback is not None and not _update_due(root, interval_hours):
-        return fallback
-    if pin is not None and fallback is not None and fallback.source == "managed" and fallback.version == pin.removeprefix("v"):
-        _record_check(root, fallback, latest_tag=pin)
-        return fallback
-
-    strict = _bool_env("MCP_TUNNEL_UPDATE_REQUIRED", False)
-    try:
-        release = _release(pin)
-        tag = _normalize_tag(str(release.get("tag_name") or ""))
-        if fallback is not None and fallback.source == "managed" and fallback.version == tag.removeprefix("v"):
-            _record_check(root, fallback, latest_tag=tag)
+        if not _bool_env("MCP_TUNNEL_AUTO_UPDATE", True):
+            if fallback is None:
+                raise TunnelRuntimeError("Tunnel auto-update is disabled and no local runtime is available.")
             return fallback
-        return _install_release(root, release)
-    except TunnelRuntimeError as exc:
-        if strict or fallback is None:
-            raise
-        return TunnelRuntimeSelection(
-            path=fallback.path,
-            version=fallback.version,
-            source=fallback.source,
-            platform_key=fallback.platform_key,
-            warning=str(exc),
-        )
 
+        try:
+            interval_hours = float(os.getenv("MCP_TUNNEL_UPDATE_INTERVAL_HOURS", str(DEFAULT_UPDATE_INTERVAL_HOURS)))
+        except ValueError as exc:
+            raise TunnelRuntimeError("MCP_TUNNEL_UPDATE_INTERVAL_HOURS must be numeric.") from exc
+        if interval_hours < 0:
+            raise TunnelRuntimeError("MCP_TUNNEL_UPDATE_INTERVAL_HOURS cannot be negative.")
+
+        pin_raw = os.getenv("MCP_TUNNEL_VERSION", "").strip()
+        pin = _normalize_tag(pin_raw) if pin_raw else None
+        if pin is None and fallback is not None and not _update_due(root, interval_hours):
+            return fallback
+        if pin is not None and fallback is not None and fallback.source == "managed" and fallback.version == pin.removeprefix("v"):
+            _record_check(root, fallback, latest_tag=pin)
+            return fallback
+
+        strict = _bool_env("MCP_TUNNEL_UPDATE_REQUIRED", False)
+        try:
+            release = _release(pin)
+            tag = _normalize_tag(str(release.get("tag_name") or ""))
+            if fallback is not None and fallback.source == "managed" and fallback.version == tag.removeprefix("v"):
+                _record_check(root, fallback, latest_tag=tag)
+                return fallback
+            return _install_release(root, release)
+        except TunnelRuntimeError as exc:
+            if strict or fallback is None:
+                raise
+            return TunnelRuntimeSelection(
+                path=fallback.path,
+                version=fallback.version,
+                source=fallback.source,
+                platform_key=fallback.platform_key,
+                warning=str(exc),
+            )
 
 def detect_profile() -> str:
     explicit = os.getenv("MCP_TUNNEL_PROFILE", "").strip()
