@@ -73,10 +73,11 @@ def test_build_windows_zip_is_deterministic_and_has_manifest(release_repo: Path,
     assert first.sha256 == second.sha256
     with zipfile.ZipFile(first.path) as archive:
         names = set(archive.namelist())
-        manifest_name = "windows-agent-mcp-v0.2.7/RELEASE-MANIFEST.json"
+        manifest_name = "computerpilot-mcp-v0.2.7/RELEASE-MANIFEST.json"
         assert manifest_name in names
         manifest = json.loads(archive.read(manifest_name))
         assert manifest["target"] == "windows-amd64"
+        assert manifest["project"] == "computerpilot-mcp"
         assert manifest["bundled_tunnel_runtime_included"] is False
         assert manifest["managed_tunnel_runtime"] is True
         assert manifest["tunnel_runtime_download_on_first_use"] is True
@@ -94,7 +95,7 @@ def test_build_posix_tar_preserves_launcher_executable_without_bundled_runtime(
     )
     with tarfile.open(result.path, "r:gz") as archive:
         names = set(archive.getnames())
-        prefix = "windows-agent-mcp-v0.2.7"
+        prefix = "computerpilot-mcp-v0.2.7"
         assert f"{prefix}/tunnel-client.exe" not in names
         launcher = archive.getmember(f"{prefix}/start_mcp.sh")
         assert launcher.mode & 0o111

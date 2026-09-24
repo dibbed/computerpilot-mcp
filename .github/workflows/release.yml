@@ -95,4 +95,4 @@ jobs:
             echo "Release $TAG already exists; leaving it unchanged."
             exit 0
           fi
-          gh release create "$TAG" dist/*             --target "$SHA"             --title "$TAG - Cross-Platform Preview"             --notes-file "docs/V${VERSION}-RELEASE-NOTES.md"
+          gh release create "$TAG" dist/*             --target "$SHA"             --title "ComputerPilot MCP $TAG - Cross-Platform Preview"             --notes-file "docs/V${VERSION}-RELEASE-NOTES.md"

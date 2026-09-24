@@ -1,4 +1,4 @@
-"""Cross-platform local developer-agent MCP entrypoint."""
+"""ComputerPilot MCP cross-platform computer-use and developer-automation entrypoint."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ mcp = create_server()
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local Developer Agent MCP Server")
+    parser = argparse.ArgumentParser(description="ComputerPilot MCP Server")
     parser.add_argument(
         "--transport",
         choices=("stdio", "streamable-http"),
