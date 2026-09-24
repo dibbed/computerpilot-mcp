@@ -24,12 +24,13 @@ def fingerprint(root: Path, mode: str, profile: str) -> str:
     digest = hashlib.sha256()
     digest.update(json.dumps([sys.executable, sys.version, sys.prefix, mode, profile]).encode())
     paths = {root / name for name in (
-        "requirements.txt", "requirements-browser.txt", "pyproject.toml", "main.py",
-        "local_pc_mcp.py", ".venv/pyvenv.cfg", ".env",
+        "requirements.txt", "requirements-runtime.txt", "requirements-quality.txt",
+        "requirements-browser.txt", "requirements-dev.txt", "pyproject.toml", "main.py",
+        "local_pc_mcp.py", "start_mcp.sh", ".venv/pyvenv.cfg", ".env",
     )}
     for directory in ("core", "tools", "scripts"):
         paths.update(path for path in (root / directory).rglob("*")
-                     if path.suffix in {".py", ".ps1", ".bat"} and "__pycache__" not in path.parts)
+                     if path.suffix in {".py", ".ps1", ".bat", ".sh"} and "__pycache__" not in path.parts)
     # Metadata changes catch pip installs/uninstalls without importing packages on every start.
     site = Path(sysconfig.get_paths()["purelib"])
     for metadata in site.glob("*.dist-info"):
