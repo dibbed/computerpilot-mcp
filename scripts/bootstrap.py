@@ -74,11 +74,13 @@ def _mode() -> str:
 
 
 def _load_control_plane_key() -> None:
-    if os.getenv("CONTROL_PLANE_API_KEY", "").strip():
+    existing = os.getenv("CONTROL_PLANE_API_KEY", "").strip().lstrip("\ufeff")
+    if existing:
+        os.environ["CONTROL_PLANE_API_KEY"] = existing
         return
     secret = ROOT / ".secrets" / "control_plane_api_key.txt"
     try:
-        value = secret.read_text(encoding="utf-8").strip()
+        value = secret.read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
     except OSError:
         value = ""
     if not value:

@@ -185,3 +185,18 @@ def test_corrupt_or_incomplete_cache_is_miss(root: Path, contents: str) -> None:
     cache.parent.mkdir()
     cache.write_text(contents)
     assert not doctor.cache_matches(root, doctor.fingerprint(root, "local-http", "demo"))
+
+
+def test_doctor_main_loads_secret_with_utf8_bom(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(doctor, "ROOT", root)
+    secret = root / ".secrets" / "control_plane_api_key.txt"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_bytes(b"\xef\xbb\xbfsecret-from-doctor-bom\r\n")
+    selection = TunnelRuntimeSelection(root / "tunnel-client.exe", "0.0.14", "test", "windows-amd64")
+    monkeypatch.setattr(doctor, "current_runtime", lambda r: selection)
+    monkeypatch.setattr(doctor, "detect_profile", lambda: "demo")
+    monkeypatch.setattr(doctor, "doctor", lambda *args: None)
+    monkeypatch.setattr(doctor.sys, "argv", ["doctor", "--mode", "tunnel", "--profile", "demo"])
+    assert doctor.main() == 0
+    assert doctor.os.environ["CONTROL_PLANE_API_KEY"] == "secret-from-doctor-bom"

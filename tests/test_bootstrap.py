@@ -50,6 +50,18 @@ def test_control_plane_key_loads_from_portable_secret_path(
     assert os.environ["CONTROL_PLANE_API_KEY"] == "secret-value"
 
 
+def test_control_plane_key_strips_utf8_bom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    secret = tmp_path / ".secrets" / "control_plane_api_key.txt"
+    secret.parent.mkdir()
+    secret.write_bytes(b"\xef\xbb\xbfsecret-with-bom\r\n")
+    bootstrap._load_control_plane_key()
+    assert os.environ["CONTROL_PLANE_API_KEY"] == "secret-with-bom"
+
+
 @pytest.mark.parametrize(
     "cached,doctor_exit,expected_dependency_calls,expected_full_calls",
     [
