@@ -6,6 +6,9 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Fixed
+- Treat the upstream tunnel-client dispatcher signature `failed to post error response to control plane | controlplane responder: retry wait: context canceled` as a non-fatal warning in the local control panel. The cancellation remains visible in Recent Events, while Runtime Errors and `last_error` remain reserved for actual ERROR/FATAL conditions. Other control-plane response failures, including HTTP/status failures, stay classified as errors.
+
 ## [0.2.6] - 2026-09-24
 
 ### Improved
