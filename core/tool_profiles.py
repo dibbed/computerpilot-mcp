@@ -7,18 +7,31 @@ from dataclasses import dataclass
 from core.errors import ToolError
 
 ALL_DOMAINS = (
-    "filesystem", "terminal", "process", "windows", "project", "language", "testing", "git",
+    "filesystem", "terminal", "process", "system", "windows", "project", "language", "testing", "git",
     "browser", "desktop", "memory", "jobs", "recovery", "workflows",
 )
 
 PROFILE_DOMAINS: dict[str, tuple[str, ...]] = {
     "minimal": ("filesystem", "project", "recovery"),
-    "coding": ("filesystem", "terminal", "process", "project", "language", "testing", "git", "memory", "jobs", "recovery", "workflows"),
+    "coding": (
+        "filesystem",
+        "terminal",
+        "process",
+        "system",
+        "project",
+        "language",
+        "testing",
+        "git",
+        "memory",
+        "jobs",
+        "recovery",
+        "workflows",
+    ),
     "git": ("filesystem", "project", "testing", "git", "recovery", "workflows"),
     "testing": ("terminal", "project", "language", "testing", "recovery", "workflows"),
-    "desktop": ("process", "windows", "desktop", "recovery", "workflows"),
+    "desktop": ("process", "system", "windows", "desktop", "recovery", "workflows"),
     "browser": ("terminal", "browser", "recovery", "workflows"),
-    "operations": ("terminal", "process", "windows", "jobs", "recovery", "workflows"),
+    "operations": ("terminal", "process", "system", "windows", "jobs", "recovery", "workflows"),
     "full": ALL_DOMAINS,
 }
 

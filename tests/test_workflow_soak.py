@@ -22,7 +22,7 @@ def test_workflow_soak_smoke_covers_restarts_reconciliation_retention_and_leaks(
     assert result["uncertain_reconciled"] == 2
     assert result["process_restarts"] == 1
     assert result["mcp_restart_checks"] == [
-        {"tool_count": 110, "health_status": "healthy", "workflow_total": 0}
+        {"tool_count": 112, "health_status": "healthy", "workflow_total": 0}
     ]
     assert result["leaked_leases"] == 0
     assert result["orphan_operations"] == 0
