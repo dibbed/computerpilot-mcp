@@ -274,7 +274,7 @@ def _request_bytes(url: str, *, timeout: float = 30.0) -> bytes:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed HTTPS upstream
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.read()
     except (OSError, urllib.error.URLError) as exc:
         raise TunnelRuntimeError(f"Tunnel runtime update request failed: {type(exc).__name__}") from exc
