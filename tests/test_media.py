@@ -6,9 +6,9 @@ import os
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from mcp import Client
 from mcp.types import CallToolResult, ImageContent
-import pytest
 from PIL import Image, ImageGrab
 
 from core.media import image_tool_result
