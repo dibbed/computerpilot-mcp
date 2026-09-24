@@ -201,7 +201,7 @@ def test_real_workers_respect_max_running_jobs(tmp_path: Path, monkeypatch: pyte
     while time.monotonic() < deadline:
         rows = [store.get(job_id) for job_id in job_ids]
         statuses = [str(row["status"]) for row in rows]
-        peak_active = max(peak_active, sum(status in ACTIVE_JOB_STATUSES for status in statuses))
+        peak_active = max(peak_active, _active_count(store))
         saw_queued = saw_queued or "queued" in statuses
         if all(status == "succeeded" for status in statuses):
             break
