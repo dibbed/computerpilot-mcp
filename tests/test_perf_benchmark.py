@@ -255,8 +255,10 @@ def test_launcher_benchmark_executes_real_bootstrap(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert _launcher_validation_once() == {"exit_code": 0}
-    assert captured[0].casefold() == "powershell.exe"
-    assert any(part.endswith("bootstrap.ps1") for part in captured)
+    if os.name == "nt":
+        assert captured[:5] == ["cmd.exe", "/d", "/s", "/c", "START_MCP.bat"]
+    else:
+        assert captured == [str(Path(__file__).resolve().parents[1] / "start_mcp.sh")]
 
 
 def test_project_lookup_benchmark_exercises_real_tool(tmp_path: Path) -> None:
