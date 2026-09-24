@@ -7,6 +7,7 @@ tracked binaries, then run that immutable managed copy.
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 import argparse
 import hashlib
 import json
@@ -136,7 +137,7 @@ def _failed_check_path(root: Path) -> Path:
     return _state_root(root) / "last-check-failure.json"
 
 
-def _update_lock(root: Path):
+def _update_lock(root: Path) -> AbstractContextManager[None]:
     """Serialize managed-runtime checks and publication across local processes."""
 
     return exclusive_file_lock(_state_root(root) / ".update.lock")
