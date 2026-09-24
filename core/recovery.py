@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 import json
 import os
 import threading
@@ -25,7 +26,7 @@ _JOURNAL_LOCK_WAIT_SEC = 10.0
 RecordType = Literal["begin", "result", "uncertain", "reconciliation", "acknowledged"]
 
 
-def _interprocess_journal_lock(path: Path):
+def _interprocess_journal_lock(path: Path) -> AbstractContextManager[None]:
     """Serialize journal append and compaction across runtime processes."""
 
     lock_path = path.with_name(f".{path.name}.lock")
