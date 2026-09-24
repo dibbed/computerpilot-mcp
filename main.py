@@ -1,4 +1,4 @@
-"""Ali Windows Agent MCP entrypoint."""
+"""Cross-platform local developer-agent MCP entrypoint."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ mcp = create_server()
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Windows Full Access MCP Server")
+    parser = argparse.ArgumentParser(description="Local Developer Agent MCP Server")
     parser.add_argument(
         "--transport",
         choices=("stdio", "streamable-http"),
