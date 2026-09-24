@@ -8,14 +8,13 @@ import os
 import tempfile
 import time
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from core.config import SETTINGS
 from core.errors import ToolError
+from core.file_lock import exclusive_file_lock
 
 MEMORY_SCHEMA_VERSION = 2
 MEMORY_MAX_BYTES = 131_072
@@ -24,47 +23,18 @@ MEMORY_SOURCES = ("user", "project_scan", "manual", "tool", "legacy")
 _MEMORY_LOCK_WAIT_SEC = 10.0
 
 
-@contextmanager
-def memory_write_lock(path: Path) -> Iterator[None]:
+def memory_write_lock(path: Path):
     """Serialize optimistic check/merge/save across independent MCP processes."""
 
     lock_dir = SETTINGS.state_dir / "memory_locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
     canonical = os.path.normcase(str(path.resolve(strict=False)))
     lock_key = hashlib.sha256(canonical.encode("utf-8", errors="replace")).hexdigest()
     lock_path = lock_dir / f"{lock_key}.lock"
-    # Windows byte-range locks work on zero-length files. Seeding byte 0
-    # before taking ownership creates a first-open race between independent
-    # processes, so lock the empty file directly.
-    with lock_path.open("a+b", buffering=0) as handle:
-        handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            deadline = time.monotonic() + _MEMORY_LOCK_WAIT_SEC
-            while True:
-                try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(f"Timed out locking project memory {path}.") from None
-                    time.sleep(0.01)
-            try:
-                yield
-            finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            return
-
-        import fcntl
-
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
-
+    return exclusive_file_lock(
+        lock_path,
+        timeout_sec=_MEMORY_LOCK_WAIT_SEC,
+        label=f"project memory {path}",
+    )
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
