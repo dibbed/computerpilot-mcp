@@ -6,6 +6,16 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Added
+- Add a verified managed Secure MCP Tunnel updater. Normal tunnel startup can resolve the latest stable official `openai/tunnel-client` release for the host platform, verify the archive against both GitHub asset SHA-256 metadata and upstream `SHA256SUMS.txt`, validate the binary-reported version, and publish the immutable bundle under `.agent_state/tunnel-runtime/`.
+- Add update controls for an exact upstream version pin, update-check interval, strict update-required mode, prerelease opt-in, and explicit binary override.
+- Add platform-aware tunnel release selection for Windows, Linux, and macOS on amd64/arm64 as groundwork for a later full cross-platform MCP migration.
+
+### Changed
+- Resolve the actual tunnel runtime before Supervisor startup instead of always launching the Git-tracked `tunnel-client.exe`.
+- Detect the tunnel profile directly from environment/profile files so narrow runtime binaries do not depend on the full client's `profiles list` command.
+- Treat the Git-tracked v0.0.11 full-client set as an offline fallback rather than the normal freshness source.
+
 ### Fixed
 - Treat the upstream tunnel-client dispatcher signature `failed to post error response to control plane | controlplane responder: retry wait: context canceled` as a non-fatal warning in the local control panel. The cancellation remains visible in Recent Events, while Runtime Errors and `last_error` remain reserved for actual ERROR/FATAL conditions. Other control-plane response failures, including HTTP/status failures, stay classified as errors.
 
