@@ -37,6 +37,7 @@ def release_repo(tmp_path: Path) -> Path:
     (tmp_path / "cloudflared.exe").write_bytes(b"cloudflare")
     (tmp_path / "cloudflared-manifest.json").write_text("{}\n", encoding="utf-8")
     _git(tmp_path, "add", ".")
+    _git(tmp_path, "update-index", "--chmod=+x", "start_mcp.sh")
     _git(
         tmp_path,
         "-c",
