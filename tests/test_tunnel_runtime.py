@@ -13,7 +13,7 @@ from scripts import tunnel_runtime as module
 
 
 class FakeResponse(io.BytesIO):
-    def __enter__(self) -> "FakeResponse":
+    def __enter__(self) -> FakeResponse:
         return self
 
     def __exit__(self, *args: object) -> None:
