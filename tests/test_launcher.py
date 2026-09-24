@@ -44,28 +44,40 @@ def test_launcher_restarts_then_honors_interrupt(tmp_path: Path, first_exit: int
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell bootstrap")
-@pytest.mark.parametrize("cached,doctor_exit", [(True, 0), (False, 0), (False, 9)])
-def test_bootstrap_fast_and_full_paths(tmp_path: Path, cached: bool, doctor_exit: int) -> None:
+@pytest.mark.parametrize("start,expected_args,exit_code", [
+    (False, [], 0),
+    (True, ["--start"], 17),
+])
+def test_powershell_bootstrap_delegates_to_python_module(
+    tmp_path: Path, start: bool, expected_args: list[str], exit_code: int,
+) -> None:
     project = tmp_path / "bootstrap project"
     scripts = project / "scripts"
     scripts.mkdir(parents=True)
     shutil.copyfile(Path(__file__).resolve().parents[1] / "scripts/bootstrap.ps1", scripts / "bootstrap.ps1")
-    subprocess.run([sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", str(project / ".venv")],
-                   check=True, capture_output=True, timeout=40)
-    (project / "requirements.txt").write_text("")
-    (project / "requirements-browser.txt").write_text("")
-    # A local pip substitute records installation without touching the test environment.
-    (project / "pip.py").write_text("from pathlib import Path\nPath('pip-called').touch()\n")
-    (scripts / "doctor.py").write_text(
-        "import sys\nfrom pathlib import Path\n"
-        "with Path('doctor-calls').open('a') as f: f.write(' '.join(sys.argv[1:])+'\\n')\n"
-        f"raise SystemExit(({0 if cached else 2}) if '--check' in sys.argv else {doctor_exit})\n"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", str(project / ".venv")],
+        check=True,
+        capture_output=True,
+        timeout=40,
     )
-    environment = {**os.environ, "MCP_START_MODE": "local-http"}
-    result = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(scripts / "bootstrap.ps1")],
-                            cwd=project, env=environment, capture_output=True, text=True, timeout=60)
-    assert result.returncode == (15 if doctor_exit else 0), result.stdout + result.stderr
-    calls = (project / "doctor-calls").read_text().splitlines()
-    assert len(calls) == (1 if cached else 2)
-    assert "--check" in calls[0]
-    assert (project / "pip-called").exists() is not cached
+    (scripts / "bootstrap.py").write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "Path('bootstrap-args').write_text(' '.join(sys.argv[1:]))\n"
+        f"raise SystemExit({exit_code})\n",
+        encoding="utf-8",
+    )
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(scripts / "bootstrap.ps1"),
+    ]
+    if start:
+        command.append("-Start")
+    result = subprocess.run(command, cwd=project, capture_output=True, text=True, timeout=60)
+    assert result.returncode == exit_code, result.stdout + result.stderr
+    assert (project / "bootstrap-args").read_text(encoding="utf-8").split() == expected_args
