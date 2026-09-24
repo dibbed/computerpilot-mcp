@@ -6,8 +6,11 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
 import psutil
 import pytest
@@ -20,7 +23,7 @@ from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor,
 
 @pytest.mark.parametrize("status", ["queued", "running", "orphaned", "succeeded", "failed"])
 @pytest.mark.parametrize("kind", ["job_state", "job_request_key_state"])
-def test_real_job_state_evidence(tmp_path, monkeypatch, status, kind):
+def test_real_job_state_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, kind: str) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
     monkeypatch.setattr("core.job_scheduler.ensure_job_scheduler", lambda *_: None)
     monkeypatch.setattr(reconcilers, "JobStore", lambda: store)
@@ -45,7 +48,9 @@ def test_real_job_state_evidence(tmp_path, monkeypatch, status, kind):
 
 
 
-def test_durable_job_workflow_completes_with_public_job_id_contract(tmp_path, monkeypatch):
+def test_durable_job_workflow_completes_with_public_job_id_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     job_store = JobStore(tmp_path / "jobs.sqlite3")
     workflow_store = WorkflowStore(tmp_path / "workflows.sqlite3")
     request_key = "workflow-executor-job-id-contract"
@@ -86,9 +91,11 @@ def test_durable_job_workflow_completes_with_public_job_id_contract(tmp_path, mo
     assert job_store.output(job_id)["stdout"]["text"].strip() == "workflow-job-ok"
 
 
-def test_durable_job_action_and_reconciler_use_public_job_id_contract(tmp_path, monkeypatch):
+def test_durable_job_action_and_reconciler_use_public_job_id_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
-    external_refs = []
+    external_refs: list[dict[str, Any]] = []
     request_key = "workflow-job-id-contract"
     monkeypatch.setattr("core.workflow_actions.JobStore", lambda: store)
     monkeypatch.setattr(reconcilers, "JobStore", lambda: store)
@@ -135,9 +142,9 @@ def test_durable_job_action_and_reconciler_use_public_job_id_contract(tmp_path, 
 
 
 @pytest.fixture
-def http_endpoint():
+def http_endpoint() -> Iterator[str]:
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
+        def do_GET(self) -> None:
             status = int(self.path.strip("/"))
             body = b"x" * (1_048_577 if status == 200 else 12)
             self.send_response(status)
@@ -145,8 +152,8 @@ def http_endpoint():
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, *_):
-            pass
+        def log_message(self, format: str, *args: Any) -> None:
+            del format, args
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -160,7 +167,7 @@ def http_endpoint():
 
 
 @pytest.mark.parametrize("status", [404, 500])
-def test_http_error_status_is_observable(http_endpoint, status):
+def test_http_error_status_is_observable(http_endpoint: str, status: int) -> None:
     evidence = reconcilers._http_response({
         "url": f"{http_endpoint}/{status}", "status": status,
         "sha256": hashlib.sha256(b"x" * 12).hexdigest(),
@@ -170,7 +177,7 @@ def test_http_error_status_is_observable(http_endpoint, status):
 
 
 @pytest.mark.parametrize("wanted_hash", [hashlib.sha256(b"x" * 1_048_577).hexdigest(), "0" * 64])
-def test_truncated_http_body_cannot_prove_hash(http_endpoint, wanted_hash):
+def test_truncated_http_body_cannot_prove_hash(http_endpoint: str, wanted_hash: str) -> None:
     evidence = reconcilers._http_response({
         "url": f"{http_endpoint}/200", "sha256": wanted_hash,
     }).data
@@ -179,16 +186,16 @@ def test_truncated_http_body_cannot_prove_hash(http_endpoint, wanted_hash):
     assert evidence.get("sha256") is None
 
 
-def test_http_status_only_survives_body_limit(http_endpoint):
+def test_http_status_only_survives_body_limit(http_endpoint: str) -> None:
     evidence = reconcilers._http_response({"url": f"{http_endpoint}/200"}).data
     assert evidence["conclusive"] is True
     assert evidence["satisfied"] is True
     assert evidence.get("sha256") is None
 
 
-def test_http_reconciler_observes_redirect_status_without_following():
+def test_http_reconciler_observes_redirect_status_without_following() -> None:
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
+        def do_GET(self) -> None:
             if self.path == "/redirect":
                 self.send_response(302)
                 self.send_header("Location", "/final")
@@ -197,8 +204,8 @@ def test_http_reconciler_observes_redirect_status_without_following():
             self.send_response(200)
             self.end_headers()
 
-        def log_message(self, *_):
-            pass
+        def log_message(self, format: str, *args: Any) -> None:
+            del format, args
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -217,8 +224,8 @@ def test_http_reconciler_observes_redirect_status_without_following():
         thread.join(timeout=5)
 
 
-def test_git_index_unicode_literal_path(tmp_path):
-    def git(*args):
+def test_git_index_unicode_literal_path(tmp_path: Path) -> None:
+    def git(*args: str) -> None:
         subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
 
     git("init")
