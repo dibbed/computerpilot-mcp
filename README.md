@@ -31,7 +31,7 @@ Windows native desktop screenshot/input and semantic UI Automation are capabilit
 - Optional Playwright browser automation with bounded shared pools and isolated sessions.
 - Windows-only native desktop screenshot/input and semantic UI Automation, registered only when supported.
 - Supervised runtime health, restart backoff, mutation-aware drain, loopback control panel, and bounded local state.
-- Verified managed OpenAI Secure Tunnel updates with checksum/version validation, immutable publication, offline fallback, and bounded retry backoff.
+- Verified managed OpenAI Secure Tunnel bootstrap/update with automatic OS/architecture selection, checksum/version validation, managed-cache fallback, and bounded retry backoff.
 
 ## Architecture
 
@@ -80,9 +80,9 @@ The HTTP server is stateless and loopback-only by default.
 - Browser automation requires Playwright plus the desired browser runtime.
 - Semantic desktop UI Automation is Windows-only.
 
-The repository contains a Windows amd64 `tunnel-client.exe` + Cloudflared set as an **offline Windows fallback**. Normal startup on all supported platforms resolves the official `openai/tunnel-client` asset, verifies GitHub SHA-256 metadata and upstream `SHA256SUMS.txt`, validates the binary version, and installs an immutable managed runtime under `.agent_state/tunnel-runtime/`.
+The repository does **not** vendor tunnel-client or Cloudflared binaries. On the first tunnel-mode startup, the launcher detects the host OS and architecture, resolves the latest non-prerelease `openai/tunnel-client` release, selects the matching official `tunnel-client-runtime-cloudflared` archive, verifies both GitHub SHA-256 metadata and upstream `SHA256SUMS.txt`, validates the binary version, and installs an immutable managed runtime under `.agent_state/tunnel-runtime/`.
 
-Linux/macOS release archives intentionally omit the Windows fallback executables.
+All project release archives are source/runtime-controller packages only. After the first verified download, the managed cache is reused for offline startup and periodically checked for newer upstream releases.
 
 ## Release Artifacts
 
@@ -697,9 +697,7 @@ An uncertain record means the runtime ended after the mutation started but befor
 ├── memory/                       # Bounded project-memory data and documentation
 ├── tests/                        # Unit and integration tests
 ├── third_party/                  # Bundled third-party notices and licenses
-├── tunnel-client.exe             # Windows-only offline tunnel fallback
-├── cloudflared.exe               # Windows-only offline transport fallback
-├── BINARY_PROVENANCE.md          # Runtime binary provenance and hashes
+├── BINARY_PROVENANCE.md          # Managed upstream runtime provenance policy
 ├── CHANGELOG.md                  # Release history
 ├── CONTRIBUTING.md               # Contribution guide
 ├── SECURITY.md                   # Security reporting guidance
@@ -707,23 +705,20 @@ An uncertain record means the runtime ended after the mutation started but befor
 └── THIRD_PARTY_NOTICES.md        # Third-party attribution
 ```
 
-## Updating the Windows Offline Tunnel Fallback
+## Managed Secure Tunnel Runtime
 
-`tunnel-client.exe`, `cloudflared.exe`, and `cloudflared-manifest.json` are the tracked Windows amd64 offline fallback and must be treated as a matched set. Normal startup on every supported platform prefers the verified managed updater; Linux/macOS release artifacts do not contain these Windows executables.
+Upstream tunnel binaries are intentionally excluded from Git and from every project release artifact. Tunnel mode uses the managed updater in `scripts/tunnel_runtime.py`.
 
-When updating them:
+On first use it:
 
-1. Use only an official upstream release.
-2. Download the correct Windows architecture.
-3. Verify the release artifact hash before replacement.
-4. Replace the matched runtime files together.
-5. Recompute local SHA-256 hashes.
-6. Update [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
-7. Update third-party notices if upstream licensing changed.
-8. Run pytest, Ruff, mypy, compileall, health checks, and the full doctor.
-9. Validate both local HTTP and tunnel startup before merging the change.
+1. Detects Windows/Linux/macOS and amd64/arm64.
+2. Queries the latest official non-prerelease `openai/tunnel-client` release.
+3. Selects the matching `tunnel-client-runtime-cloudflared-vX.Y.Z-<os>-<arch>.zip`.
+4. Verifies the GitHub asset digest and the upstream `SHA256SUMS.txt` entry.
+5. Extracts into `.agent_state/tunnel-runtime/<version>/<platform>/`.
+6. Executes the downloaded runtime only after its reported semantic version matches the release tag.
 
-Do not replace only one bundled executable unless upstream documentation explicitly states that the combination is compatible.
+Later starts reuse that verified cache. When the update interval expires, the updater checks upstream again and atomically replaces the managed runtime only after full verification. If the network is unavailable and a verified managed cache already exists, startup can continue from that cache. A completely fresh installation with no cache fails closed if the first secure download cannot be verified.
 
 ## Development Workflow
 

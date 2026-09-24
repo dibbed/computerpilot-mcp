@@ -1,120 +1,55 @@
-# Bundled Binary Provenance and Managed Tunnel Runtime
+# Secure Tunnel Runtime Provenance
 
-This document separates two different responsibilities:
+This repository does not vendor OpenAI tunnel-client or Cloudflared executables.
 
-1. the **Git-tracked offline fallback** binaries shipped with the repository; and
-2. the **managed runtime** selected by normal tunnel startup.
+## Runtime source
 
-The managed runtime is intentionally installed outside tracked source under
-`.agent_state/tunnel-runtime/` so updating the Secure MCP Tunnel does not rewrite
-the Git checkout or replace a running executable in place.
-
-> The tunnel-client and Cloudflared binaries are third-party components authored
-> by OpenAI and Cloudflare, Inc. They are not authored by Ali Khalili.
-
-## 1. Git-tracked fallback inventory
-
-The current repository fallback remains the older full-client matched set:
-
-| File | Version | Architecture | SHA-256 |
-| --- | --- | --- | --- |
-| `tunnel-client.exe` | `0.0.11+8d55683eeef80bc5e360d95abf4692454fafc615` | windows/amd64 | `7D3C7D492CE84B52835E11865A835A8A5BCD4A669DEE84E169AA11B314DC952A` |
-| `cloudflared.exe` | `2026.7.2` | windows/amd64 | `88024CF82CEC72D10604C13AA4670016DCA375C602E200B551EC9D53B31E874D` |
-| `cloudflared-manifest.json` | pinned to Cloudflared `2026.7.2` | N/A | `149C1B5C0095FFAB41C3986D620CA18C35373E05C5B6CA0BEA88AC19F6D4A7A5` |
-
-The manifest checksum above is retained from the original fallback provenance.
-When validating a local checkout, compute the file digest directly rather than
-treating this table as a substitute for an integrity check.
-
-### Fallback tunnel-client provenance
+Tunnel mode acquires its runtime only from the official public repository:
 
 - Upstream repository: `openai/tunnel-client`
-- Upstream release: `v0.0.11`
-- Upstream Git commit: `8d55683eeef80bc5e360d95abf4692454fafc615`
-- Original asset: `tunnel-client-v0.0.11-windows-amd64.zip`
-- Original archive SHA-256: `eb912c86c6ccde90cda805cb17009507176a656725cf86c36fabe1901a12e29b`
+- Release discovery: GitHub `releases/latest` by default
+- Default flavor: `tunnel-client-runtime-cloudflared`
+- Supported host mappings: Windows/Linux/macOS on amd64/arm64
+- Local managed cache: `.agent_state/tunnel-runtime/`
 
-These tracked files are retained for the Windows amd64 source checkout/release artifact so tunnel mode still has a known local fallback when a managed release has not yet been installed and GitHub is unavailable. Linux/macOS release artifacts intentionally omit the Windows executables and use the verified managed updater.
+The managed runtime is local machine state and is intentionally ignored by Git.
 
-## 2. Normal managed-runtime policy
+## First-run installation
 
-Normal startup uses `scripts.tunnel_runtime` before launching the Supervisor.
+When no compatible managed runtime is installed, `scripts/tunnel_runtime.py`:
 
-The resolver:
+1. detects the host OS and CPU architecture;
+2. requests the latest official non-draft, non-prerelease upstream release;
+3. selects `tunnel-client-runtime-cloudflared-vX.Y.Z-<os>-<arch>.zip`;
+4. requires the asset URL to be an approved `github.com/openai/tunnel-client` URL;
+5. verifies the GitHub release asset SHA-256 digest;
+6. downloads and verifies upstream `SHA256SUMS.txt`;
+7. rejects archive path traversal and symbolic links;
+8. extracts into an immutable version/platform directory under `.agent_state/tunnel-runtime/`;
+9. executes the downloaded binary with `--version` and requires it to match the release tag;
+10. atomically records the selected path, platform, flavor, version, asset name, and archive hash in `current.json`.
 
-1. honors an explicit `MCP_TUNNEL_CLIENT_BIN` override;
-2. otherwise checks an already verified managed runtime;
-3. recognizes a locally present `tunnel-client-runtime[.exe]` when one exists;
-4. checks the official `openai/tunnel-client` stable release channel when the
-   configured update interval has elapsed;
-5. downloads the exact full-client archive for the detected OS/architecture;
-6. validates the release asset SHA-256 from GitHub release metadata;
-7. independently matches the same archive against upstream `SHA256SUMS.txt`;
-8. extracts only after those checks into a staging directory;
-9. runs the downloaded binary with `--version` and requires the reported
-   semantic version to equal the selected release tag;
-10. atomically publishes the immutable version directory under
-    `.agent_state/tunnel-runtime/<tag>/<platform-arch>/`;
-11. points the Supervisor at that managed binary.
+A fresh installation fails closed if the runtime cannot be downloaded and verified.
 
-A failed network request, invalid archive, digest mismatch, version mismatch, or
-unsafe ZIP path cannot replace a known-good runtime.
+## Update and offline behavior
 
-As of 2026-09-24, the latest stable upstream release observed during this work is
-`v0.0.14`. The updater does **not** hard-code that version unless
-`MCP_TUNNEL_VERSION=v0.0.14` is explicitly configured.
+The default updater periodically checks the official latest release. A newer runtime is published locally only after all verification succeeds.
 
-## 3. Update controls
+If a previously verified managed cache exists and a later update check fails because the network or upstream service is unavailable, the existing managed runtime may be reused. There is no repository-bundled binary fallback.
 
-| Variable | Meaning | Default |
-| --- | --- | --- |
-| `MCP_TUNNEL_AUTO_UPDATE` | Enable official release checks during startup | `1` |
-| `MCP_TUNNEL_UPDATE_INTERVAL_HOURS` | Minimum interval between latest-release checks | `24` |
-| `MCP_TUNNEL_VERSION` | Optional exact stable release pin | latest stable |
-| `MCP_TUNNEL_UPDATE_REQUIRED` | Fail startup instead of using a valid fallback after update failure | `0` |
-| `MCP_TUNNEL_ALLOW_PRERELEASE` | Permit an explicitly selected prerelease | `0` |
-| `MCP_TUNNEL_CLIENT_BIN` | Explicit operator-selected binary path; bypasses auto-update | unset |
+Operators can pin a specific upstream version with `MCP_TUNNEL_VERSION`, disable automatic checks with `MCP_TUNNEL_AUTO_UPDATE=0`, require a successful update check with `MCP_TUNNEL_UPDATE_REQUIRED=1`, or provide an explicit local override with `MCP_TUNNEL_CLIENT_BIN`.
 
-The default behavior is availability-preserving: an update failure is visible,
-but a previously validated runtime or local fallback may still be used.
-Operators that require strict freshness can set
-`MCP_TUNNEL_UPDATE_REQUIRED=1`.
+## Repository and release policy
 
-## 4. Platform selection
+The following upstream runtime files must not be tracked or embedded in project release archives:
 
-The updater currently understands official upstream archive naming for:
+- `tunnel-client` / `tunnel-client.exe`
+- `tunnel-client-runtime*`
+- `tunnel-client-runtime-cloudflared*`
+- `cloudflared` / `cloudflared.exe`
+- `cloudflared-manifest.json`
+- upstream runtime ZIP/license/SPDX sidecars
 
-- Windows amd64 / arm64
-- Linux amd64 / arm64
-- macOS (darwin) amd64 / arm64
+`.gitignore` excludes these files, and `scripts.package_release` fails closed if an upstream tunnel runtime file is tracked at repository root.
 
-As of project v0.2.7, the core MCP runtime is a cross-platform preview: launcher/bootstrap, process ownership, terminal execution, system diagnostics, jobs/workflows, file locking, health/doctor validation, browser tooling, and managed tunnel acquisition have Windows/Linux/macOS implementations or capability-aware behavior. Native desktop screenshot/input and semantic UI Automation remain Windows-only and are not registered on Linux/macOS.
-
-## 5. Security and release rules
-
-- Only HTTPS assets under the official `openai/tunnel-client` GitHub release
-  namespace are accepted.
-- Draft releases are rejected.
-- Prereleases are rejected unless explicitly enabled.
-- Release archive integrity must agree with both GitHub asset metadata and
-  upstream `SHA256SUMS.txt`.
-- ZIP traversal paths are rejected before extraction.
-- A downloaded binary must successfully report the expected release version.
-- Managed releases are installed into versioned immutable directories rather
-  than overwriting the active executable.
-- Secrets and tunnel profile contents are never written into updater metadata.
-- `.agent_state/` remains ignored by Git and must never be packaged as a
-  source or release artifact.
-
-## 6. Historical local runtime note
-
-A local project archive supplied during v0.2.6 follow-up contained:
-
-- full `tunnel-client.exe` at **0.0.11**
-- `tunnel-client-runtime.exe` at **0.0.14**
-- the matching v0.0.14 runtime SPDX/license evidence
-
-The previous Supervisor still launched the full `tunnel-client.exe`, so that
-manual runtime addition did not change the actually executed tunnel version.
-The managed resolver removes this ambiguity by selecting and reporting the
-binary that the Supervisor will really execute.
+This keeps project releases platform-neutral at the source/controller layer and prevents stale upstream executables from being silently redistributed.

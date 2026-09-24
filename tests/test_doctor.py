@@ -16,8 +16,8 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(doctor.sysconfig, "get_paths", lambda: {"purelib": str(tmp_path / "site")})
     monkeypatch.setenv("TUNNEL_CLIENT_PROFILE_DIR", str(tmp_path / "profiles"))
     for name in ("main.py", "requirements.txt", "requirements-browser.txt", "pyproject.toml", "core/config.py",
-                 "tools/example.py", "scripts/bootstrap.ps1", "local_pc_mcp.py", "START_MCP.bat", "start_mcp.sh", "tunnel-client.exe",
-                 "tunnel-client-runtime.exe", "cloudflared.exe", "profiles/demo.yaml", "site/example.dist-info/METADATA"):
+                 "tools/example.py", "scripts/bootstrap.ps1", "local_pc_mcp.py", "START_MCP.bat", "start_mcp.sh",
+                 "profiles/demo.yaml", "site/example.dist-info/METADATA"):
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("original", encoding="utf-8")
@@ -27,7 +27,6 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.mark.parametrize("name", ["main.py", "requirements.txt", "requirements-browser.txt", "pyproject.toml",
                                       "core/config.py", "tools/example.py", "scripts/bootstrap.ps1", "local_pc_mcp.py",
-                                      "tunnel-client.exe", "tunnel-client-runtime.exe", "cloudflared.exe",
                                       "profiles/demo.yaml", "site/example.dist-info/METADATA"])
 def test_fingerprint_invalidates_same_size_edits(root: Path, name: str) -> None:
     before = doctor.fingerprint(root, "tunnel", "demo")

@@ -22,11 +22,21 @@ SUPPORTED_TARGETS = (
     "macos-amd64",
     "macos-arm64",
 )
-_WINDOWS_FALLBACK_FILES = frozenset({
-    "tunnel-client.exe",
+_FORBIDDEN_UPSTREAM_ROOT_FILES = frozenset({
+    "cloudflared",
     "cloudflared.exe",
     "cloudflared-manifest.json",
+    "tunnel-client",
+    "tunnel-client.exe",
+    "tunnel-client-runtime",
+    "tunnel-client-runtime.exe",
+    "tunnel-client-runtime-cloudflared",
+    "tunnel-client-runtime-cloudflared.exe",
 })
+_FORBIDDEN_UPSTREAM_ROOT_PREFIXES = (
+    "tunnel-client-runtime-",
+    "tunnel-client-runtime-cloudflared-",
+)
 _FORBIDDEN_PARTS = frozenset({
     ".agent_state",
     ".secrets",
@@ -95,6 +105,13 @@ def tracked_entries(root: Path, ref: str = "HEAD") -> list[GitEntry]:
             raise RuntimeError(f"Unsafe tracked path: {path!r}")
         if any(part in _FORBIDDEN_PARTS for part in parts):
             raise RuntimeError(f"Forbidden runtime/build path is tracked: {path!r}")
+        if len(parts) == 1:
+            root_name = parts[0].casefold()
+            if (
+                root_name in _FORBIDDEN_UPSTREAM_ROOT_FILES
+                or any(root_name.startswith(prefix) for prefix in _FORBIDDEN_UPSTREAM_ROOT_PREFIXES)
+            ):
+                raise RuntimeError(f"Bundled upstream tunnel runtime file must not be tracked: {path!r}")
         entries.append(GitEntry(path=path, mode=int(mode_raw, 8)))
     return sorted(entries, key=lambda item: item.path)
 
@@ -129,9 +146,7 @@ def validate_version(root: Path, ref: str, version: str) -> None:
 def _entries_for_target(entries: list[GitEntry], target: str) -> list[GitEntry]:
     if target not in SUPPORTED_TARGETS:
         raise ValueError(f"Unsupported target: {target}")
-    if target.startswith("windows-"):
-        return entries
-    return [entry for entry in entries if entry.path not in _WINDOWS_FALLBACK_FILES]
+    return entries
 
 
 def _manifest(
@@ -151,8 +166,9 @@ def _manifest(
         "target": target,
         "source_commit": commit.strip(),
         "file_count": len(entries),
-        "windows_offline_tunnel_fallback_included": target.startswith("windows-"),
+        "bundled_tunnel_runtime_included": False,
         "managed_tunnel_runtime": True,
+        "tunnel_runtime_download_on_first_use": True,
     }
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
 

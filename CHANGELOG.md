@@ -6,6 +6,15 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+### Changed
+- Stop tracking and redistributing upstream tunnel-client/Cloudflared binaries in the repository and project release artifacts.
+- Make first tunnel-mode startup detect the host OS/architecture and download the latest verified official `tunnel-client-runtime-cloudflared` archive from `openai/tunnel-client`.
+- Treat only the managed `.agent_state/tunnel-runtime` cache (or an explicit `MCP_TUNNEL_CLIENT_BIN` override) as a valid local tunnel runtime; legacy repository/root binaries are no longer fallback candidates.
+- Make project packaging fail closed if an upstream tunnel runtime file is accidentally tracked at repository root.
+
+### Fixed
+- Honor the most recent failed-update timestamp even when a managed runtime metadata record already exists, preventing repeated network checks during configured failure backoff.
+
 ## [0.2.8] - 2026-09-24
 
 ### Fixed
