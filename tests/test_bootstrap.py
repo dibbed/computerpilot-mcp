@@ -62,6 +62,19 @@ def test_control_plane_key_strips_utf8_bom(
     assert os.environ["CONTROL_PLANE_API_KEY"] == "secret-with-bom"
 
 
+def test_control_plane_key_handles_utf16_and_quotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    secret = tmp_path / ".secrets" / "control_plane_api_key.txt"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_bytes('"secret-with-utf16-quotes"'.encode("utf-16"))
+    bootstrap._load_control_plane_key()
+    assert os.environ["CONTROL_PLANE_API_KEY"] == "secret-with-utf16-quotes"
+    assert secret.read_bytes() == b"secret-with-utf16-quotes"
+
+
 @pytest.mark.parametrize(
     "cached,doctor_exit,expected_dependency_calls,expected_full_calls",
     [

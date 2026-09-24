@@ -200,3 +200,18 @@ def test_doctor_main_loads_secret_with_utf8_bom(root: Path, monkeypatch: pytest.
     monkeypatch.setattr(doctor.sys, "argv", ["doctor", "--mode", "tunnel", "--profile", "demo"])
     assert doctor.main() == 0
     assert doctor.os.environ["CONTROL_PLANE_API_KEY"] == "secret-from-doctor-bom"
+
+
+def test_doctor_main_loads_secret_with_utf16_and_quotes(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(doctor, "ROOT", root)
+    secret = root / ".secrets" / "control_plane_api_key.txt"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_bytes("'secret-from-doctor-utf16'".encode("utf-16"))
+    selection = TunnelRuntimeSelection(root / "tunnel-client.exe", "0.0.14", "test", "windows-amd64")
+    monkeypatch.setattr(doctor, "current_runtime", lambda r: selection)
+    monkeypatch.setattr(doctor, "detect_profile", lambda: "demo")
+    monkeypatch.setattr(doctor, "doctor", lambda *args: None)
+    monkeypatch.setattr(doctor.sys, "argv", ["doctor", "--mode", "tunnel", "--profile", "demo"])
+    assert doctor.main() == 0
+    assert doctor.os.environ["CONTROL_PLANE_API_KEY"] == "secret-from-doctor-utf16"

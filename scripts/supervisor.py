@@ -30,7 +30,13 @@ from core.executor import _creation_flags
 from core.jobs import JobStore
 from core.lifecycle import lifecycle_control_request
 from core.singleflight import SingleFlight
-from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile, profile_run_args
+from scripts.tunnel_runtime import (
+    TunnelRuntimeError,
+    clean_control_plane_key,
+    current_runtime,
+    detect_profile,
+    profile_run_args,
+)
 
 
 def restart_delay(failures: int) -> int:
@@ -136,7 +142,7 @@ class Supervisor:
                                                        backupCount=3, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
         self.logger.addHandler(handler)
-        self.secret = os.environ.get("CONTROL_PLANE_API_KEY", "").strip().lstrip("\ufeff")
+        self.secret = clean_control_plane_key(os.environ.get("CONTROL_PLANE_API_KEY", ""))
         self.owned: dict[int, psutil.Process] = {}
 
     @staticmethod

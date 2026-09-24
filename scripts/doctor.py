@@ -16,7 +16,14 @@ from pathlib import Path
 
 from core.file_lock import exclusive_file_lock
 from core.platform import detect_capabilities
-from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile, profile_directory, profile_run_args
+from scripts.tunnel_runtime import (
+    TunnelRuntimeError,
+    clean_control_plane_key,
+    current_runtime,
+    detect_profile,
+    profile_directory,
+    profile_run_args,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -221,13 +228,14 @@ def main() -> int:
                 profile = detect_profile()
             current_runtime(ROOT)
             secret = ROOT / ".secrets/control_plane_api_key.txt"
-            existing = os.getenv("CONTROL_PLANE_API_KEY", "").strip().lstrip("\ufeff")
+            existing = clean_control_plane_key(os.getenv("CONTROL_PLANE_API_KEY", ""))
             if existing:
                 os.environ["CONTROL_PLANE_API_KEY"] = existing
             elif secret.is_file():
-                os.environ["CONTROL_PLANE_API_KEY"] = (
-                    secret.read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
-                )
+                try:
+                    os.environ["CONTROL_PLANE_API_KEY"] = clean_control_plane_key(secret.read_bytes())
+                except (OSError, ValueError):
+                    pass
             if not os.getenv("CONTROL_PLANE_API_KEY"):
                 raise RuntimeError("CONTROL_PLANE_API_KEY or .secrets/control_plane_api_key.txt is required")
         if args.check:

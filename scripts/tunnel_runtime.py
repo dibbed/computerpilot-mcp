@@ -75,6 +75,46 @@ def _version_key(version: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in matched.group(1).split("."))  # type: ignore[return-value]
 
 
+def clean_control_plane_key(raw: str | bytes | None) -> str:
+    """Normalize control-plane API key, stripping BOMs, UTF-16 wrappers, quotes, and whitespace."""
+    if not raw:
+        return ""
+    if isinstance(raw, bytes):
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            for encoding in ("utf-16", "utf-16-le", "utf-16-be"):
+                try:
+                    text = raw.decode(encoding)
+                    break
+                except (UnicodeDecodeError, ValueError):
+                    continue
+            else:
+                text = raw.decode("utf-8", errors="replace")
+        elif b"\x00" in raw:
+            for encoding in ("utf-16-be", "utf-16-le", "utf-16"):
+                try:
+                    candidate = raw.decode(encoding)
+                    if "\x00" not in candidate:
+                        text = candidate
+                        break
+                except (UnicodeDecodeError, ValueError):
+                    continue
+            else:
+                text = raw.decode("utf-8", errors="replace")
+        else:
+            try:
+                text = raw.decode("utf-8-sig")
+            except (UnicodeDecodeError, ValueError):
+                text = raw.decode("latin1", errors="replace")
+    else:
+        text = raw
+    cleaned = text.replace("\x00", "").strip().lstrip("\ufeff").strip()
+    if (len(cleaned) >= 2) and (
+        (cleaned[0] == '"' and cleaned[-1] == '"') or (cleaned[0] == "'" and cleaned[-1] == "'")
+    ):
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
 def platform_parts(
     *,
     system: str | None = None,
