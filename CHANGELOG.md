@@ -2,9 +2,11 @@
 
 All notable project-level changes are documented here.
 
-Project releases are independent from the bundled upstream tunnel-client.exe version; binary runtime provenance remains in BINARY_PROVENANCE.md.
+Project releases do not bundle upstream tunnel-client/Cloudflared executables; managed runtime provenance and verification rules are documented in BINARY_PROVENANCE.md.
 
 ## [Unreleased]
+
+## [0.2.9] - 2026-09-24
 
 ### Changed
 - Stop tracking and redistributing upstream tunnel-client/Cloudflared binaries in the repository and project release artifacts.
