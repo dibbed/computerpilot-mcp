@@ -87,7 +87,10 @@ def _kernel32() -> Any:
     with _KERNEL32_LOCK:
         if _KERNEL32 is not None:
             return _KERNEL32
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        win_dll = getattr(ctypes, "WinDLL", None)
+        if win_dll is None:
+            raise OSError("ctypes.WinDLL is unavailable on this Windows runtime.")
+        kernel32 = win_dll("kernel32", use_last_error=True)
         specs: tuple[tuple[str, list[Any], Any], ...] = (
             ("CreateJobObjectW", [ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
             ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, _DWORD], wintypes.BOOL),
@@ -111,7 +114,8 @@ def _kernel32() -> Any:
 
 
 def _last_error() -> int:
-    return int(ctypes.get_last_error())
+    getter = getattr(ctypes, "get_last_error", None)
+    return int(getter()) if callable(getter) else 0
 
 
 def windows_job_objects_enabled() -> bool:
@@ -169,7 +173,9 @@ class WindowsJob:
             handle = self._handle
             if handle is None:
                 raise OSError("Job Object handle is closed.")
-            ctypes.set_last_error(0)
+            setter = getattr(ctypes, "set_last_error", None)
+            if callable(setter):
+                setter(0)
             if not _kernel32().AssignProcessToJobObject(handle, process_handle):
                 raise OSError(f"AssignProcessToJobObject failed: {_last_error()}")
 
