@@ -202,7 +202,7 @@ def test_background_output_is_unlimited_by_default(tmp_path: Path) -> None:
 
 def test_read_window_uses_lines_offsets_and_limits(tmp_path: Path) -> None:
     target = tmp_path / "lines.txt"
-    target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+    target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8", newline="")
     result = read_window(
         str(target),
         start_line=2,
