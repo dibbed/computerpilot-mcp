@@ -9,14 +9,13 @@ import queue
 import re
 import threading
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from core.config import SETTINGS, Settings
+from core.file_lock import exclusive_file_lock
 
 _LOCK_WAIT_SEC = 5.0
 _SYNC_FALLBACK_WAIT_SEC = 0.05
@@ -55,43 +54,11 @@ def _policy_from_settings(settings: Settings) -> AuditPolicy:
     )
 
 
-@contextmanager
-def _interprocess_lock(path: Path) -> Iterator[None]:
+def _interprocess_lock(path: Path):
     """Serialize append/rotation across MCP, supervisor, and durable-worker processes."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f".{path.name}.lock")
-    # Windows byte-range locks work on an empty file. Do not seed byte 0
-    # before taking the lock: concurrent first-openers can otherwise race,
-    # and one process may flush into byte 0 while another already owns it.
-    with lock_path.open("a+b", buffering=0) as handle:
-        handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            deadline = time.monotonic() + _LOCK_WAIT_SEC
-            while True:
-                try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(f"Timed out locking audit file {path}.") from None
-                    time.sleep(0.01)
-            try:
-                yield
-            finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            return
-
-        import fcntl
-
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+    return exclusive_file_lock(lock_path, timeout_sec=_LOCK_WAIT_SEC, label=f"audit file {path}")
 
 
 class AuditWriter:
