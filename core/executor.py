@@ -22,7 +22,7 @@ import psutil
 from core.artifacts import Delivery, deliver_stream
 from core.errors import ToolError
 from core.timings import timing_span
-from core.windows_job import OwnedProcess, spawn_owned_process
+from core.process_ownership import OwnedProcess, spawn_owned_process
 
 OutputMode = Literal["head", "tail", "both"]
 SPOOL_MEMORY_BYTES = 1_048_576
@@ -268,8 +268,8 @@ def run_bounded(
                 timed_out = True
                 process.terminate_tree(force=True)
                 exit_code = process.wait(timeout=5.0)
-        # Closing a successful command's Job Object kills any descendants that
-        # outlived the root and releases inherited pipe handles before drain.
+        # Releasing platform ownership reaps descendants that outlived the root
+        # and releases inherited pipe handles before drain.
         process.close_ownership()
         with timing_span("process_drain"):
             stdout_thread.join(timeout=2.0)
@@ -320,7 +320,7 @@ _BACKGROUND_LOCK = threading.Lock()
 
 
 def _release_background_ownership(process: OwnedProcess) -> None:
-    """Release the Job Object as soon as the root exits, reaping surviving descendants."""
+    """Release process-tree ownership as soon as the root exits, reaping descendants."""
     try:
         process.wait()
     except (OSError, subprocess.SubprocessError):
