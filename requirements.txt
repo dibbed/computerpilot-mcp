@@ -1,6 +1,2 @@
-mcp[cli]>=2.0,<2.1
-pydantic>=2.12,<3
-psutil>=7.0,<8
-charset-normalizer>=3.4,<4
-Pillow>=11,<13
-uiautomation>=2.0.29,<3; sys_platform == "win32"
+-r requirements-runtime.txt
+-r requirements-quality.txt
