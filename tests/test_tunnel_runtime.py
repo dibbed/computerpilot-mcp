@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -197,7 +198,7 @@ def test_ensure_runtime_uses_update_lock(
     entered: list[bool] = []
 
     @module.contextmanager
-    def fake_lock(root: Path):
+    def fake_lock(root: Path) -> Iterator[None]:
         assert root == tmp_path
         entered.append(True)
         yield
