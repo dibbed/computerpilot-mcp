@@ -1,9 +1,6 @@
 mcp[cli]>=2.0,<2.1
 pydantic>=2.12,<3
 psutil>=7.0,<8
-uiautomation>=2.0.29,<3
 charset-normalizer>=3.4,<4
 Pillow>=11,<13
-pytest>=8.4,<10
-ruff>=0.12,<1
-mypy>=1.17,<2
+uiautomation>=2.0.29,<3; sys_platform == "win32"
