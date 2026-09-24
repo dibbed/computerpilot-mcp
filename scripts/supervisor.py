@@ -150,6 +150,18 @@ class Supervisor:
             return "WARN"
         return "INFO"
 
+    @staticmethod
+    def _runtime_event_level(level: str, component: str, message: str, error: str) -> str:
+        """Normalize known non-fatal upstream cancellation noise without hiding real failures."""
+        if (
+            level in {"ERROR", "FATAL"}
+            and component == "dispatcher"
+            and message == "failed to post error response to control plane"
+            and "controlplane responder: retry wait: context canceled" in error.casefold()
+        ):
+            return "WARN"
+        return level
+
     def event(self, message: str) -> None:
         if self.secret:
             message = message.replace(self.secret, "[redacted]")
@@ -163,13 +175,16 @@ class Supervisor:
                 raw_level = str(entry.get("level", "INFO")).upper()
                 level = "WARN" if raw_level == "WARNING" else raw_level
                 component = str(entry.get("component") or "runtime")
-                if level == "INFO" and entry["msg"] in {
+                entry_message = str(entry["msg"])
+                entry_error = str(entry.get("error") or "")
+                level = self._runtime_event_level(level, component, entry_message, entry_error)
+                if level == "INFO" and entry_message in {
                     "run", "provided", "invoking", "OnStart hook executing", "OnStart hook executed",
                 }:
                     return  # Keep framework wiring noise in the rotated file, not the panel.
-                display = f"{level} {component}: {entry['msg']}"
-                if entry.get("error"):
-                    display += f" | {entry['error']}"
+                display = f"{level} {component}: {entry_message}"
+                if entry_error:
+                    display += f" | {entry_error}"
         except (ValueError, TypeError):
             pass
 
