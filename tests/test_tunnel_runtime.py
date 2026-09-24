@@ -67,7 +67,7 @@ def test_detect_profile_finds_yaml_without_running_full_client(
     assert module.detect_profile() == "alpha"
 
 
-def test_current_runtime_prefers_newer_bundled_runtime(
+def test_current_runtime_preserves_full_client_fallback_flavor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("MCP_TUNNEL_CLIENT_BIN", raising=False)
@@ -82,9 +82,9 @@ def test_current_runtime_prefers_newer_bundled_runtime(
 
     monkeypatch.setattr(module, "binary_version", fake_version)
     selection = module.current_runtime(tmp_path)
-    assert selection.path == runtime
-    assert selection.version == "0.0.14"
-    assert selection.source == "bundled-runtime"
+    assert selection.path == client
+    assert selection.version == "0.0.11"
+    assert selection.source == "bundled-client"
 
 
 def test_safe_extract_rejects_path_traversal(tmp_path: Path) -> None:
