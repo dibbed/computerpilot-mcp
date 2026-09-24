@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import os
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -85,6 +84,17 @@ def test_current_runtime_preserves_full_client_fallback_flavor(
     assert selection.path == client
     assert selection.version == "0.0.11"
     assert selection.source == "bundled-client"
+
+
+def test_safe_extract_rejects_symbolic_links(tmp_path: Path) -> None:
+    archive = tmp_path / "symlink.zip"
+    info = zipfile.ZipInfo("link")
+    info.create_system = 3
+    info.external_attr = (0o120777 << 16)
+    with zipfile.ZipFile(archive, "w") as writer:
+        writer.writestr(info, "target")
+    with pytest.raises(module.TunnelRuntimeError, match="symbolic link"):
+        module._safe_extract(archive, tmp_path / "extract")
 
 
 def test_safe_extract_rejects_path_traversal(tmp_path: Path) -> None:
