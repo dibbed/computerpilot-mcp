@@ -231,6 +231,20 @@ def test_ensure_runtime_falls_back_when_update_is_offline(
     assert selection.path == bundled
     assert selection.version == "0.0.11"
     assert selection.warning == "offline"
+    failure = json.loads(
+        (tmp_path / ".agent_state/tunnel-runtime/last-check-failure.json").read_text(encoding="utf-8")
+    )
+    assert failure["error"] == "offline"
+
+    monkeypatch.setenv("MCP_TUNNEL_UPDATE_INTERVAL_HOURS", "24")
+    monkeypatch.setattr(
+        module,
+        "_release",
+        lambda tag: (_ for _ in ()).throw(AssertionError("release check should be backed off")),
+    )
+    second = module.ensure_runtime(tmp_path)
+    assert second.path == bundled
+    assert second.warning is None
 
 
 def test_required_update_does_not_silently_fall_back(
