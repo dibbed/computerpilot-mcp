@@ -6,6 +6,9 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+### Fixed
+- Install the managed `tunnel-client-runtime-cloudflared` flavor in its own version/platform subdirectory so Windows upgrades can migrate while a legacy full-client executable from the same upstream version is still running, instead of failing with an access-denied error while replacing the live directory.
+
 ## [0.2.9] - 2026-09-24
 
 ### Changed

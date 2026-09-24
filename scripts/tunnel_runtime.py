@@ -397,7 +397,10 @@ def _install_release(root: Path, release: dict[str, Any]) -> TunnelRuntimeSelect
         raise TunnelRuntimeError(f"SHA256SUMS.txt verification failed for {asset_name}.")
 
     runtime_root = _state_root(root)
-    final_dir = runtime_root / tag / key
+    # Keep each runtime flavor in its own directory. Older releases stored the
+    # full client directly under <version>/<platform>; replacing that directory
+    # fails on Windows while the legacy executable is still running.
+    final_dir = runtime_root / tag / key / MANAGED_RUNTIME_FLAVOR
     binary_name = executable_name(system_name)
     if final_dir.is_dir():
         try:

@@ -715,7 +715,7 @@ On first use it:
 2. Queries the latest official non-prerelease `openai/tunnel-client` release.
 3. Selects the matching `tunnel-client-runtime-cloudflared-vX.Y.Z-<os>-<arch>.zip`.
 4. Verifies the GitHub asset digest and the upstream `SHA256SUMS.txt` entry.
-5. Extracts into `.agent_state/tunnel-runtime/<version>/<platform>/`.
+5. Extracts into `.agent_state/tunnel-runtime/<version>/<platform>/tunnel-client-runtime-cloudflared/`, keeping legacy/full-client installs separate so a live Windows runtime never has to be deleted during migration.
 6. Executes the downloaded runtime only after its reported semantic version matches the release tag.
 
 Later starts reuse that verified cache. When the update interval expires, the updater checks upstream again and atomically replaces the managed runtime only after full verification. If the network is unavailable and a verified managed cache already exists, startup can continue from that cache. A completely fresh installation with no cache fails closed if the first secure download cannot be verified.
