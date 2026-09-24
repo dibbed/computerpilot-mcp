@@ -6,6 +6,17 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-09-24
+
+### Fixed
+- Normalize `CONTROL_PLANE_API_KEY` loading across bootstrap, Doctor, and Supervisor so UTF-8 BOM, UTF-16 LE/BE files, surrounding quotes, and incidental whitespace cannot turn a valid key into a malformed tunnel configuration.
+- Handle control-plane key decoding failures safely and consistently instead of letting an unhandled Unicode decode error break startup or diagnostics.
+- Centralize control-plane API-key normalization in the managed tunnel runtime path so every startup/health component uses the same resilient parsing rules.
+
+### Validation
+- Add regression coverage for BOM-prefixed, UTF-16, quoted, whitespace-padded, and decode-failure control-plane key inputs across bootstrap, Doctor, and managed tunnel runtime helpers.
+- Full release validation evidence is recorded in `docs/V0.2.8-VALIDATION.md`.
+
 ## [0.2.7] - 2026-09-24
 
 ### Added
