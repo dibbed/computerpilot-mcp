@@ -71,13 +71,18 @@ The Streamable HTTP server is stateless and binds to `127.0.0.1` by default.
 - Tunnel mode only: a valid control-plane API key and tunnel profile.
 - Browser automation only: Playwright plus the required browser runtime.
 
-The repository includes the Windows tunnel runtime binaries required by the default tunnel mode:
+The repository includes Windows tunnel binaries as an **offline fallback**:
 
 - `tunnel-client.exe`
 - `cloudflared.exe`
 - `cloudflared-manifest.json`
 
-Keep these files together as a matched set. See [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md) before replacing them.
+Normal tunnel startup does not blindly trust that fallback forever. The launcher resolves the official
+`openai/tunnel-client` release for the current OS/architecture, verifies the release asset SHA-256
+against both GitHub release metadata and `SHA256SUMS.txt`, validates the downloaded binary with
+`--version`, and installs the immutable verified bundle under `.agent_state/tunnel-runtime/`.
+The Supervisor then runs the managed copy. If GitHub is temporarily unavailable, the newest already
+validated managed or local runtime remains usable. See [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
 
 ## Quick Start
 
@@ -121,11 +126,17 @@ The launcher performs the following startup flow:
 
 ```text
 [1/5] Create or reuse .venv
-[2/5] Verify Python version
+[2/5] Verify Python version and resolve the Secure Tunnel runtime
 [3/5] Install or validate dependencies
 [4/5] Run fast validation or the full startup doctor
 [5/5] Start the MCP supervisor
 ```
+
+In tunnel mode, runtime resolution checks for an official update only when the configured update interval
+has elapsed. The default is 24 hours. Release downloads are staged and verified before publication; a
+failed download or checksum never replaces a working runtime. Set `MCP_TUNNEL_VERSION` to pin an exact
+stable release, `MCP_TUNNEL_AUTO_UPDATE=0` to disable network update checks, or
+`MCP_TUNNEL_UPDATE_REQUIRED=1` when startup must fail instead of using a known-good fallback.
 
 On later starts, a successful validation fingerprint allows unchanged environments to skip the expensive full doctor path.
 
@@ -213,6 +224,10 @@ Common settings:
 | --- | --- | --- |
 | `MCP_START_MODE` | Launcher mode: `tunnel` or `local-http` | `tunnel` |
 | `MCP_TUNNEL_PROFILE` | Secure Tunnel profile | auto-detected / `default` |
+| `MCP_TUNNEL_AUTO_UPDATE` | Check official tunnel-client releases during startup | enabled |
+| `MCP_TUNNEL_UPDATE_INTERVAL_HOURS` | Minimum time between latest-release checks | `24` |
+| `MCP_TUNNEL_VERSION` | Optional exact upstream release pin | latest stable |
+| `MCP_TUNNEL_UPDATE_REQUIRED` | Fail startup if a requested update cannot be verified | disabled |
 | `MCP_TOOL_PROFILE` | Tool catalog profile (`minimal`, `coding`, `git`, `testing`, `desktop`, `browser`, `operations`, or `full`) | `full` |
 | `CONTROL_PLANE_API_KEY` | Tunnel control-plane credential | none |
 | `MCP_MAX_RUNNING_JOBS` | Maximum simultaneously active durable jobs | `4` |
