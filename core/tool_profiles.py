@@ -28,6 +28,8 @@ PREFERRED_USE: dict[str, str] = {
     "write_file": "Use only for an intentional full-file replacement.",
     "rename_symbol": "Use semantic rename instead of text replacement when a language server supports it.",
     "run_process": "Use for a bounded foreground process with captured output.",
+    "run_shell": "Use for intentional POSIX shell expansion on Linux/macOS; prefer run_process otherwise.",
+    "run_cmd": "Use for intentional Windows CMD expansion; prefer run_process otherwise.",
     "run_background": "Use for a long-running process that needs a managed session.",
     "submit_job": "Use for durable execution that must survive MCP runtime restarts.",
     "affected_tests": "Use to identify a conservative focused test set for changed code.",
