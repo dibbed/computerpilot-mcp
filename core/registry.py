@@ -13,6 +13,7 @@ from pydantic import ConfigDict
 
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.heartbeat import lifespan
+from core.platform import available_domains, detect_capabilities
 from core.recovery import OPERATION_RECOVERY
 from core.resource_health import collect_resource_metrics
 from core.timings import ToolRequestTimingMiddleware, install_sdk_timing_hooks
@@ -59,6 +60,8 @@ def create_server() -> MCPServer:
     ArgModelBase.model_rebuild(force=True)
     ensure_runtime_dirs()
     profile = resolve_profile(SETTINGS.tool_profile)
+    capabilities = detect_capabilities()
+    active_domains = available_domains(profile.domains, capabilities)
     server = MCPServer(
         name=SETTINGS.server_name,
         title="Ali Windows Agent MCP",
@@ -75,7 +78,7 @@ def create_server() -> MCPServer:
         lifespan=lifespan,
         middleware=[ToolRequestTimingMiddleware()],
     )
-    for domain in profile.domains:
+    for domain in active_domains:
         registrar = REGISTRARS.get(domain)
         if registrar is not None:
             registrar(server)
@@ -88,8 +91,12 @@ def create_server() -> MCPServer:
         return {
             "ok": True,
             "active_profile": profile.name,
-            "active_domains": list(profile.domains),
-            "available_domains": list(ALL_DOMAINS),
+            "active_domains": list(active_domains),
+            "requested_domains": list(profile.domains),
+            "available_domains": list(available_domains(ALL_DOMAINS, capabilities)),
+            "unavailable_domains": [domain for domain in profile.domains if domain not in active_domains],
+            "platform": capabilities.platform_key,
+            "capabilities": capabilities.as_dict(),
             "profiles": {name: list(domains) for name, domains in PROFILE_DOMAINS.items()},
         }
 
@@ -160,14 +167,17 @@ def create_server() -> MCPServer:
             "server": SETTINGS.server_name,
             "version": SETTINGS.version,
             "tool_profile": profile.name,
-            "tool_domains": list(profile.domains),
+            "tool_domains": list(active_domains),
+            "requested_tool_domains": list(profile.domains),
             "tool_count": len(tools),
             "unique_tool_names": len({tool.name for tool in tools}) == len(tools),
             "python": platform.python_version(),
             "platform": platform.platform(),
+            "platform_key": capabilities.platform_key,
             "windows": os.name == "nt",
-            "browser_optional_installed": importlib.util.find_spec("playwright") is not None,
-            "semantic_desktop_available": os.name == "nt" and importlib.util.find_spec("uiautomation") is not None,
+            "capabilities": capabilities.as_dict(),
+            "browser_optional_installed": capabilities.browser,
+            "semantic_desktop_available": capabilities.semantic_ui,
             "audit_log": str(SETTINGS.audit_log),
             "operation_recovery": operation_recovery,
             "health_status": health_status,
