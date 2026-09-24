@@ -168,7 +168,8 @@ def test_catalog_benchmark_smoke() -> None:
     result = report["results"][0]
     assert result["name"] == "tool_catalog"
     assert result["status"] == "ok"
-    assert result["details"]["tool_count"] == 112
+    expected_tool_count = len(asyncio.run(create_server().list_tools()))
+    assert result["details"]["tool_count"] == expected_tool_count
     assert result["details"]["catalog_json_bytes"] > 10_000
 
 

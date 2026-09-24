@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import replace
 
 import pytest
@@ -23,14 +24,21 @@ def _names(profile: str) -> set[str]:
 def test_full_is_default_and_preserves_complete_catalog() -> None:
     assert resolve_profile(None).name == "full"
     names = _names("full")
-    assert len(names) == 112
+    if os.name == "nt":
+        assert len(names) == 112
+    else:
+        assert "run_shell" in names
+        assert "run_cmd" not in names
+        assert "installed_programs" not in names
+        assert "windows_services" not in names
+        assert "desktop_screenshot" not in names
     assert {
         "read_file",
         "run_process",
         "system_info",
         "installed_software",
         "system_services",
-        "ui_invoke",
+        *(["ui_invoke"] if os.name == "nt" else []),
         "reconcile_operation",
         "discover_tool_domains",
         "recommend_tools",

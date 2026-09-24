@@ -34,7 +34,6 @@ REQUIRED_TOOLS = {
     "apply_patch",
     "run_process",
     "run_powershell",
-    "run_cmd",
     "list_processes",
     "process_info",
     "kill_process",
@@ -44,8 +43,8 @@ REQUIRED_TOOLS = {
     "memory_usage",
     "disk_usage",
     "environment_variables",
-    "installed_programs",
-    "windows_services",
+    "installed_software",
+    "system_services",
     "project_summary",
     "find_function",
     "find_class",
@@ -86,15 +85,24 @@ REQUIRED_TOOLS = {
     "browser_screenshot",
     "browser_click",
     "browser_fill",
-    "desktop_screenshot",
-    "active_window",
-    "mouse_click",
-    "keyboard_type",
-    "hotkey",
     "memory_read",
     "memory_update",
     "job_wait",
 }
+
+if os.name == "nt":
+    REQUIRED_TOOLS.update({
+        "run_cmd",
+        "installed_programs",
+        "windows_services",
+        "desktop_screenshot",
+        "active_window",
+        "mouse_click",
+        "keyboard_type",
+        "hotkey",
+    })
+else:
+    REQUIRED_TOOLS.add("run_shell")
 
 
 def _structured(result: Any) -> dict[str, Any]:
@@ -158,7 +166,8 @@ def test_registration_is_unique_strict_and_compact() -> None:
     server = create_server()
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
-    assert len(names) == 112
+    if os.name == "nt":
+        assert len(names) == 112
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     for tool in tools:

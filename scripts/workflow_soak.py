@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -106,6 +107,7 @@ async def run():
         payload = response.structured_content or {}
         print(json.dumps({
             "tool_count": payload.get("tool_count"),
+            "unique_tool_names": payload.get("unique_tool_names"),
             "health_status": payload.get("health_status"),
             "workflow_total": payload.get("workflow_total"),
         }, separators=(",", ":")))
@@ -126,8 +128,13 @@ asyncio.run(run())
         payload = json.loads(result.stdout.strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError) as exc:
         raise RuntimeError("MCP restart smoke returned invalid output") from exc
-    if payload.get("tool_count") != 112:
-        raise RuntimeError(f"MCP restart registered {payload.get('tool_count')} tools instead of 112")
+    tool_count = payload.get("tool_count")
+    if not isinstance(tool_count, int) or tool_count <= 0:
+        raise RuntimeError(f"MCP restart returned invalid tool count: {tool_count!r}")
+    if payload.get("unique_tool_names") is not True:
+        raise RuntimeError("MCP restart registered duplicate tool names")
+    if os.name == "nt" and tool_count != 112:
+        raise RuntimeError(f"MCP restart registered {tool_count} tools instead of 112 on Windows")
     return payload
 
 
