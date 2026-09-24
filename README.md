@@ -2,15 +2,15 @@
 
 A cross-platform local developer-agent backend built on the Model Context Protocol (MCP). It exposes filesystem/code intelligence, process execution, durable jobs, browser automation, Git, testing, system diagnostics, project memory, recovery/workflow orchestration, and image delivery through one supervised local MCP runtime.
 
-Current MCP release: **v0.2.9 Cross-Platform Preview**. The repository name `windows-agent-mcp` and backward-compatible MCP server identifier `ali_windows_agent_mcp` remain unchanged in this compatibility release.
+Current MCP release: **v0.2.10 Cross-Platform Preview**. The repository name `windows-agent-mcp` and backward-compatible MCP server identifier `ali_windows_agent_mcp` remain unchanged in this compatibility release.
 
 The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only Streamable HTTP server.
 
-> Release history belongs in [CHANGELOG.md](CHANGELOG.md). v0.2.9 release evidence is recorded in [docs/V0.2.9-VALIDATION.md](docs/V0.2.9-VALIDATION.md). Binary provenance and managed-runtime rules are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
+> Release history belongs in [CHANGELOG.md](CHANGELOG.md). v0.2.10 release evidence is recorded in [docs/V0.2.10-VALIDATION.md](docs/V0.2.10-VALIDATION.md). Binary provenance and managed-runtime rules are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
 
 ## Platform Support
 
-| Platform | Status | Native CI in v0.2.9 | Launcher | Native desktop/UIA |
+| Platform | Status | Native CI in v0.2.10 | Launcher | Native desktop/UIA |
 | --- | --- | --- | --- | --- |
 | Windows amd64 | Supported | Python 3.10 + 3.12 | `START_MCP.bat` | Supported |
 | Linux amd64 | Preview | Python 3.10 + 3.12 | `start_mcp.sh` | Not exposed |
@@ -18,7 +18,7 @@ The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only S
 | Linux arm64 | Preview package target | Packaging/updater mapping | `start_mcp.sh` | Not exposed |
 | macOS amd64 | Preview package target | Packaging/updater mapping | `start_mcp.sh` | Not exposed |
 
-The Python core is architecture-neutral. The Secure Tunnel updater selects the official upstream asset for the detected OS/architecture. Linux arm64 and macOS amd64 packages are published from the same source/runtime contract, but v0.2.9 does not claim a dedicated native hosted-runner execution for those two architecture combinations.
+The Python core is architecture-neutral. The Secure Tunnel updater selects the official upstream asset for the detected OS/architecture. Linux arm64 and macOS amd64 packages are published from the same source/runtime contract, but v0.2.10 does not claim a dedicated native hosted-runner execution for those two architecture combinations.
 
 Windows native desktop screenshot/input and semantic UI Automation are capability-gated and are not registered on Linux/macOS. Browser automation is the portable UI path when Playwright is installed.
 
@@ -86,13 +86,13 @@ All project release archives are source/runtime-controller packages only. After 
 
 ## Release Artifacts
 
-v0.2.9 packaging produces:
+v0.2.10 packaging produces:
 
-- `windows-agent-mcp-v0.2.9-windows-amd64.zip`
-- `windows-agent-mcp-v0.2.9-linux-amd64.tar.gz`
-- `windows-agent-mcp-v0.2.9-linux-arm64.tar.gz`
-- `windows-agent-mcp-v0.2.9-macos-amd64.tar.gz`
-- `windows-agent-mcp-v0.2.9-macos-arm64.tar.gz`
+- `windows-agent-mcp-v0.2.10-windows-amd64.zip`
+- `windows-agent-mcp-v0.2.10-linux-amd64.tar.gz`
+- `windows-agent-mcp-v0.2.10-linux-arm64.tar.gz`
+- `windows-agent-mcp-v0.2.10-macos-amd64.tar.gz`
+- `windows-agent-mcp-v0.2.10-macos-arm64.tar.gz`
 - `SHA256SUMS.txt`
 
 Artifacts are deterministically generated from tracked Git blobs. Packaging fails if runtime/secrets/build-state paths are tracked, embeds `RELEASE-MANIFEST.json`, and preserves executable mode for `start_mcp.sh`.
