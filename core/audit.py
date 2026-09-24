@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 import atexit
 import json
 import os
@@ -54,7 +55,7 @@ def _policy_from_settings(settings: Settings) -> AuditPolicy:
     )
 
 
-def _interprocess_lock(path: Path):
+def _interprocess_lock(path: Path) -> AbstractContextManager[None]:
     """Serialize append/rotation across MCP, supervisor, and durable-worker processes."""
 
     lock_path = path.with_name(f".{path.name}.lock")
