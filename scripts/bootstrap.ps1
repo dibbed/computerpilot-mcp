@@ -14,7 +14,10 @@ function Stop-WithError([string]$Message, [int]$Code = 1) {
 $VenvPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
     Write-Host '[1/5] Creating Python virtual environment...'
-    if (Get-Command py.exe -ErrorAction SilentlyContinue) {
+    if ($env:PYTHON_BIN) {
+        & $env:PYTHON_BIN -m venv (Join-Path $ProjectRoot '.venv')
+    }
+    elseif (Get-Command py.exe -ErrorAction SilentlyContinue) {
         & py.exe -3 -m venv (Join-Path $ProjectRoot '.venv')
     }
     elseif (Get-Command python.exe -ErrorAction SilentlyContinue) {
