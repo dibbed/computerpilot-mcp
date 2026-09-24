@@ -74,6 +74,51 @@ def test_supervisor_snapshot_exposes_timing_events_and_errors(tmp_path: Path) ->
         close_logger(supervisor)
 
 
+def test_supervisor_treats_canceled_controlplane_response_retry_as_warning(tmp_path: Path) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    try:
+        supervisor.event(json.dumps({
+            "level": "ERROR",
+            "component": "dispatcher",
+            "msg": "failed to post error response to control plane",
+            "error": "controlplane responder: retry wait: context canceled",
+        }))
+
+        snapshot = supervisor.state_snapshot()
+
+        assert snapshot["event_count"] == 1
+        assert snapshot["error_count"] == 0
+        assert snapshot["recent_errors"] == []
+        assert snapshot["last_error"] is None
+        assert snapshot["recent_events"][-1]["level"] == "WARN"
+        assert snapshot["recent_events"][-1]["component"] == "dispatcher"
+        assert snapshot["recent_events"][-1]["message"] == (
+            "WARN dispatcher: failed to post error response to control plane"
+            " | controlplane responder: retry wait: context canceled"
+        )
+    finally:
+        close_logger(supervisor)
+
+
+def test_supervisor_keeps_other_controlplane_post_failures_as_errors(tmp_path: Path) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    try:
+        supervisor.event(json.dumps({
+            "level": "ERROR",
+            "component": "dispatcher",
+            "msg": "failed to post error response to control plane",
+            "error": "controlplane responder: unexpected status 503",
+        }))
+
+        snapshot = supervisor.state_snapshot()
+
+        assert snapshot["error_count"] == 1
+        assert snapshot["recent_events"][-1]["level"] == "ERROR"
+        assert snapshot["recent_errors"][-1]["message"].endswith("unexpected status 503")
+    finally:
+        close_logger(supervisor)
+
+
 def test_process_snapshot_tolerates_process_table_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
     supervisor.set_state(pid=12345)
