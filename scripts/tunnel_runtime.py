@@ -289,7 +289,7 @@ def _request_bytes(url: str, *, timeout: float = 30.0) -> bytes:
         url,
         headers={
             "Accept": "application/vnd.github+json",
-            "User-Agent": "windows-agent-mcp-tunnel-updater",
+            "User-Agent": "computerpilot-mcp-tunnel-updater",
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )

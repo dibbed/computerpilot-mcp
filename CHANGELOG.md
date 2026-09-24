@@ -6,6 +6,22 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-25
+
+### Changed
+- Rebrand the project from `windows-agent-mcp` / Local Developer Agent MCP to **ComputerPilot MCP** and rename future GitHub release artifacts to `computerpilot-mcp-v<version>-<target>`.
+- Update the MCP display title and public-facing descriptions around the project's broader cross-platform computer-use and developer-automation scope.
+- Refresh README discovery/landing content with the ComputerPilot MCP identity, search-oriented terminology, badges, use-case framing, and a faster quick-start path.
+- Add package metadata, keywords, classifiers, and canonical project URLs for `computerpilot-mcp`.
+- Rename the tunnel updater user agent and release manifest project identifier to `computerpilot-mcp`.
+
+### Compatibility
+- Keep the MCP protocol server identifier `ali_windows_agent_mcp` unchanged so existing client and Secure Tunnel configurations continue to work.
+- Preserve historical v0.2.x release notes and artifacts under their original names; the new artifact naming contract starts with v0.3.0.
+
+### Validation
+- Re-run full tests, lint, type checking, platform validation, packaging smoke, and published-artifact inventory checks for the rebrand release.
+
 ## [0.2.10] - 2026-09-25
 
 ### Fixed

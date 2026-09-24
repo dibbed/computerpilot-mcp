@@ -65,8 +65,8 @@ def create_server() -> MCPServer:
     active_domains = available_domains(profile.domains, capabilities)
     server = MCPServer(
         name=SETTINGS.server_name,
-        title="Ali Windows Agent MCP",
-        description="Local full-access Windows developer-agent backend with structured output.",
+        title="ComputerPilot MCP",
+        description="Cross-platform computer-use and developer-automation MCP backend with structured output.",
         instructions=(
             "Use absolute paths for external projects. Text output is complete by default and accepts optional explicit limits. "
             "Paginate listing and analysis results. Prefer replace_exact, anchored, or AST symbol edits over write_file. "

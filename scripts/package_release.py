@@ -161,7 +161,7 @@ def _manifest(
     assert isinstance(commit, str)
     payload = {
         "schema_version": 1,
-        "project": "windows-agent-mcp",
+        "project": "computerpilot-mcp",
         "version": version,
         "target": target,
         "source_commit": commit.strip(),
@@ -174,7 +174,7 @@ def _manifest(
 
 
 def _archive_prefix(version: str) -> str:
-    return f"windows-agent-mcp-v{version}"
+    return f"computerpilot-mcp-v{version}"
 
 
 def _write_zip(

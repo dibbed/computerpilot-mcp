@@ -1,16 +1,50 @@
-# Local Developer Agent MCP
+# ComputerPilot MCP
 
-A cross-platform local developer-agent backend built on the Model Context Protocol (MCP). It exposes filesystem/code intelligence, process execution, durable jobs, browser automation, Git, testing, system diagnostics, project memory, recovery/workflow orchestration, and image delivery through one supervised local MCP runtime.
+**Cross-platform computer use and developer automation over MCP.**
 
-Current MCP release: **v0.2.10 Cross-Platform Preview**. The repository name `windows-agent-mcp` and backward-compatible MCP server identifier `ali_windows_agent_mcp` remain unchanged in this compatibility release.
+[![Release](https://img.shields.io/github/v/release/dibbed/computerpilot-mcp?label=release)](https://github.com/dibbed/computerpilot-mcp/releases/latest)
+[![CI](https://github.com/dibbed/computerpilot-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dibbed/computerpilot-mcp/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/dibbed/computerpilot-mcp?style=flat)](https://github.com/dibbed/computerpilot-mcp/stargazers)
+
+ComputerPilot MCP gives MCP-capable AI agents one supervised local runtime for **computer use**, **developer automation**, browser control, filesystem/code intelligence, terminal and process execution, Git, testing, durable background jobs, recovery, and workflow orchestration.
+
+Windows adds native screenshots, desktop input, and semantic UI Automation. Linux and macOS share the portable filesystem, terminal, browser, Git, testing, jobs, recovery, and workflow core.
+
+Current MCP release: **v0.3.0 Cross-Platform Preview**. The project was renamed from `windows-agent-mcp` to `computerpilot-mcp`. The backward-compatible MCP server identifier `ali_windows_agent_mcp` intentionally remains unchanged so existing tunnel/client configurations continue to work.
 
 The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only Streamable HTTP server.
 
-> Release history belongs in [CHANGELOG.md](CHANGELOG.md). v0.2.10 release evidence is recorded in [docs/V0.2.10-VALIDATION.md](docs/V0.2.10-VALIDATION.md). Binary provenance and managed-runtime rules are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
+> Release history belongs in [CHANGELOG.md](CHANGELOG.md). v0.3.0 release evidence is recorded in [docs/V0.3.0-VALIDATION.md](docs/V0.3.0-VALIDATION.md). Binary provenance and managed-runtime rules are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
+
+## Why ComputerPilot MCP
+
+- **Computer use + desktop automation** — native Windows screenshot/input/UI Automation, plus portable browser automation.
+- **Developer automation** — files, search, code intelligence, terminal/process execution, Git, testing, diagnostics, and project memory.
+- **Reliable agent runtime** — durable background jobs, recoverable operations, workflows, supervised restarts, mutation-aware drains, and health reporting.
+- **Cross-platform by design** — Windows amd64 is fully supported, with Linux/macOS preview targets and architecture-aware release packaging.
+- **Secure remote access without vendored tunnel binaries** — verified managed OpenAI Secure MCP Tunnel bootstrap with checksum and version validation.
+
+## Quick Start at a Glance
+
+Windows:
+
+```cmd
+START_MCP.bat
+```
+
+Linux/macOS:
+
+```sh
+./start_mcp.sh
+```
+
+Local HTTP mode is available at `http://127.0.0.1:8765/mcp`; the supervised control panel runs on `http://127.0.0.1:8766/`.
 
 ## Platform Support
 
-| Platform | Status | Native CI in v0.2.10 | Launcher | Native desktop/UIA |
+| Platform | Status | Native CI in v0.3.0 | Launcher | Native desktop/UIA |
 | --- | --- | --- | --- | --- |
 | Windows amd64 | Supported | Python 3.10 + 3.12 | `START_MCP.bat` | Supported |
 | Linux amd64 | Preview | Python 3.10 + 3.12 | `start_mcp.sh` | Not exposed |
@@ -18,7 +52,7 @@ The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only S
 | Linux arm64 | Preview package target | Packaging/updater mapping | `start_mcp.sh` | Not exposed |
 | macOS amd64 | Preview package target | Packaging/updater mapping | `start_mcp.sh` | Not exposed |
 
-The Python core is architecture-neutral. The Secure Tunnel updater selects the official upstream asset for the detected OS/architecture. Linux arm64 and macOS amd64 packages are published from the same source/runtime contract, but v0.2.10 does not claim a dedicated native hosted-runner execution for those two architecture combinations.
+The Python core is architecture-neutral. The Secure Tunnel updater selects the official upstream asset for the detected OS/architecture. Linux arm64 and macOS amd64 packages are published from the same source/runtime contract, but v0.3.0 does not claim a dedicated native hosted-runner execution for those two architecture combinations.
 
 Windows native desktop screenshot/input and semantic UI Automation are capability-gated and are not registered on Linux/macOS. Browser automation is the portable UI path when Playwright is installed.
 
@@ -56,7 +90,7 @@ ChatGPT / MCP Client
    local_pc_mcp.py
         |
         v
- Local Developer Agent MCP
+ ComputerPilot MCP
 ```
 
 ### Local HTTP Mode
@@ -66,7 +100,7 @@ MCP Client
     |
     | http://127.0.0.1:8765/mcp
     v
-Local Developer Agent MCP
+ComputerPilot MCP
 ```
 
 The HTTP server is stateless and loopback-only by default.
@@ -86,13 +120,13 @@ All project release archives are source/runtime-controller packages only. After 
 
 ## Release Artifacts
 
-v0.2.10 packaging produces:
+v0.3.0 packaging produces:
 
-- `windows-agent-mcp-v0.2.10-windows-amd64.zip`
-- `windows-agent-mcp-v0.2.10-linux-amd64.tar.gz`
-- `windows-agent-mcp-v0.2.10-linux-arm64.tar.gz`
-- `windows-agent-mcp-v0.2.10-macos-amd64.tar.gz`
-- `windows-agent-mcp-v0.2.10-macos-arm64.tar.gz`
+- `computerpilot-mcp-v0.3.0-windows-amd64.zip`
+- `computerpilot-mcp-v0.3.0-linux-amd64.tar.gz`
+- `computerpilot-mcp-v0.3.0-linux-arm64.tar.gz`
+- `computerpilot-mcp-v0.3.0-macos-amd64.tar.gz`
+- `computerpilot-mcp-v0.3.0-macos-arm64.tar.gz`
 - `SHA256SUMS.txt`
 
 Artifacts are deterministically generated from tracked Git blobs. Packaging fails if runtime/secrets/build-state paths are tracked, embeds `RELEASE-MANIFEST.json`, and preserves executable mode for `start_mcp.sh`.
