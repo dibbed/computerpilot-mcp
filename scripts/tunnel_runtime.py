@@ -533,18 +533,23 @@ def detect_profile() -> str:
     configured_dir = os.getenv("TUNNEL_CLIENT_PROFILE_DIR", "").strip()
     if configured_dir:
         profile_dir = Path(configured_dir).expanduser()
-    elif platform.system().casefold() == "windows":
-        appdata = os.getenv("APPDATA", "").strip()
-        profile_dir = (Path(appdata) if appdata else Path.home() / "AppData" / "Roaming") / "tunnel-client"
     else:
         xdg = os.getenv("XDG_CONFIG_HOME", "").strip()
-        profile_dir = (Path(xdg).expanduser() if xdg else Path.home() / ".config") / "tunnel-client"
+        home = os.getenv("HOME", "").strip()
+        if xdg:
+            profile_dir = Path(xdg).expanduser() / "tunnel-client"
+        elif home:
+            profile_dir = Path(home).expanduser() / ".config" / "tunnel-client"
+        elif platform.system().casefold() == "windows":
+            appdata = os.getenv("APPDATA", "").strip()
+            profile_dir = (Path(appdata) if appdata else Path.home() / "AppData" / "Roaming") / "tunnel-client"
+        else:
+            profile_dir = Path.home() / ".config" / "tunnel-client"
 
     try:
         candidates = sorted({
             path.stem
-            for pattern in ("*.yaml", "*.yml")
-            for path in profile_dir.glob(pattern)
+            for path in profile_dir.glob("*.yaml")
             if path.is_file() and path.stem
         })
     except OSError:
