@@ -137,7 +137,7 @@ def detect_capabilities(
         system=current,
         architecture=arch,
         # POSIX atomic process-group ownership is introduced in the next migration phase.
-        process_tree_ownership=is_windows,
+        process_tree_ownership=current in {"windows", "linux", "macos"},
         desktop_screenshot=is_windows,
         desktop_input=is_windows,
         semantic_ui=is_windows and importlib.util.find_spec("uiautomation") is not None,
