@@ -51,7 +51,10 @@ class INPUT(ctypes.Structure):
 
 _USER32: Any = None
 if os.name == "nt":
-    _USER32 = ctypes.WinDLL("user32", use_last_error=True)
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        raise OSError("ctypes.WinDLL is unavailable on this Windows runtime.")
+    _USER32 = win_dll("user32", use_last_error=True)
     _USER32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
     _USER32.SendInput.restype = wintypes.UINT
     _USER32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
@@ -114,10 +117,15 @@ def _user32() -> Any:
     return _USER32
 
 
+def _win_error() -> OSError:
+    factory = getattr(ctypes, "WinError", None)
+    return factory() if callable(factory) else OSError("Windows API call failed.")
+
+
 def _send_input(value: INPUT) -> None:
     sent = _user32().SendInput(1, ctypes.byref(value), ctypes.sizeof(INPUT))
     if sent != 1:
-        raise ctypes.WinError()
+        raise _win_error()
 
 
 def _send_key(vk: int, key_up: bool = False) -> None:
@@ -161,7 +169,7 @@ def send_hotkey(keys: list[str], hold_ms: int) -> None:
 def click_mouse(x: int, y: int, button: str, clicks: int, interval_ms: int) -> None:
     require_windows()
     if not _user32().SetCursorPos(x, y):
-        raise ctypes.WinError()
+        raise _win_error()
     down, up = MOUSE_FLAGS[button]
     for index in range(clicks):
         _send_input(INPUT(type=INPUT_MOUSE, mi=MOUSEINPUT(0, 0, 0, down, 0, 0)))
@@ -183,7 +191,7 @@ def foreground_window() -> dict[str, Any]:
     thread_id = user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
     rect = wintypes.RECT()
     if not user32.GetWindowRect(handle, ctypes.byref(rect)):
-        raise ctypes.WinError()
+        raise _win_error()
     return {
         "ok": True,
         "handle": int(handle),
