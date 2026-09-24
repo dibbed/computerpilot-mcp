@@ -218,15 +218,18 @@ def _explicit_override() -> TunnelRuntimeSelection | None:
 
 def _local_candidates(root: Path) -> list[TunnelRuntimeSelection]:
     system_name, architecture = platform_parts()
-    candidates: list[tuple[Path, str, int]] = [
-        (root / runtime_executable_name(system_name), "bundled-runtime", 2),
-        (root / executable_name(system_name), "bundled-client", 1),
+    candidates: list[tuple[Path, str, int, int]] = [
+        # Keep the full-client fallback ahead of a manually dropped narrow runtime.
+        # The managed installer also uses the full-client release archive, preserving
+        # the command/Cloudflared surface that the Supervisor historically ran.
+        (root / executable_name(system_name), "bundled-client", 2, 1),
+        (root / runtime_executable_name(system_name), "bundled-runtime", 1, 1),
     ]
     managed = _managed_from_metadata(root)
-    resolved: list[tuple[TunnelRuntimeSelection, int]] = []
+    resolved: list[tuple[TunnelRuntimeSelection, int, int]] = []
     if managed is not None:
-        resolved.append((managed, 3))
-    for path, source, priority in candidates:
+        resolved.append((managed, 2, 2))
+    for path, source, flavor_rank, source_rank in candidates:
         if not path.is_file():
             continue
         try:
@@ -240,9 +243,13 @@ def _local_candidates(root: Path) -> list[TunnelRuntimeSelection]:
                 source=source,
                 platform_key=f"{system_name}-{architecture}",
             ),
-            priority,
+            flavor_rank,
+            source_rank,
         ))
-    resolved.sort(key=lambda item: (_version_key(item[0].version), item[1]), reverse=True)
+    resolved.sort(
+        key=lambda item: (item[1], _version_key(item[0].version), item[2]),
+        reverse=True,
+    )
     return [item[0] for item in resolved]
 
 
@@ -303,13 +310,12 @@ def _verified_asset_bytes(asset: dict[str, Any]) -> bytes:
         raise TunnelRuntimeError("Tunnel runtime release asset URL is not an approved OpenAI GitHub URL.")
     content = _request_bytes(url, timeout=120.0)
     digest = str(asset.get("digest") or "")
-    if digest:
-        if not digest.startswith("sha256:"):
-            raise TunnelRuntimeError("Tunnel runtime release asset uses an unsupported digest algorithm.")
-        expected = digest.partition(":")[2].casefold()
-        actual = hashlib.sha256(content).hexdigest()
-        if actual != expected:
-            raise TunnelRuntimeError(f"SHA-256 mismatch for release asset {asset.get('name')!r}.")
+    if not digest.startswith("sha256:"):
+        raise TunnelRuntimeError("Tunnel runtime release asset is missing a GitHub SHA-256 digest.")
+    expected = digest.partition(":")[2].casefold()
+    actual = hashlib.sha256(content).hexdigest()
+    if actual != expected:
+        raise TunnelRuntimeError(f"SHA-256 mismatch for release asset {asset.get('name')!r}.")
     return content
 
 
