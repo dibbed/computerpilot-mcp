@@ -126,8 +126,8 @@ asyncio.run(run())
         payload = json.loads(result.stdout.strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError) as exc:
         raise RuntimeError("MCP restart smoke returned invalid output") from exc
-    if payload.get("tool_count") != 110:
-        raise RuntimeError(f"MCP restart registered {payload.get('tool_count')} tools instead of 110")
+    if payload.get("tool_count") != 112:
+        raise RuntimeError(f"MCP restart registered {payload.get('tool_count')} tools instead of 112")
     return payload
 
 
