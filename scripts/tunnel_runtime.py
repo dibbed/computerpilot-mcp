@@ -523,6 +523,9 @@ def detect_profile() -> str:
     explicit = os.getenv("MCP_TUNNEL_PROFILE", "").strip()
     if explicit:
         return explicit
+    upstream_profile = os.getenv("TUNNEL_CLIENT_PROFILE", "").strip()
+    if upstream_profile:
+        return upstream_profile
 
     profile_file = os.getenv("TUNNEL_CLIENT_PROFILE_FILE", "").strip()
     if profile_file:
@@ -555,6 +558,14 @@ def detect_profile() -> str:
     except OSError:
         candidates = []
     return candidates[0] if candidates else "default"
+
+
+def profile_run_args(profile: str | None) -> list[str]:
+    """Preserve upstream config/profile-file precedence when building runtime CLI args."""
+    if os.getenv("TUNNEL_CLIENT_CONFIG", "").strip() or os.getenv("TUNNEL_CLIENT_PROFILE_FILE", "").strip():
+        return []
+    selected = (profile or "").strip()
+    return ["--profile", selected] if selected else []
 
 
 def _selection_payload(selection: TunnelRuntimeSelection) -> dict[str, Any]:
