@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -9,7 +8,7 @@ from pathlib import Path
 import psutil
 import pytest
 
-from core.executor import run_bounded, start_background, close_background_captures
+from core.executor import close_background_captures, run_bounded, start_background
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX process-group integration requires POSIX")
 
