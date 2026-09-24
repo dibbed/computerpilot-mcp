@@ -31,6 +31,7 @@ from tools.process import register as register_process
 from tools.project import register as register_project
 from tools.recovery import register as register_recovery
 from tools.terminal import register as register_terminal
+from tools.system import register as register_system
 from tools.testing import register as register_testing
 from tools.windows import register as register_windows
 from tools.workflows import register as register_workflows
@@ -39,6 +40,7 @@ REGISTRARS = {
     "filesystem": register_filesystem,
     "terminal": register_terminal,
     "process": register_process,
+    "system": register_system,
     "windows": register_windows,
     "project": register_project,
     "language": register_language,
