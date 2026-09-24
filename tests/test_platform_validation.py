@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from core.platform import PlatformCapabilities
 from scripts import platform_validation
 
@@ -23,7 +25,7 @@ def _caps() -> PlatformCapabilities:
     )
 
 
-def test_platform_validation_runs_launcher_doctor_benchmark_and_soak(monkeypatch) -> None:
+def test_platform_validation_runs_launcher_doctor_benchmark_and_soak(monkeypatch: pytest.MonkeyPatch) -> None:
     commands: list[tuple[str, list[str]]] = []
 
     def fake_run(
