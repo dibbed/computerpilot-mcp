@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -28,17 +29,19 @@ def test_jobs_and_artifacts_across_mcp_clients(tmp_path: Path, monkeypatch: pyte
             assert response.structured_content and response.structured_content["deduplicated"]
             assert response.structured_content["job_id"] == job_id
             state = response.structured_content
-            for _ in range(20):
-                if state["status"] == "succeeded":
-                    break
+            deadline = time.monotonic() + 45
+            while state["status"] not in {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}:
+                if time.monotonic() >= deadline:
+                    worker_log = tmp_path / "jobs" / job_id / "worker.log"
+                    details = worker_log.read_text(encoding="utf-8", errors="replace") if worker_log.exists() else "<missing>"
+                    raise AssertionError(f"Job failed to finish: state={state!r}; worker_log={details[-4000:]!r}")
                 response = await client.call_tool(
                     "job_wait",
                     {"job_id": job_id, "after_version": state["version"], "timeout": 1},
                 )
                 assert response.structured_content
                 state = response.structured_content
-            else:
-                raise AssertionError("Job failed to finish")
+            assert state["status"] == "succeeded", state
             response = await client.call_tool("job_output", {"job_id": job_id, "delivery": "file"})
             assert response.structured_content
             assert Path(response.structured_content["stdout"]["path"]).read_text().strip() == "hello"

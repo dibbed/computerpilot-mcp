@@ -174,7 +174,7 @@ def _read_pipe(pipe: BinaryIO | None, capture: OutputCapture) -> None:
 def _creation_flags() -> int:
     if os.name != "nt":
         return 0
-    return subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    return int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) | int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def _process_env(extra: dict[str, str] | None) -> dict[str, str]:

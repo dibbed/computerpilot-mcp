@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -201,7 +202,7 @@ def test_background_output_is_unlimited_by_default(tmp_path: Path) -> None:
 
 def test_read_window_uses_lines_offsets_and_limits(tmp_path: Path) -> None:
     target = tmp_path / "lines.txt"
-    target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+    target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8", newline="")
     result = read_window(
         str(target),
         start_line=2,
@@ -210,7 +211,7 @@ def test_read_window_uses_lines_offsets_and_limits(tmp_path: Path) -> None:
         max_chars=8,
         encoding="auto",
     )
-    assert result["content"].replace("\r\n", "\n") == "wo\nthre"
+    assert result["content"].replace("\r\n", "\n") == "wo\nthree"
     assert len(result["content"]) == 8
     assert result["truncated"] is True
 
@@ -273,6 +274,7 @@ def test_safe_refactor_rolls_back_failed_validation(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == original
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows transient replace retry policy")
 def test_atomic_write_retries_transient_windows_replace_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

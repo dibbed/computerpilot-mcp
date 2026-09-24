@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import platform
@@ -28,7 +29,7 @@ def _run(command: list[str], *, timeout: float = 30.0) -> subprocess.CompletedPr
 def _windows_installed_software() -> list[dict[str, Any]]:
     if os.name != "nt":
         return []
-    import winreg
+    winreg: Any = importlib.import_module("winreg")
 
     locations = [
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", winreg.KEY_WOW64_64KEY),

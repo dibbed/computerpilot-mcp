@@ -174,7 +174,7 @@ def domain_available(domain: str, capabilities: PlatformCapabilities | None = No
     if domain in _PORTABLE_DOMAINS:
         return True
     if domain == "windows":
-        return caps.system_services or caps.installed_software
+        return caps.system == "windows"
     if domain == "desktop":
         return caps.desktop_input or caps.desktop_screenshot or caps.semantic_ui
     return domain not in _WINDOWS_ONLY_DOMAINS

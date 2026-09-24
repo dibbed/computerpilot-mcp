@@ -69,7 +69,12 @@ class JobScheduler:
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "stdout.bin").touch(exist_ok=True)
         (directory / "stderr.bin").touch(exist_ok=True)
-        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        flags = (
+            int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            | int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+            if os.name == "nt"
+            else 0
+        )
         try:
             with (directory / "worker.log").open("ab") as log:
                 process = subprocess.Popen(

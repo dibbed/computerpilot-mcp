@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -33,7 +34,6 @@ REQUIRED_TOOLS = {
     "apply_patch",
     "run_process",
     "run_powershell",
-    "run_cmd",
     "list_processes",
     "process_info",
     "kill_process",
@@ -44,8 +44,8 @@ REQUIRED_TOOLS = {
     "memory_usage",
     "disk_usage",
     "environment_variables",
-    "installed_programs",
-    "windows_services",
+    "installed_software",
+    "system_services",
     "project_summary",
     "find_function",
     "code_context",
@@ -87,11 +87,6 @@ REQUIRED_TOOLS = {
     "browser_click",
     "browser_fill",
     "browser_close",
-    "desktop_screenshot",
-    "active_window",
-    "mouse_click",
-    "keyboard_type",
-    "hotkey",
     "memory_read",
     "memory_update",
     "memory_list",
@@ -106,13 +101,6 @@ REQUIRED_TOOLS = {
     "reconcile_operation",
     "acknowledge_uncertain_operation",
     "get_operation_history",
-    "ui_list_windows",
-    "ui_find_elements",
-    "ui_get_element",
-    "ui_invoke",
-    "ui_set_value",
-    "ui_select",
-    "ui_wait_for_element",
     "discover_tool_domains",
     "recommend_tools",
     "workflow_plan",
@@ -125,6 +113,27 @@ REQUIRED_TOOLS = {
     "workflow_resume",
     "workflow_cancel",
 }
+
+if os.name == "nt":
+    REQUIRED_TOOLS.update({
+        "run_cmd",
+        "installed_programs",
+        "windows_services",
+        "desktop_screenshot",
+        "active_window",
+        "mouse_click",
+        "keyboard_type",
+        "hotkey",
+        "ui_list_windows",
+        "ui_find_elements",
+        "ui_get_element",
+        "ui_invoke",
+        "ui_set_value",
+        "ui_select",
+        "ui_wait_for_element",
+    })
+else:
+    REQUIRED_TOOLS.add("run_shell")
 
 
 def _structured(result: Any, operation: str) -> dict[str, Any]:

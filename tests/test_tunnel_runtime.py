@@ -5,6 +5,7 @@ import io
 import json
 import zipfile
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -197,7 +198,7 @@ def test_ensure_runtime_uses_update_lock(
     monkeypatch.setattr(module, "binary_version", lambda path: "0.0.11")
     entered: list[bool] = []
 
-    @module.contextmanager
+    @contextmanager
     def fake_lock(root: Path) -> Iterator[None]:
         assert root == tmp_path
         entered.append(True)

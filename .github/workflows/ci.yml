@@ -11,12 +11,20 @@ permissions:
 
 jobs:
   validate:
-    name: Test & Validate (Windows)
-    runs-on: windows-latest
+    name: Test & Validate (${{ matrix.platform }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
         python-version: ["3.10", "3.12"]
+        include:
+          - os: windows-latest
+            platform: Windows
+          - os: ubuntu-latest
+            platform: Linux
+          - os: macos-latest
+            platform: macOS
 
     steps:
       - name: Checkout repository

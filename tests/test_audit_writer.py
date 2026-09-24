@@ -220,6 +220,10 @@ def test_close_timeout_keeps_writer_retryable_until_thread_stops(
     assert writer._thread.is_alive()
 
     release.set()
+    thread = writer._thread
+    assert thread is not None
+    thread.join(timeout=2)
+    assert not thread.is_alive()
     writer.close()
     assert writer._thread is None
 

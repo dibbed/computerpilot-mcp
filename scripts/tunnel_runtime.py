@@ -23,11 +23,12 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from core.file_lock import exclusive_file_lock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM_REPOSITORY = "openai/tunnel-client"
@@ -136,32 +137,10 @@ def _failed_check_path(root: Path) -> Path:
     return _state_root(root) / "last-check-failure.json"
 
 
-@contextmanager
-def _update_lock(root: Path) -> Iterator[None]:
+def _update_lock(root: Path) -> AbstractContextManager[None]:
     """Serialize managed-runtime checks and publication across local processes."""
-    lock_path = _state_root(root) / ".update.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as handle:
-        if os.name == "nt":
-            import msvcrt
 
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            try:
-                yield
-            finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            return
-
-        import fcntl
-
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
-
+    return exclusive_file_lock(_state_root(root) / ".update.lock")
 
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
