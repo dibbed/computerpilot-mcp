@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -9,7 +10,7 @@ import pytest
 
 from core.errors import ToolError
 from core.registry import create_server
-from tools.filesystem import registry, service
+from tools.filesystem import registry, search_snapshots, service
 from tools.filesystem.search_snapshots import SearchSnapshotStore, search_fingerprint
 
 ToolFunction = Callable[..., dict[str, Any]]
@@ -242,6 +243,47 @@ def test_store_count_quota_evicts_oldest_snapshot(tmp_path: Path) -> None:
     assert handles[1].snapshot_id in files
     assert handles[2].snapshot_id in files
     assert len(files) == 2
+
+
+def test_store_count_quota_uses_created_at_when_file_mtimes_tie(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = {"value": 100.0}
+    store = SearchSnapshotStore(
+        tmp_path / "snapshots",
+        ttl_sec=1_000,
+        max_bytes=1_000_000,
+        max_count=2,
+        clock=lambda: now["value"],
+    )
+    fingerprint = _fingerprint(tmp_path)
+    real_replace = search_snapshots.os.replace
+
+    def replace_with_fixed_mtime(source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                                 destination: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> None:
+        real_replace(source, destination)
+        os.utime(destination, ns=(1_000_000_000, 1_000_000_000))
+
+    monkeypatch.setattr(search_snapshots.os, "replace", replace_with_fixed_mtime)
+
+    handles = []
+    for index in range(3):
+        now["value"] += 1
+        handles.append(
+            store.create(
+                [{"path": f"item-{index}", "matched_in": ["name"]}],
+                fingerprint=fingerprint,
+                count_mode="exact",
+                result_order="path",
+                scan_truncated=False,
+                total_count=1,
+            )
+        )
+
+    files = {path.stem for path in (tmp_path / "snapshots").glob("*.jsonl")}
+    assert handles[0].snapshot_id not in files
+    assert handles[1].snapshot_id in files
+    assert handles[2].snapshot_id in files
 
 
 def test_store_byte_quota_evicts_old_snapshot_without_exceeding_budget(tmp_path: Path) -> None:
