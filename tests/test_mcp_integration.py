@@ -178,11 +178,12 @@ def test_registration_is_unique_strict_and_compact() -> None:
 
 def test_output_limit_schemas_default_to_unlimited_without_hard_maximum() -> None:
     tools = {tool.name: tool for tool in asyncio.run(create_server().list_tools())}
+    shell_tool = "run_cmd" if os.name == "nt" else "run_shell"
     fields = {
         "read_file": ("max_chars",),
         "run_process": ("stdout_limit", "stderr_limit"),
         "run_powershell": ("stdout_limit", "stderr_limit"),
-        "run_cmd": ("stdout_limit", "stderr_limit"),
+        shell_tool: ("stdout_limit", "stderr_limit"),
         "run_background": ("capture_limit",),
         "run_pytest": ("output_max_chars",),
         "process_info": ("max_command_chars",),

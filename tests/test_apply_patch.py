@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
 
 import pytest
@@ -124,7 +125,7 @@ def test_apply_patch_rolls_back_every_file_when_validation_fails(tmp_path: Path)
         apply_patch_transaction(
             tmp_path,
             MODIFY_AND_CREATE,
-            validation_command=["cmd.exe", "/d", "/s", "/c", "exit 7"],
+            validation_command=[sys.executable, "-c", "raise SystemExit(7)"],
             validation_cwd=tmp_path,
         )
 

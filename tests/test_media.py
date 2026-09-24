@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 from pathlib import Path
 from typing import Any, cast
 
 from mcp import Client
 from mcp.types import CallToolResult, ImageContent
+import pytest
 from PIL import Image, ImageGrab
 
 from core.media import image_tool_result
@@ -76,6 +78,7 @@ def test_image_tool_result_auto_compresses_large_sources(tmp_path: Path) -> None
     assert len(base64.b64decode(image_block.data)) == vision["bytes"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Native desktop screenshot MCP domain is Windows-only")
 def test_desktop_screenshot_returns_image_content_through_mcp(
     monkeypatch: Any,
     tmp_path: Path,

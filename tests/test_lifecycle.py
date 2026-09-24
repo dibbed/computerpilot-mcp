@@ -24,12 +24,13 @@ def _write_control(path: Path, command: str, request_id: str, deadline: float) -
 
 def test_mutation_guard_set_matches_mcp_annotations() -> None:
     tools = asyncio.run(create_server().list_tools())
+    names = {tool.name for tool in tools}
     annotated_mutations = {
         tool.name
         for tool in tools
         if tool.annotations is not None and tool.annotations.read_only_hint is False
     }
-    assert annotated_mutations == MUTATING_TOOL_OPERATIONS
+    assert annotated_mutations == MUTATING_TOOL_OPERATIONS & names
 
 
 def test_runtime_lifecycle_drains_active_mutation_and_rejects_new_work(tmp_path: Path) -> None:
