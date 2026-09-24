@@ -1,3 +1,24 @@
+[project]
+name = "windows-agent-mcp"
+version = "0.2.6"
+description = "High-performance local developer-agent MCP with durable jobs and Secure Tunnel support."
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=2.0,<2.1",
+    "pydantic>=2.12,<3",
+    "psutil>=7.0,<8",
+    "charset-normalizer>=3.4,<4",
+    "Pillow>=11,<13",
+]
+
+[project.optional-dependencies]
+windows = ["uiautomation>=2.0.29,<3"]
+dev = [
+    "pytest>=8.4,<10",
+    "ruff>=0.12,<1",
+    "mypy>=1.17,<2",
+]
+
 [tool.pytest.ini_options]
 addopts = "-q --basetemp=.pytest-tmp"
 cache_dir = ".pytest_cache"
