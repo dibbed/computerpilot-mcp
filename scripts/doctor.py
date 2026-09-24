@@ -14,7 +14,7 @@ import sysconfig
 import tempfile
 from pathlib import Path
 
-from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile, profile_run_args
+from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile, profile_directory, profile_run_args
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -42,9 +42,8 @@ def fingerprint(root: Path, mode: str, profile: str) -> str:
             paths.add(current_runtime(root).path)
         except TunnelRuntimeError:
             pass
-        config_home = Path(os.getenv("APPDATA", str(Path.home() / ".config")))
-        profile_dir = Path(os.getenv("TUNNEL_CLIENT_PROFILE_DIR", str(config_home / "tunnel-client")))
-        paths.update(profile_dir / f"{profile}{extension}" for extension in (".yaml", ".yml"))
+        profile_dir = profile_directory()
+        paths.add(profile_dir / f"{profile}.yaml")
         for name in ("TUNNEL_CLIENT_CONFIG", "TUNNEL_CLIENT_PROFILE_FILE", "CLOUDFLARED_PATH", "CA_BUNDLE"):
             if os.getenv(name):
                 paths.add(Path(os.environ[name]))
