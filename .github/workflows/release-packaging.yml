@@ -1,0 +1,38 @@
+name: Release Packaging Smoke
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build all release targets
+        shell: bash
+        run: |
+          VERSION="$(python -c 'from core.config import SETTINGS; print(SETTINGS.version)')"
+          python -m scripts.package_release --version "$VERSION" --all --output-dir dist --json
+          test -s dist/SHA256SUMS.txt
+
+      - name: Validate archive inventory
+        shell: bash
+        run: |
+          test "$(find dist -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) | wc -l)" -eq 5
+          sha256sum --check dist/SHA256SUMS.txt
