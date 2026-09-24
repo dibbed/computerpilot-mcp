@@ -1,6 +1,6 @@
 [project]
 name = "windows-agent-mcp"
-version = "0.2.8"
+version = "0.2.9"
 description = "High-performance local developer-agent MCP with durable jobs and Secure Tunnel support."
 requires-python = ">=3.10"
 dependencies = [
