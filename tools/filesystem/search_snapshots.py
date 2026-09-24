@@ -298,18 +298,21 @@ class SearchSnapshotStore:
     def _enforce_quota_locked(self, *, protect: Path | None, now: float) -> None:
         self._cleanup_expired_locked(now, exclude={protect} if protect is not None else None)
         files = self._snapshot_files_locked()
-        records: list[tuple[float, Path, int]] = []
+        records: list[tuple[float, str, Path, int]] = []
         for path in files:
             try:
                 stat = path.stat()
-            except OSError:
+                header = self._read_header_locked(path)
+            except (OSError, ToolError):
                 continue
-            records.append((stat.st_mtime_ns, path, stat.st_size))
-        records.sort(key=lambda item: item[0])
-        total_bytes = sum(item[2] for item in records)
+            created_at = header.get("created_at")
+            logical_created_at = float(created_at) if isinstance(created_at, (int, float)) else stat.st_mtime_ns / 1_000_000_000
+            records.append((logical_created_at, path.name, path, stat.st_size))
+        records.sort(key=lambda item: (item[0], item[1]))
+        total_bytes = sum(item[3] for item in records)
 
         while len(records) > self.max_count or total_bytes > self.max_bytes:
-            removable_index = next((index for index, (_, path, _) in enumerate(records) if path != protect), None)
+            removable_index = next((index for index, (_, _, path, _) in enumerate(records) if path != protect), None)
             if removable_index is None:
                 if protect is not None:
                     protect.unlink(missing_ok=True)
@@ -317,7 +320,7 @@ class SearchSnapshotStore:
                     "search_snapshot_quota_exceeded",
                     "Search snapshot cannot fit inside the configured snapshot quota.",
                 )
-            _, path, size = records.pop(removable_index)
+            _, _, path, size = records.pop(removable_index)
             path.unlink(missing_ok=True)
             total_bytes -= size
 
