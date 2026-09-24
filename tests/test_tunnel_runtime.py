@@ -185,6 +185,30 @@ def test_install_release_verifies_both_release_digest_and_checksum_manifest(
     assert metadata["archive_sha256"] == archive_hash
 
 
+def test_ensure_runtime_uses_update_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MCP_TUNNEL_CLIENT_BIN", raising=False)
+    monkeypatch.setenv("MCP_TUNNEL_AUTO_UPDATE", "0")
+    monkeypatch.setattr(module, "platform_parts", lambda **_: ("windows", "amd64"))
+    bundled = tmp_path / "tunnel-client.exe"
+    _fake_binary(bundled, "0.0.11")
+    monkeypatch.setattr(module, "binary_version", lambda path: "0.0.11")
+    entered: list[bool] = []
+
+    @module.contextmanager
+    def fake_lock(root: Path):
+        assert root == tmp_path
+        entered.append(True)
+        yield
+
+    monkeypatch.setattr(module, "_update_lock", fake_lock)
+    selection = module.ensure_runtime(tmp_path)
+
+    assert entered == [True]
+    assert selection.path == bundled
+
+
 def test_ensure_runtime_falls_back_when_update_is_offline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
