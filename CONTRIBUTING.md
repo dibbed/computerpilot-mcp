@@ -1,58 +1,179 @@
-# Contributing Guidelines
+# Contributing to ComputerPilot MCP
 
-Thank you for your interest in contributing to the Windows Developer Agent MCP project!
+Thanks for helping improve ComputerPilot MCP.
 
----
+This repository contains a cross-platform MCP runtime with platform-specific adapters, durable local state, process execution, browser/desktop automation, recovery, workflows, and release automation. Changes should preserve those boundaries rather than making one platform or one execution path the implicit default.
 
-## 1. Development Environment
+## Development environment
 
-- **Operating System**: Windows 10 or Windows 11 (x86-64 / amd64).
-- **Python**: Python 3.10+ required.
-- **PowerShell**: Windows PowerShell 5.1 or PowerShell 7+.
+### Requirements
+
+- Python 3.10 or newer.
+- Git.
+- Windows, Linux, or macOS.
+- `sh` on Linux/macOS.
+- PowerShell is required only for Windows launcher/bootstrap paths and PowerShell-specific functionality.
+- Playwright is optional unless you are changing browser behavior.
+- `pyright-langserver` is optional unless you are validating LSP integrations.
 
 ### Bootstrap
 
-Set up the development virtual environment and verify dependencies:
+The launchers create/reuse `.venv` and validate dependencies.
+
+Windows:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
+$env:MCP_START_MODE = "local-http"
+.\START_MCP.bat
 ```
 
-This creates `.venv`, installs requirements from `requirements.txt`, and validates imports.
+Linux/macOS:
 
----
-
-## 2. Quality & Validation Standards
-
-Before submitting changes, all checks must pass cleanly:
-
-```powershell
-# 1. Run unit and integration tests
-.\.venv\Scripts\python.exe -m pytest
-
-# 2. Check code style and linting
-.\.venv\Scripts\python.exe -m ruff check .
-
-# 3. Verify static type safety
-.\.venv\Scripts\python.exe -m mypy core tools scripts tests
-
-# 4. Run MCP health checks
-.\.venv\Scripts\python.exe -m scripts.health_check --json
+```sh
+MCP_START_MODE=local-http ./start_mcp.sh
 ```
 
----
+For direct development you can also create a virtual environment and install:
 
-## 3. Strict Rules for Contributions
+```sh
+python -m pip install -r requirements-dev.txt
+```
 
-### No Secrets
-- Never commit credentials, private tokens, API keys, session data, or personal paths.
-- Store test credentials only in mocks or temporary environment variables within test fixtures.
+Browser work additionally needs:
 
-### Bundled Binary Rules
-- Do **not** independently replace or upgrade `tunnel-client.exe` or `cloudflared.exe` without following the matched-set procedure.
-- If binary updates are proposed, they must be sourced directly from official [openai/tunnel-client](https://github.com/openai/tunnel-client/releases) releases.
-- Any change to binaries **must** be accompanied by updated hashes and metadata in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+```sh
+python -m pip install -r requirements-browser.txt
+python -m playwright install chromium
+```
 
-### Code Quality
-- Preserve component boundaries and domain separation (`core/`, `tools/`, `scripts/`).
-- Do not weaken or delete existing tests to force CI to pass.
+## Branch and commit workflow
+
+Use a focused branch for each coherent change.
+
+```text
+branch
+  ↓
+implementation + focused tests
+  ↓
+repository validation
+  ↓
+commit
+  ↓
+push
+  ↓
+pull request
+  ↓
+CI / release gates when applicable
+  ↓
+merge
+```
+
+Prefer commits that leave the repository valid at that point in history. Do not force-push published/released history or rewrite release tags.
+
+## Validation
+
+Before opening a pull request, run the checks relevant to your change.
+
+Core validation:
+
+```sh
+python -m compileall -q core tools scripts tests
+python -m ruff check .
+python -m mypy core tools scripts tests
+python main.py --check
+python -m scripts.health_check --json
+python -m pytest
+```
+
+For cross-platform/release-sensitive changes:
+
+```sh
+python -m scripts.platform_validation --json
+```
+
+For packaging changes:
+
+```sh
+python -m scripts.package_release --version <current-version> --all --output-dir dist --json
+```
+
+Then validate `dist/SHA256SUMS.txt`.
+
+For browser changes:
+
+```sh
+python -m scripts.doctor --mode local-http --browser
+```
+
+## Platform rules
+
+Portable domains must continue to import and register on supported Windows, Linux, and macOS hosts.
+
+Platform-specific behavior must remain capability-gated:
+
+- Windows desktop screenshot/input and semantic UI Automation are Windows-only.
+- `run_cmd` is Windows-only.
+- POSIX shell behavior belongs on Linux/macOS.
+- PowerShell tools are available only when PowerShell/pwsh exists.
+- Process-tree ownership has separate Windows Job Object and POSIX process-group implementations.
+
+Do not hide real portability failures with broad skips. Prefer fixing the assumption or making the capability contract explicit.
+
+## Secrets and local state
+
+Never commit:
+
+- `.secrets/`
+- `.agent_state/`
+- `.venv/`
+- local `.env` files
+- generated databases/logs/output
+- real API keys, tokens, cookies, or credentials
+
+Sanitize logs before attaching them to issues or pull requests.
+
+## Secure Tunnel runtime rules
+
+The repository does **not** vendor OpenAI tunnel-client or Cloudflared executables.
+
+Tunnel mode obtains a managed runtime through `scripts/tunnel_runtime.py` from official `openai/tunnel-client` releases and validates release metadata, SHA-256 data, archive safety, and binary version before publication under `.agent_state/tunnel-runtime/`.
+
+Changes to this path must preserve fail-closed verification, safe archive extraction, managed-cache behavior, and [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
+
+Do not add upstream runtime executables or archives to Git or release packages.
+
+## Recovery and mutation safety
+
+Be especially careful when changing filesystem edits, Git mutations, process execution, jobs, recovery, or workflows.
+
+Important invariants:
+
+- do not blindly replay uncertain external side effects;
+- keep mutation evidence durable enough for reconciliation;
+- preserve hash/version guards where present;
+- keep durable-job idempotency semantics stable;
+- preserve workflow optimistic-version and lease rules;
+- keep resource locks scoped rather than replacing them with one global lock.
+
+Tests should cover failure/restart behavior when a change affects these invariants.
+
+## Pull requests
+
+A useful pull request explains:
+
+- the problem;
+- the change;
+- how it was validated;
+- platform impact;
+- compatibility impact;
+- documentation impact.
+
+Use the repository pull request template and keep the scope reviewable.
+
+## Documentation
+
+Update public documentation when behavior, configuration, platform support, security boundaries, or release artifacts change.
+
+Keep historical release notes factual. Do not rewrite published release history for presentation purposes.
+
+See [docs/README.md](docs/README.md) for the public documentation map.

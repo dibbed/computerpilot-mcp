@@ -1,0 +1,72 @@
+name: Bug report
+description: Report a reproducible problem in ComputerPilot MCP
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please remove secrets, private source, tokens, cookies, and sensitive local-state data before submitting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest reliable sequence of commands or MCP tool calls that reproduces the problem.
+      placeholder: |
+        1. Start with ...
+        2. Call ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ComputerPilot MCP version or commit
+      placeholder: "v0.3.0 or git SHA"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: "Windows 11 amd64 / Ubuntu amd64 / macOS arm64"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.8"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Start mode
+      options:
+        - local-http
+        - tunnel
+        - direct development / test
+        - not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Paste only the relevant health/Doctor/log output. Never include secrets or private source.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, tokens, cookies, private source, and other sensitive local data from this report.
+          required: true

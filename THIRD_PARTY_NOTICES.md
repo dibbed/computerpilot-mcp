@@ -1,75 +1,66 @@
 # Third-Party Notices
 
-This project uses and, in the Windows amd64 release artifact, bundles third-party software components. Linux/macOS release artifacts omit the tracked Windows tunnel/Cloudflared fallback and acquire the OpenAI Secure Tunnel runtime through the verified managed updater when needed. This document provides attribution and licensing notices for these components.
+ComputerPilot MCP is licensed under the Apache License, Version 2.0 (Copyright 2026 Ali Khalili).
 
-The project as a whole is licensed under the Apache License, Version 2.0 (Copyright 2026 Ali Khalili). However, Ali Khalili does **not** claim ownership or authorship of bundled third-party binaries and dependencies.
+The project depends on third-party software and can download an external Secure Tunnel runtime. The repository does **not** claim ownership or authorship of those components.
 
----
+## OpenAI Secure MCP Tunnel runtime
 
-## 1. OpenAI Tunnel Client (`tunnel-client.exe`, Windows offline fallback)
+Tunnel mode can download a managed runtime from the official public project:
 
-- **Component**: `tunnel-client.exe` (version `0.0.11+8d55683eeef80bc5e360d95abf4692454fafc615`)
-- **Author**: OpenAI
-- **Upstream Project**: [https://github.com/openai/tunnel-client](https://github.com/openai/tunnel-client)
-- **License**: Apache License, Version 2.0
-- **Notice File**: [third_party/tunnel-client/NOTICE](third_party/tunnel-client/NOTICE)
-- **License File**: [third_party/tunnel-client/LICENSE](third_party/tunnel-client/LICENSE)
+- Project: `openai/tunnel-client`
+- Upstream: https://github.com/openai/tunnel-client
+- Runtime flavor used by default: `tunnel-client-runtime-cloudflared`
+- License: Apache License 2.0
 
-```
-Copyright 2026 OpenAI
+ComputerPilot MCP does not vendor the tunnel runtime executable in Git or in project release archives. It is downloaded separately into `.agent_state/tunnel-runtime/` and verified according to [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+The repository keeps the upstream license/notice material under:
 
-    http://www.apache.org/licenses/LICENSE-2.0
+- [third_party/tunnel-client/LICENSE](third_party/tunnel-client/LICENSE)
+- [third_party/tunnel-client/NOTICE](third_party/tunnel-client/NOTICE)
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
+These files provide attribution and license context; their presence does not mean the upstream executable is bundled.
 
----
+## Cloudflare Tunnel
 
-## 2. Cloudflare Tunnel Client (`cloudflared.exe`, Windows offline fallback)
+The upstream `tunnel-client-runtime-cloudflared` distribution integrates Cloudflare Tunnel functionality.
 
-- **Component**: `cloudflared.exe` (version `2026.7.2`)
-- **Author**: Cloudflare, Inc.
-- **Upstream Project**: [https://github.com/cloudflare/cloudflared](https://github.com/cloudflare/cloudflared)
-- **Manifest**: `cloudflared-manifest.json`
-- **License**: Apache License, Version 2.0
-- **License File**: [third_party/cloudflared/LICENSE](third_party/cloudflared/LICENSE)
+- Project: `cloudflare/cloudflared`
+- Upstream: https://github.com/cloudflare/cloudflared
+- License: Apache License 2.0
 
-```
-Copyright (c) Cloudflare, Inc.
+The repository retains:
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+- [third_party/cloudflared/LICENSE](third_party/cloudflared/LICENSE)
 
-    http://www.apache.org/licenses/LICENSE-2.0
+ComputerPilot MCP does not separately vendor a Cloudflared executable in current project releases.
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
+## Python dependencies
 
----
+Runtime and development dependencies are declared in:
 
-## 3. Python Runtime Dependencies
+- `requirements-runtime.txt`
+- `requirements-quality.txt`
+- `requirements-dev.txt`
+- `requirements-browser.txt`
+- `pyproject.toml`
 
-The project relies on external Python packages defined in `requirements.txt` and `requirements-browser.txt`. Each dependency is subject to its respective open-source license:
+Notable dependencies include:
 
-- `mcp`: MIT License
-- `pydantic`: MIT License
-- `psutil`: BSD-3-Clause License
-- `charset-normalizer`: MIT License
-- `Pillow`: HPND License
-- `pytest`: MIT License
-- `ruff`: MIT / Apache-2.0 License
-- `mypy`: MIT License
-- `playwright` (optional): Apache-2.0 License
+- `mcp`
+- `pydantic`
+- `psutil`
+- `charset-normalizer`
+- `Pillow`
+- `uiautomation` on Windows
+- `pytest`, `ruff`, and `mypy` for validation
+- `playwright` for optional browser automation
+
+Each dependency remains subject to its own upstream license and distribution terms.
+
+## Release artifacts
+
+Current release packaging is source/runtime-controller packaging. It intentionally excludes upstream tunnel-client/Cloudflared executables and local runtime state.
+
+See [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md) and [scripts/package_release.py](scripts/package_release.py) for the enforced packaging policy.
