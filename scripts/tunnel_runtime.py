@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -347,6 +348,9 @@ def _safe_extract(archive_path: Path, destination: Path) -> None:
                 candidate.relative_to(root)
             except ValueError as exc:
                 raise TunnelRuntimeError("Tunnel runtime archive contains an unsafe path.") from exc
+            unix_mode = (member.external_attr >> 16) & 0o170000
+            if stat.S_ISLNK(unix_mode):
+                raise TunnelRuntimeError("Tunnel runtime archive contains a symbolic link.")
         archive.extractall(destination)
 
 
