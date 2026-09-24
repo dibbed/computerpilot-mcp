@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 import hashlib
 import json
 import os
@@ -23,7 +24,7 @@ MEMORY_SOURCES = ("user", "project_scan", "manual", "tool", "legacy")
 _MEMORY_LOCK_WAIT_SEC = 10.0
 
 
-def memory_write_lock(path: Path):
+def memory_write_lock(path: Path) -> AbstractContextManager[None]:
     """Serialize optimistic check/merge/save across independent MCP processes."""
 
     lock_dir = SETTINGS.state_dir / "memory_locks"
