@@ -62,6 +62,28 @@ def test_profile_run_args_preserves_explicit_config_sources(monkeypatch: pytest.
     assert module.profile_run_args("custom") == ["--profile", "custom"]
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, ""),
+        ("", ""),
+        (b"", ""),
+        ("sk-plain-credential", "sk-plain-credential"),
+        (b"sk-plain-credential\r\n", "sk-plain-credential"),
+        (b"\xef\xbb\xbfsk-utf8-bom\r\n", "sk-utf8-bom"),
+        ("sk-utf16-le".encode("utf-16"), "sk-utf16-le"),
+        ("sk-utf16-be".encode("utf-16-be"), "sk-utf16-be"),
+        ('"sk-double-quoted"', "sk-double-quoted"),
+        ("'sk-single-quoted'", "sk-single-quoted"),
+        (b'\xef\xbb\xbf"sk-bom-quoted"\r\n', "sk-bom-quoted"),
+        (b'\xef\xbb\xbf   \'sk-spaced-quoted\'   \r\n', "sk-spaced-quoted"),
+        ("sk-with-newline\n\n".encode("utf-16"), "sk-with-newline"),
+    ],
+)
+def test_clean_control_plane_key(raw: str | bytes | None, expected: str) -> None:
+    assert module.clean_control_plane_key(raw) == expected
+
+
 def test_detect_profile_prefers_explicit_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TUNNEL_CLIENT_PROFILE", "upstream")
     monkeypatch.setenv("MCP_TUNNEL_PROFILE", "work")

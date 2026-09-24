@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from scripts.tunnel_runtime import TunnelRuntimeError, detect_profile, ensure_runtime
+from scripts.tunnel_runtime import TunnelRuntimeError, clean_control_plane_key, detect_profile, ensure_runtime
 
 ROOT = Path(__file__).resolve().parents[1]
 MIN_PYTHON = (3, 10)
@@ -74,14 +74,14 @@ def _mode() -> str:
 
 
 def _load_control_plane_key() -> None:
-    existing = os.getenv("CONTROL_PLANE_API_KEY", "").strip().lstrip("\ufeff")
+    existing = clean_control_plane_key(os.getenv("CONTROL_PLANE_API_KEY", ""))
     if existing:
         os.environ["CONTROL_PLANE_API_KEY"] = existing
         return
     secret = ROOT / ".secrets" / "control_plane_api_key.txt"
     try:
-        value = secret.read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
-    except OSError:
+        value = clean_control_plane_key(secret.read_bytes())
+    except (OSError, ValueError):
         value = ""
     if not value:
         raise BootstrapError(
@@ -89,6 +89,11 @@ def _load_control_plane_key() -> None:
             17,
         )
     os.environ["CONTROL_PLANE_API_KEY"] = value
+    try:
+        if secret.is_file() and secret.read_bytes() != value.encode("utf-8"):
+            secret.write_bytes(value.encode("utf-8"))
+    except OSError:
+        pass
 
 
 def _resolve_tunnel() -> str:
