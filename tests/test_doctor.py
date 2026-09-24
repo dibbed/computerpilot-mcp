@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from scripts import doctor
+from scripts.tunnel_runtime import TunnelRuntimeSelection
 
 
 @pytest.fixture
@@ -66,7 +67,17 @@ def test_change_during_doctor_not_cached(root: Path, monkeypatch: pytest.MonkeyP
 
 def test_full_validation_includes_smoke_and_tunnel(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(doctor, "_run", lambda root, label, command: calls.append(command))
+    monkeypatch.setattr(doctor, "_run", lambda root, label, command, timeout=120: calls.append(command))
+    monkeypatch.setattr(
+        doctor,
+        "current_runtime",
+        lambda root: TunnelRuntimeSelection(
+            path=root / "tunnel-client.exe",
+            version="0.0.14",
+            source="test",
+            platform_key="windows-amd64",
+        ),
+    )
     monkeypatch.setattr(
         doctor,
         "search_backend_diagnostics",

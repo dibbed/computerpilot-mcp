@@ -1,52 +1,124 @@
-# Bundled Binary Provenance and Integrity
+# Bundled Binary Provenance and Managed Tunnel Runtime
 
-This document records the provenance, checksums, and licensing for third-party executable binaries bundled in this repository.
+This document separates two different responsibilities:
 
-> **Notice**: The executable binaries (`tunnel-client.exe`, `cloudflared.exe`) and their companion manifest (`cloudflared-manifest.json`) are third-party software components authored by OpenAI and Cloudflare, Inc. They are **not** authored by Ali Khalili.
+1. the **Git-tracked offline fallback** binaries shipped with the repository; and
+2. the **managed runtime** selected by normal tunnel startup.
 
----
+The managed runtime is intentionally installed outside tracked source under
+`.agent_state/tunnel-runtime/` so updating the Secure MCP Tunnel does not rewrite
+the Git checkout or replace a running executable in place.
 
-## 1. Inventory & Integrity Baseline
+> The tunnel-client and Cloudflared binaries are third-party components authored
+> by OpenAI and Cloudflare, Inc. They are not authored by Ali Khalili.
 
-| File | Version | Architecture | SHA-256 Checksum | License |
-| :--- | :--- | :--- | :--- | :--- |
-| `tunnel-client.exe` | `0.0.11+8d55683eeef80bc5e360d95abf4692454fafc615` | `windows/amd64` | `7D3C7D492CE84B52835E11865A835A8A5BCD4A669DEE84E169AA11B314DC952A` | Apache-2.0 |
-| `cloudflared.exe` | `2026.7.2` (built 2026-07-15T13:30:00Z) | `windows/amd64` | `88024CF82CEC72D10604C13AA4670016DCA375C602E200B551EC9D53B31E874D` | Apache-2.0 |
-| `cloudflared-manifest.json` | Pinned to `cloudflared` `2026.7.2` | N/A | `149C1B5C0095FFAB41C3986D620CA18C35373E05C5B6CA0BEA88AC19F6D4A7A5` | Apache-2.0 |
+## 1. Git-tracked fallback inventory
 
----
+The current repository fallback remains the older full-client matched set:
 
-## 2. Component Details
+| File | Version | Architecture | SHA-256 |
+| --- | --- | --- | --- |
+| `tunnel-client.exe` | `0.0.11+8d55683eeef80bc5e360d95abf4692454fafc615` | windows/amd64 | `7D3C7D492CE84B52835E11865A835A8A5BCD4A669DEE84E169AA11B314DC952A` |
+| `cloudflared.exe` | `2026.7.2` | windows/amd64 | `88024CF82CEC72D10604C13AA4670016DCA375C602E200B551EC9D53B31E874D` |
+| `cloudflared-manifest.json` | pinned to Cloudflared `2026.7.2` | N/A | `149C1B5C0095FFAB41C3986D620CA18C35373E05C5B6CA0BEA88AC19F6D4A7A5` |
 
-### `tunnel-client.exe`
+The manifest checksum above is retained from the original fallback provenance.
+When validating a local checkout, compute the file digest directly rather than
+treating this table as a substitute for an integrity check.
 
-- **Purpose**: OpenAI Secure MCP Tunnel client daemon. Establishes an outbound encrypted tunnel to the OpenAI MCP control plane, forwarding incoming MCP tool calls to the local agent server.
-- **Upstream Project**: [openai/tunnel-client](https://github.com/openai/tunnel-client)
-- **Upstream Release**: [v0.0.11](https://github.com/openai/tunnel-client/releases/tag/v0.0.11) (published 2026-08-07T06:56:35Z)
-- **Upstream Git Commit**: `8d55683eeef80bc5e360d95abf4692454fafc615`
-- **Release Asset**: `tunnel-client-v0.0.11-windows-amd64.zip`
-- **Upstream Archive Checksum**: `eb912c86c6ccde90cda805cb17009507176a656725cf86c36fabe1901a12e29b` (verified in official `SHA256SUMS.txt`)
-- **Authenticode Signature**: `NotSigned` (expected; standard for upstream open-source Go builds)
-- **Why Bundled**: Enables immediate out-of-the-box startup on Windows via `START_MCP.bat` without requiring users to install Go, build from source, or manage external binary path environments.
+### Fallback tunnel-client provenance
 
-### `cloudflared.exe`
+- Upstream repository: `openai/tunnel-client`
+- Upstream release: `v0.0.11`
+- Upstream Git commit: `8d55683eeef80bc5e360d95abf4692454fafc615`
+- Original asset: `tunnel-client-v0.0.11-windows-amd64.zip`
+- Original archive SHA-256: `eb912c86c6ccde90cda805cb17009507176a656725cf86c36fabe1901a12e29b`
 
-- **Purpose**: Cloudflare Tunnel client daemon invoked internally by `tunnel-client.exe` when establishing transport tunnels via Cloudflare edge infrastructure.
-- **Upstream Project**: [cloudflare/cloudflared](https://github.com/cloudflare/cloudflared)
-- **Upstream Release**: [2026.7.2](https://github.com/cloudflare/cloudflared/releases/tag/2026.7.2)
-- **Pinned Commit**: `8679787525edc8575b2948a7c4a50b6292c6d426`
-- **Go Module Reference**: `github.com/cloudflare/cloudflared@v0.0.0-20260715110107-8679787525ed`
-- **Why Bundled**: `tunnel-client.exe` expects `cloudflared.exe` to reside in the same directory for Cloudflare-backed transports. Removing or renaming `cloudflared.exe` breaks tunnel connectivity even though Python code does not call `cloudflared.exe` directly.
+These tracked files are retained so tunnel mode still has a known local fallback
+when a managed release has not yet been installed and GitHub is unavailable.
 
-### `cloudflared-manifest.json`
+## 2. Normal managed-runtime policy
 
-- **Purpose**: Upstream integrity metadata distributed with `tunnel-client` to declare the exact version, commit, module sum, and platform targets of the bundled `cloudflared.exe`.
-- **Why Bundled**: Maintained alongside the binary pair to preserve provenance traceability and upstream compatibility.
+Normal startup uses `scripts.tunnel_runtime` before launching the Supervisor.
 
----
+The resolver:
 
-## 3. Bundled Distribution Policy
+1. honors an explicit `MCP_TUNNEL_CLIENT_BIN` override;
+2. otherwise checks an already verified managed runtime;
+3. recognizes a locally present `tunnel-client-runtime[.exe]` when one exists;
+4. checks the official `openai/tunnel-client` stable release channel when the
+   configured update interval has elapsed;
+5. downloads the exact full-client archive for the detected OS/architecture;
+6. validates the release asset SHA-256 from GitHub release metadata;
+7. independently matches the same archive against upstream `SHA256SUMS.txt`;
+8. extracts only after those checks into a staging directory;
+9. runs the downloaded binary with `--version` and requires the reported
+   semantic version to equal the selected release tag;
+10. atomically publishes the immutable version directory under
+    `.agent_state/tunnel-runtime/<tag>/<platform-arch>/`;
+11. points the Supervisor at that managed binary.
 
-1. **Matched Set Invariant**: The three files (`tunnel-client.exe`, `cloudflared.exe`, and `cloudflared-manifest.json`) form an interdependent matched set. Neither executable should be replaced or updated independently.
-2. **Authoritative Sources Only**: Replacements must originate exclusively from official [openai/tunnel-client releases](https://github.com/openai/tunnel-client/releases). Unofficial mirrors, forums, or third-party builds are strictly prohibited.
-3. **Integrity Verification**: Any future binary update must verify upstream signatures and checksums before staging, and this document must be updated to match the new hashes.
+A failed network request, invalid archive, digest mismatch, version mismatch, or
+unsafe ZIP path cannot replace a known-good runtime.
+
+As of 2026-09-24, the latest stable upstream release observed during this work is
+`v0.0.14`. The updater does **not** hard-code that version unless
+`MCP_TUNNEL_VERSION=v0.0.14` is explicitly configured.
+
+## 3. Update controls
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `MCP_TUNNEL_AUTO_UPDATE` | Enable official release checks during startup | `1` |
+| `MCP_TUNNEL_UPDATE_INTERVAL_HOURS` | Minimum interval between latest-release checks | `24` |
+| `MCP_TUNNEL_VERSION` | Optional exact stable release pin | latest stable |
+| `MCP_TUNNEL_UPDATE_REQUIRED` | Fail startup instead of using a valid fallback after update failure | `0` |
+| `MCP_TUNNEL_ALLOW_PRERELEASE` | Permit an explicitly selected prerelease | `0` |
+| `MCP_TUNNEL_CLIENT_BIN` | Explicit operator-selected binary path; bypasses auto-update | unset |
+
+The default behavior is availability-preserving: an update failure is visible,
+but a previously validated runtime or local fallback may still be used.
+Operators that require strict freshness can set
+`MCP_TUNNEL_UPDATE_REQUIRED=1`.
+
+## 4. Platform selection
+
+The updater currently understands official upstream archive naming for:
+
+- Windows amd64 / arm64
+- Linux amd64 / arm64
+- macOS (darwin) amd64 / arm64
+
+This only makes **tunnel runtime acquisition** platform-aware. It does not mean
+the Windows Agent MCP itself is already cross-platform. Windows-only process
+ownership, UI Automation, desktop tooling, launcher behavior, system
+diagnostics, and other OS-specific surfaces remain separate migration work.
+
+## 5. Security and release rules
+
+- Only HTTPS assets under the official `openai/tunnel-client` GitHub release
+  namespace are accepted.
+- Draft releases are rejected.
+- Prereleases are rejected unless explicitly enabled.
+- Release archive integrity must agree with both GitHub asset metadata and
+  upstream `SHA256SUMS.txt`.
+- ZIP traversal paths are rejected before extraction.
+- A downloaded binary must successfully report the expected release version.
+- Managed releases are installed into versioned immutable directories rather
+  than overwriting the active executable.
+- Secrets and tunnel profile contents are never written into updater metadata.
+- `.agent_state/` remains ignored by Git and must never be packaged as a
+  source or release artifact.
+
+## 6. Historical local runtime note
+
+A local project archive supplied during v0.2.6 follow-up contained:
+
+- full `tunnel-client.exe` at **0.0.11**
+- `tunnel-client-runtime.exe` at **0.0.14**
+- the matching v0.0.14 runtime SPDX/license evidence
+
+The previous Supervisor still launched the full `tunnel-client.exe`, so that
+manual runtime addition did not change the actually executed tunnel version.
+The managed resolver removes this ambiguity by selecting and reporting the
+binary that the Supervisor will really execute.

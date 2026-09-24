@@ -14,6 +14,8 @@ import sysconfig
 import tempfile
 from pathlib import Path
 
+from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile, profile_run_args
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -35,6 +37,10 @@ def fingerprint(root: Path, mode: str, profile: str) -> str:
     paths.add(Path(sys.executable))
     if mode == "tunnel":
         paths.update(root / name for name in ("tunnel-client.exe", "tunnel-client-runtime.exe", "cloudflared.exe"))
+        try:
+            paths.add(current_runtime(root).path)
+        except TunnelRuntimeError:
+            pass
         config_home = Path(os.getenv("APPDATA", str(Path.home() / ".config")))
         profile_dir = Path(os.getenv("TUNNEL_CLIENT_PROFILE_DIR", str(config_home / "tunnel-client")))
         paths.update(profile_dir / f"{profile}{extension}" for extension in (".yaml", ".yml"))
@@ -118,14 +124,22 @@ def validate(root: Path, mode: str, profile: str, browser: bool = False) -> None
             "page=b.new_page(); page.goto('about:blank'); b.close(); p.stop()"
         )])
     if mode == "tunnel":
-        try:
-            _run(root, "Secure MCP Tunnel doctor", [str(root / "tunnel-client.exe"), "doctor", "--profile", profile, "--json"])
-        except RuntimeError as exc:
-            # Port conflicts or transient network issues are non-fatal for local MCP startup.
-            if "exit" in str(exc):
-                print(f"WARN tunnel doctor: {exc} (non-fatal)")
-            else:
-                raise
+        selection = current_runtime(root)
+        _run(root, f"Secure MCP Tunnel runtime v{selection.version}", [str(selection.path), "--version"], timeout=15)
+        if selection.path.name.casefold() in {"tunnel-client.exe", "tunnel-client"}:
+            try:
+                _run(
+                    root,
+                    "Secure MCP Tunnel doctor",
+                    [str(selection.path), "doctor", *profile_run_args(profile), "--json"],
+                )
+            except RuntimeError as exc:
+                # Network, profile, or port conditions can make the upstream doctor fail
+                # while the local MCP itself remains valid. Keep the failure observable.
+                if "exit" in str(exc):
+                    print(f"WARN tunnel doctor: {exc} (non-fatal)")
+                else:
+                    raise
 
 
 def doctor(root: Path, mode: str, profile: str, browser: bool = False) -> None:
@@ -159,9 +173,8 @@ def main() -> int:
         profile = args.profile
         if args.mode == "tunnel":
             if not profile:
-                result = subprocess.run([str(ROOT / "tunnel-client.exe"), "profiles", "list"],
-                                        capture_output=True, text=True, timeout=15, check=True)
-                profile = next((line.split("\t")[0].strip() for line in result.stdout.splitlines() if "\t" in line), "default")
+                profile = detect_profile()
+            current_runtime(ROOT)
             secret = ROOT / ".secrets/control_plane_api_key.txt"
             if not os.getenv("CONTROL_PLANE_API_KEY") and secret.is_file():
                 os.environ["CONTROL_PLANE_API_KEY"] = secret.read_text(encoding="utf-8").strip()

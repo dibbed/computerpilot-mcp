@@ -30,6 +30,7 @@ from core.executor import _creation_flags
 from core.jobs import JobStore
 from core.lifecycle import lifecycle_control_request
 from core.singleflight import SingleFlight
+from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile, profile_run_args
 
 
 def restart_delay(failures: int) -> int:
@@ -745,26 +746,7 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
 
 
 def _default_profile() -> str:
-    env_profile = os.getenv("MCP_TUNNEL_PROFILE")
-    if env_profile:
-        return env_profile
-    tunnel_client = PROJECT_ROOT / "tunnel-client.exe"
-    if tunnel_client.is_file():
-        try:
-            result = subprocess.run(
-                [str(tunnel_client), "profiles", "list"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            for line in result.stdout.splitlines():
-                parts = line.split("\t")
-                if len(parts) >= 2 and parts[0].strip():
-                    return parts[0].strip()
-        except Exception:
-            pass
-    return "default"
+    return detect_profile()
 
 
 def main() -> int:
@@ -773,10 +755,23 @@ def main() -> int:
     parser.add_argument("--profile", default=_default_profile())
     parser.add_argument("--panel-port", type=int, default=8766)
     args = parser.parse_args()
-    command = ([str(PROJECT_ROOT / "tunnel-client.exe"), "run", "--profile", args.profile]
-               if args.mode == "tunnel" else
-               [sys.executable, str(PROJECT_ROOT / "main.py"), "--transport", "streamable-http"])
-    supervisor = Supervisor(command, readiness_url="http://127.0.0.1:8080/readyz" if args.mode == "tunnel" else None)
+    if args.mode == "tunnel":
+        try:
+            tunnel_runtime = current_runtime(PROJECT_ROOT)
+        except TunnelRuntimeError as exc:
+            print(f"ERROR tunnel runtime: {exc}", file=sys.stderr)
+            return 16
+        command = [str(tunnel_runtime.path), "run", *profile_run_args(args.profile)]
+        readiness_url = "http://127.0.0.1:8080/readyz"
+        print(
+            f"Tunnel runtime: v{tunnel_runtime.version} "
+            f"({tunnel_runtime.source}, {tunnel_runtime.path})",
+            flush=True,
+        )
+    else:
+        command = [sys.executable, str(PROJECT_ROOT / "main.py"), "--transport", "streamable-http"]
+        readiness_url = None
+    supervisor = Supervisor(command, readiness_url=readiness_url)
     panel = make_panel(supervisor, args.panel_port)
     thread = threading.Thread(target=panel.serve_forever, daemon=True)
     thread.start()

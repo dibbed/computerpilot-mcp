@@ -42,26 +42,30 @@ $StartMode = if ($env:MCP_START_MODE) { $env:MCP_START_MODE } else { 'tunnel' }
 if ($StartMode -notin @('tunnel', 'local-http')) { Stop-WithError 'Unsupported MCP_START_MODE.' 16 }
 $Profile = 'default'
 if ($StartMode -eq 'tunnel') {
-    $TunnelClient = Join-Path $ProjectRoot 'tunnel-client.exe'
+    Write-Host 'INFO Resolving Secure MCP Tunnel runtime...'
+    $PreviousErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $TunnelClientOutput = & $VenvPython -m scripts.tunnel_runtime ensure --print-path
+    $TunnelClientExit = $LASTEXITCODE
+    $ErrorActionPreference = $PreviousErrorPreference
+    if ($TunnelClientExit -ne 0 -or -not $TunnelClientOutput) {
+        Stop-WithError 'No verified tunnel-client runtime is available.' 16
+    }
+    $TunnelClient = ($TunnelClientOutput | Select-Object -Last 1).Trim()
     if (-not (Test-Path -LiteralPath $TunnelClient -PathType Leaf)) {
-        Stop-WithError 'tunnel-client.exe is missing.' 16
+        Stop-WithError "Resolved tunnel-client runtime is missing: $TunnelClient" 16
     }
-    $Profile = if ($env:MCP_TUNNEL_PROFILE) {
-        $env:MCP_TUNNEL_PROFILE
-    } else {
-        $DetectedProfiles = & $TunnelClient profiles list 2>$null
-        $Candidate = $null
-        if ($DetectedProfiles) {
-            foreach ($Line in ($DetectedProfiles -split "`r?`n")) {
-                $Parts = $Line -split "`t"
-                if ($Parts.Count -ge 2 -and $Parts[0].Trim()) {
-                    $Candidate = $Parts[0].Trim()
-                    break
-                }
-            }
-        }
-        if ($Candidate) { $Candidate } else { 'default' }
+    $env:MCP_TUNNEL_CLIENT_BIN = $TunnelClient
+
+    $DetectedProfile = (& $VenvPython -m scripts.tunnel_runtime profile 2>$null | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0 -or -not $DetectedProfile) {
+        $Profile = 'default'
     }
+    else {
+        $Profile = $DetectedProfile.Trim()
+    }
+    if (-not $Profile) { $Profile = 'default' }
+
     if (-not $env:CONTROL_PLANE_API_KEY) {
         $SecretFile = Join-Path $ProjectRoot '.secrets\control_plane_api_key.txt'
         if (Test-Path -LiteralPath $SecretFile -PathType Leaf) {
