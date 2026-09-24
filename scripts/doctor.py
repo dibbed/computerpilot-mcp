@@ -14,6 +14,8 @@ import sysconfig
 import tempfile
 from pathlib import Path
 
+from core.file_lock import exclusive_file_lock
+from core.platform import detect_capabilities
 from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile, profile_directory, profile_run_args
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,9 +109,52 @@ def search_backend_diagnostics() -> dict[str, str | None]:
     }
 
 
+def platform_diagnostics(root: Path) -> dict[str, object]:
+    """Validate the host contract required by the portable MCP runtime."""
+
+    capabilities = detect_capabilities()
+    if capabilities.system == "unknown":
+        raise RuntimeError("Unsupported operating system.")
+    if capabilities.architecture == "unknown":
+        raise RuntimeError("Unsupported CPU architecture.")
+    if not capabilities.process_tree_ownership:
+        raise RuntimeError("Process-tree ownership is unavailable on this host.")
+    if not capabilities.secure_tunnel:
+        raise RuntimeError("Secure Tunnel release mapping is unavailable on this host.")
+    if capabilities.system in {"linux", "macos"} and not capabilities.posix_shell:
+        raise RuntimeError("A POSIX sh executable is required on Linux/macOS.")
+
+    launcher = root / ("START_MCP.bat" if capabilities.system == "windows" else "start_mcp.sh")
+    if not launcher.is_file():
+        raise RuntimeError(f"Platform launcher is missing: {launcher.name}")
+    if capabilities.system in {"linux", "macos"} and not os.access(launcher, os.X_OK):
+        raise RuntimeError("start_mcp.sh must be executable.")
+
+    lock_path = root / ".agent_state" / "doctor-platform.lock"
+    try:
+        with exclusive_file_lock(lock_path, timeout_sec=2, label="doctor platform lock"):
+            pass
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+    return {
+        "platform": capabilities.platform_key,
+        "process_tree_ownership": capabilities.process_tree_ownership,
+        "system_services": capabilities.system_services,
+        "installed_software": capabilities.installed_software,
+        "powershell": capabilities.powershell,
+        "posix_shell": capabilities.posix_shell,
+        "secure_tunnel": capabilities.secure_tunnel,
+        "browser": capabilities.browser,
+        "launcher": launcher.name,
+    }
+
+
 def validate(root: Path, mode: str, profile: str, browser: bool = False) -> None:
     """Run the existing complete MCP/filesystem/terminal smoke, plus environment checks."""
     python = sys.executable
+    platform_info = platform_diagnostics(root)
+    print("INFO platform " + json.dumps(platform_info, sort_keys=True, separators=(",", ":")))
     _run(root, "dependency imports", [python, "-c", "import mcp,pydantic,psutil,charset_normalizer,PIL,pytest,ruff,mypy"])
     _run(root, "pip check", [python, "-m", "pip", "check"])
     _run(root, "MCP filesystem and terminal smoke", [python, "-m", "scripts.health_check", "--json"])

@@ -567,16 +567,19 @@ def _workflow_lease_renew_once(store: WorkflowStore) -> dict[str, Any]:
 
 
 def _launcher_validation_once() -> dict[str, Any]:
+    environment = os.environ.copy()
+    environment["MCP_START_MODE"] = "local-http"
+    environment["MCP_START_VALIDATE_ONLY"] = "1"
+    environment["PYTHON_BIN"] = sys.executable
+    command = (
+        ["cmd.exe", "/d", "/s", "/c", "START_MCP.bat"]
+        if os.name == "nt"
+        else [str(PROJECT_ROOT / "start_mcp.sh")]
+    )
     result = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(PROJECT_ROOT / "scripts" / "bootstrap.ps1"),
-        ],
+        command,
         cwd=PROJECT_ROOT,
+        env=environment,
         capture_output=True,
         timeout=180,
     )

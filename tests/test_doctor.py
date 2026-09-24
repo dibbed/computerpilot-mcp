@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from core.platform import PlatformCapabilities
 from scripts import doctor
 from scripts.tunnel_runtime import TunnelRuntimeSelection
 
@@ -15,11 +16,12 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(doctor.sysconfig, "get_paths", lambda: {"purelib": str(tmp_path / "site")})
     monkeypatch.setenv("TUNNEL_CLIENT_PROFILE_DIR", str(tmp_path / "profiles"))
     for name in ("main.py", "requirements.txt", "requirements-browser.txt", "pyproject.toml", "core/config.py",
-                 "tools/example.py", "scripts/bootstrap.ps1", "local_pc_mcp.py", "tunnel-client.exe",
+                 "tools/example.py", "scripts/bootstrap.ps1", "local_pc_mcp.py", "START_MCP.bat", "start_mcp.sh", "tunnel-client.exe",
                  "tunnel-client-runtime.exe", "cloudflared.exe", "profiles/demo.yaml", "site/example.dist-info/METADATA"):
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("original", encoding="utf-8")
+    (tmp_path / "start_mcp.sh").chmod(0o755)
     return tmp_path
 
 
@@ -63,6 +65,44 @@ def test_change_during_doctor_not_cached(root: Path, monkeypatch: pytest.MonkeyP
     with pytest.raises(RuntimeError, match="changed during"):
         doctor.doctor(root, "local-http", "demo")
     assert not (root / ".agent_state/startup-validation.json").exists()
+
+
+def _platform_caps(**overrides: object) -> PlatformCapabilities:
+    values: dict[str, object] = {
+        "system": "linux",
+        "architecture": "amd64",
+        "process_tree_ownership": True,
+        "desktop_screenshot": False,
+        "desktop_input": False,
+        "semantic_ui": False,
+        "system_services": True,
+        "installed_software": True,
+        "powershell": False,
+        "posix_shell": True,
+        "secure_tunnel": True,
+        "browser": False,
+    }
+    values.update(overrides)
+    return PlatformCapabilities(**values)  # type: ignore[arg-type]
+
+
+def test_platform_diagnostics_validates_launcher_and_lock(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor, "detect_capabilities", lambda: _platform_caps())
+    result = doctor.platform_diagnostics(root)
+    assert result["platform"] == "linux-amd64"
+    assert result["launcher"] == "start_mcp.sh"
+    assert result["process_tree_ownership"] is True
+    assert not (root / ".agent_state/doctor-platform.lock").exists()
+
+
+def test_platform_diagnostics_fails_without_process_ownership(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        doctor,
+        "detect_capabilities",
+        lambda: _platform_caps(process_tree_ownership=False),
+    )
+    with pytest.raises(RuntimeError, match="Process-tree ownership"):
+        doctor.platform_diagnostics(root)
 
 
 def test_full_validation_includes_smoke_and_tunnel(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
