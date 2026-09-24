@@ -34,6 +34,14 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 - Remove first-open races in the Windows audit and project-memory interprocess locks: zero-length lock files are locked directly instead of seeding byte 0 before ownership is acquired.
 - Serialize recovery-journal append and compaction across processes so concurrent runtime maintenance cannot lose pending or uncertain operation records.
 
+### Validation
+- Full pytest release suite: **611 passed** in 130.57s on isolated implementation commit a5b10df.
+- Ruff: zero violations; mypy: zero issues across **173 source files**; compileall passed.
+- MCP startup/health passed with **110 unique tools**, filesystem/terminal probes, zero unresolved workflow operations, and zero active workflow leases in isolated state.
+- Quick benchmark: **38 passed**, **2 intentional opt-in skips**, **0 errors** across 40 result cases.
+- Workflow soak: 300 workflows, 270 completed, 30 expected deterministic failures, 10/10 uncertain operations reconciled, 3/3 isolated MCP restarts healthy with 110 tools, 5/5 durable jobs succeeded, zero leaked leases/orphan rows, WAL reduced from 280,192 bytes to 0 after checkpoint, and 3.027 MiB RSS growth.
+- Detailed release evidence is recorded in docs/V0.2.6-VALIDATION.md.
+
 ## [0.2.5] - 2026-09-20
 
 ### Workflow correctness and durability
