@@ -46,7 +46,6 @@ def fingerprint(root: Path, mode: str, profile: str) -> str:
         paths.update(metadata / name for name in ("METADATA", "RECORD"))
     paths.add(Path(sys.executable))
     if mode == "tunnel":
-        paths.update(root / name for name in ("tunnel-client.exe", "tunnel-client-runtime.exe", "cloudflared.exe"))
         try:
             paths.add(current_runtime(root).path)
         except TunnelRuntimeError:

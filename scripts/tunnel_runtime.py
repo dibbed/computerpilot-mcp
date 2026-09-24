@@ -1,8 +1,9 @@
 """Secure managed tunnel-client selection and self-update support.
 
-The repository-bundled tunnel client remains an offline fallback. Normal startup
-can install a verified upstream release into .agent_state without mutating Git
-tracked binaries, then run that immutable managed copy.
+Tunnel binaries are never shipped from this repository. On first tunnel-mode
+startup the host platform/architecture is detected, the latest verified upstream
+runtime-with-Cloudflared release is installed under .agent_state, and subsequent
+starts reuse that immutable managed cache while periodically checking for updates.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from core.file_lock import exclusive_file_lock
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM_REPOSITORY = "openai/tunnel-client"
 GITHUB_API = f"https://api.github.com/repos/{UPSTREAM_REPOSITORY}"
+MANAGED_RUNTIME_FLAVOR = "tunnel-client-runtime-cloudflared"
 DEFAULT_UPDATE_INTERVAL_HOURS = 24.0
 METADATA_SCHEMA_VERSION = 1
 _VERSION_RE = re.compile(r"(?<![0-9])(\d+\.\d+\.\d+)(?![0-9])")
@@ -150,15 +152,12 @@ def platform_key() -> str:
 
 
 def executable_name(system_name: str) -> str:
-    return "tunnel-client.exe" if system_name == "windows" else "tunnel-client"
-
-
-def runtime_executable_name(system_name: str) -> str:
-    return "tunnel-client-runtime.exe" if system_name == "windows" else "tunnel-client-runtime"
+    suffix = ".exe" if system_name == "windows" else ""
+    return f"{MANAGED_RUNTIME_FLAVOR}{suffix}"
 
 
 def release_asset_name(tag: str, system_name: str, architecture: str) -> str:
-    return f"tunnel-client-{tag}-{system_name}-{architecture}.zip"
+    return f"{MANAGED_RUNTIME_FLAVOR}-{tag}-{system_name}-{architecture}.zip"
 
 
 def _state_root(root: Path) -> Path:
@@ -233,7 +232,10 @@ def _managed_from_metadata(root: Path) -> TunnelRuntimeSelection | None:
     path_raw = metadata.get("binary_path")
     version = str(metadata.get("version") or "").removeprefix("v")
     recorded_platform = str(metadata.get("platform") or "")
+    recorded_flavor = str(metadata.get("runtime_flavor") or "")
     if not isinstance(path_raw, str) or not path_raw or _VERSION_RE.fullmatch(version) is None:
+        return None
+    if recorded_flavor != MANAGED_RUNTIME_FLAVOR:
         return None
     path = Path(path_raw)
     if not path.is_absolute():
@@ -269,51 +271,17 @@ def _explicit_override() -> TunnelRuntimeSelection | None:
     return TunnelRuntimeSelection(path=path, version=version, source="override", platform_key=platform_key())
 
 
-def _local_candidates(root: Path) -> list[TunnelRuntimeSelection]:
-    system_name, architecture = platform_parts()
-    candidates: list[tuple[Path, str, int, int]] = [
-        # Keep the full-client fallback ahead of a manually dropped narrow runtime.
-        # The managed installer also uses the full-client release archive, preserving
-        # the command/Cloudflared surface that the Supervisor historically ran.
-        (root / executable_name(system_name), "bundled-client", 2, 1),
-        (root / runtime_executable_name(system_name), "bundled-runtime", 1, 1),
-    ]
-    managed = _managed_from_metadata(root)
-    resolved: list[tuple[TunnelRuntimeSelection, int, int]] = []
-    if managed is not None:
-        resolved.append((managed, 2, 2))
-    for path, source, flavor_rank, source_rank in candidates:
-        if not path.is_file():
-            continue
-        try:
-            version = binary_version(path)
-        except TunnelRuntimeError:
-            continue
-        resolved.append((
-            TunnelRuntimeSelection(
-                path=path,
-                version=version,
-                source=source,
-                platform_key=f"{system_name}-{architecture}",
-            ),
-            flavor_rank,
-            source_rank,
-        ))
-    resolved.sort(
-        key=lambda item: (item[1], _version_key(item[0].version), item[2]),
-        reverse=True,
-    )
-    return [item[0] for item in resolved]
-
-
 def current_runtime(root: Path = PROJECT_ROOT) -> TunnelRuntimeSelection:
     override = _explicit_override()
     if override is not None:
         return override
-    candidates = _local_candidates(root)
-    if not candidates:
-        raise TunnelRuntimeError("No usable tunnel-client runtime is available.")
-    return candidates[0]
+    managed = _managed_from_metadata(root)
+    if managed is None:
+        raise TunnelRuntimeError(
+            "No managed tunnel runtime is installed yet. Run tunnel startup or "
+            "python -m scripts.tunnel_runtime ensure to download the latest verified runtime."
+        )
+    return managed
 
 
 def _request_bytes(url: str, *, timeout: float = 30.0) -> bytes:
@@ -488,6 +456,7 @@ def _record_current(
             "version": tag,
             "platform": key,
             "binary_path": str(binary.resolve()),
+            "runtime_flavor": MANAGED_RUNTIME_FLAVOR,
             "archive_asset": asset_name,
             "archive_sha256": archive_sha256,
             "checked_at": time.time(),
@@ -520,6 +489,7 @@ def _record_check(root: Path, selection: TunnelRuntimeSelection, *, latest_tag: 
         "version": f"v{selection.version}",
         "platform": selection.platform_key,
         "binary_path": str(selection.path.resolve()),
+        "runtime_flavor": MANAGED_RUNTIME_FLAVOR,
         "checked_at": time.time(),
         "latest_seen": latest_tag,
         "upstream_repository": UPSTREAM_REPOSITORY,
@@ -530,13 +500,18 @@ def _record_check(root: Path, selection: TunnelRuntimeSelection, *, latest_tag: 
 
 def _update_due(root: Path, interval_hours: float, *, include_failures: bool) -> bool:
     metadata = _read_json(_metadata_path(root))
+    timestamps: list[float] = []
     checked_at = metadata.get("checked_at") if metadata else None
-    if not isinstance(checked_at, (int, float)) and include_failures:
+    if isinstance(checked_at, (int, float)):
+        timestamps.append(float(checked_at))
+    if include_failures:
         failed = _read_json(_failed_check_path(root))
-        checked_at = failed.get("checked_at") if failed else None
-    if not isinstance(checked_at, (int, float)):
+        failed_at = failed.get("checked_at") if failed else None
+        if isinstance(failed_at, (int, float)):
+            timestamps.append(float(failed_at))
+    if not timestamps:
         return True
-    return time.time() - float(checked_at) >= max(interval_hours, 0.0) * 3600.0
+    return time.time() - max(timestamps) >= max(interval_hours, 0.0) * 3600.0
 
 
 def ensure_runtime(root: Path = PROJECT_ROOT) -> TunnelRuntimeSelection:
@@ -553,7 +528,10 @@ def ensure_runtime(root: Path = PROJECT_ROOT) -> TunnelRuntimeSelection:
 
         if not _bool_env("MCP_TUNNEL_AUTO_UPDATE", True):
             if fallback is None:
-                raise TunnelRuntimeError("Tunnel auto-update is disabled and no local runtime is available.")
+                raise TunnelRuntimeError(
+                    "Tunnel auto-update is disabled and no managed runtime is installed. "
+                    "Enable MCP_TUNNEL_AUTO_UPDATE or set MCP_TUNNEL_CLIENT_BIN explicitly."
+                )
             return fallback
 
         try:

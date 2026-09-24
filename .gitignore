@@ -44,12 +44,23 @@ graphify-out/
 memory/*.json
 !memory/*.example.json
 
-# Local unversioned/experimental tunnel runtime downloads
+# Upstream Secure Tunnel binaries/sidecars are always downloaded into .agent_state.
+# Never vendor them into the repository.
+tunnel-client
+tunnel-client.exe
+tunnel-client-runtime*
+tunnel-client-*.zip
+tunnel-client-*-licenses.txt
+tunnel-client-*.spdx.json
+cloudflared
+cloudflared.exe
+cloudflared-manifest.json
+cloudflared-*.zip
+cloudflared-*.tar.gz
 
 # Local development workflows and temporary documentation
 docs/superpowers/
 docs/roadmap/
-tunnel-client-runtime*
 
 # Local SQLite databases and write-ahead logs
 # Also ignore rollback-journal variants created by non-WAL SQLite connections.

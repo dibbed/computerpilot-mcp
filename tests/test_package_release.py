@@ -33,9 +33,6 @@ def release_repo(tmp_path: Path) -> Path:
     launcher.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
     launcher.chmod(0o755)
     (tmp_path / "README.md").write_text("hello\n", encoding="utf-8")
-    (tmp_path / "tunnel-client.exe").write_bytes(b"tunnel")
-    (tmp_path / "cloudflared.exe").write_bytes(b"cloudflare")
-    (tmp_path / "cloudflared-manifest.json").write_text("{}\n", encoding="utf-8")
     _git(tmp_path, "add", ".")
     _git(tmp_path, "update-index", "--chmod=+x", "start_mcp.sh")
     _git(
@@ -51,16 +48,13 @@ def release_repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_target_filter_keeps_windows_fallback_only_for_windows(release_repo: Path) -> None:
+def test_target_filter_uses_same_source_inventory_for_all_platforms(release_repo: Path) -> None:
     entries = tracked_entries(release_repo)
     windows = {entry.path for entry in _entries_for_target(entries, "windows-amd64")}
     linux = {entry.path for entry in _entries_for_target(entries, "linux-amd64")}
-    assert "tunnel-client.exe" in windows
-    assert "cloudflared.exe" in windows
-    assert "cloudflared-manifest.json" in windows
-    assert "tunnel-client.exe" not in linux
-    assert "cloudflared.exe" not in linux
-    assert "cloudflared-manifest.json" not in linux
+    assert windows == linux
+    assert "tunnel-client.exe" not in windows
+    assert "cloudflared.exe" not in windows
 
 
 def test_build_windows_zip_is_deterministic_and_has_manifest(release_repo: Path, tmp_path: Path) -> None:
@@ -83,10 +77,12 @@ def test_build_windows_zip_is_deterministic_and_has_manifest(release_repo: Path,
         assert manifest_name in names
         manifest = json.loads(archive.read(manifest_name))
         assert manifest["target"] == "windows-amd64"
-        assert manifest["windows_offline_tunnel_fallback_included"] is True
+        assert manifest["bundled_tunnel_runtime_included"] is False
+        assert manifest["managed_tunnel_runtime"] is True
+        assert manifest["tunnel_runtime_download_on_first_use"] is True
 
 
-def test_build_posix_tar_preserves_launcher_executable_and_excludes_windows_fallback(
+def test_build_posix_tar_preserves_launcher_executable_without_bundled_runtime(
     release_repo: Path,
     tmp_path: Path,
 ) -> None:
@@ -106,7 +102,8 @@ def test_build_posix_tar_preserves_launcher_executable_and_excludes_windows_fall
         assert manifest_stream is not None
         manifest = json.loads(manifest_stream.read())
         assert manifest["target"] == "linux-arm64"
-        assert manifest["windows_offline_tunnel_fallback_included"] is False
+        assert manifest["bundled_tunnel_runtime_included"] is False
+        assert manifest["tunnel_runtime_download_on_first_use"] is True
 
 
 def test_version_mismatch_fails_closed(release_repo: Path, tmp_path: Path) -> None:
@@ -145,4 +142,22 @@ def test_forbidden_tracked_runtime_path_fails_closed(tmp_path: Path) -> None:
         "fixture",
     )
     with pytest.raises(RuntimeError, match="Forbidden"):
+        tracked_entries(tmp_path)
+
+
+def test_bundled_upstream_tunnel_file_fails_closed(tmp_path: Path) -> None:
+    _git(tmp_path, "init")
+    (tmp_path / "tunnel-client-runtime-cloudflared.exe").write_bytes(b"bad")
+    _git(tmp_path, "add", "-f", "tunnel-client-runtime-cloudflared.exe")
+    _git(
+        tmp_path,
+        "-c",
+        "user.name=Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "commit",
+        "-m",
+        "fixture",
+    )
+    with pytest.raises(RuntimeError, match="must not be tracked"):
         tracked_entries(tmp_path)

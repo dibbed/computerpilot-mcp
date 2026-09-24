@@ -27,6 +27,23 @@ def _fake_binary(path: Path, version: str) -> None:
     path.write_bytes(b"fake-" + version.encode())
 
 
+def _fake_managed_runtime(root: Path, version: str = "0.0.14") -> Path:
+    path = root / ".agent_state/tunnel-runtime" / f"v{version}" / "windows-amd64" / "tunnel-client-runtime-cloudflared.exe"
+    _fake_binary(path, version)
+    metadata = {
+        "schema_version": 1,
+        "version": f"v{version}",
+        "platform": "windows-amd64",
+        "binary_path": str(path.resolve()),
+        "runtime_flavor": "tunnel-client-runtime-cloudflared",
+        "checked_at": 0.0,
+    }
+    current = root / ".agent_state/tunnel-runtime/current.json"
+    current.parent.mkdir(parents=True, exist_ok=True)
+    current.write_text(json.dumps(metadata), encoding="utf-8")
+    return path
+
+
 def test_platform_parts_maps_supported_hosts() -> None:
     assert module.platform_parts(system="Windows", machine="AMD64") == ("windows", "amd64")
     assert module.platform_parts(system="Linux", machine="x86_64") == ("linux", "amd64")
@@ -40,8 +57,10 @@ def test_platform_parts_rejects_unknown_architecture() -> None:
 
 def test_release_asset_name_is_platform_specific() -> None:
     assert module.release_asset_name("v0.0.14", "windows", "amd64") == (
-        "tunnel-client-v0.0.14-windows-amd64.zip"
+        "tunnel-client-runtime-cloudflared-v0.0.14-windows-amd64.zip"
     )
+    assert module.executable_name("windows") == "tunnel-client-runtime-cloudflared.exe"
+    assert module.executable_name("linux") == "tunnel-client-runtime-cloudflared"
 
 
 def test_checksum_manifest_requires_exact_asset_name() -> None:
@@ -121,24 +140,12 @@ def test_detect_profile_matches_upstream_xdg_then_home_precedence(
     assert module.detect_profile() == "xdg-profile"
 
 
-def test_current_runtime_preserves_full_client_fallback_flavor(
+def test_current_runtime_requires_managed_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("MCP_TUNNEL_CLIENT_BIN", raising=False)
-    monkeypatch.setattr(module, "platform_parts", lambda **_: ("windows", "amd64"))
-    runtime = tmp_path / "tunnel-client-runtime.exe"
-    client = tmp_path / "tunnel-client.exe"
-    _fake_binary(runtime, "0.0.14")
-    _fake_binary(client, "0.0.11")
-
-    def fake_version(path: Path) -> str:
-        return "0.0.14" if "runtime" in path.name else "0.0.11"
-
-    monkeypatch.setattr(module, "binary_version", fake_version)
-    selection = module.current_runtime(tmp_path)
-    assert selection.path == client
-    assert selection.version == "0.0.11"
-    assert selection.source == "bundled-client"
+    with pytest.raises(module.TunnelRuntimeError, match="No managed tunnel runtime"):
+        module.current_runtime(tmp_path)
 
 
 def test_safe_extract_rejects_symbolic_links(tmp_path: Path) -> None:
@@ -168,12 +175,12 @@ def test_install_release_verifies_both_release_digest_and_checksum_manifest(
 
     archive_buffer = io.BytesIO()
     with zipfile.ZipFile(archive_buffer, "w") as writer:
-        writer.writestr("tunnel-client.exe", b"binary")
+        writer.writestr("tunnel-client-runtime-cloudflared.exe", b"binary")
         writer.writestr("cloudflared.exe", b"cloudflared")
         writer.writestr("cloudflared-manifest.json", "{}")
     archive = archive_buffer.getvalue()
     archive_hash = hashlib.sha256(archive).hexdigest()
-    sums = f"{archive_hash}  tunnel-client-v0.0.14-windows-amd64.zip\n".encode()
+    sums = f"{archive_hash}  tunnel-client-runtime-cloudflared-v0.0.14-windows-amd64.zip\n".encode()
     sums_hash = hashlib.sha256(sums).hexdigest()
 
     release: dict[str, Any] = {
@@ -185,10 +192,10 @@ def test_install_release_verifies_both_release_digest_and_checksum_manifest(
                 "digest": f"sha256:{sums_hash}",
             },
             {
-                "name": "tunnel-client-v0.0.14-windows-amd64.zip",
+                "name": "tunnel-client-runtime-cloudflared-v0.0.14-windows-amd64.zip",
                 "browser_download_url": (
                     "https://github.com/openai/tunnel-client/releases/download/v0.0.14/"
-                    "tunnel-client-v0.0.14-windows-amd64.zip"
+                    "tunnel-client-runtime-cloudflared-v0.0.14-windows-amd64.zip"
                 ),
                 "digest": f"sha256:{archive_hash}",
             },
@@ -206,6 +213,7 @@ def test_install_release_verifies_both_release_digest_and_checksum_manifest(
     assert selection.path.is_file()
     metadata = json.loads((tmp_path / ".agent_state/tunnel-runtime/current.json").read_text(encoding="utf-8"))
     assert metadata["version"] == "v0.0.14"
+    assert metadata["runtime_flavor"] == "tunnel-client-runtime-cloudflared"
     assert metadata["archive_sha256"] == archive_hash
 
 
@@ -215,9 +223,8 @@ def test_ensure_runtime_uses_update_lock(
     monkeypatch.delenv("MCP_TUNNEL_CLIENT_BIN", raising=False)
     monkeypatch.setenv("MCP_TUNNEL_AUTO_UPDATE", "0")
     monkeypatch.setattr(module, "platform_parts", lambda **_: ("windows", "amd64"))
-    bundled = tmp_path / "tunnel-client.exe"
-    _fake_binary(bundled, "0.0.11")
-    monkeypatch.setattr(module, "binary_version", lambda path: "0.0.11")
+    managed = _fake_managed_runtime(tmp_path)
+    monkeypatch.setattr(module, "binary_version", lambda path: "0.0.14")
     entered: list[bool] = []
 
     @contextmanager
@@ -230,10 +237,10 @@ def test_ensure_runtime_uses_update_lock(
     selection = module.ensure_runtime(tmp_path)
 
     assert entered == [True]
-    assert selection.path == bundled
+    assert selection.path == managed
 
 
-def test_ensure_runtime_falls_back_when_update_is_offline(
+def test_ensure_runtime_falls_back_to_managed_cache_when_update_is_offline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("MCP_TUNNEL_CLIENT_BIN", raising=False)
@@ -241,9 +248,8 @@ def test_ensure_runtime_falls_back_when_update_is_offline(
     monkeypatch.setenv("MCP_TUNNEL_UPDATE_INTERVAL_HOURS", "0")
     monkeypatch.delenv("MCP_TUNNEL_UPDATE_REQUIRED", raising=False)
     monkeypatch.setattr(module, "platform_parts", lambda **_: ("windows", "amd64"))
-    bundled = tmp_path / "tunnel-client.exe"
-    _fake_binary(bundled, "0.0.11")
-    monkeypatch.setattr(module, "binary_version", lambda path: "0.0.11")
+    managed = _fake_managed_runtime(tmp_path)
+    monkeypatch.setattr(module, "binary_version", lambda path: "0.0.14")
     monkeypatch.setattr(
         module,
         "_release",
@@ -252,8 +258,8 @@ def test_ensure_runtime_falls_back_when_update_is_offline(
 
     selection = module.ensure_runtime(tmp_path)
 
-    assert selection.path == bundled
-    assert selection.version == "0.0.11"
+    assert selection.path == managed
+    assert selection.version == "0.0.14"
     assert selection.warning == "offline"
     failure = json.loads(
         (tmp_path / ".agent_state/tunnel-runtime/last-check-failure.json").read_text(encoding="utf-8")
@@ -267,8 +273,36 @@ def test_ensure_runtime_falls_back_when_update_is_offline(
         lambda tag: (_ for _ in ()).throw(AssertionError("release check should be backed off")),
     )
     second = module.ensure_runtime(tmp_path)
-    assert second.path == bundled
+    assert second.path == managed
     assert second.warning is None
+
+
+def test_first_run_without_managed_cache_installs_latest_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MCP_TUNNEL_CLIENT_BIN", raising=False)
+    monkeypatch.setenv("MCP_TUNNEL_AUTO_UPDATE", "1")
+    monkeypatch.setattr(module, "platform_parts", lambda **_: ("windows", "amd64"))
+    release = {"tag_name": "v0.0.14"}
+    installed = module.TunnelRuntimeSelection(
+        tmp_path / ".agent_state/tunnel-runtime/v0.0.14/windows-amd64/tunnel-client-runtime-cloudflared.exe",
+        "0.0.14",
+        "managed",
+        "windows-amd64",
+    )
+    seen: list[object] = []
+
+    def fake_release(tag: str | None) -> dict[str, str]:
+        seen.append(tag)
+        return release
+
+    monkeypatch.setattr(module, "_release", fake_release)
+    monkeypatch.setattr(module, "_install_release", lambda root, value: installed)
+
+    selection = module.ensure_runtime(tmp_path)
+
+    assert seen == [None]
+    assert selection == installed
 
 
 def test_required_update_does_not_silently_fall_back(
@@ -279,9 +313,8 @@ def test_required_update_does_not_silently_fall_back(
     monkeypatch.setenv("MCP_TUNNEL_UPDATE_INTERVAL_HOURS", "0")
     monkeypatch.setenv("MCP_TUNNEL_UPDATE_REQUIRED", "1")
     monkeypatch.setattr(module, "platform_parts", lambda **_: ("windows", "amd64"))
-    bundled = tmp_path / "tunnel-client.exe"
-    _fake_binary(bundled, "0.0.11")
-    monkeypatch.setattr(module, "binary_version", lambda path: "0.0.11")
+    _fake_managed_runtime(tmp_path)
+    monkeypatch.setattr(module, "binary_version", lambda path: "0.0.14")
     monkeypatch.setattr(
         module,
         "_release",
