@@ -50,9 +50,22 @@ def test_checksum_manifest_requires_exact_asset_name() -> None:
     assert module._checksum_for(manifest, "tunnel-client-v0.0.14-windows-amd64.zip") == "a" * 64
 
 
+def test_profile_run_args_preserves_explicit_config_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TUNNEL_CLIENT_CONFIG", "custom.yaml")
+    assert module.profile_run_args("default") == []
+    monkeypatch.delenv("TUNNEL_CLIENT_CONFIG")
+    monkeypatch.setenv("TUNNEL_CLIENT_PROFILE_FILE", "profiles/custom.yaml")
+    assert module.profile_run_args("custom") == []
+    monkeypatch.delenv("TUNNEL_CLIENT_PROFILE_FILE")
+    assert module.profile_run_args("custom") == ["--profile", "custom"]
+
+
 def test_detect_profile_prefers_explicit_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TUNNEL_CLIENT_PROFILE", "upstream")
     monkeypatch.setenv("MCP_TUNNEL_PROFILE", "work")
     assert module.detect_profile() == "work"
+    monkeypatch.delenv("MCP_TUNNEL_PROFILE")
+    assert module.detect_profile() == "upstream"
 
 
 def test_detect_profile_finds_yaml_without_running_full_client(
