@@ -26,9 +26,9 @@ import zipfile
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from core.file_lock import exclusive_file_lock
-from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM_REPOSITORY = "openai/tunnel-client"
