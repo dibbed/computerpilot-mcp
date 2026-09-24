@@ -42,7 +42,7 @@ $StartMode = if ($env:MCP_START_MODE) { $env:MCP_START_MODE } else { 'tunnel' }
 if ($StartMode -notin @('tunnel', 'local-http')) { Stop-WithError 'Unsupported MCP_START_MODE.' 16 }
 $Profile = 'default'
 if ($StartMode -eq 'tunnel') {
-    Write-Host '[2/5] Resolving Secure MCP Tunnel runtime...'
+    Write-Host 'INFO Resolving Secure MCP Tunnel runtime...'
     $PreviousErrorPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     $TunnelClientOutput = & $VenvPython -m scripts.tunnel_runtime ensure --print-path
