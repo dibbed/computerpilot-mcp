@@ -1,12 +1,12 @@
 # Third-Party Notices
 
-This project bundles and redistributes third-party software components. This document provides attribution and licensing notices for these components.
+This project uses and, in the Windows amd64 release artifact, bundles third-party software components. Linux/macOS release artifacts omit the tracked Windows tunnel/Cloudflared fallback and acquire the OpenAI Secure Tunnel runtime through the verified managed updater when needed. This document provides attribution and licensing notices for these components.
 
 The project as a whole is licensed under the Apache License, Version 2.0 (Copyright 2026 Ali Khalili). However, Ali Khalili does **not** claim ownership or authorship of bundled third-party binaries and dependencies.
 
 ---
 
-## 1. OpenAI Tunnel Client (`tunnel-client.exe`)
+## 1. OpenAI Tunnel Client (`tunnel-client.exe`, Windows offline fallback)
 
 - **Component**: `tunnel-client.exe` (version `0.0.11+8d55683eeef80bc5e360d95abf4692454fafc615`)
 - **Author**: OpenAI
@@ -33,7 +33,7 @@ limitations under the License.
 
 ---
 
-## 2. Cloudflare Tunnel Client (`cloudflared.exe`)
+## 2. Cloudflare Tunnel Client (`cloudflared.exe`, Windows offline fallback)
 
 - **Component**: `cloudflared.exe` (version `2026.7.2`)
 - **Author**: Cloudflare, Inc.

@@ -1,218 +1,194 @@
-# Windows Developer Agent MCP
+# Local Developer Agent MCP
 
-A local Windows developer-agent backend built on the Model Context Protocol (MCP). It exposes filesystem, code intelligence, process execution, durable jobs, browser automation, desktop interaction, Git, testing, system diagnostics, project memory, and image delivery through one MCP server designed for long-running local use.
+A cross-platform local developer-agent backend built on the Model Context Protocol (MCP). It exposes filesystem/code intelligence, process execution, durable jobs, browser automation, Git, testing, system diagnostics, project memory, recovery/workflow orchestration, and image delivery through one supervised local MCP runtime.
 
-Current MCP release: **v0.2.6**. This project version is independent from the bundled upstream tunnel-client binary version.
+Current MCP release: **v0.2.7 Cross-Platform Preview**. The repository name `windows-agent-mcp` and backward-compatible MCP server identifier `ali_windows_agent_mcp` remain unchanged in this compatibility release.
 
 The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only Streamable HTTP server.
 
-> Release history belongs in [CHANGELOG.md](CHANGELOG.md). v0.2.6 release evidence is recorded in [docs/V0.2.6-VALIDATION.md](docs/V0.2.6-VALIDATION.md). Binary provenance and hashes are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
+> Release history belongs in [CHANGELOG.md](CHANGELOG.md). v0.2.7 release evidence is recorded in [docs/V0.2.7-VALIDATION.md](docs/V0.2.7-VALIDATION.md). Binary provenance and managed-runtime rules are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
+
+## Platform Support
+
+| Platform | Status | Native CI in v0.2.7 | Launcher | Native desktop/UIA |
+| --- | --- | --- | --- | --- |
+| Windows amd64 | Supported | Python 3.10 + 3.12 | `START_MCP.bat` | Supported |
+| Linux amd64 | Preview | Python 3.10 + 3.12 | `start_mcp.sh` | Not exposed |
+| macOS arm64 | Preview | Python 3.10 + 3.12 | `start_mcp.sh` | Not exposed |
+| Linux arm64 | Preview package target | Packaging/updater mapping | `start_mcp.sh` | Not exposed |
+| macOS amd64 | Preview package target | Packaging/updater mapping | `start_mcp.sh` | Not exposed |
+
+The Python core is architecture-neutral. The Secure Tunnel updater selects the official upstream asset for the detected OS/architecture. Linux arm64 and macOS amd64 packages are published from the same source/runtime contract, but v0.2.7 does not claim a dedicated native hosted-runner execution for those two architecture combinations.
+
+Windows native desktop screenshot/input and semantic UI Automation are capability-gated and are not registered on Linux/macOS. Browser automation is the portable UI path when Playwright is installed.
 
 ## What This Project Provides
 
-- Full local Windows filesystem access with atomic writes, backups, exact edits, anchored edits, and AST-aware Python refactoring.
-- PowerShell, CMD, and native process execution with bounded output delivery and background process support.
-- Durable SQLite-backed jobs that survive MCP runtime restarts and support idempotent submission, cancellation, output retrieval, and version-aware waiting.
-- Python codebase intelligence plus explicit Language Server Protocol queries and transactional semantic edits.
-- Fast file search with exact counting, bounded scans, and optional immutable snapshot pagination.
-- Guarded Git inspection, branch creation, staging, committing, conflict discovery, and explicit file restoration.
-- Integrated pytest, Ruff, and mypy execution with unified diagnostics, affected-test selection, change-aware verification, and durable incremental watches.
-- Optional Playwright browser automation with shared browser pools and isolated sessions.
-- Desktop screenshots and model-visible PNG/JPEG/WebP delivery.
-- Windows system diagnostics for processes, CPU, memory, disks, services, installed programs, and environment metadata.
-- Versioned project memory with provenance and optimistic concurrency checks.
-- A supervised runtime with health monitoring, restart backoff, mutation-aware draining, recovery metadata, and a loopback control panel.
-- Bounded local state for audit logs, backups, artifacts, job history, workflow history, browser sessions, caches, and search snapshots.
+- Cross-platform filesystem, editing, search, code intelligence, Git, testing, durable jobs/workflows, recovery, and project memory.
+- Native process execution, Windows CMD, PowerShell where installed, and explicit POSIX `sh` on Linux/macOS.
+- Deterministic process-tree ownership through Windows Job Objects or dedicated POSIX sessions/process groups.
+- Portable CPU/memory/disk/environment diagnostics with OS-specific service and installed-software backends.
+- Optional Playwright browser automation with bounded shared pools and isolated sessions.
+- Windows-only native desktop screenshot/input and semantic UI Automation, registered only when supported.
+- Supervised runtime health, restart backoff, mutation-aware drain, loopback control panel, and bounded local state.
+- Verified managed OpenAI Secure Tunnel updates with checksum/version validation, immutable publication, offline fallback, and bounded retry backoff.
 
 ## Architecture
 
-The recommended launcher is `START_MCP.bat`. It creates or reuses the local Python environment, validates dependencies, runs startup checks when required, and starts the supervisor.
+Recommended launchers:
+
+- Windows: `START_MCP.bat`
+- Linux/macOS: `./start_mcp.sh`
+
+Both create/reuse `.venv`, validate dependencies, run cached/full startup checks, resolve the tunnel runtime when needed, and start the Python supervisor.
 
 ### Secure Tunnel Mode
-
-This is the default mode.
 
 ```text
 ChatGPT / MCP Client
         |
         | OpenAI Secure MCP Tunnel
         v
-  tunnel-client.exe
+ managed tunnel-client
         |
         | local stdio MCP transport
         v
    local_pc_mcp.py
         |
         v
- Windows Developer Agent MCP
+ Local Developer Agent MCP
 ```
 
-The supervisor owns the tunnel runtime, monitors heartbeat and readiness, performs bounded restart recovery, and exposes the local control panel.
-
 ### Local HTTP Mode
-
-Local HTTP mode bypasses the external tunnel and exposes MCP only on loopback:
 
 ```text
 MCP Client
     |
     | http://127.0.0.1:8765/mcp
     v
-Windows Developer Agent MCP
+Local Developer Agent MCP
 ```
 
-The Streamable HTTP server is stateless and binds to `127.0.0.1` by default.
+The HTTP server is stateless and loopback-only by default.
 
 ## Requirements
 
-- Windows 10 or Windows 11, x86-64 / amd64.
 - Python 3.10 or newer.
-- Windows PowerShell 5.1 or PowerShell 7+.
-- Tunnel mode only: a valid control-plane API key and tunnel profile.
-- Browser automation only: Playwright plus the required browser runtime.
+- Windows 10/11 amd64, a supported Linux environment, or macOS.
+- POSIX hosts require `sh`.
+- Tunnel mode requires a control-plane API key and tunnel profile.
+- Browser automation requires Playwright plus the desired browser runtime.
+- Semantic desktop UI Automation is Windows-only.
 
-The repository includes Windows tunnel binaries as an **offline fallback**:
+The repository contains a Windows amd64 `tunnel-client.exe` + Cloudflared set as an **offline Windows fallback**. Normal startup on all supported platforms resolves the official `openai/tunnel-client` asset, verifies GitHub SHA-256 metadata and upstream `SHA256SUMS.txt`, validates the binary version, and installs an immutable managed runtime under `.agent_state/tunnel-runtime/`.
 
-- `tunnel-client.exe`
-- `cloudflared.exe`
-- `cloudflared-manifest.json`
+Linux/macOS release archives intentionally omit the Windows fallback executables.
 
-Normal tunnel startup does not blindly trust that fallback forever. The launcher resolves the official
-`openai/tunnel-client` release for the current OS/architecture, verifies the release asset SHA-256
-against both GitHub release metadata and `SHA256SUMS.txt`, validates the downloaded binary with
-`--version`, and installs the immutable verified bundle under `.agent_state/tunnel-runtime/`.
-The Supervisor then runs the managed copy. If GitHub is temporarily unavailable, the newest already
-validated managed or local runtime remains usable. See [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
+## Release Artifacts
+
+v0.2.7 packaging produces:
+
+- `windows-agent-mcp-v0.2.7-windows-amd64.zip`
+- `windows-agent-mcp-v0.2.7-linux-amd64.tar.gz`
+- `windows-agent-mcp-v0.2.7-linux-arm64.tar.gz`
+- `windows-agent-mcp-v0.2.7-macos-amd64.tar.gz`
+- `windows-agent-mcp-v0.2.7-macos-arm64.tar.gz`
+- `SHA256SUMS.txt`
+
+Artifacts are deterministically generated from tracked Git blobs. Packaging fails if runtime/secrets/build-state paths are tracked, embeds `RELEASE-MANIFEST.json`, and preserves executable mode for `start_mcp.sh`.
 
 ## Quick Start
 
-### 1. Prepare Tunnel Credentials
+### 1. Tunnel credentials
 
-Skip this section if you only want local HTTP mode.
-
-The recommended local secret location is:
+Skip for local HTTP mode. Recommended secret path on every platform:
 
 ```text
-.secrets\control_plane_api_key.txt
+.secrets/control_plane_api_key.txt
 ```
 
-Put only the control-plane API key in that file. `.secrets/` is ignored by Git.
-
-You can alternatively use an environment variable:
+PowerShell:
 
 ```powershell
 $env:CONTROL_PLANE_API_KEY = "your-api-key"
-```
-
-If you have more than one tunnel profile, select one explicitly:
-
-```powershell
 $env:MCP_TUNNEL_PROFILE = "your-profile"
 ```
 
-When no profile is specified, the launcher attempts to detect a configured profile and otherwise falls back to `default`.
+POSIX:
 
-### 2. Start the MCP Runtime
+```sh
+export CONTROL_PLANE_API_KEY="your-api-key"
+export MCP_TUNNEL_PROFILE="your-profile"
+```
 
-From the repository root:
+### 2. Start
+
+Windows:
 
 ```cmd
 START_MCP.bat
 ```
 
-You can also double-click `START_MCP.bat` in Explorer.
+Linux/macOS:
 
-The launcher performs the following startup flow:
+```sh
+./start_mcp.sh
+```
+
+Shared startup flow:
 
 ```text
 [1/5] Create or reuse .venv
-[2/5] Verify Python version and resolve the Secure Tunnel runtime
+[2/5] Verify Python version and resolve Secure Tunnel runtime
 [3/5] Install or validate dependencies
-[4/5] Run fast validation or the full startup doctor
-[5/5] Start the MCP supervisor
+[4/5] Run cached validation or full startup doctor
+[5/5] Start MCP supervisor
 ```
 
-In tunnel mode, runtime resolution checks for an official update only when the configured update interval
-has elapsed. The default is 24 hours. Release downloads are staged and verified before publication; a
-failed download or checksum never replaces a working runtime. Set `MCP_TUNNEL_VERSION` to pin an exact
-stable release, `MCP_TUNNEL_AUTO_UPDATE=0` to disable network update checks, or
-`MCP_TUNNEL_UPDATE_REQUIRED=1` when startup must fail instead of using a known-good fallback.
+Use `MCP_TUNNEL_VERSION` to pin an upstream tunnel release, `MCP_TUNNEL_AUTO_UPDATE=0` to disable release checks, or `MCP_TUNNEL_UPDATE_REQUIRED=1` for fail-closed freshness.
 
-On later starts, a successful validation fingerprint allows unchanged environments to skip the expensive full doctor path.
-
-Keep the launcher window open while using the service.
-
-### 3. Open the Local Control Panel
-
-When the supervisor is running:
+### 3. Control panel
 
 ```text
 http://127.0.0.1:8766/
 ```
 
-The panel provides a richer live dashboard: Supervisor/runtime start times and uptime, lifecycle/drain state, MCP and tunnel health, restart/probe counters, process RAM and start times, whole-database job status summaries plus the 20 latest jobs, `.agent_state` storage breakdown, searchable/filterable structured events, a dedicated recent-error view, raw logs, and guarded Restart / Stop controls.
-
-### 4. Stop the Runtime
-
-Use either:
-
-- `Ctrl+C` in the launcher window, or
-- **Stop** in the local control panel.
-
-The supervisor attempts a bounded mutation drain before stopping the managed runtime.
+The panel is loopback-only and reports runtime lifecycle, health, processes, durable jobs, local storage, structured events/errors, and guarded restart/stop controls.
 
 ## Local HTTP Mode
 
-To run without the Secure MCP Tunnel:
+Windows:
 
 ```powershell
 $env:MCP_START_MODE = "local-http"
 .\START_MCP.bat
 ```
 
-The MCP endpoint becomes available at:
+Linux/macOS:
+
+```sh
+MCP_START_MODE=local-http ./start_mcp.sh
+```
+
+Endpoint:
 
 ```text
 http://127.0.0.1:8765/mcp
 ```
 
-To return to tunnel mode in the same shell:
+Direct development:
 
-```powershell
-Remove-Item Env:MCP_START_MODE -ErrorAction SilentlyContinue
+```sh
+python -m main --transport streamable-http --host 127.0.0.1 --port 8765 --path /mcp
 ```
-
-For direct development use, after the virtual environment exists you can also run:
-
-```powershell
-.\.venv\Scripts\python.exe main.py --transport streamable-http --host 127.0.0.1 --port 8765 --path /mcp
-```
-
-The supervised launcher remains the recommended normal runtime because it adds health monitoring and restart handling.
 
 ## Browser Automation Setup
 
-Browser automation is optional. The core server does not require Playwright.
-
-Install the browser dependency set:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-browser.txt
+```sh
+python -m pip install -r requirements-browser.txt
+python -m playwright install chromium
+python -m scripts.doctor --mode local-http --browser
 ```
-
-Install Chromium for Playwright:
-
-```powershell
-.\.venv\Scripts\python.exe -m playwright install chromium
-```
-
-Validate browser startup:
-
-```powershell
-.\.venv\Scripts\python.exe -m scripts.doctor --mode local-http --browser
-```
-
-Browser sessions use isolated `BrowserContext` instances and can share compatible browser processes. Session and pool counts are bounded and idle resources are reclaimed automatically.
 
 ## Configuration
 
@@ -281,13 +257,13 @@ Language-server MCP tools do not accept caller-supplied executable commands. The
 
 ### Processes and Terminal Commands
 
-- Run native executables.
-- Run PowerShell and CMD commands.
-- Start and monitor background processes.
-- Read incremental process output.
-- Terminate process trees.
+- Run native executables without implicit shell expansion.
+- Run CMD on Windows.
+- Run PowerShell where `powershell` / `pwsh` is installed.
+- Run explicit POSIX `sh -c` commands on Linux/macOS.
+- Start/monitor background processes, read incremental output, and terminate owned process trees.
 
-On supported Windows hosts, runtime-owned command trees use Windows Job Objects for deterministic cleanup. An emergency compatibility fallback can be selected with `MCP_WINDOWS_JOB_OBJECTS=0`.
+Windows uses Job Objects for descendant cleanup. Linux/macOS use dedicated POSIX sessions/process groups with bounded TERM/KILL escalation. `MCP_WINDOWS_JOB_OBJECTS=0` remains an emergency Windows-only compatibility fallback.
 
 ### Durable Jobs
 
@@ -374,7 +350,7 @@ fall back to the full suite. A timed-out or unavailable required verifier always
 
 `collect_diagnostics` emits one stable schema with `file`, range, severity, code, message, and source fields, plus per-backend status and a `required_unknown` flag. `start_validation_watch` submits a persistent job that snapshots the repository, debounces bursts, verifies settled changes, and writes one JSONL record per generation. Use the normal `job_status`, `job_output`, `job_wait`, and `cancel_job` tools to manage its lifecycle.
 
-### Windows and System Diagnostics
+### System Diagnostics
 
 The server can inspect:
 
@@ -382,10 +358,10 @@ The server can inspect:
 - Virtual memory and swap.
 - Mounted volumes.
 - Processes.
-- Windows services.
-- Installed programs.
+- System services through Windows SCM, Linux systemd/SysV detection, or macOS launchd.
+- Installed software through Windows Registry, Linux package-manager backends, or macOS application/system metadata.
 - Environment variable names, with values opt-in.
-- Foreground-window metadata.
+- Foreground-window metadata on supported Windows desktop hosts.
 
 ## Output Delivery
 
@@ -622,7 +598,7 @@ Timing records are written under local ignored state and contain metadata and du
 
 ## Security Model
 
-This project intentionally has broad local capabilities. Treat access to the MCP endpoint as equivalent to granting a development agent access to the Windows account running it.
+This project intentionally has broad local capabilities. Treat access to the MCP endpoint as equivalent to granting a development agent access to the local OS account running it.
 
 Important safeguards:
 
@@ -704,21 +680,25 @@ An uncertain record means the runtime ended after the mutation started but befor
 
 ```text
 .
-├── START_MCP.bat                 # Recommended Windows launcher
+├── START_MCP.bat                 # Windows launcher
+├── start_mcp.sh                  # Linux/macOS launcher
 ├── main.py                       # MCP server entrypoint
 ├── local_pc_mcp.py               # stdio entrypoint used by the tunnel runtime
-├── requirements.txt              # Core Python dependencies
+├── requirements.txt              # Runtime + quality dependency aggregate
+├── requirements-runtime.txt      # Runtime dependencies
+├── requirements-quality.txt      # pytest/Ruff/mypy validation dependencies
+├── requirements-dev.txt          # Development aggregate
 ├── requirements-browser.txt      # Optional Playwright dependencies
 ├── pyproject.toml                # pytest, Ruff, and mypy configuration
 ├── .env.example                  # Environment configuration reference
 ├── core/                         # Runtime, config, jobs, audit, lifecycle, output policies
 ├── tools/                        # MCP tool implementations
-├── scripts/                      # Bootstrap, supervisor, doctor, health, benchmarks
+├── scripts/                      # Bootstrap, supervisor, doctor, validation, packaging, benchmarks
 ├── memory/                       # Bounded project-memory data and documentation
 ├── tests/                        # Unit and integration tests
 ├── third_party/                  # Bundled third-party notices and licenses
-├── tunnel-client.exe             # Secure MCP Tunnel runtime
-├── cloudflared.exe               # Tunnel transport companion
+├── tunnel-client.exe             # Windows-only offline tunnel fallback
+├── cloudflared.exe               # Windows-only offline transport fallback
 ├── BINARY_PROVENANCE.md          # Runtime binary provenance and hashes
 ├── CHANGELOG.md                  # Release history
 ├── CONTRIBUTING.md               # Contribution guide
@@ -727,9 +707,9 @@ An uncertain record means the runtime ended after the mutation started but befor
 └── THIRD_PARTY_NOTICES.md        # Third-party attribution
 ```
 
-## Updating Bundled Tunnel Binaries
+## Updating the Windows Offline Tunnel Fallback
 
-`tunnel-client.exe`, `cloudflared.exe`, and `cloudflared-manifest.json` must be treated as a matched runtime set.
+`tunnel-client.exe`, `cloudflared.exe`, and `cloudflared-manifest.json` are the tracked Windows amd64 offline fallback and must be treated as a matched set. Normal startup on every supported platform prefers the verified managed updater; Linux/macOS release artifacts do not contain these Windows executables.
 
 When updating them:
 
