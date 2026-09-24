@@ -14,7 +14,7 @@ import sysconfig
 import tempfile
 from pathlib import Path
 
-from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile
+from scripts.tunnel_runtime import TunnelRuntimeError, current_runtime, detect_profile, profile_run_args
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -131,7 +131,7 @@ def validate(root: Path, mode: str, profile: str, browser: bool = False) -> None
                 _run(
                     root,
                     "Secure MCP Tunnel doctor",
-                    [str(selection.path), "doctor", "--profile", profile, "--json"],
+                    [str(selection.path), "doctor", *profile_run_args(profile), "--json"],
                 )
             except RuntimeError as exc:
                 # Network, profile, or port conditions can make the upstream doctor fail
