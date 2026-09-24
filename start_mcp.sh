@@ -23,6 +23,11 @@ else
     printf '%s\n' '[1/5] Virtual environment found.'
 fi
 
+if [ "${MCP_START_VALIDATE_ONLY:-0}" = "1" ]; then
+    "$VENV_PYTHON" -m scripts.bootstrap
+    exit $?
+fi
+
 failures=0
 while :; do
     "$VENV_PYTHON" -m scripts.bootstrap --start

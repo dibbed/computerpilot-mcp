@@ -6,6 +6,11 @@ set "MCP_POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not exist "%MCP_POWERSHELL%" set "MCP_POWERSHELL=powershell.exe"
 set "MCP_FAILURES=0"
 
+if /I "%MCP_START_VALIDATE_ONLY%"=="1" (
+    "%MCP_POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\bootstrap.ps1"
+    exit /b %ERRORLEVEL%
+)
+
 :start_mcp
 "%MCP_POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\bootstrap.ps1" -Start
 set "MCP_EXIT_CODE=%ERRORLEVEL%"
