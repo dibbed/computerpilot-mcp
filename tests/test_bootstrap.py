@@ -48,3 +48,42 @@ def test_control_plane_key_loads_from_portable_secret_path(
     secret.write_text("secret-value\n", encoding="utf-8")
     bootstrap._load_control_plane_key()
     assert os.environ["CONTROL_PLANE_API_KEY"] == "secret-value"
+
+
+@pytest.mark.parametrize(
+    "cached,doctor_exit,expected_dependency_calls,expected_full_calls",
+    [
+        (True, 0, 0, 0),
+        (False, 0, 1, 1),
+        (False, 9, 1, 1),
+    ],
+)
+def test_validate_fast_and_full_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    cached: bool,
+    doctor_exit: int,
+    expected_dependency_calls: int,
+    expected_full_calls: int,
+) -> None:
+    monkeypatch.setenv("MCP_START_MODE", "local-http")
+    dependency_calls: list[bool] = []
+    full_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(bootstrap, "_doctor_check", lambda mode, profile: cached)
+    monkeypatch.setattr(bootstrap, "_ensure_dependencies", lambda: dependency_calls.append(True))
+
+    def full_doctor(mode: str, profile: str) -> None:
+        full_calls.append((mode, profile))
+        if doctor_exit:
+            raise bootstrap.BootstrapError("doctor failed", 15)
+
+    monkeypatch.setattr(bootstrap, "_full_doctor", full_doctor)
+
+    if doctor_exit:
+        with pytest.raises(bootstrap.BootstrapError) as error:
+            bootstrap.validate()
+        assert error.value.code == 15
+    else:
+        assert bootstrap.validate() == ("local-http", "default")
+
+    assert len(dependency_calls) == expected_dependency_calls
+    assert len(full_calls) == expected_full_calls
