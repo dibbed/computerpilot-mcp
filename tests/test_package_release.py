@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import tarfile
 import zipfile
@@ -102,7 +101,9 @@ def test_build_posix_tar_preserves_launcher_executable_and_excludes_windows_fall
         assert f"{prefix}/tunnel-client.exe" not in names
         launcher = archive.getmember(f"{prefix}/start_mcp.sh")
         assert launcher.mode & 0o111
-        manifest = json.loads(archive.extractfile(f"{prefix}/RELEASE-MANIFEST.json").read())
+        manifest_stream = archive.extractfile(f"{prefix}/RELEASE-MANIFEST.json")
+        assert manifest_stream is not None
+        manifest = json.loads(manifest_stream.read())
         assert manifest["target"] == "linux-arm64"
         assert manifest["windows_offline_tunnel_fallback_included"] is False
 

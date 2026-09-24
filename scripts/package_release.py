@@ -13,7 +13,6 @@ import tarfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SUPPORTED_TARGETS = (

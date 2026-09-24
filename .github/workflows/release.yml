@@ -80,7 +80,7 @@ jobs:
           set -euo pipefail
           VERSION="${{ steps.release.outputs.version }}"
           python -m scripts.package_release --version "$VERSION" --all --output-dir dist --json
-          sha256sum --check dist/SHA256SUMS.txt
+          (cd dist && sha256sum --check SHA256SUMS.txt)
           notes="docs/V${VERSION}-RELEASE-NOTES.md"
           test -s "$notes"
 
