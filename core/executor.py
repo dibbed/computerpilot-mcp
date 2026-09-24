@@ -21,8 +21,8 @@ import psutil
 
 from core.artifacts import Delivery, deliver_stream
 from core.errors import ToolError
-from core.timings import timing_span
 from core.process_ownership import OwnedProcess, spawn_owned_process
+from core.timings import timing_span
 
 OutputMode = Literal["head", "tail", "both"]
 SPOOL_MEMORY_BYTES = 1_048_576
