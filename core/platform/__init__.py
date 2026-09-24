@@ -17,6 +17,7 @@ _PORTABLE_DOMAINS = frozenset({
     "filesystem",
     "terminal",
     "process",
+    "system",
     "project",
     "language",
     "testing",
@@ -141,8 +142,26 @@ def detect_capabilities(
         desktop_screenshot=is_windows,
         desktop_input=is_windows,
         semantic_ui=is_windows and importlib.util.find_spec("uiautomation") is not None,
-        system_services=is_windows,
-        installed_software=is_windows,
+        system_services=(
+            is_windows
+            or (current == "linux" and (shutil.which("systemctl") is not None or Path("/etc/init.d").is_dir()))
+            or (current == "macos" and shutil.which("launchctl") is not None)
+        ),
+        installed_software=(
+            is_windows
+            or (
+                current == "linux"
+                and any(shutil.which(name) is not None for name in ("dpkg-query", "rpm", "pacman"))
+            )
+            or (
+                current == "macos"
+                and (
+                    shutil.which("system_profiler") is not None
+                    or Path("/Applications").is_dir()
+                    or (Path.home() / "Applications").is_dir()
+                )
+            )
+        ),
         powershell=(shutil.which("pwsh") is not None) or (is_windows and shutil.which("powershell") is not None),
         posix_shell=is_posix and shutil.which("sh") is not None,
         secure_tunnel=supported_host,
