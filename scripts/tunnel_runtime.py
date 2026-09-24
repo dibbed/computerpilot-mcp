@@ -577,6 +577,24 @@ def ensure_runtime(root: Path = PROJECT_ROOT) -> TunnelRuntimeSelection:
             )
 
 
+def profile_directory() -> Path:
+    """Return the upstream tunnel-client profile directory using its real precedence."""
+    configured_dir = os.getenv("TUNNEL_CLIENT_PROFILE_DIR", "").strip()
+    if configured_dir:
+        return Path(configured_dir).expanduser()
+
+    xdg = os.getenv("XDG_CONFIG_HOME", "").strip()
+    home = os.getenv("HOME", "").strip()
+    if xdg:
+        return Path(xdg).expanduser() / "tunnel-client"
+    if home:
+        return Path(home).expanduser() / ".config" / "tunnel-client"
+    if platform.system().casefold() == "windows":
+        appdata = os.getenv("APPDATA", "").strip()
+        return (Path(appdata) if appdata else Path.home() / "AppData" / "Roaming") / "tunnel-client"
+    return Path.home() / ".config" / "tunnel-client"
+
+
 def detect_profile() -> str:
     explicit = os.getenv("MCP_TUNNEL_PROFILE", "").strip()
     if explicit:
@@ -591,22 +609,7 @@ def detect_profile() -> str:
         if stem:
             return stem
 
-    configured_dir = os.getenv("TUNNEL_CLIENT_PROFILE_DIR", "").strip()
-    if configured_dir:
-        profile_dir = Path(configured_dir).expanduser()
-    else:
-        xdg = os.getenv("XDG_CONFIG_HOME", "").strip()
-        home = os.getenv("HOME", "").strip()
-        if xdg:
-            profile_dir = Path(xdg).expanduser() / "tunnel-client"
-        elif home:
-            profile_dir = Path(home).expanduser() / ".config" / "tunnel-client"
-        elif platform.system().casefold() == "windows":
-            appdata = os.getenv("APPDATA", "").strip()
-            profile_dir = (Path(appdata) if appdata else Path.home() / "AppData" / "Roaming") / "tunnel-client"
-        else:
-            profile_dir = Path.home() / ".config" / "tunnel-client"
-
+    profile_dir = profile_directory()
     try:
         candidates = sorted({
             path.stem
