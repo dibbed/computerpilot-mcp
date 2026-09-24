@@ -2,11 +2,11 @@
 
 A local Windows developer-agent backend built on the Model Context Protocol (MCP). It exposes filesystem, code intelligence, process execution, durable jobs, browser automation, desktop interaction, Git, testing, system diagnostics, project memory, and image delivery through one MCP server designed for long-running local use.
 
-Current MCP release: **v0.2.5**. This project version is independent from the bundled upstream tunnel-client binary version.
+Current MCP release: **v0.2.6**. This project version is independent from the bundled upstream tunnel-client binary version.
 
 The project can run through the OpenAI Secure MCP Tunnel or as a loopback-only Streamable HTTP server.
 
-> Release history belongs in [CHANGELOG.md](CHANGELOG.md). v0.2.5 release evidence is recorded in [docs/V0.2.5-VALIDATION.md](docs/V0.2.5-VALIDATION.md). Binary provenance and hashes are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
+> Release history belongs in [CHANGELOG.md](CHANGELOG.md). v0.2.6 release evidence is recorded in [docs/V0.2.6-VALIDATION.md](docs/V0.2.6-VALIDATION.md). Binary provenance and hashes are documented in [BINARY_PROVENANCE.md](BINARY_PROVENANCE.md).
 
 ## What This Project Provides
 
