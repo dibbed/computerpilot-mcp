@@ -6,18 +6,42 @@ Project releases are independent from the bundled upstream tunnel-client.exe ver
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-09-24
+
 ### Added
-- Add a verified managed Secure MCP Tunnel updater. Normal tunnel startup can resolve the latest stable official `openai/tunnel-client` release for the host platform, verify the archive against both GitHub asset SHA-256 metadata and upstream `SHA256SUMS.txt`, validate the binary-reported version, and publish the immutable bundle under `.agent_state/tunnel-runtime/`.
-- Add update controls for an exact upstream version pin, update-check interval, strict update-required mode, prerelease opt-in, and explicit binary override.
-- Add platform-aware tunnel release selection for Windows, Linux, and macOS on amd64/arm64 as groundwork for a later full cross-platform MCP migration.
+- Add verified managed Secure MCP Tunnel updates with official release discovery, exact OS/architecture asset selection, dual SHA-256 verification, binary-version validation, immutable publication, pinning/strict modes, offline fallback, and failed-check backoff.
+- Add normalized Windows/Linux/macOS + amd64/arm64 platform detection and an explicit capability contract exposed through discovery and health.
+- Add POSIX process ownership via dedicated sessions/process groups while preserving Windows Job Objects.
+- Add POSIX `run_shell`, portable PowerShell detection, and Windows-only `run_cmd`.
+- Add shared Python bootstrap plus executable `start_mcp.sh` for Linux/macOS while preserving `START_MCP.bat`.
+- Add the portable `system` domain with Windows SCM/Registry, Linux package-manager/systemd/SysV, and macOS launchd/system-profiler/application adapters.
+- Add shared cross-platform inter-process file locking for audit, project memory, recovery journal, and tunnel updater publication.
+- Add platform-aware Doctor diagnostics and a release validation runner covering real launcher bootstrap, full Doctor, durable-job benchmark, and workflow restart/reconciliation soak.
+- Add six-job CI across Windows/Linux/macOS on Python 3.10/3.12 plus a three-host Python 3.12 release gate.
+- Add deterministic packaging for Windows amd64, Linux amd64/arm64, and macOS amd64/arm64 with embedded release manifests and `SHA256SUMS.txt`.
+- Add guarded release automation that publishes only an exact `release: vX.Y.Z` main commit after Platform Release Validation, normal CI, and packaging smoke all succeed for the same SHA.
 
 ### Changed
-- Resolve the actual tunnel runtime before Supervisor startup instead of always launching the Git-tracked `tunnel-client.exe`.
-- Detect the tunnel profile directly from environment/profile files so narrow runtime binaries do not depend on the full client's `profiles list` command.
-- Treat the Git-tracked v0.0.11 full-client set as an offline fallback rather than the normal freshness source.
+- Gate Windows desktop/UIA and legacy Windows domains by host capabilities instead of importing/registering them on POSIX.
+- Make tool catalogs, health checks, benchmarks, workflow restart checks, and lifecycle mutation contracts host-aware.
+- Resolve the actual managed tunnel runtime before Supervisor startup instead of always launching the tracked v0.0.11 full client.
+- Follow upstream tunnel profile/config precedence without depending on the full client's `profiles list` command.
+- Treat the tracked v0.0.11 + Cloudflared set as a Windows amd64 offline fallback; POSIX release artifacts omit those Windows executables.
+- Make startup Doctor and launcher benchmarks execute the actual host launcher.
+- Load Win32 ctypes/subprocess/Registry dependencies lazily so POSIX import, Ruff, mypy, startup, and health remain clean.
 
 ### Fixed
-- Treat the upstream tunnel-client dispatcher signature `failed to post error response to control plane | controlplane responder: retry wait: context canceled` as a non-fatal warning in the local control panel. The cancellation remains visible in Recent Events, while Runtime Errors and `last_error` remain reserved for actual ERROR/FATAL conditions. Other control-plane response failures, including HTTP/status failures, stay classified as errors.
+- Treat the upstream tunnel-client dispatcher cancellation signature as a non-fatal panel warning while retaining actual ERROR/FATAL reporting.
+- Remove platform-sensitive assumptions around fixed polling counts, CRLF character windows, Windows-only commands/catalog counts, audit close retry timing, durable-job completion timing, and supervisor drain scheduling.
+- Put POSIX `run_shell` under the same lifecycle/recovery mutation guard as other mutating execution tools.
+- Prevent the legacy `windows` domain from activating on POSIX merely because generic system service/software capabilities exist.
+
+### Validation
+- CI requires compileall, Ruff, mypy, startup, health, and full pytest on Windows/Linux/macOS with Python 3.10 and 3.12.
+- Platform Release Validation additionally runs real launcher validation, full local Doctor, quick catalog/startup/resilience/jobs benchmark with durable jobs, and workflow restart/reconciliation soak on all three OSes using Python 3.12.
+- Release Packaging Smoke builds all five target archives and verifies their `SHA256SUMS.txt`.
+- Publication is idempotent and requires all same-SHA gates to succeed.
+- Detailed evidence and platform limitations are in `docs/V0.2.7-VALIDATION.md`.
 
 ## [0.2.6] - 2026-09-24
 
