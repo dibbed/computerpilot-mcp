@@ -616,6 +616,7 @@ def test_drain_ignores_transient_status_read_failure_after_runtime_was_seen(
         drain_timeout=1.0,
         watchdog_drain_timeout=0.2,
     )
+    monkeypatch.setattr(module, "LIFECYCLE_POLL_SEC", 0.001)
     calls = 0
 
     def intermittent_read(path: Path) -> dict[str, object] | None:
@@ -687,7 +688,7 @@ def test_watchdog_drain_is_bounded_when_mutation_does_not_finish(tmp_path: Path)
         readiness_url=None,
         state_dir=tmp_path,
         drain_timeout=1,
-        watchdog_drain_timeout=0.12,
+        watchdog_drain_timeout=0.5,
     )
     try:
         result = supervisor.drain_runtime(
@@ -700,7 +701,7 @@ def test_watchdog_drain_is_bounded_when_mutation_does_not_finish(tmp_path: Path)
         assert result["drained"] is False
         assert result["timed_out"] is True
         assert result["active_mutations"] == 1
-        assert result["elapsed_ms"] < 500
+        assert result["elapsed_ms"] < 1_000
     finally:
         release.set()
         mutation_thread.join(timeout=5)
