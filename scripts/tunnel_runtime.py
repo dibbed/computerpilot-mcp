@@ -7,7 +7,6 @@ tracked binaries, then run that immutable managed copy.
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
 import argparse
 import hashlib
 import json
@@ -24,6 +23,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 

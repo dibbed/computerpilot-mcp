@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
 import atexit
 import json
 import os
@@ -10,6 +9,7 @@ import queue
 import re
 import threading
 import time
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
