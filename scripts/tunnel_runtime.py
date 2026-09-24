@@ -132,6 +132,10 @@ def _metadata_path(root: Path) -> Path:
     return _state_root(root) / "current.json"
 
 
+def _failed_check_path(root: Path) -> Path:
+    return _state_root(root) / "last-check-failure.json"
+
+
 @contextmanager
 def _update_lock(root: Path) -> Iterator[None]:
     """Serialize managed-runtime checks and publication across local processes."""
@@ -471,6 +475,23 @@ def _record_current(
             "upstream_repository": UPSTREAM_REPOSITORY,
         },
     )
+    _clear_failed_check(root)
+
+
+def _record_failed_check(root: Path, error: str) -> None:
+    _write_json_atomic(
+        _failed_check_path(root),
+        {
+            "schema_version": METADATA_SCHEMA_VERSION,
+            "checked_at": time.time(),
+            "error": error[:500],
+            "upstream_repository": UPSTREAM_REPOSITORY,
+        },
+    )
+
+
+def _clear_failed_check(root: Path) -> None:
+    _failed_check_path(root).unlink(missing_ok=True)
 
 
 def _record_check(root: Path, selection: TunnelRuntimeSelection, *, latest_tag: str) -> None:
@@ -485,13 +506,15 @@ def _record_check(root: Path, selection: TunnelRuntimeSelection, *, latest_tag: 
         "upstream_repository": UPSTREAM_REPOSITORY,
     })
     _write_json_atomic(_metadata_path(root), existing)
+    _clear_failed_check(root)
 
 
-def _update_due(root: Path, interval_hours: float) -> bool:
+def _update_due(root: Path, interval_hours: float, *, include_failures: bool) -> bool:
     metadata = _read_json(_metadata_path(root))
-    if not metadata:
-        return True
-    checked_at = metadata.get("checked_at")
+    checked_at = metadata.get("checked_at") if metadata else None
+    if not isinstance(checked_at, (int, float)) and include_failures:
+        failed = _read_json(_failed_check_path(root))
+        checked_at = failed.get("checked_at") if failed else None
     if not isinstance(checked_at, (int, float)):
         return True
     return time.time() - float(checked_at) >= max(interval_hours, 0.0) * 3600.0
@@ -523,13 +546,17 @@ def ensure_runtime(root: Path = PROJECT_ROOT) -> TunnelRuntimeSelection:
 
         pin_raw = os.getenv("MCP_TUNNEL_VERSION", "").strip()
         pin = _normalize_tag(pin_raw) if pin_raw else None
-        if pin is None and fallback is not None and not _update_due(root, interval_hours):
+        strict = _bool_env("MCP_TUNNEL_UPDATE_REQUIRED", False)
+        if (
+            pin is None
+            and fallback is not None
+            and not _update_due(root, interval_hours, include_failures=not strict)
+        ):
             return fallback
         if pin is not None and fallback is not None and fallback.source == "managed" and fallback.version == pin.removeprefix("v"):
             _record_check(root, fallback, latest_tag=pin)
             return fallback
 
-        strict = _bool_env("MCP_TUNNEL_UPDATE_REQUIRED", False)
         try:
             release = _release(pin)
             tag = _normalize_tag(str(release.get("tag_name") or ""))
@@ -538,6 +565,7 @@ def ensure_runtime(root: Path = PROJECT_ROOT) -> TunnelRuntimeSelection:
                 return fallback
             return _install_release(root, release)
         except TunnelRuntimeError as exc:
+            _record_failed_check(root, str(exc))
             if strict or fallback is None:
                 raise
             return TunnelRuntimeSelection(
@@ -547,6 +575,7 @@ def ensure_runtime(root: Path = PROJECT_ROOT) -> TunnelRuntimeSelection:
                 platform_key=fallback.platform_key,
                 warning=str(exc),
             )
+
 
 def detect_profile() -> str:
     explicit = os.getenv("MCP_TUNNEL_PROFILE", "").strip()
