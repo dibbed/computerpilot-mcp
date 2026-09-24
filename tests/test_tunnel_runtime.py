@@ -62,8 +62,26 @@ def test_detect_profile_finds_yaml_without_running_full_client(
     monkeypatch.delenv("TUNNEL_CLIENT_PROFILE_FILE", raising=False)
     monkeypatch.setenv("TUNNEL_CLIENT_PROFILE_DIR", str(tmp_path))
     (tmp_path / "zeta.yaml").write_text("config_version: 1\n", encoding="utf-8")
-    (tmp_path / "alpha.yml").write_text("config_version: 1\n", encoding="utf-8")
+    (tmp_path / "alpha.yaml").write_text("config_version: 1\n", encoding="utf-8")
+    (tmp_path / "ignored.yml").write_text("config_version: 1\n", encoding="utf-8")
     assert module.detect_profile() == "alpha"
+
+
+def test_detect_profile_matches_upstream_xdg_then_home_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MCP_TUNNEL_PROFILE", raising=False)
+    monkeypatch.delenv("TUNNEL_CLIENT_PROFILE_FILE", raising=False)
+    monkeypatch.delenv("TUNNEL_CLIENT_PROFILE_DIR", raising=False)
+    xdg = tmp_path / "xdg"
+    home = tmp_path / "home"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(home))
+    (xdg / "tunnel-client").mkdir(parents=True)
+    (home / ".config" / "tunnel-client").mkdir(parents=True)
+    (xdg / "tunnel-client" / "xdg-profile.yaml").write_text("config_version: 1\n", encoding="utf-8")
+    (home / ".config" / "tunnel-client" / "home-profile.yaml").write_text("config_version: 1\n", encoding="utf-8")
+    assert module.detect_profile() == "xdg-profile"
 
 
 def test_current_runtime_preserves_full_client_fallback_flavor(
