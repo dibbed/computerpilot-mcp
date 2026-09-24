@@ -34,8 +34,7 @@ treating this table as a substitute for an integrity check.
 - Original asset: `tunnel-client-v0.0.11-windows-amd64.zip`
 - Original archive SHA-256: `eb912c86c6ccde90cda805cb17009507176a656725cf86c36fabe1901a12e29b`
 
-These tracked files are retained so tunnel mode still has a known local fallback
-when a managed release has not yet been installed and GitHub is unavailable.
+These tracked files are retained for the Windows amd64 source checkout/release artifact so tunnel mode still has a known local fallback when a managed release has not yet been installed and GitHub is unavailable. Linux/macOS release artifacts intentionally omit the Windows executables and use the verified managed updater.
 
 ## 2. Normal managed-runtime policy
 
@@ -89,10 +88,7 @@ The updater currently understands official upstream archive naming for:
 - Linux amd64 / arm64
 - macOS (darwin) amd64 / arm64
 
-This only makes **tunnel runtime acquisition** platform-aware. It does not mean
-the Windows Agent MCP itself is already cross-platform. Windows-only process
-ownership, UI Automation, desktop tooling, launcher behavior, system
-diagnostics, and other OS-specific surfaces remain separate migration work.
+As of project v0.2.7, the core MCP runtime is a cross-platform preview: launcher/bootstrap, process ownership, terminal execution, system diagnostics, jobs/workflows, file locking, health/doctor validation, browser tooling, and managed tunnel acquisition have Windows/Linux/macOS implementations or capability-aware behavior. Native desktop screenshot/input and semantic UI Automation remain Windows-only and are not registered on Linux/macOS.
 
 ## 5. Security and release rules
 
