@@ -30,8 +30,8 @@ from tools.memory import register as register_memory
 from tools.process import register as register_process
 from tools.project import register as register_project
 from tools.recovery import register as register_recovery
-from tools.terminal import register as register_terminal
 from tools.system import register as register_system
+from tools.terminal import register as register_terminal
 from tools.testing import register as register_testing
 from tools.windows import register as register_windows
 from tools.workflows import register as register_workflows
