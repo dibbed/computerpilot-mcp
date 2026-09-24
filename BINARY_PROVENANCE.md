@@ -20,7 +20,7 @@ The current repository fallback remains the older full-client matched set:
 | --- | --- | --- | --- |
 | `tunnel-client.exe` | `0.0.11+8d55683eeef80bc5e360d95abf4692454fafc615` | windows/amd64 | `7D3C7D492CE84B52835E11865A835A8A5BCD4A669DEE84E169AA11B314DC952A` |
 | `cloudflared.exe` | `2026.7.2` | windows/amd64 | `88024CF82CEC72D10604C13AA4670016DCA375C602E200B551EC9D53B31E874D` |
-| `cloudflared-manifest.json` | pinned to Cloudflared `2026.7.2` | N/A | `149C1B5C0095FFAB41C3986D620CA18C35373E05C5B6D4A7A5` |
+| `cloudflared-manifest.json` | pinned to Cloudflared `2026.7.2` | N/A | `149C1B5C0095FFAB41C3986D620CA18C35373E05C5B6CA0BEA88AC19F6D4A7A5` |
 
 The manifest checksum above is retained from the original fallback provenance.
 When validating a local checkout, compute the file digest directly rather than
