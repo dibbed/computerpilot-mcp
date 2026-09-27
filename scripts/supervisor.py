@@ -22,6 +22,7 @@ from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, BinaryIO, cast
+from urllib.parse import parse_qs, urlsplit
 
 import psutil
 
@@ -32,6 +33,22 @@ from core.executor import _creation_flags
 from core.jobs import JobStore
 from core.lifecycle import lifecycle_control_request
 from core.singleflight import SingleFlight
+from core.transport_health import classify_transport_health
+from core.workflow_store import workflow_store
+from scripts.panel_data import (
+    build_identity,
+    config_snapshot,
+    doctor_snapshot,
+    memory_summary,
+    process_details,
+    redact_diagnostics,
+    storage_breakdown,
+    summarize_transport_history,
+    system_snapshot,
+    tail_jsonl,
+    timing_summary,
+    tunnel_snapshot,
+)
 from scripts.tunnel_runtime import (
     TunnelRuntimeError,
     clean_control_plane_key,
@@ -53,6 +70,10 @@ LIFECYCLE_STATUS_MAX_BYTES = 16_384
 LIFECYCLE_POLL_SEC = 0.025
 LIFECYCLE_START_GRACE_SEC = 0.25
 LIFECYCLE_STOP_ACK_SEC = 0.25
+TRANSPORT_HEALTH_MAX_BYTES = 128 * 1024
+TOOL_ACTIVITY_MAX_BYTES = 16 * 1024
+TRANSPORT_HISTORY_MAX_BYTES = 4 * 1024 * 1024
+TRANSPORT_HISTORY_BACKUPS = 3
 
 
 class PanelStatusCache:
@@ -96,6 +117,11 @@ class Supervisor:
                  drain_timeout: float | None = None, watchdog_drain_timeout: float | None = None) -> None:
         self.command = command
         self.readiness_url = readiness_url
+        self.health_details_url = (
+            readiness_url.rsplit("/", 1)[0] + "/health?details=true"
+            if readiness_url is not None
+            else None
+        )
         self.state_dir = state_dir or SETTINGS.state_dir
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.heartbeat = self.state_dir / f"heartbeat-{uuid.uuid4().hex}"
@@ -132,6 +158,12 @@ class Supervisor:
             "next_retry_seconds": None,
             "failed_probes": 0,
             "runtime_generation": 0,
+            "transport_diagnosis": "LOCAL_MODE" if readiness_url is None else "UNKNOWN",
+            "transport_health": None,
+            "tool_activity": None,
+            "transport_stall_observations": 0,
+            "transport_restart_confirmed": False,
+            "last_transport_recovery_at": None,
         }
         self.logs: deque[str] = deque(maxlen=100)
         self.events: deque[dict[str, Any]] = deque(maxlen=200)
@@ -145,8 +177,24 @@ class Supervisor:
                                                        backupCount=3, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
         self.logger.addHandler(handler)
+        self.transport_logger = logging.getLogger(f"mcp.transport.{uuid.uuid4().hex}")
+        self.transport_logger.setLevel(logging.INFO)
+        self.transport_logger.propagate = False
+        transport_handler = logging.handlers.RotatingFileHandler(
+            self.state_dir / "transport-health.jsonl",
+            maxBytes=TRANSPORT_HISTORY_MAX_BYTES,
+            backupCount=TRANSPORT_HISTORY_BACKUPS,
+            encoding="utf-8",
+        )
+        transport_handler.setFormatter(logging.Formatter("%(message)s"))
+        self.transport_logger.addHandler(transport_handler)
         self.secret = clean_control_plane_key(os.environ.get("CONTROL_PLANE_API_KEY", ""))
         self.owned: dict[int, psutil.Process] = {}
+        self.current_tool_activity_path: Path | None = None
+        self.current_runtime_health_path: Path | None = None
+        self._transport_stall_observations = 0
+        self._last_transport_history_at = 0.0
+        self._last_transport_diagnosis: str | None = None
 
     @staticmethod
     def _plain_event_level(message: str) -> str:
@@ -282,6 +330,98 @@ class Supervisor:
                 values.setdefault("last_state_change_at", time.time())
             self.state.update(values)
 
+    @staticmethod
+    def _read_bounded_json(path: Path | None, max_bytes: int) -> dict[str, Any] | None:
+        if path is None:
+            return None
+        try:
+            if path.stat().st_size > max_bytes:
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _fetch_tunnel_health(self) -> dict[str, Any] | None:
+        if self.health_details_url is None:
+            return None
+        try:
+            with urllib.request.urlopen(self.health_details_url, timeout=2) as response:
+                if response.status != 200:
+                    return None
+                raw = response.read(TRANSPORT_HEALTH_MAX_BYTES + 1)
+        except (OSError, ValueError):
+            return None
+        if len(raw) > TRANSPORT_HEALTH_MAX_BYTES:
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _record_transport_history(self, summary: dict[str, Any]) -> None:
+        now = time.time()
+        diagnosis = str(summary.get("diagnosis") or "UNKNOWN")
+        interval_elapsed = now - self._last_transport_history_at >= SETTINGS.transport_history_interval_sec
+        if diagnosis == self._last_transport_diagnosis and not interval_elapsed:
+            return
+        record = {
+            "time": now,
+            "diagnosis": diagnosis,
+            "severity": summary.get("severity"),
+            "reason": summary.get("reason"),
+            "ready": summary.get("ready"),
+            "restart_recommended": summary.get("restart_recommended"),
+            "restart_confirmed": summary.get("restart_confirmed"),
+            "stall_observations": summary.get("stall_observations"),
+            "runtime": summary.get("runtime"),
+            "control_plane": summary.get("control_plane"),
+            "queue": summary.get("queue"),
+            "dispatcher": summary.get("dispatcher"),
+            "response_delivery": summary.get("response_delivery"),
+            "tool_activity": summary.get("tool_activity"),
+            "diagnostic_ages": summary.get("diagnostic_ages"),
+        }
+        self.transport_logger.info(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+        self._last_transport_history_at = now
+        self._last_transport_diagnosis = diagnosis
+
+    def transport_snapshot(self, ready: bool | None) -> dict[str, Any]:
+        activity = self._read_bounded_json(self.current_tool_activity_path, TOOL_ACTIVITY_MAX_BYTES)
+        detailed = self._fetch_tunnel_health() if self.health_details_url is not None else None
+        summary = classify_transport_health(
+            detailed,
+            tool_activity=activity,
+            ready=ready,
+            tunnel_mode=self.health_details_url is not None,
+            now=time.time(),
+            poll_stall_grace_sec=SETTINGS.tunnel_poll_stall_grace_sec,
+            upstream_idle_sec=SETTINGS.transport_upstream_idle_sec,
+            mcp_tool_stall_sec=SETTINGS.mcp_tool_stall_sec,
+        )
+        if summary["diagnosis"] == "POLL_STALLED" and summary["restart_recommended"]:
+            self._transport_stall_observations += 1
+        else:
+            self._transport_stall_observations = 0
+        confirmed = (
+            SETTINGS.tunnel_poll_watchdog_enabled
+            and self._transport_stall_observations >= SETTINGS.tunnel_poll_stall_confirmations
+        )
+        summary["stall_observations"] = self._transport_stall_observations
+        summary["restart_confirmed"] = confirmed
+        summary["watchdog_enabled"] = SETTINGS.tunnel_poll_watchdog_enabled
+        summary["required_confirmations"] = SETTINGS.tunnel_poll_stall_confirmations
+        self.set_state(
+            transport_diagnosis=summary["diagnosis"],
+            transport_health=summary,
+            tool_activity=activity,
+            transport_stall_observations=self._transport_stall_observations,
+            transport_restart_confirmed=confirmed,
+        )
+        self._record_transport_history(summary)
+        return summary
+
     def _runtime_lifecycle_paths(self) -> tuple[Path, Path]:
         directory = self.state_dir / "runtime_lifecycle"
         directory.mkdir(parents=True, exist_ok=True)
@@ -331,7 +471,7 @@ class Supervisor:
         status_path: Path,
     ) -> dict[str, Any]:
         """Request a bounded mutation drain before terminating one runtime generation."""
-        timeout = self.watchdog_drain_timeout if reason == "watchdog_unhealthy" else self.drain_timeout
+        timeout = self.watchdog_drain_timeout if reason.startswith("watchdog_") else self.drain_timeout
         request_id = uuid.uuid4().hex
         started = time.monotonic()
         deadline_monotonic = started + timeout
@@ -440,8 +580,9 @@ class Supervisor:
                     ready = response.status == 200
             except (OSError, ValueError):
                 ready = False
+        transport = self.transport_snapshot(ready)
         self.set_state(mcp_healthy=heartbeat_ok, tunnel_healthy=ready)
-        return heartbeat_ok and ready is not False
+        return heartbeat_ok and ready is not False and not bool(transport.get("restart_confirmed"))
 
     def remember_children(self, process: subprocess.Popen[bytes]) -> None:
         try:
@@ -536,13 +677,25 @@ class Supervisor:
                 self.restart.clear()
                 self.heartbeat.unlink(missing_ok=True)
                 control_path, status_path = self._runtime_lifecycle_paths()
+                generation_id = control_path.stem.removeprefix("control-")
+                activity_path = control_path.with_name(f"activity-{generation_id}.json")
+                health_path = control_path.with_name(f"health-{generation_id}.json")
                 control_path.unlink(missing_ok=True)
                 status_path.unlink(missing_ok=True)
+                activity_path.unlink(missing_ok=True)
+                health_path.unlink(missing_ok=True)
+                self.current_tool_activity_path = activity_path
+                self.current_runtime_health_path = health_path
+                self._transport_stall_observations = 0
+                self._last_transport_history_at = 0.0
+                self._last_transport_diagnosis = None
                 env = os.environ.copy()
                 env["MCP_HEARTBEAT_FILE"] = str(self.heartbeat)
                 env["MCP_LIFECYCLE_CONTROL_FILE"] = str(control_path)
                 env["MCP_LIFECYCLE_STATUS_FILE"] = str(status_path)
-                env["MCP_RUNTIME_GENERATION_ID"] = control_path.stem.removeprefix("control-")
+                env["MCP_RUNTIME_GENERATION_ID"] = generation_id
+                env["MCP_TOOL_ACTIVITY_FILE"] = str(activity_path)
+                env["MCP_RUNTIME_HEALTH_FILE"] = str(health_path)
                 started = time.monotonic()
                 process = None
                 readers: list[threading.Thread] = []
@@ -563,6 +716,11 @@ class Supervisor:
                         runtime_started_at=runtime_started_at,
                         last_runtime_started_at=runtime_started_at,
                         runtime_generation=attempts + 1,
+                        transport_diagnosis="LOCAL_MODE" if self.health_details_url is None else "UNKNOWN",
+                        transport_health=None,
+                        tool_activity=None,
+                        transport_stall_observations=0,
+                        transport_restart_confirmed=False,
                     )
                     self.event(f"Runtime started pid={process.pid} restart_count={attempts}")
                     for pipe in (process.stdout, process.stderr):
@@ -581,7 +739,17 @@ class Supervisor:
                                 missed += 1
                                 self.set_state(state="unhealthy", failed_probes=missed)
                                 if missed >= 3:
-                                    reason = "watchdog_unhealthy"
+                                    state = self.state_snapshot()
+                                    if bool(state.get("transport_restart_confirmed")):
+                                        reason = "watchdog_poll_stalled"
+                                        self.set_state(last_transport_recovery_at=time.time())
+                                        self.event(json.dumps({
+                                            "level": "WARN",
+                                            "component": "transport",
+                                            "msg": "confirmed control-plane poll stall; restarting runtime",
+                                        }))
+                                    else:
+                                        reason = "watchdog_unhealthy"
                                     break
                             self.stop.wait(self.interval)
                     except KeyboardInterrupt:
@@ -591,7 +759,9 @@ class Supervisor:
                         reason = "user_stop"
                     elif self.restart.is_set():
                         reason = "user_restart"
-                    if process.poll() is None and reason in {"watchdog_unhealthy", "user_restart", "user_stop"}:
+                    if process.poll() is None and (
+                        reason.startswith("watchdog_") or reason in {"user_restart", "user_stop"}
+                    ):
                         self.drain_runtime(
                             process,
                             reason=reason,
@@ -603,8 +773,13 @@ class Supervisor:
                     self.set_state(last_exit_code=code, last_exit_reason=reason)
                     if not reason.startswith("user_") and not self.snapshot()["last_error"]:
                         self.set_state(last_error=reason)
-                    if reason in {"watchdog_unhealthy", "user_restart", "user_stop"}:
-                        audit_action("supervisor_terminate_runtime", target=str(process.pid), details={"reason": reason}, durable=True)
+                    if reason.startswith("watchdog_") or reason in {"user_restart", "user_stop"}:
+                        audit_action(
+                            "supervisor_terminate_runtime",
+                            target=str(process.pid),
+                            details={"reason": reason},
+                            durable=True,
+                        )
                 except Exception as exc:
                     self.event(f"Runtime launch failed: {type(exc).__name__}: {exc}")
                     self.set_state(last_error=str(exc))
@@ -619,6 +794,10 @@ class Supervisor:
                         self.event(f"Runtime cleanup completed pid={process.pid} exit_code={process.returncode}")
                     control_path.unlink(missing_ok=True)
                     status_path.unlink(missing_ok=True)
+                    activity_path.unlink(missing_ok=True)
+                    health_path.unlink(missing_ok=True)
+                    self.current_tool_activity_path = None
+                    self.current_runtime_health_path = None
                     for thread in readers:
                         thread.join(timeout=2)
                 if self.stop.is_set():
@@ -641,9 +820,10 @@ class Supervisor:
         finally:
             self.set_state(state="stopped", pid=None, mcp_healthy=False)
             self.heartbeat.unlink(missing_ok=True)
-            for handler in list(self.logger.handlers):
-                handler.close()
-                self.logger.removeHandler(handler)
+            for logger in (self.logger, self.transport_logger):
+                for handler in list(logger.handlers):
+                    handler.close()
+                    logger.removeHandler(handler)
 
 
 def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
@@ -667,7 +847,7 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
                 size = path.stat().st_size
                 relative = path.relative_to(supervisor.state_dir)
             except (FileNotFoundError, PermissionError, OSError):
-                continue  # Concurrent finalization or cleanup may remove a path.
+                continue
             storage["total"] += size
             top = relative.parts[0] if relative.parts else ""
             name = path.name.casefold()
@@ -681,14 +861,16 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
                 or ".db-" in name
             ):
                 storage["databases"] += size
-            elif name.startswith(("supervisor.log", "audit")) or path.suffix.casefold() in {".log", ".jsonl"}:
+            elif name.startswith(("supervisor.log", "audit", "transport-health")) or path.suffix.casefold() in {".log", ".jsonl"}:
                 storage["logs"] += size
             else:
                 storage["other"] += size
         return storage
 
-    def job_snapshot() -> dict[str, Any]:
-        result = store.list(0, 20)
+    def job_snapshot(offset: int = 0, limit: int = 20) -> dict[str, Any]:
+        bounded_offset = min(max(offset, 0), 1_000_000)
+        bounded_limit = min(max(limit, 1), 100)
+        result = store.list(bounded_offset, bounded_limit)
         counts: dict[str, int] = {}
         try:
             with closing(store.connect()) as connection:
@@ -735,12 +917,185 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
             "output_preview_limit_bytes": PANEL_JOB_OUTPUT_PREVIEW_BYTES,
         }
 
+    def runtime_health_snapshot() -> dict[str, Any]:
+        return supervisor._read_bounded_json(supervisor.current_runtime_health_path, 512 * 1024) or {}
+
+    def summary_snapshot() -> dict[str, Any]:
+        snapshot = supervisor.state_snapshot()
+        for key in ("logs", "recent_events", "recent_errors"):
+            snapshot.pop(key, None)
+        snapshot.update(cache.get("processes", PANEL_PROCESS_TTL_SEC, supervisor.process_snapshot))
+        jobs = cache.get("jobs_summary", PANEL_JOBS_TTL_SEC, lambda: job_snapshot(0, 1))
+        jobs.pop("items", None)
+        snapshot["jobs"] = jobs
+        health = runtime_health_snapshot()
+        snapshot["runtime_health_status"] = health.get("health_status")
+        snapshot["resource_pressure"] = health.get("resource_pressure")
+        snapshot["runtime_tool_count"] = health.get("tool_count")
+        snapshot["panel_api_version"] = 2
+        return snapshot
+
+    def events_snapshot() -> dict[str, Any]:
+        snapshot = supervisor.state_snapshot()
+        return {
+            "server_time": snapshot["server_time"],
+            "event_count": snapshot["event_count"],
+            "error_count": snapshot["error_count"],
+            "recent_events": snapshot["recent_events"],
+            "recent_errors": snapshot["recent_errors"],
+            "logs": snapshot["logs"],
+            "last_error": snapshot.get("last_error"),
+        }
+
+    def insights_snapshot() -> dict[str, Any]:
+        return {
+            "identity": cache.get("identity", 30.0, build_identity),
+            "runtime_health": runtime_health_snapshot(),
+            "tunnel": cache.get(
+                "tunnel_identity",
+                60.0,
+                lambda: tunnel_snapshot(readiness_url=supervisor.readiness_url),
+            ),
+            "system": cache.get("system", 5.0, system_snapshot),
+            "storage": cache.get(
+                "storage_breakdown",
+                PANEL_STORAGE_TTL_SEC,
+                lambda: storage_breakdown(supervisor.state_dir),
+            ),
+            "memory": cache.get("memory", 30.0, memory_summary),
+            "performance": cache.get(
+                "performance",
+                10.0,
+                lambda: timing_summary(supervisor.state_dir / "timings.jsonl"),
+            ),
+        }
+
+    def workflow_snapshot() -> dict[str, Any]:
+        health = runtime_health_snapshot()
+        recent = health.get("recent_workflows")
+        if isinstance(recent, dict):
+            return recent
+        return {"items": [], "count": 0, "total_count": 0, "offset": 0, "has_more": False}
+
+    def recovery_snapshot() -> dict[str, Any]:
+        health = runtime_health_snapshot()
+        recovery = health.get("operation_recovery")
+        if not isinstance(recovery, dict):
+            return {"items": [], "count": 0, "total_count": 0, "pending_count": 0}
+        raw_items = recovery.get("uncertain")
+        items = raw_items if isinstance(raw_items, list) else []
+        return {
+            "items": items[:100],
+            "count": len(items[:100]),
+            "total_count": int(recovery.get("uncertain_count", len(items)) or 0),
+            "pending_count": int(recovery.get("pending_count", 0) or 0),
+            "enabled": bool(recovery.get("enabled", True)),
+        }
+
+    def workflow_detail_snapshot(workflow_id: str) -> dict[str, Any]:
+        store = workflow_store(supervisor.state_dir / "workflows.sqlite3")
+        workflow = store.get(workflow_id)
+        operations = store.list_operations(workflow_id, limit=100)
+        safe_steps = [
+            {
+                "step_index": step.get("step_index"),
+                "state": step.get("state"),
+                "attempts": step.get("attempts"),
+                "started_at": step.get("started_at"),
+                "finished_at": step.get("finished_at"),
+                "error": step.get("error"),
+            }
+            for step in workflow.get("steps", [])
+            if isinstance(step, dict)
+        ]
+        safe_operations = []
+        allowed_operation_keys = (
+            "operation_id",
+            "step_index",
+            "operation_index",
+            "action",
+            "state",
+            "attempts",
+            "version",
+            "started_at",
+            "updated_at",
+            "finished_at",
+            "error",
+        )
+        for operation in operations.get("items", []):
+            if isinstance(operation, dict):
+                safe_operations.append({
+                    key: operation.get(key)
+                    for key in allowed_operation_keys
+                    if key in operation
+                })
+        return {
+            "workflow_id": workflow.get("workflow_id"),
+            "state": workflow.get("state"),
+            "current_step": workflow.get("current_step"),
+            "version": workflow.get("version"),
+            "execution_compatible": workflow.get("execution_compatible"),
+            "cancel_requested_at": workflow.get("cancel_requested_at"),
+            "cancel_reason": workflow.get("cancel_reason"),
+            "created_at": workflow.get("created_at"),
+            "updated_at": workflow.get("updated_at"),
+            "last_error": workflow.get("last_error"),
+            "steps": safe_steps,
+            "operations": safe_operations,
+            "operation_count": int(operations.get("total_count", len(safe_operations)) or 0),
+            "operations_truncated": bool(operations.get("has_more", False)),
+        }
+
+    def transport_history_snapshot(limit: int = 100) -> dict[str, Any]:
+        events = events_snapshot()["recent_events"]
+        return summarize_transport_history(
+            supervisor.state_dir / "transport-health.jsonl",
+            limit=limit,
+            recent_events=events,
+        )
+
+    def doctor_view() -> dict[str, Any]:
+        insights = insights_snapshot()
+        summary = summary_snapshot()
+        transport = summary.get("transport_health")
+        return doctor_snapshot(
+            runtime_health=insights["runtime_health"],
+            transport=transport if isinstance(transport, dict) else {},
+            system=insights["system"],
+            tunnel=insights["tunnel"],
+        )
+
+    def diagnostics_snapshot() -> dict[str, Any]:
+        insights = insights_snapshot()
+        events = events_snapshot()
+        payload = {
+            "generated_at": time.time(),
+            "identity": insights["identity"],
+            "summary": summary_snapshot(),
+            "runtime_health": insights["runtime_health"],
+            "tunnel": insights["tunnel"],
+            "system": insights["system"],
+            "storage": insights["storage"],
+            "performance": insights["performance"],
+            "config": config_snapshot(),
+            "transport_history": transport_history_snapshot(100),
+            "recent_events": events["recent_events"][-100:],
+            "recent_errors": events["recent_errors"][-50:],
+            "workflows": workflow_snapshot(),
+            "recovery": recovery_snapshot(),
+            "doctor": doctor_view(),
+        }
+        return cast(dict[str, Any], redact_diagnostics(payload, secret_values=(supervisor.secret, token)))
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
             pass
 
         def valid_host(self) -> bool:
             return self.headers.get("Host") == f"127.0.0.1:{cast(ThreadingHTTPServer, self.server).server_port}"
+
+        def authorized(self) -> bool:
+            return secrets.compare_digest(self.headers.get("X-Control-Token", ""), token)
 
         def send(self, data: bytes, content_type: str = "application/json", status: int = 200) -> None:
             self.send_response(status)
@@ -749,57 +1104,219 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+                "connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'",
+            )
             self.end_headers()
             self.wfile.write(data)
 
+        def send_json(self, value: Any, status: int = 200) -> None:
+            self.send(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), status=status)
+
+        def send_download(self, path: Path, filename: str) -> None:
+            try:
+                size = path.stat().st_size
+                source = path.open("rb")
+            except OSError:
+                self.send(b"{}", status=404)
+                return
+            with source:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                while True:
+                    chunk = source.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+
+        @staticmethod
+        def _job_id(value: str) -> str | None:
+            return value if len(value) == 32 and all(char in "0123456789abcdefABCDEF" for char in value) else None
+
+        def _query_int(self, query: dict[str, list[str]], name: str, default: int, minimum: int, maximum: int) -> int:
+            raw = query.get(name, [str(default)])[0]
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = default
+            return min(max(value, minimum), maximum)
+
         def do_GET(self) -> None:
             if not self.valid_host():
-                self.send(b'{}', status=403)
+                self.send(b"{}", status=403)
                 return
-            if self.path == "/":
+            target = urlsplit(self.path)
+            path = target.path
+            query = parse_qs(target.query)
+            if path == "/":
                 html = (PROJECT_ROOT / "tools" / "panel" / "index.html").read_text(encoding="utf-8")
                 self.send(html.replace("__CONTROL_TOKEN__", token).encode(), "text/html; charset=utf-8")
-            elif self.path == "/favicon.ico":
+                return
+            if path == "/favicon.ico":
                 self.send(b"", "image/x-icon", 204)
-            elif self.path == "/api/status":
+                return
+            if path == "/api/status":
                 snapshot = supervisor.state_snapshot()
                 snapshot.update(cache.get("processes", PANEL_PROCESS_TTL_SEC, supervisor.process_snapshot))
-                snapshot["jobs"] = cache.get("jobs", PANEL_JOBS_TTL_SEC, job_snapshot)
+                snapshot["jobs"] = cache.get("jobs", PANEL_JOBS_TTL_SEC, lambda: job_snapshot(0, 20))
                 snapshot["storage_bytes"] = cache.get("storage", PANEL_STORAGE_TTL_SEC, storage_bytes)
-                self.send(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            elif self.path.startswith("/api/jobs/"):
-                if not secrets.compare_digest(self.headers.get("X-Control-Token", ""), token):
-                    self.send(b'{}', status=403)
-                    return
-                job_id = self.path.removeprefix("/api/jobs/")
-                if len(job_id) != 32 or any(char not in "0123456789abcdefABCDEF" for char in job_id):
-                    self.send(b'{}', status=404)
+                snapshot["panel_api_version"] = 2
+                self.send_json(snapshot)
+                return
+            if path == "/api/summary":
+                self.send_json(summary_snapshot())
+                return
+
+            if not self.authorized():
+                self.send(b"{}", status=403)
+                return
+
+            if path == "/api/insights":
+                self.send_json(insights_snapshot())
+            elif path == "/api/events":
+                self.send_json(events_snapshot())
+            elif path == "/api/jobs":
+                offset = self._query_int(query, "offset", 0, 0, 1_000_000)
+                limit = self._query_int(query, "limit", 20, 1, 100)
+                self.send_json(job_snapshot(offset, limit))
+            elif path.startswith("/api/jobs/") and path.endswith("/output/download"):
+                job_id = self._job_id(path.removeprefix("/api/jobs/").removesuffix("/output/download"))
+                stream = query.get("stream", ["stdout"])[0]
+                if job_id is None or stream not in {"stdout", "stderr"}:
+                    self.send(b"{}", status=404)
                     return
                 try:
-                    details = job_details(job_id)
+                    store.get(job_id)
                 except ToolError as exc:
                     if exc.code == "job_not_found":
-                        self.send(b'{}', status=404)
+                        self.send(b"{}", status=404)
                         return
                     raise
-                self.send(json.dumps(details, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                output_path = store.output_dir / job_id / f"{stream}.bin"
+                self.send_download(output_path, f"{job_id}-{stream}.bin")
+            elif path.startswith("/api/jobs/") and path.endswith("/output"):
+                job_id = self._job_id(path.removeprefix("/api/jobs/").removesuffix("/output"))
+                if job_id is None:
+                    self.send(b"{}", status=404)
+                    return
+                stdout_since = self._query_int(query, "stdout_since", 0, 0, 2_147_483_647)
+                stderr_since = self._query_int(query, "stderr_since", 0, 0, 2_147_483_647)
+                max_bytes = self._query_int(query, "max_bytes", PANEL_JOB_OUTPUT_PREVIEW_BYTES, 16, 64 * 1024)
+                try:
+                    self.send_json(store.progress(
+                        job_id,
+                        stdout_since_byte=stdout_since,
+                        stderr_since_byte=stderr_since,
+                        max_bytes=max_bytes,
+                    ))
+                except ToolError as exc:
+                    if exc.code == "job_not_found":
+                        self.send(b"{}", status=404)
+                        return
+                    raise
+                except ValueError:
+                    self.send(b"{}", status=400)
+            elif path.startswith("/api/jobs/"):
+                job_id = self._job_id(path.removeprefix("/api/jobs/"))
+                if job_id is None:
+                    self.send(b"{}", status=404)
+                    return
+                try:
+                    self.send_json(job_details(job_id))
+                except ToolError as exc:
+                    if exc.code == "job_not_found":
+                        self.send(b"{}", status=404)
+                        return
+                    raise
+            elif path == "/api/transport/history":
+                limit = self._query_int(query, "limit", 100, 1, 500)
+                self.send_json(transport_history_snapshot(limit))
+            elif path == "/api/audit":
+                limit = self._query_int(query, "limit", 50, 1, 200)
+                items = tail_jsonl(supervisor.state_dir / "audit.jsonl", limit=limit)
+                self.send_json({"items": items, "count": len(items)})
+            elif path == "/api/workflows":
+                self.send_json(workflow_snapshot())
+            elif path.startswith("/api/workflows/"):
+                workflow_id = path.removeprefix("/api/workflows/")
+                if not workflow_id or len(workflow_id) > 128:
+                    self.send(b"{}", status=404)
+                    return
+                try:
+                    self.send_json(workflow_detail_snapshot(workflow_id))
+                except ToolError as exc:
+                    if exc.code == "workflow_not_found":
+                        self.send(b"{}", status=404)
+                        return
+                    raise
+            elif path == "/api/recovery":
+                self.send_json(recovery_snapshot())
+            elif path == "/api/config":
+                self.send_json(config_snapshot())
+            elif path == "/api/doctor":
+                self.send_json(doctor_view())
+            elif path == "/api/diagnostics":
+                self.send_json(diagnostics_snapshot())
+            elif path.startswith("/api/processes/"):
+                raw_pid = path.removeprefix("/api/processes/")
+                try:
+                    pid = int(raw_pid)
+                except ValueError:
+                    self.send(b"{}", status=404)
+                    return
+                processes = supervisor.process_snapshot().get("active_processes", [])
+                allowed = {int(item["pid"]) for item in processes if item.get("pid") is not None}
+                detail = process_details(pid, allowed)
+                if detail is None:
+                    self.send(b"{}", status=404)
+                    return
+                self.send_json(detail)
             else:
-                self.send(b'{}', status=404)
+                self.send(b"{}", status=404)
 
         def do_POST(self) -> None:
             origin = f"http://127.0.0.1:{cast(ThreadingHTTPServer, self.server).server_port}"
-            if (not self.valid_host() or self.headers.get("Origin") != origin
-                    or not secrets.compare_digest(self.headers.get("X-Control-Token", ""), token)):
-                self.send(b'{}', status=403)
+            if (
+                not self.valid_host()
+                or self.headers.get("Origin") != origin
+                or not self.authorized()
+            ):
+                self.send(b"{}", status=403)
                 return
-            if self.path == "/api/restart":
+            path = urlsplit(self.path).path
+            if path == "/api/restart":
                 supervisor.restart.set()
-            elif self.path == "/api/stop":
-                supervisor.stop.set()
-            else:
-                self.send(b'{}', status=404)
+                self.send_json({"ok": True})
                 return
-            self.send(b'{"ok":true}')
+            if path == "/api/stop":
+                supervisor.stop.set()
+                self.send_json({"ok": True})
+                return
+            if path.startswith("/api/jobs/") and path.endswith("/cancel"):
+                job_id = self._job_id(path.removeprefix("/api/jobs/").removesuffix("/cancel"))
+                if job_id is None:
+                    self.send(b"{}", status=404)
+                    return
+                try:
+                    result = store.cancel(job_id)
+                except ToolError as exc:
+                    if exc.code == "job_not_found":
+                        self.send(b"{}", status=404)
+                        return
+                    raise
+                self.send_json(result)
+                return
+            self.send(b"{}", status=404)
 
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
