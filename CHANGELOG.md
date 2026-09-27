@@ -6,6 +6,9 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+### Added
+- Make Recent Jobs rows in the local control panel open a token-protected detail modal with the stored command, working directory, timeouts, process metadata, exit/error state, bounded stdout/stderr previews, keyboard activation, and command copy.
+
 ### Documentation
 - Rebuild the repository landing page around verifiable capabilities, platform boundaries, practical workflows, and a shorter first-run path.
 - Add public guides for installation, architecture, platform support, tooling, configuration, troubleshooting, and the guarded release process.

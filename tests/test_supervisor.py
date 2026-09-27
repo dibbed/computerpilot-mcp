@@ -325,6 +325,9 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         assert "Windows Agent MCP Control Panel" in html
         assert "Recent Events" in html
         assert "Runtime Errors" in html
+        assert "Job details" in html
+        assert "Copy command" in html
+        assert "/api/jobs/" in html
         assert re.search(r"[\u0600-\u06FF]", html) is None
         with urllib.request.urlopen(base + "/api/status") as response:
             status = json.load(response)
@@ -340,6 +343,74 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         assert status["jobs"]["active_count"] == 0
         assert status["jobs"]["problem_count"] == 0
         assert status["storage_bytes"]["total"] >= 0
+
+        job_store = JobStore(tmp_path / "jobs.sqlite3")
+        job_id = "a" * 32
+        created = time.time() - 5
+        updated = time.time() - 1
+        spec = json.dumps({
+            "command": [sys.executable, "-c", "print('panel detail')"],
+            "cwd": str(tmp_path),
+            "timeout_sec": 15,
+            "queue_timeout_sec": 4,
+            "encoding": "utf-8",
+        }, sort_keys=True)
+        db = job_store.connect()
+        try:
+            with db:
+                db.execute(
+                    "INSERT INTO jobs "
+                    "(id,request_key,fingerprint,spec,status,created,updated,version,worker_pid,pid,exit_code,"
+                    "cancel_requested,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        job_id,
+                        "panel-detail",
+                        "fingerprint",
+                        spec,
+                        "succeeded",
+                        created,
+                        updated,
+                        2,
+                        111,
+                        222,
+                        0,
+                        0,
+                        None,
+                    ),
+                )
+        finally:
+            db.close()
+        output_dir = job_store.output_dir / job_id
+        output_dir.mkdir(exist_ok=True)
+        (output_dir / "stdout.bin").write_bytes(b"hello stdout\n")
+        (output_dir / "stderr.bin").write_bytes(b"warning stderr\n")
+
+        missing_token = urllib.request.Request(base + f"/api/jobs/{job_id}")
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(missing_token)
+        try:
+            assert error.value.code == 403
+        finally:
+            error.value.close()
+
+        detail_request = urllib.request.Request(
+            base + f"/api/jobs/{job_id}",
+            headers={"X-Control-Token": token[1]},
+        )
+        with urllib.request.urlopen(detail_request) as response:
+            detail = json.load(response)
+        assert detail["job_id"] == job_id
+        assert detail["status"] == "succeeded"
+        assert detail["command"][-1] == "print('panel detail')"
+        assert detail["command_line"]
+        assert detail["cwd"] == str(tmp_path)
+        assert detail["timeout_sec"] == 15
+        assert detail["queue_timeout_sec"] == 4
+        assert detail["worker_pid"] == 111
+        assert detail["pid"] == 222
+        assert detail["stdout"]["text"] == "hello stdout\n"
+        assert detail["stderr"]["text"] == "warning stderr\n"
+        assert detail["output_preview_limit_bytes"] == module.PANEL_JOB_OUTPUT_PREVIEW_BYTES
         for origin, key in [("https://evil.example", token[1]), (base, "wrong")]:
             request = urllib.request.Request(base + "/api/restart", data=b"", headers={"Origin": origin, "X-Control-Token": key})
             with pytest.raises(urllib.error.HTTPError) as error:

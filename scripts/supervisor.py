@@ -9,6 +9,7 @@ import logging
 import logging.handlers
 import os
 import secrets
+import shlex
 import subprocess
 import sys
 import threading
@@ -26,6 +27,7 @@ import psutil
 
 from core.audit import audit_action
 from core.config import PROJECT_ROOT, SETTINGS
+from core.errors import ToolError
 from core.executor import _creation_flags
 from core.jobs import JobStore
 from core.lifecycle import lifecycle_control_request
@@ -46,6 +48,7 @@ def restart_delay(failures: int) -> int:
 PANEL_PROCESS_TTL_SEC = 2.0
 PANEL_JOBS_TTL_SEC = 2.0
 PANEL_STORAGE_TTL_SEC = 20.0
+PANEL_JOB_OUTPUT_PREVIEW_BYTES = 32 * 1024
 LIFECYCLE_STATUS_MAX_BYTES = 16_384
 LIFECYCLE_POLL_SEC = 0.025
 LIFECYCLE_START_GRACE_SEC = 0.25
@@ -698,6 +701,40 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
         result["problem_count"] = sum(counts.get(status, 0) for status in ("failed", "timed_out", "interrupted"))
         return result
 
+    def job_details(job_id: str) -> dict[str, Any]:
+        status = store.get(job_id)
+        raw = store.raw(job_id)
+        try:
+            spec = json.loads(str(raw["spec"]))
+        except (TypeError, ValueError):
+            spec = {}
+        if not isinstance(spec, dict):
+            spec = {}
+        raw_command = spec.get("command")
+        command = [str(item) for item in raw_command] if isinstance(raw_command, list) else []
+        command_line = (
+            subprocess.list2cmdline(command)
+            if os.name == "nt"
+            else shlex.join(command)
+        ) if command else ""
+        output = store.progress(job_id, max_bytes=PANEL_JOB_OUTPUT_PREVIEW_BYTES)
+        return {
+            "ok": True,
+            **status,
+            "worker_pid": raw.get("worker_pid"),
+            "worker_created": raw.get("worker_created"),
+            "pid_created": raw.get("pid_created"),
+            "command": command,
+            "command_line": command_line,
+            "cwd": str(spec.get("cwd") or ""),
+            "timeout_sec": spec.get("timeout_sec"),
+            "queue_timeout_sec": spec.get("queue_timeout_sec"),
+            "encoding": str(spec.get("encoding") or "utf-8"),
+            "stdout": output["stdout"],
+            "stderr": output["stderr"],
+            "output_preview_limit_bytes": PANEL_JOB_OUTPUT_PREVIEW_BYTES,
+        }
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
             pass
@@ -730,6 +767,22 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
                 snapshot["jobs"] = cache.get("jobs", PANEL_JOBS_TTL_SEC, job_snapshot)
                 snapshot["storage_bytes"] = cache.get("storage", PANEL_STORAGE_TTL_SEC, storage_bytes)
                 self.send(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            elif self.path.startswith("/api/jobs/"):
+                if not secrets.compare_digest(self.headers.get("X-Control-Token", ""), token):
+                    self.send(b'{}', status=403)
+                    return
+                job_id = self.path.removeprefix("/api/jobs/")
+                if len(job_id) != 32 or any(char not in "0123456789abcdefABCDEF" for char in job_id):
+                    self.send(b'{}', status=404)
+                    return
+                try:
+                    details = job_details(job_id)
+                except ToolError as exc:
+                    if exc.code == "job_not_found":
+                        self.send(b'{}', status=404)
+                        return
+                    raise
+                self.send(json.dumps(details, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
             else:
                 self.send(b'{}', status=404)
 
