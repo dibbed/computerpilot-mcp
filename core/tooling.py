@@ -14,6 +14,7 @@ from core.lifecycle import RUNTIME_LIFECYCLE
 from core.recovery import OPERATION_RECOVERY
 from core.response import failure
 from core.timings import tool_timing
+from core.tool_activity import TOOL_ACTIVITY
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 MUTATING = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
@@ -116,7 +117,7 @@ def compact_errors(operation: str) -> Callable[[F], F]:
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 try:
-                    with tool_timing(operation):
+                    with TOOL_ACTIVITY.track(operation), tool_timing(operation):
                         if operation in MUTATING_TOOL_OPERATIONS:
                             target = _mutation_target(signature, args, kwargs)
                             with RUNTIME_LIFECYCLE.mutation(operation):
@@ -140,7 +141,7 @@ def compact_errors(operation: str) -> Callable[[F], F]:
         @functools.wraps(fn)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
-                with tool_timing(operation):
+                with TOOL_ACTIVITY.track(operation), tool_timing(operation):
                     if operation in MUTATING_TOOL_OPERATIONS:
                         target = _mutation_target(signature, args, kwargs)
                         with RUNTIME_LIFECYCLE.mutation(operation):

@@ -10,20 +10,23 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from core.jobs import JobStore
 from core.lifecycle import RuntimeLifecycle
 from core.recovery import OperationRecoveryJournal
+from core.workflows import StepDefinition, WorkflowDefinition, WorkflowStore
 from scripts import supervisor as module
 from scripts.supervisor import Supervisor, make_panel, restart_delay
 
 
 def close_logger(supervisor: Supervisor) -> None:
-    for handler in list(supervisor.logger.handlers):
-        handler.close()
-        supervisor.logger.removeHandler(handler)
+    for logger in (supervisor.logger, supervisor.transport_logger):
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
 
 
 def _file_text_is(path: Path, expected: str) -> bool:
@@ -322,11 +325,34 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         token = re.search(r"const token='([^']+)'", html)
         assert token
         assert '<html lang="en" dir="ltr">' in html
-        assert "Windows Agent MCP Control Panel" in html
+        assert "ComputerPilot MCP Control Panel" in html
+        assert "System & Build Identity" in html
+        assert "Resource Budgets" in html
+        assert "Transport History" in html
+        assert "Recovery Center" in html
+        assert "Workflow Dashboard" in html
+        assert "Recent Operations" in html
+        assert "Runtime Health" in html
+        assert "Tool Activity" in html
+        assert "Browser Runtime" in html
+        assert "Slowest Tools" in html
+        assert "System Doctor" in html
+        assert "Session Budget" in html
+        assert "Operation Recovery" in html
+        assert "Response Deadline Drops" in html
+        assert "Load more stdout" in html
+        assert "o.has_more" in html
+        assert "chunk.has_more" in html
+        assert 'id="storageCategories"' in html
+        assert 'id="processDetail" class="meta-grid"' in html
+        assert "Timing & Lifecycle" in html
+        assert "Last Exit / Drain" in html
         assert "Recent Events" in html
         assert "Runtime Errors" in html
+        assert "Raw Logs" in html
         assert "Job details" in html
         assert "Copy command" in html
+        assert "Download stdout" in html
         assert "/api/jobs/" in html
         assert re.search(r"[\u0600-\u06FF]", html) is None
         with urllib.request.urlopen(base + "/api/status") as response:
@@ -411,6 +437,24 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         assert detail["stdout"]["text"] == "hello stdout\n"
         assert detail["stderr"]["text"] == "warning stderr\n"
         assert detail["output_preview_limit_bytes"] == module.PANEL_JOB_OUTPUT_PREVIEW_BYTES
+
+        output_request = urllib.request.Request(
+            base + f"/api/jobs/{job_id}/output?stdout_since=6&stderr_since=8&max_bytes=1024",
+            headers={"X-Control-Token": token[1]},
+        )
+        with urllib.request.urlopen(output_request) as response:
+            output = json.load(response)
+        assert output["stdout"]["text"] == "stdout\n"
+        assert output["stderr"]["text"] == "stderr\n"
+
+        download_request = urllib.request.Request(
+            base + f"/api/jobs/{job_id}/output/download?stream=stdout",
+            headers={"X-Control-Token": token[1]},
+        )
+        with urllib.request.urlopen(download_request) as response:
+            assert response.read() == b"hello stdout\n"
+            assert response.headers["Content-Disposition"].startswith("attachment;")
+
         for origin, key in [("https://evil.example", token[1]), (base, "wrong")]:
             request = urllib.request.Request(base + "/api/restart", data=b"", headers={"Origin": origin, "X-Control-Token": key})
             with pytest.raises(urllib.error.HTTPError) as error:
@@ -433,6 +477,140 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
             assert error.value.code == 403
         finally:
             error.value.close()
+    finally:
+        panel.shutdown()
+        panel.server_close()
+        thread.join(timeout=5)
+        close_logger(supervisor)
+
+
+def test_panel_observability_endpoints_are_guarded_and_bounded(tmp_path: Path) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    workflow_store = WorkflowStore(tmp_path / "workflows.sqlite3")
+    workflow = workflow_store.create(
+        WorkflowDefinition(
+            "panel-observability",
+            (StepDefinition("inspect", "verify_changes", {"cwd": str(tmp_path)}),),
+        ),
+        {"api_token": "must-not-leak", "safe": "visible"},
+    )
+    health_path = tmp_path / "runtime-health-test.json"
+    supervisor.current_runtime_health_path = health_path
+    health_path.write_text(json.dumps({
+        "ok": True,
+        "server": "ali_windows_agent_mcp",
+        "version": module.SETTINGS.version,
+        "tool_profile": "full",
+        "tool_count": 112,
+        "tool_domains": ["filesystem", "jobs", "recovery", "workflows"],
+        "platform_key": "windows-amd64",
+        "capabilities": {"secure_tunnel": True, "browser": True},
+        "health_status": "healthy",
+        "degraded_reasons": [],
+        "resource_pressure": "normal",
+        "resource_usage": {
+            "ast_cache_bytes": {"value": 1024, "max": 4096, "unit": "bytes", "usage_ratio": 0.25},
+            "running_jobs": {"value": 0, "max": 4, "unit": "jobs", "usage_ratio": 0.0},
+        },
+        "rss_mb": 64.0,
+        "workflow_total": 0,
+        "queued_workflows": 0,
+        "running_workflows": 0,
+        "uncertain_workflows": 0,
+        "unresolved_workflow_operations": 0,
+        "operation_recovery": {"uncertain_count": 0, "pending_count": 0, "uncertain": []},
+    }), encoding="utf-8")
+    (tmp_path / "transport-health.jsonl").write_text(
+        json.dumps({"time": time.time(), "diagnosis": "HEALTHY", "severity": "ok"}) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "audit.jsonl").write_text(
+        json.dumps({
+            "time": "2026-09-27T22:00:00+00:00",
+            "operation": "run_process",
+            "outcome": "completed",
+            "pid": 123,
+            "target": str(tmp_path),
+            "details": {"exit_code": 0},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    panel = make_panel(supervisor, 0)
+    thread = threading.Thread(target=panel.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{panel.server_port}"
+    try:
+        with urllib.request.urlopen(base) as response:
+            html = response.read().decode()
+        token_match = re.search(r"const token='([^']+)'", html)
+        assert token_match
+        token = token_match[1]
+
+        with urllib.request.urlopen(base + "/api/summary") as response:
+            summary = json.load(response)
+        assert summary["state"] == "starting"
+        assert "recent_events" not in summary
+        assert "recent_errors" not in summary
+        assert "logs" not in summary
+        assert "items" not in summary["jobs"]
+
+        guarded = (
+            "/api/insights",
+            "/api/transport/history",
+            "/api/audit",
+            "/api/workflows",
+            "/api/recovery",
+            "/api/config",
+            "/api/doctor",
+            "/api/diagnostics",
+        )
+        for endpoint in guarded:
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(base + endpoint)
+            try:
+                assert error.value.code == 403
+            finally:
+                error.value.close()
+
+        def get_json(endpoint: str) -> dict[str, Any]:
+            request = urllib.request.Request(
+                base + endpoint,
+                headers={"X-Control-Token": token},
+            )
+            with urllib.request.urlopen(request) as response:
+                return json.load(response)
+
+        insights = get_json("/api/insights")
+        assert insights["identity"]["product"] == "ComputerPilot MCP"
+        assert insights["identity"]["version"] == module.SETTINGS.version
+        assert insights["runtime_health"]["tool_count"] == 112
+        assert insights["runtime_health"]["resource_pressure"] == "normal"
+        assert insights["tunnel"]["mode"] == "local-http"
+        assert insights["storage"]["total"] >= 0
+        assert "cpu_percent" in insights["system"]
+        assert "memory" in insights["system"]
+
+        transport = get_json("/api/transport/history")
+        assert transport["items"][0]["diagnosis"] == "HEALTHY"
+        audit = get_json("/api/audit")
+        assert audit["items"][0]["operation"] == "run_process"
+        assert get_json("/api/workflows")["items"] == []
+        workflow_detail = get_json(f"/api/workflows/{workflow['workflow_id']}")
+        assert workflow_detail["workflow_id"] == workflow["workflow_id"]
+        assert workflow_detail["steps"][0]["step_index"] == 0
+        serialized_workflow = json.dumps(workflow_detail).casefold()
+        assert "must-not-leak" not in serialized_workflow
+        assert "inputs" not in workflow_detail
+        assert "definition" not in workflow_detail
+        assert "evidence" not in serialized_workflow
+        assert get_json("/api/recovery")["items"] == []
+        config = get_json("/api/config")
+        assert config["tunnel_poll_watchdog_enabled"] is True
+        doctor = get_json("/api/doctor")
+        assert doctor["status"] in {"healthy", "warning", "critical", "pending"}
+        diagnostics = get_json("/api/diagnostics")
+        assert diagnostics["identity"]["product"] == "ComputerPilot MCP"
+        assert "secrets" not in json.dumps(diagnostics).casefold()
     finally:
         panel.shutdown()
         panel.server_close()

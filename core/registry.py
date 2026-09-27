@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import platform
 from typing import Any
 
 from mcp.server import MCPServer
@@ -11,6 +9,7 @@ from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict
 
 from core.config import SETTINGS, ensure_runtime_dirs
+from core.health_snapshot import collect_server_health
 from core.heartbeat import lifespan
 from core.platform import available_domains, detect_capabilities
 from core.recovery import OPERATION_RECOVERY
@@ -137,65 +136,13 @@ def create_server() -> MCPServer:
     @server.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("server_health")
     async def server_health() -> dict[str, Any]:
-        """Return compact runtime, registration, platform, and optional-browser health."""
-
-        tools = await server.list_tools()
-        browser_stats = await BROWSER_MANAGER.stats()
-        resources = collect_resource_metrics(browser_stats)
-        resource_usage = resources.pop("budgets")
-        workflow_health = workflow_store(SETTINGS.workflow_db).health_summary()
-        operation_recovery = OPERATION_RECOVERY.summary()
-        degraded_reasons: list[str] = []
-        if int(operation_recovery["uncertain_count"]) > 0:
-            degraded_reasons.append("operation_recovery_uncertain")
-        if int(operation_recovery["pending_count"]) > 0:
-            degraded_reasons.append("operation_recovery_pending")
-        if int(workflow_health["unresolved_operation_count"]) > 0:
-            degraded_reasons.append("unresolved_uncertain_operations")
-        if int(workflow_health["workflow_db_bytes"]) >= SETTINGS.workflow_db_warn_bytes:
-            degraded_reasons.append("workflow_db_pressure")
-        resource_pressure = resources.get("resource_pressure")
-        if resource_pressure in {"warning", "critical"}:
-            degraded_reasons.append("resource_pressure")
-        if resource_pressure == "critical":
-            health_status = "unhealthy"
-        elif degraded_reasons:
-            health_status = "degraded"
-        else:
-            health_status = "healthy"
-        return {
-            "ok": True,
-            "server": SETTINGS.server_name,
-            "version": SETTINGS.version,
-            "tool_profile": profile.name,
-            "tool_domains": list(active_domains),
-            "requested_tool_domains": list(profile.domains),
-            "tool_count": len(tools),
-            "unique_tool_names": len({tool.name for tool in tools}) == len(tools),
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-            "platform_key": capabilities.platform_key,
-            "windows": os.name == "nt",
-            "capabilities": capabilities.as_dict(),
-            "browser_optional_installed": capabilities.browser,
-            "semantic_desktop_available": capabilities.semantic_ui,
-            "audit_log": str(SETTINGS.audit_log),
-            "operation_recovery": operation_recovery,
-            "health_status": health_status,
-            "degraded_reasons": degraded_reasons,
-            "workflow_total": workflow_health["workflow_total"],
-            "workflow_operation_total": workflow_health["workflow_operation_total"],
-            "workflow_event_total": workflow_health["workflow_event_total"],
-            "workflow_db_bytes": workflow_health["workflow_db_bytes"],
-            "active_workflow_leases": workflow_health["active_workflow_leases"],
-            "queued_workflows": workflow_health["queued_workflows"],
-            "running_workflows": workflow_health["running_workflows"],
-            "uncertain_workflows": workflow_health["uncertain_workflows"],
-            "unresolved_workflow_operations": workflow_health["unresolved_workflow_operations"],
-            "workflow_health": workflow_health,
-            "resource_budgets": SETTINGS.resource_budgets(),
-            "resource_usage": resource_usage,
-            **resources,
-        }
+        return await collect_server_health(
+            server,
+            settings=SETTINGS,
+            browser_manager=BROWSER_MANAGER,
+            resource_collector=collect_resource_metrics,
+            recovery=OPERATION_RECOVERY,
+            workflow_store_factory=workflow_store,
+        )
 
     return server

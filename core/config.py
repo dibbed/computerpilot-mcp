@@ -20,6 +20,13 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), maximum)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().casefold() not in {"0", "false", "no", "off", ""}
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Small immutable runtime configuration."""
@@ -44,6 +51,12 @@ class Settings:
     max_running_jobs: int = _env_int("MCP_MAX_RUNNING_JOBS", 4, 1, 256)
     supervisor_drain_sec: int = _env_int("MCP_SUPERVISOR_DRAIN_SEC", 15, 1, 300)
     supervisor_watchdog_drain_sec: int = _env_int("MCP_SUPERVISOR_WATCHDOG_DRAIN_SEC", 2, 1, 30)
+    transport_upstream_idle_sec: int = _env_int("MCP_TRANSPORT_UPSTREAM_IDLE_SEC", 300, 30, 86_400)
+    tunnel_poll_stall_grace_sec: int = _env_int("MCP_TUNNEL_POLL_STALL_GRACE_SEC", 15, 1, 300)
+    tunnel_poll_stall_confirmations: int = _env_int("MCP_TUNNEL_POLL_STALL_CONFIRMATIONS", 3, 1, 20)
+    tunnel_poll_watchdog_enabled: bool = _env_bool("MCP_TUNNEL_POLL_WATCHDOG", True)
+    mcp_tool_stall_sec: int = _env_int("MCP_TOOL_STALL_SEC", 3_600, 60, 86_400)
+    transport_history_interval_sec: int = _env_int("MCP_TRANSPORT_HISTORY_INTERVAL_SEC", 60, 5, 3_600)
     audit_batch_size: int = _env_int("MCP_AUDIT_BATCH_SIZE", 64, 1, 1_024)
     audit_flush_ms: int = _env_int("MCP_AUDIT_FLUSH_MS", 50, 1, 5_000)
     audit_queue_max: int = _env_int("MCP_AUDIT_QUEUE_MAX", 2_048, 64, 100_000)

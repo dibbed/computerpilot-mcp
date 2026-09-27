@@ -99,6 +99,42 @@ Also check `MCP_TOOL_PROFILE`: a smaller profile may intentionally omit the tool
 
 Use `discover_tool_domains` to inspect the active profile and platform capability set.
 
+## A long ChatGPT turn looks stuck but the local MCP is still running
+
+Open the loopback control panel at `http://127.0.0.1:8766/` and inspect **Transport Health** before restarting anything.
+
+The Supervisor reads the managed tunnel runtime's detailed health endpoint and keeps these failure classes separate:
+
+- `HEALTHY`: control-plane polling and local transport components are healthy;
+- `UPSTREAM_IDLE`: polling is healthy, but no new upstream command has reached the local transport recently;
+- `POLL_STALLED`: the current control-plane poll exceeded the runtime-reported deadline plus the configured grace period;
+- `CONTROL_PLANE_BACKOFF`: polling reports failures/backoff but has not crossed the stall threshold;
+- `QUEUE_BACKPRESSURE`: local queue pressure can intentionally pause polling and must not be mistaken for a dead poll loop;
+- `DISPATCH_STALLED`: the dispatcher is not accepting work normally;
+- `RESPONSE_DELIVERY_STALLED`: response delivery is not in a healthy accepted state;
+- `MCP_STALLED`: a local MCP tool call has remained active beyond the diagnostic threshold.
+
+`UPSTREAM_IDLE` is evidence that the local transport is still healthy; it does **not** trigger automatic recovery. Only a repeated, confirmed `POLL_STALLED` diagnosis is eligible for the conservative poll watchdog.
+
+For timeline evidence, inspect the bounded rotated metadata log:
+
+```text
+.agent_state/transport-health.jsonl
+```
+
+The activity snapshot and transport history contain only timestamps, component state, counters, process/generation identifiers, and tool names. Tool arguments, results, file contents, typed text, and credentials are not written there.
+
+If needed, tune or disable the watchdog with:
+
+```text
+MCP_TRANSPORT_UPSTREAM_IDLE_SEC
+MCP_TUNNEL_POLL_STALL_GRACE_SEC
+MCP_TUNNEL_POLL_STALL_CONFIRMATIONS
+MCP_TUNNEL_POLL_WATCHDOG
+MCP_TOOL_STALL_SEC
+MCP_TRANSPORT_HISTORY_INTERVAL_SEC
+```
+
 ## An operation is `uncertain`
 
 Do not rerun it blindly.

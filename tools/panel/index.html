@@ -4,11 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>Windows Agent MCP · Local Control Panel</title>
+<title>ComputerPilot MCP · Local Control Panel</title>
 <style>
 :root{
-  --bg:#071019;--panel:#0e1b28;--line:#20384b;--text:#edf6fb;--muted:#91aabe;--soft:#b9ccd9;
-  --accent:#68e0bd;--ok:#65e6a7;--warn:#f6c96b;--bad:#ff8d91;--info:#7ec8ff;--shadow:0 18px 50px rgba(0,0,0,.28)
+  --bg:#071019;--panel:#0e1b28;--panel2:#0a1722;--line:#20384b;--line2:#2b4c62;
+  --text:#edf6fb;--muted:#91aabe;--soft:#b9ccd9;--accent:#68e0bd;--info:#7ec8ff;
+  --ok:#65e6a7;--warn:#f6c96b;--bad:#ff8d91;--shadow:0 18px 50px rgba(0,0,0,.28)
 }
 *{box-sizing:border-box}
 html{background:var(--bg)}
@@ -19,164 +20,578 @@ linear-gradient(180deg,#08131d 0%,#071019 55%,#050b11 100%)}
 body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:
 linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),
 linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);background-size:32px 32px}
-main{position:relative;max-width:1420px;margin:0 auto;padding:34px 24px 64px}
-.topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:18px}
-.brand-kicker{display:flex;align-items:center;gap:9px;color:var(--accent);font-size:12px;font-weight:700;letter-spacing:1.4px}
+main{position:relative;max-width:1480px;margin:0 auto;padding:30px 22px 70px}
+.topbar{display:flex;justify-content:space-between;align-items:flex-start;gap:22px;flex-wrap:wrap}
+.kicker{display:flex;align-items:center;gap:9px;color:var(--accent);font-size:12px;font-weight:800;letter-spacing:1.35px}
 .live-dot{width:9px;height:9px;border-radius:99px;background:var(--warn);box-shadow:0 0 0 6px rgba(246,201,107,.09)}
 .live-dot.ok{background:var(--ok);box-shadow:0 0 0 6px rgba(101,230,167,.10)}
 .live-dot.bad{background:var(--bad);box-shadow:0 0 0 6px rgba(255,141,145,.10)}
-h1{font-size:clamp(27px,4vw,42px);margin:8px 0 8px;letter-spacing:-.7px}
-.subtitle{color:var(--muted);margin:0;line-height:1.8;max-width:760px}
-.actions{display:flex;gap:10px;flex-wrap:wrap}
-button{border:1px solid transparent;border-radius:11px;padding:11px 17px;cursor:pointer;font:inherit;font-weight:700;transition:.18s ease;background:var(--accent);color:#052018;box-shadow:0 8px 22px rgba(104,224,189,.12)}
+h1{font-size:clamp(29px,4vw,43px);margin:8px 0 7px;letter-spacing:-.8px}
+.subtitle{margin:0;color:var(--muted);line-height:1.7;max-width:830px}
+.actions{display:flex;gap:9px;flex-wrap:wrap}
+button{border:1px solid transparent;border-radius:10px;padding:10px 15px;cursor:pointer;font:inherit;font-weight:750;background:var(--accent);color:#052018;transition:.16s;box-shadow:0 8px 20px rgba(104,224,189,.12)}
 button:hover{transform:translateY(-1px);filter:brightness(1.04)}
-button.stop{background:#2b171c;border-color:#62333a;color:#ffc3c5;box-shadow:none}
-button:disabled{opacity:.48;cursor:wait;transform:none}
-.connection-strip{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;background:linear-gradient(90deg,rgba(104,224,189,.07),rgba(100,181,255,.05));border:1px solid var(--line);border-radius:14px;padding:11px 14px;margin:18px 0 20px;color:var(--soft);font-size:13px}
-.connection-strip strong{color:var(--text)}
-.status-pill,.mini-pill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:999px;padding:5px 10px;background:#0b1722;color:var(--soft);font-size:12px;white-space:nowrap}
-.status-pill.ok,.mini-pill.ok{border-color:rgba(101,230,167,.35);color:var(--ok);background:rgba(101,230,167,.08)}
-.status-pill.warn,.mini-pill.warn{border-color:rgba(246,201,107,.35);color:var(--warn);background:rgba(246,201,107,.08)}
-.status-pill.bad,.mini-pill.bad{border-color:rgba(255,141,145,.35);color:var(--bad);background:rgba(255,141,145,.08)}
-.grid{display:grid;gap:14px}.overview{grid-template-columns:repeat(6,minmax(0,1fr));margin-bottom:16px}
-.card,.panel{background:linear-gradient(180deg,rgba(18,35,51,.94),rgba(12,26,39,.94));border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}
-.card{padding:17px;min-height:124px;position:relative;overflow:hidden}
-.card:after{content:"";position:absolute;left:-40px;bottom:-55px;width:120px;height:120px;border-radius:50%;background:rgba(100,181,255,.04)}
-.card-label{font-size:12px;color:var(--muted);font-weight:650}.card-value{margin-top:14px;font-size:24px;font-weight:800;line-height:1.25;overflow-wrap:anywhere}.card-sub{margin-top:8px;color:var(--muted);font-size:12px}
-.panel{padding:20px;margin-top:14px;overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:16px}.panel h2{font-size:18px;margin:0}.panel-note{font-size:12px;color:var(--muted)}
-.two{grid-template-columns:1.15fr .85fr}.meta-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
-.meta{background:#0b1824;border:1px solid #1b3447;border-radius:12px;padding:12px 13px;min-height:73px}
-.meta span{display:block;color:var(--muted);font-size:11px;margin-bottom:7px}.meta strong{font-size:13px;line-height:1.6;overflow-wrap:anywhere}
-.ltr{direction:ltr;text-align:left;font-variant-numeric:tabular-nums}
-table{width:100%;border-collapse:collapse;min-width:720px}.table-wrap{overflow:auto;border:1px solid #1c3446;border-radius:12px}
-th,td{padding:12px 13px;border-bottom:1px solid #1b3142;text-align:left;font-size:13px;vertical-align:middle}
-th{position:sticky;top:0;background:#0b1824;color:#91aabe;font-size:11px;z-index:1}tr:last-child td{border-bottom:0}tbody tr:hover{background:rgba(100,181,255,.035)}
-.job-row{cursor:pointer;transition:background .16s ease,box-shadow .16s ease}.job-row:hover{background:rgba(126,200,255,.065)}.job-row:focus-visible{outline:2px solid rgba(126,200,255,.75);outline-offset:-2px;background:rgba(126,200,255,.07)}.job-row td:first-child{position:relative;padding-left:20px}.job-row td:first-child:before{content:"";position:absolute;left:9px;top:50%;width:4px;height:4px;border-radius:50%;background:var(--info);transform:translateY(-50%);opacity:0;transition:.16s}.job-row:hover td:first-child:before,.job-row:focus-visible td:first-child:before{opacity:1}
-.job-id{font-family:Consolas,monospace;font-size:11px;color:#a9c5d7}.muted{color:var(--muted)}.issue{color:var(--bad)}.summary-chips{display:flex;flex-wrap:wrap;gap:8px}
-.timeline{display:flex;flex-direction:column;gap:9px;max-height:520px;overflow:auto;padding-left:3px}
-.event{display:grid;grid-template-columns:76px 92px 1fr;gap:10px;align-items:start;padding:11px 12px;background:#0b1824;border:1px solid #1a3245;border-radius:12px}.event:hover{border-color:#2a506b}
-.event-time{direction:ltr;text-align:left;color:var(--muted);font:11px Consolas,monospace;padding-top:3px}.event-level{font-size:10px;font-weight:800;text-align:center;border-radius:999px;padding:4px 7px}
-.event-level.INFO{color:var(--info);background:rgba(126,200,255,.09)}.event-level.WARN{color:var(--warn);background:rgba(246,201,107,.10)}.event-level.ERROR,.event-level.FATAL{color:var(--bad);background:rgba(255,141,145,.10)}
-.event-message{font-size:13px;line-height:1.7;overflow-wrap:anywhere}.event-component{display:block;color:var(--muted);font-size:10px;margin-top:4px}
-.filters{display:flex;gap:8px;flex-wrap:wrap}select,input{background:#0a1722;color:var(--text);border:1px solid #274256;border-radius:9px;padding:8px 10px;font:inherit;font-size:12px}input{min-width:180px}
-.error-list{display:flex;flex-direction:column;gap:9px}.error-box{border:1px solid rgba(255,141,145,.25);background:rgba(255,141,145,.055);border-radius:12px;padding:12px 13px}.error-box time{font-size:11px;color:#d6a9ac}.error-box p{margin:5px 0 0;line-height:1.7;font-size:13px}
-.empty{padding:25px;text-align:center;color:var(--muted);border:1px dashed #284356;border-radius:12px;background:rgba(255,255,255,.01)}
-.storage-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:9px}.storage-item{background:#0b1824;border:1px solid #1b3447;border-radius:11px;padding:12px}.storage-item span{display:block;color:var(--muted);font-size:10px}.storage-item strong{display:block;margin-top:6px;font-size:14px}
-section.raw details{background:#09141e;border:1px solid #1c3446;border-radius:12px;padding:12px}summary{cursor:pointer;color:#b9d2e1;font-weight:650}
-pre{direction:ltr;text-align:left;white-space:pre-wrap;overflow-wrap:anywhere;max-height:420px;overflow:auto;font:12px/1.6 Consolas,monospace;color:#b8cfdd;margin:12px 0 0}
-body.modal-open{overflow:hidden}.job-modal{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;padding:24px}.job-modal.open{display:flex}.job-modal-backdrop{position:absolute;inset:0;background:rgba(2,8,13,.78);backdrop-filter:blur(10px)}.job-dialog{position:relative;width:min(1120px,100%);max-height:min(90vh,960px);overflow:auto;background:linear-gradient(180deg,#112333 0%,#0a1722 100%);border:1px solid #2b4b61;border-radius:20px;box-shadow:0 28px 90px rgba(0,0,0,.58)}.job-dialog:before{content:"";position:absolute;inset:0 0 auto;height:1px;background:linear-gradient(90deg,transparent,rgba(104,224,189,.65),rgba(126,200,255,.5),transparent)}.job-modal-head{position:sticky;top:0;z-index:3;display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:22px 24px 18px;background:rgba(15,31,45,.96);backdrop-filter:blur(14px);border-bottom:1px solid #213e52}.job-modal-title-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.job-modal-title{margin:0;font-size:22px}.job-full-id{margin-top:7px;color:#8aa5b8;font:11px Consolas,monospace;overflow-wrap:anywhere}.job-modal-meta{margin-top:6px;color:var(--muted);font-size:11px}.job-close{width:38px;height:38px;min-width:38px;padding:0;border-radius:11px;background:#0b1824;border-color:#2a475b;color:#bcd0dc;box-shadow:none;font-size:23px;line-height:1}.job-close:hover{color:#fff;border-color:#416b87}.job-modal-body{padding:20px 24px 25px}.job-loading{padding:46px 20px;text-align:center;color:var(--muted)}.job-detail-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.job-detail-card{min-height:82px;padding:12px 13px;background:#0b1824;border:1px solid #1d394d;border-radius:12px}.job-detail-card span{display:block;color:var(--muted);font-size:10px;margin-bottom:7px}.job-detail-card strong{display:block;font-size:14px;line-height:1.45;overflow-wrap:anywhere}.job-detail-card small{display:block;color:#708da1;font-size:10px;margin-top:5px;line-height:1.45}.job-section{margin-top:13px;padding:14px;background:#08151f;border:1px solid #1d394d;border-radius:13px}.job-section-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px}.job-section-head strong{font-size:12px}.job-section-head span{color:var(--muted);font-size:10px}.job-code{margin:0;max-height:220px;padding:12px 13px;background:#050e15;border:1px solid #183044;border-radius:10px;color:#c7dce8}.job-copy{padding:7px 10px;border-radius:8px;background:#10283a;border-color:#28506b;color:#bfe3f4;box-shadow:none;font-size:11px}.job-path{font:12px/1.7 Consolas,monospace;color:#b9cedb;overflow-wrap:anywhere}.job-error-box{margin-top:13px;padding:13px 14px;border:1px solid rgba(255,141,145,.3);background:rgba(255,141,145,.065);border-radius:12px}.job-error-box strong{display:block;color:var(--bad);font-size:11px;margin-bottom:6px}.job-error-box div{font-size:12px;line-height:1.7;overflow-wrap:anywhere}.job-error-box.hidden{display:none}.job-output-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:13px}.job-output{min-width:0;padding:14px;background:#08151f;border:1px solid #1d394d;border-radius:13px}.job-output-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.job-output-head strong{font-size:12px}.job-output-head span{font-size:10px;color:var(--muted);text-align:right}.job-output pre{min-height:90px;max-height:280px;margin-top:10px;padding:11px 12px;background:#050e15;border:1px solid #183044;border-radius:10px;color:#b9d2df}.job-private-note{margin-top:13px;color:#718da0;font-size:10px;line-height:1.6}
-#notice{margin:0;color:var(--muted)}footer{margin-top:25px;color:#6f899d;font-size:11px;text-align:center}
-@media(max-width:1180px){.overview{grid-template-columns:repeat(3,1fr)}.storage-grid{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:850px){main{padding:22px 14px 44px}.two{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}.job-detail-grid{grid-template-columns:repeat(2,1fr)}.job-output-grid{grid-template-columns:1fr}}
-@media(max-width:560px){.overview{grid-template-columns:repeat(2,1fr)}.storage-grid{grid-template-columns:repeat(2,1fr)}.card-value{font-size:20px}.event{grid-template-columns:62px 68px 1fr}.meta-grid{grid-template-columns:1fr}.actions{width:100%}.actions button{flex:1}.job-modal{padding:8px}.job-dialog{max-height:94vh;border-radius:15px}.job-modal-head{padding:16px}.job-modal-body{padding:14px 14px 18px}.job-detail-grid{grid-template-columns:1fr}}
+button.secondary{background:#10283a;color:#c8e3f0;border-color:#2a506b;box-shadow:none}
+button.danger{background:#2b171c;color:#ffc3c5;border-color:#62333a;box-shadow:none}
+button.mini{padding:6px 9px;font-size:11px;border-radius:8px}
+button:disabled{opacity:.45;cursor:wait;transform:none}
+.connection{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:18px 0 18px;padding:11px 14px;border:1px solid var(--line);border-radius:13px;background:linear-gradient(90deg,rgba(104,224,189,.07),rgba(100,181,255,.05));font-size:13px;color:var(--soft)}
+.status-pill,.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:5px 9px;background:#0b1722;color:var(--soft);font-size:11px;white-space:nowrap}
+.ok{color:var(--ok)!important;border-color:rgba(101,230,167,.34)!important}.warn{color:var(--warn)!important;border-color:rgba(246,201,107,.34)!important}.bad{color:var(--bad)!important;border-color:rgba(255,141,145,.34)!important}.info{color:var(--info)!important}
+.grid{display:grid;gap:13px}.overview{grid-template-columns:repeat(6,minmax(0,1fr));margin-bottom:15px}.two{grid-template-columns:1fr 1fr}.three{grid-template-columns:repeat(3,minmax(0,1fr))}
+.card,.panel{background:linear-gradient(180deg,rgba(18,35,51,.95),rgba(12,26,39,.95));border:1px solid var(--line);border-radius:15px;box-shadow:var(--shadow)}
+.card{padding:16px;min-height:118px}.card-label{font-size:11px;color:var(--muted);font-weight:700}.card-value{font-size:23px;font-weight:850;margin-top:13px;line-height:1.3;overflow-wrap:anywhere}.card-sub{font-size:11px;color:var(--muted);margin-top:7px;line-height:1.45}
+.panel{padding:18px;margin-top:13px;overflow:hidden}.panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:14px}.panel h2{font-size:17px;margin:0}.panel-note{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.5}
+.meta-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.meta{background:var(--panel2);border:1px solid #1b3447;border-radius:11px;padding:11px;min-height:70px}.meta span{display:block;color:var(--muted);font-size:10px;margin-bottom:6px}.meta strong{display:block;font-size:12px;line-height:1.45;overflow-wrap:anywhere}
+.table-wrap{overflow:auto;border:1px solid #1c3446;border-radius:11px}table{width:100%;border-collapse:collapse;min-width:700px}th,td{padding:10px 11px;border-bottom:1px solid #1b3142;text-align:left;font-size:12px;vertical-align:middle}th{position:sticky;top:0;background:#0b1824;color:#91aabe;font-size:10px;z-index:1}tr:last-child td{border-bottom:0}tbody tr:hover{background:rgba(126,200,255,.035)}.clickable{cursor:pointer}
+.mono{font-family:Consolas,monospace;font-variant-numeric:tabular-nums}.muted{color:var(--muted)}.issue{color:var(--bad)}
+.bar-row{display:grid;grid-template-columns:minmax(120px,1fr) 2fr 92px;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid #1a3041}.bar-row:last-child{border-bottom:0}.bar-label{font-size:11px;color:var(--soft)}.bar{height:8px;border-radius:99px;background:#08131d;overflow:hidden;border:1px solid #1d394d}.bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--info));border-radius:99px}.bar-value{font:10px Consolas,monospace;color:var(--muted);text-align:right}
+.chips{display:flex;gap:7px;flex-wrap:wrap}.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center}input,select{background:#091722;color:var(--text);border:1px solid #29465b;border-radius:8px;padding:8px 9px;font:12px inherit}input{min-width:170px}
+.timeline{display:flex;flex-direction:column;gap:7px;max-height:500px;overflow:auto}.event{display:grid;grid-template-columns:74px 78px 1fr;gap:9px;padding:9px 10px;border:1px solid #1a3245;border-radius:10px;background:#0b1824}.event-time{font:10px Consolas,monospace;color:var(--muted)}.event-level{font-size:9px;font-weight:850;text-align:center;padding:3px 5px;border-radius:999px}.event-msg{font-size:12px;line-height:1.55;overflow-wrap:anywhere}.event-comp{display:block;color:var(--muted);font-size:9px;margin-top:3px}
+.empty{padding:22px;text-align:center;color:var(--muted);border:1px dashed #284356;border-radius:10px;background:rgba(255,255,255,.01)}
+.kv{display:grid;grid-template-columns:minmax(150px,.65fr) 1.35fr;gap:0;border:1px solid #1c3446;border-radius:11px;overflow:hidden}.kv div{padding:9px 11px;border-bottom:1px solid #1b3142;font-size:11px;overflow-wrap:anywhere}.kv div:nth-child(odd){color:var(--muted);background:#0b1824}.kv div:nth-last-child(-n+2){border-bottom:0}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;font:11px/1.55 Consolas,monospace;color:#b8cfdd;background:#061018;border:1px solid #183044;border-radius:9px;padding:11px}
+.dialog-wrap{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;padding:20px}.dialog-wrap.open{display:flex}.backdrop{position:absolute;inset:0;background:rgba(2,8,13,.8);backdrop-filter:blur(8px)}.dialog{position:relative;width:min(1040px,100%);max-height:90vh;overflow:auto;background:linear-gradient(180deg,#102333,#091722);border:1px solid #2b4b61;border-radius:18px;box-shadow:0 30px 90px rgba(0,0,0,.6)}.dialog-head{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;gap:12px;align-items:flex-start;padding:18px;background:#102130ee;border-bottom:1px solid #213e52;backdrop-filter:blur(12px)}.dialog-body{padding:17px}.dialog-close{width:36px;height:36px;padding:0;border-radius:9px;background:#0b1824;color:#c8d8e2;border-color:#2a475b;box-shadow:none;font-size:20px}.dialog-title{margin:0;font-size:19px}.dialog-sub{font:10px Consolas,monospace;color:var(--muted);margin-top:5px;overflow-wrap:anywhere}.output-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.section-title{font-size:12px;margin:15px 0 8px;color:#d7e8f1}.footer{margin-top:24px;text-align:center;color:#6f899d;font-size:10px}
+@media(max-width:1200px){.overview{grid-template-columns:repeat(3,1fr)}.meta-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:860px){main{padding:20px 12px 45px}.two,.three{grid-template-columns:1fr}.output-grid{grid-template-columns:1fr}.overview{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.meta-grid,.overview{grid-template-columns:1fr}.event{grid-template-columns:60px 62px 1fr}.actions{width:100%}.actions button{flex:1}.bar-row{grid-template-columns:1fr}.bar-value{text-align:left}}
 </style>
 </head>
 <body>
 <main>
-<header class="topbar"><div><div class="brand-kicker"><span id="liveDot" class="live-dot"></span> WINDOWS AGENT · LOCAL CONTROL</div><h1>Windows Agent MCP Control Panel</h1><p class="subtitle">Live view of the MCP runtime, lifecycle, jobs, processes, events, and errors on this machine.</p></div>
-<div class="actions"><button id="restart">Restart Runtime</button><button id="stop" class="stop">Stop Supervisor</button></div></header>
-<div class="connection-strip"><div><strong id="connectionText">Connecting…</strong> <span id="updated">—</span></div><span id="statePill" class="status-pill">Unknown status</span><p id="notice" role="status">Keep the START_MCP window open while the Supervisor is running.</p></div>
+<header class="topbar">
+<div>
+<div class="kicker"><span id="liveDot" class="live-dot"></span> COMPUTERPILOT · LOCAL CONTROL</div>
+<h1>ComputerPilot MCP Control Panel</h1>
+<p class="subtitle">Runtime, Secure Tunnel, resources, workflows, recovery, jobs, operations and performance on this machine.</p>
+</div>
+<div class="actions">
+<button id="refreshNow" class="secondary">Refresh</button>
+<button id="downloadDiagnostics" class="secondary">Export Diagnostics</button>
+<button id="restart">Restart Runtime</button>
+<button id="stop" class="danger">Stop Supervisor</button>
+</div>
+</header>
+
+<div class="connection">
+<div><strong id="connectionText">Connecting…</strong> <span id="updated">—</span></div>
+<span id="statePill" class="status-pill">Unknown</span>
+<span id="notice">Loopback-only control surface · 127.0.0.1:8766</span>
+</div>
 
 <div class="grid overview">
-<article class="card"><div class="card-label">Runtime Status</div><div id="state" class="card-value">—</div><div id="stateSub" class="card-sub">Waiting for data</div></article>
-<article class="card"><div class="card-label">MCP Health</div><div id="mcp" class="card-value">—</div><div id="mcpSub" class="card-sub">Runtime heartbeat</div></article>
-<article class="card"><div class="card-label">Tunnel Health</div><div id="tunnel" class="card-value">—</div><div id="tunnelSub" class="card-sub">Readiness endpoint</div></article>
-<article class="card"><div class="card-label">Supervisor Uptime</div><div id="supervisorUptime" class="card-value ltr">—</div><div class="card-sub">Since the control panel started</div></article>
-<article class="card"><div class="card-label">Runtime Uptime</div><div id="runtimeUptime" class="card-value ltr">—</div><div id="runtimeGeneration" class="card-sub">Runtime generation: —</div></article>
-<article class="card"><div class="card-label">Jobs</div><div id="jobTotal" class="card-value">0</div><div id="jobSub" class="card-sub">Active: 0 · Problematic: 0</div></article>
+<article class="card"><div class="card-label">Runtime Status</div><div id="state" class="card-value">—</div><div id="stateSub" class="card-sub">Waiting for summary</div></article>
+<article class="card"><div class="card-label">MCP Health</div><div id="mcp" class="card-value">—</div><div id="mcpSub" class="card-sub">Heartbeat</div></article>
+<article class="card"><div class="card-label">Tunnel Health</div><div id="tunnelHealth" class="card-value">—</div><div id="tunnelSub" class="card-sub">Control-plane polling</div></article>
+<article class="card"><div class="card-label">Resource Pressure</div><div id="pressure" class="card-value">—</div><div id="pressureSub" class="card-sub">Runtime budgets</div></article>
+<article class="card"><div class="card-label">Supervisor Uptime</div><div id="supervisorUptime" class="card-value mono">—</div><div id="runtimeUptime" class="card-sub">Runtime: —</div></article>
+<article class="card"><div class="card-label">Jobs</div><div id="jobTotal" class="card-value">0</div><div id="jobSub" class="card-sub">Active 0 · Problems 0</div></article>
 </div>
 
 <div class="grid two">
-<section class="panel"><div class="panel-head"><h2>Timing & Lifecycle</h2><span id="lifecyclePill" class="mini-pill">—</span></div><div class="meta-grid">
-<div class="meta"><span>Supervisor Started</span><strong id="supervisorStarted">—</strong></div><div class="meta"><span>Current Runtime Started</span><strong id="runtimeStarted">—</strong></div>
-<div class="meta"><span>Last State Change</span><strong id="stateChanged">—</strong></div><div class="meta"><span>Last Event</span><strong id="lastEvent">—</strong></div>
-<div class="meta"><span>Runtime PID</span><strong id="runtimePid" class="ltr">—</strong></div><div class="meta"><span>Restart Count</span><strong id="restartCount" class="ltr">0</strong></div>
-<div class="meta"><span>Active Mutations</span><strong id="mutations" class="ltr">0</strong></div><div class="meta"><span>Probe Failures</span><strong id="failedProbes" class="ltr">0</strong></div>
-</div></section>
-<section class="panel"><div class="panel-head"><h2>Last Exit / Drain</h2><span id="exitPill" class="mini-pill">—</span></div><div class="meta-grid">
-<div class="meta"><span>Last Exit Reason</span><strong id="exitReason">—</strong></div><div class="meta"><span>Exit Code</span><strong id="exitCode" class="ltr">—</strong></div>
-<div class="meta"><span>Next Retry</span><strong id="retryAfter">—</strong></div><div class="meta"><span>Last Runtime Stop</span><strong id="runtimeStopped">—</strong></div>
-</div><div id="drainSummary" class="panel-note" style="margin-top:14px">No previous drain has been recorded.</div></section>
+<section class="panel">
+<div class="panel-head"><div><h2>System & Build Identity</h2><div class="panel-note">Product version, Git state, runtime profile and active tool surface.</div></div><span id="identityPill" class="pill">—</span></div>
+<div class="meta-grid">
+<div class="meta"><span>Product</span><strong id="productName">—</strong></div>
+<div class="meta"><span>Version</span><strong id="productVersion" class="mono">—</strong></div>
+<div class="meta"><span>Git Branch</span><strong id="gitBranch" class="mono">—</strong></div>
+<div class="meta"><span>Git Commit</span><strong id="gitCommit" class="mono">—</strong></div>
+<div class="meta"><span>Python</span><strong id="pythonVersion">—</strong></div>
+<div class="meta"><span>Platform</span><strong id="platformKey">—</strong></div>
+<div class="meta"><span>Tool Profile</span><strong id="toolProfile">—</strong></div>
+<div class="meta"><span>Registered Tools</span><strong id="toolCount">—</strong></div>
 </div>
-
-<section class="panel"><div class="panel-head"><div><h2>Runtime Processes</h2><div class="panel-note">Root runtime and child processes with live RAM usage and start times.</div></div><span id="processSummary" class="mini-pill">0 processes</span></div>
-<div class="table-wrap"><table><thead><tr><th>Role</th><th>Name</th><th>PID</th><th>Status</th><th>RAM</th><th>Started</th></tr></thead><tbody id="processRows"></tbody></table></div></section>
-
-<section class="panel"><div class="panel-head"><div><h2>Recent Jobs</h2><div class="panel-note">The 20 most recent jobs; click a row for command, timing, process, error, and output details. Summary badges reflect the entire jobs database.</div></div><div id="jobChips" class="summary-chips"></div></div>
-<div class="table-wrap"><table><thead><tr><th>ID</th><th>Status</th><th>Age</th><th>PID</th><th>Exit</th><th>Last Updated</th><th>Error</th></tr></thead><tbody id="jobs"></tbody></table></div></section>
-
-<div id="jobModal" class="job-modal" aria-hidden="true"><div class="job-modal-backdrop" data-job-close></div><section class="job-dialog" role="dialog" aria-modal="true" aria-labelledby="jobModalTitle">
-<header class="job-modal-head"><div><div class="job-modal-title-row"><h2 id="jobModalTitle" class="job-modal-title">Job details</h2><span id="jobModalStatus" class="mini-pill">Loading</span></div><div id="jobModalId" class="job-full-id">—</div><div id="jobModalMeta" class="job-modal-meta">Loading job metadata…</div></div><button id="jobModalClose" class="job-close" type="button" aria-label="Close job details">×</button></header>
-<div class="job-modal-body"><div id="jobModalLoading" class="job-loading">Loading job details…</div><div id="jobModalContent" hidden>
-<div class="job-detail-grid">
-<div class="job-detail-card"><span>Created</span><strong id="jobDetailCreated">—</strong><small id="jobDetailCreatedSub"></small></div>
-<div class="job-detail-card"><span>Last Updated</span><strong id="jobDetailUpdated">—</strong><small id="jobDetailUpdatedSub"></small></div>
-<div class="job-detail-card"><span>Elapsed</span><strong id="jobDetailElapsed">—</strong><small id="jobDetailElapsedSub"></small></div>
-<div class="job-detail-card"><span>Process PID</span><strong id="jobDetailPid" class="ltr">—</strong><small id="jobDetailPidSub"></small></div>
-<div class="job-detail-card"><span>Worker PID</span><strong id="jobDetailWorkerPid" class="ltr">—</strong><small id="jobDetailWorkerPidSub"></small></div>
-<div class="job-detail-card"><span>Exit Code</span><strong id="jobDetailExit" class="ltr">—</strong><small id="jobDetailExitSub"></small></div>
-<div class="job-detail-card"><span>Execution Timeout</span><strong id="jobDetailTimeout" class="ltr">—</strong><small>Maximum command runtime</small></div>
-<div class="job-detail-card"><span>Queue Timeout</span><strong id="jobDetailQueueTimeout" class="ltr">—</strong><small id="jobDetailQueueDeadline">No queue deadline</small></div>
+</section>
+<section class="panel">
+<div class="panel-head"><div><h2>Secure Tunnel Runtime</h2><div class="panel-note">Actual selected runtime, updater source and verification metadata.</div></div><span id="tunnelRuntimePill" class="pill">—</span></div>
+<div class="meta-grid">
+<div class="meta"><span>Mode</span><strong id="tunnelMode">—</strong></div>
+<div class="meta"><span>Version</span><strong id="tunnelVersion" class="mono">—</strong></div>
+<div class="meta"><span>Source</span><strong id="tunnelSource">—</strong></div>
+<div class="meta"><span>Platform</span><strong id="tunnelPlatform">—</strong></div>
+<div class="meta"><span>Latest Seen</span><strong id="tunnelLatest">—</strong></div>
+<div class="meta"><span>Last Checked</span><strong id="tunnelChecked">—</strong></div>
+<div class="meta"><span>Updater</span><strong id="tunnelUpdater">—</strong></div>
+<div class="meta"><span>Binary</span><strong id="tunnelBinary" class="mono">—</strong></div>
 </div>
-<section class="job-section"><div class="job-section-head"><strong>Working directory</strong><span>cwd</span></div><div id="jobDetailCwd" class="job-path">—</div></section>
-<section class="job-section"><div class="job-section-head"><strong>Command</strong><button id="jobCopyCommand" class="job-copy" type="button">Copy command</button></div><pre id="jobDetailCommand" class="job-code">—</pre></section>
-<div id="jobDetailErrorBox" class="job-error-box hidden"><strong>Recorded error</strong><div id="jobDetailError">—</div></div>
-<div class="job-output-grid"><article class="job-output"><div class="job-output-head"><strong>stdout</strong><span id="jobStdoutMeta">—</span></div><pre id="jobStdout">No stdout captured.</pre></article><article class="job-output"><div class="job-output-head"><strong>stderr</strong><span id="jobStderrMeta">—</span></div><pre id="jobStderr">No stderr captured.</pre></article></div>
-<div class="job-private-note">Command arguments and output are local/private runtime data. Output previews are bounded; large streams remain stored under the local job state directory.</div>
-</div></div></section></div>
-
-<section class="panel"><div class="panel-head"><div><h2>State Storage</h2><div class="panel-note">Breakdown of storage used by this Supervisor in .agent_state.</div></div><span id="storageTotal" class="mini-pill">—</span></div>
-<div class="storage-grid"><div class="storage-item"><span>Job output</span><strong id="storageJobs">—</strong></div><div class="storage-item"><span>Artifacts</span><strong id="storageArtifacts">—</strong></div>
-<div class="storage-item"><span>Databases</span><strong id="storageDb">—</strong></div><div class="storage-item"><span>Logs / Journal</span><strong id="storageLogs">—</strong></div>
-<div class="storage-item"><span>Other</span><strong id="storageOther">—</strong></div><div class="storage-item"><span>Total</span><strong id="storageTotalCard">—</strong></div></div></section>
+</section>
+</div>
 
 <div class="grid two">
-<section class="panel"><div class="panel-head"><div><h2>Recent Events</h2><div id="eventCounter" class="panel-note">—</div></div><div class="filters"><select id="eventFilter" aria-label="Filter event level"><option value="ALL">All levels</option><option value="INFO">INFO</option><option value="WARN">WARN</option><option value="ERROR">ERROR / FATAL</option></select><input id="eventSearch" placeholder="Search events…" autocomplete="off"></div></div><div id="events" class="timeline"><div class="empty">No events have been recorded yet.</div></div></section>
-<section class="panel"><div class="panel-head"><div><h2>Runtime Errors</h2><div id="errorCounter" class="panel-note">—</div></div><span id="errorPill" class="mini-pill ok">No errors</span></div><div id="lastError" class="panel-note" style="margin-bottom:12px"></div><div id="errors" class="error-list"><div class="empty">No ERROR/FATAL events have been recorded.</div></div></section>
+<section class="panel">
+<div class="panel-head"><div><h2>Timing & Lifecycle</h2><div class="panel-note">Supervisor/runtime timing, lifecycle state, mutations and probe history.</div></div><span id="lifecyclePill" class="pill">—</span></div>
+<div class="meta-grid">
+<div class="meta"><span>Supervisor Started</span><strong id="supervisorStarted">—</strong></div>
+<div class="meta"><span>Current Runtime Started</span><strong id="runtimeStarted">—</strong></div>
+<div class="meta"><span>Last State Change</span><strong id="stateChanged">—</strong></div>
+<div class="meta"><span>Last Event</span><strong id="lastEvent">—</strong></div>
+<div class="meta"><span>Runtime PID</span><strong id="runtimePid" class="mono">—</strong></div>
+<div class="meta"><span>Restart Count</span><strong id="restartCount" class="mono">0</strong></div>
+<div class="meta"><span>Active Mutations</span><strong id="mutations" class="mono">0</strong></div>
+<div class="meta"><span>Probe Failures</span><strong id="failedProbes" class="mono">0</strong></div>
+</div>
+</section>
+<section class="panel">
+<div class="panel-head"><div><h2>Last Exit / Drain</h2><div class="panel-note">Most recent runtime termination, retry state and graceful mutation drain.</div></div><span id="exitPill" class="pill">—</span></div>
+<div class="meta-grid">
+<div class="meta"><span>Last Exit Reason</span><strong id="exitReason">—</strong></div>
+<div class="meta"><span>Exit Code</span><strong id="exitCode" class="mono">—</strong></div>
+<div class="meta"><span>Next Retry</span><strong id="retryAfter">—</strong></div>
+<div class="meta"><span>Last Runtime Stop</span><strong id="runtimeStopped">—</strong></div>
+</div>
+<div id="drainSummary" class="panel-note" style="margin-top:12px">No previous drain has been recorded.</div>
+</section>
 </div>
 
-<section class="panel raw"><details><summary>View raw panel log</summary><pre id="logs">No events have been recorded yet.</pre></details></section>
-<footer>This panel is available only on 127.0.0.1 and refreshes its data at short intervals.</footer>
+<section class="panel">
+<div class="panel-head"><div><h2>Transport Health</h2><div class="panel-note">Live control-plane polling, queue, dispatcher, response delivery and MCP activity.</div></div><span id="transportPill" class="pill">—</span></div>
+<div class="meta-grid">
+<div class="meta"><span>Diagnosis</span><strong id="transportDiagnosis">—</strong></div>
+<div class="meta"><span>Control Plane</span><strong id="controlPoll">—</strong></div>
+<div class="meta"><span>Poll Age / Threshold</span><strong id="pollAge" class="mono">—</strong></div>
+<div class="meta"><span>Queue</span><strong id="transportQueue" class="mono">—</strong></div>
+<div class="meta"><span>Dispatcher</span><strong id="transportDispatcher">—</strong></div>
+<div class="meta"><span>Response Delivery</span><strong id="responseDelivery">—</strong></div>
+<div class="meta"><span>Last MCP Tool</span><strong id="lastMcpTool">—</strong></div>
+<div class="meta"><span>Last Tool Latency</span><strong id="lastToolLatency" class="mono">—</strong></div>
+</div>
+<div id="transportReason" class="panel-note" style="margin-top:12px">Waiting for transport health.</div>
+</section>
+
+<div class="grid two">
+<section class="panel">
+<div class="panel-head"><div><h2>Resource Budgets</h2><div class="panel-note">Live child-runtime usage against configured ceilings.</div></div><span id="resourcePill" class="pill">—</span></div>
+<div id="resourceBars"></div>
+</section>
+<section class="panel">
+<div class="panel-head"><div><h2>Host Health</h2><div class="panel-note">Local CPU, memory, swap and disk context for resource-related failures.</div></div><span id="hostPill" class="pill">—</span></div>
+<div class="meta-grid">
+<div class="meta"><span>CPU</span><strong id="hostCpu">—</strong></div>
+<div class="meta"><span>Memory</span><strong id="hostMemory">—</strong></div>
+<div class="meta"><span>Available RAM</span><strong id="hostAvailable">—</strong></div>
+<div class="meta"><span>Swap</span><strong id="hostSwap">—</strong></div>
+<div class="meta"><span>Disk Free</span><strong id="hostDisk">—</strong></div>
+<div class="meta"><span>System Uptime</span><strong id="hostUptime">—</strong></div>
+</div>
+</section>
+</div>
+
+<div class="grid two">
+<section class="panel">
+<div class="panel-head"><div><h2>Runtime Health</h2><div class="panel-note">Child MCP health, registration integrity, workflow state and degradation reasons.</div></div><span id="runtimeHealthPill" class="pill">—</span></div>
+<div class="meta-grid">
+<div class="meta"><span>MCP RSS</span><strong id="runtimeRss" class="mono">—</strong></div>
+<div class="meta"><span>Health Status</span><strong id="runtimeHealthStatus">—</strong></div>
+<div class="meta"><span>Tool Names Unique</span><strong id="toolNamesUnique">—</strong></div>
+<div class="meta"><span>Workflow DB</span><strong id="workflowDbBytes" class="mono">—</strong></div>
+<div class="meta"><span>Running Workflows</span><strong id="runningWorkflows" class="mono">—</strong></div>
+<div class="meta"><span>Unresolved Operations</span><strong id="unresolvedOperations" class="mono">—</strong></div>
+<div class="meta"><span>Operation Recovery</span><strong id="operationRecovery">—</strong></div>
+</div>
+<div id="degradedReasons" class="panel-note" style="margin-top:12px">No degradation reasons reported.</div>
+</section>
+<section class="panel">
+<div class="panel-head"><div><h2>Tool Activity</h2><div class="panel-note">Metadata-only request activity from the current MCP generation.</div></div><span id="toolActivityPill" class="pill">—</span></div>
+<div class="meta-grid">
+<div class="meta"><span>Total Calls</span><strong id="toolTotalCalls" class="mono">—</strong></div>
+<div class="meta"><span>Active Calls</span><strong id="toolActiveCalls" class="mono">—</strong></div>
+<div class="meta"><span>Last Tool</span><strong id="toolLastName">—</strong></div>
+<div class="meta"><span>Last Duration</span><strong id="toolLastDuration" class="mono">—</strong></div>
+<div class="meta"><span>Last Result</span><strong id="toolLastResult">—</strong></div>
+<div class="meta"><span>Last Received</span><strong id="toolLastReceived">—</strong></div>
+<div class="meta"><span>Last Completed</span><strong id="toolLastCompleted">—</strong></div>
+<div class="meta"><span>Oldest Active</span><strong id="toolOldestActive">—</strong></div>
+</div>
+</section>
+</div>
+
+<div class="grid two">
+<section class="panel">
+<div class="panel-head"><div><h2>Browser Runtime</h2><div class="panel-note">Shared browser pool/session/context usage from the live MCP runtime.</div></div><span id="browserPill" class="pill">—</span></div>
+<div class="meta-grid">
+<div class="meta"><span>Capability</span><strong id="browserCapability">—</strong></div>
+<div class="meta"><span>Active Sessions</span><strong id="browserSessions" class="mono">—</strong></div>
+<div class="meta"><span>Pending Sessions</span><strong id="browserPending" class="mono">—</strong></div>
+<div class="meta"><span>Active Pools</span><strong id="browserPools" class="mono">—</strong></div>
+<div class="meta"><span>Active Contexts</span><strong id="browserContexts" class="mono">—</strong></div>
+<div class="meta"><span>Session Budget</span><strong id="browserSessionBudget" class="mono">—</strong></div>
+<div class="meta"><span>Pool Budget</span><strong id="browserPoolBudget" class="mono">—</strong></div>
+</div>
+</section>
+<section class="panel">
+<div class="panel-head"><div><h2>System Doctor</h2><div class="panel-note">Read-only synthesized health checks. No diagnostic commands are executed here.</div></div><span id="doctorPill" class="pill">—</span></div>
+<div id="doctorRows"></div>
+</section>
+</div>
+
+<section class="panel">
+<div class="panel-head"><div><h2>Runtime Processes</h2><div class="panel-note">Click a runtime-owned process for CPU, memory, thread, I/O and command metadata.</div></div><span id="processSummary" class="pill">0 processes</span></div>
+<div class="table-wrap"><table><thead><tr><th>Role</th><th>Name</th><th>PID</th><th>Status</th><th>RAM</th><th>Started</th></tr></thead><tbody id="processRows"></tbody></table></div>
+<div id="processDetail" class="meta-grid" style="margin-top:10px"><div class="empty" style="grid-column:1/-1">Select a process to inspect it.</div></div>
+</section>
+
+<section class="panel">
+<div class="panel-head"><div><h2>Recent Jobs</h2><div class="panel-note">Paged durable jobs with local filtering. Click a row for command, output and lifecycle details.</div></div><div id="jobChips" class="chips"></div></div>
+<div class="filters" style="margin-bottom:10px">
+<select id="jobFilter"><option value="ALL">All statuses</option><option value="running">Running</option><option value="queued">Queued</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="timed_out">Timed out</option><option value="interrupted">Interrupted</option><option value="orphaned">Orphaned</option></select>
+<input id="jobSearch" placeholder="Search job ID or error">
+<button id="jobsPrev" class="secondary mini">Previous</button><button id="jobsNext" class="secondary mini">Next</button><span id="jobsPage" class="muted"></span>
+</div>
+<div class="table-wrap"><table><thead><tr><th>ID</th><th>Status</th><th>Age</th><th>PID</th><th>Exit</th><th>Updated</th><th>Error</th></tr></thead><tbody id="jobs"></tbody></table></div>
+</section>
+
+<div class="grid two">
+<section class="panel">
+<div class="panel-head"><div><h2>Workflow Dashboard</h2><div class="panel-note">Recent durable workflows and read-only step/operation checkpoints. Select a row for safe details.</div></div><span id="workflowPill" class="pill">—</span></div>
+<div id="workflowStats" class="chips" style="margin-bottom:10px"></div>
+<div class="table-wrap"><table><thead><tr><th>Workflow</th><th>State</th><th>Step</th><th>Version</th><th>Updated</th></tr></thead><tbody id="workflowRows"></tbody></table></div>
+<div id="workflowDetail" class="meta-grid" style="margin-top:10px"><div class="empty" style="grid-column:1/-1">Select a workflow to inspect safe checkpoints.</div></div>
+</section>
+<section class="panel">
+<div class="panel-head"><div><h2>Recovery Center</h2><div class="panel-note">Uncertain or pending operations surfaced without blind replay. This view is read only.</div></div><span id="recoveryPill" class="pill">—</span></div>
+<div id="recoverySummary" class="chips" style="margin-bottom:10px"></div>
+<div id="recoveryRows"></div>
+</section>
+</div>
+
+<div class="grid two">
+<section class="panel">
+<div class="panel-head"><div><h2>State Storage</h2><div class="panel-note">Categorized .agent_state consumers and top entries, so large operational state is not hidden under a generic Other bucket.</div></div><span id="storagePill" class="pill">—</span></div>
+<div id="storageCategories" class="chips" style="margin-bottom:10px"></div>
+<div class="table-wrap"><table><thead><tr><th>Consumer</th><th>Category</th><th>Type</th><th>Files</th><th>Size</th></tr></thead><tbody id="storageRows"></tbody></table></div>
+</section>
+<section class="panel">
+<div class="panel-head"><div><h2>Performance Dashboard</h2><div class="panel-note">Recent metadata-only timing samples when MCP_TIMINGS is enabled.</div></div><span id="perfPill" class="pill">—</span></div>
+<div class="table-wrap"><table><thead><tr><th>Phase</th><th>Count</th><th>P50</th><th>P95</th><th>P99</th><th>Max</th></tr></thead><tbody id="perfRows"></tbody></table></div>
+<div class="section-title">Slowest Tools</div>
+<div class="table-wrap"><table><thead><tr><th>Tool</th><th>Count</th><th>P50</th><th>P95</th><th>P99</th><th>Max</th></tr></thead><tbody id="slowToolRows"></tbody></table></div>
+</section>
+</div>
+
+<div class="grid two">
+<section class="panel">
+<div class="panel-head"><div><h2>Capabilities & Tool Domains</h2><div class="panel-note">What this platform/runtime actually exposes.</div></div><span id="capabilityPill" class="pill">—</span></div>
+<div id="domainChips" class="chips" style="margin-bottom:10px"></div>
+<div id="capabilityGrid" class="meta-grid"></div>
+</section>
+<section class="panel">
+<div class="panel-head"><div><h2>Configuration</h2><div class="panel-note">Non-secret watchdog, budget and retention settings.</div></div><span class="pill">Read only</span></div>
+<div id="configGrid" class="kv"></div>
+</section>
+</div>
+
+<div class="grid two">
+<section class="panel">
+<div class="panel-head"><div><h2>Transport History</h2><div class="panel-note">Persisted classifications plus incident counts, watchdog recoveries and response-deadline drops.</div></div><span id="transportHistoryPill" class="pill">—</span></div>
+<div class="meta-grid" style="margin-bottom:10px">
+<div class="meta"><span>Incidents</span><strong id="transportIncidents" class="mono">0</strong></div>
+<div class="meta"><span>Poll Stalls</span><strong id="transportStalls" class="mono">0</strong></div>
+<div class="meta"><span>Watchdog Recoveries</span><strong id="transportRecoveries" class="mono">0</strong></div>
+<div class="meta"><span>Response Deadline Drops</span><strong id="transportDrops" class="mono">0</strong></div>
+<div class="meta"><span>Longest Poll Age</span><strong id="transportLongestPoll">—</strong></div>
+<div class="meta"><span>Latest Incident</span><strong id="transportLatestIncident">—</strong></div>
+</div>
+<div class="table-wrap"><table><thead><tr><th>Time</th><th>Diagnosis</th><th>Severity</th><th>Reason</th></tr></thead><tbody id="transportHistoryRows"></tbody></table></div>
+</section>
+<section class="panel">
+<div class="panel-head"><div><h2>Recent Operations</h2><div class="panel-note">Metadata-only audit trail for local MCP mutations and process actions.</div></div><span id="auditPill" class="pill">—</span></div>
+<div class="table-wrap"><table><thead><tr><th>Time</th><th>Operation</th><th>Outcome</th><th>PID</th><th>Target</th></tr></thead><tbody id="auditRows"></tbody></table></div>
+</section>
+</div>
+
+<section class="panel">
+<div class="panel-head"><div><h2>Project Memory Metadata</h2><div class="panel-note">File metadata only. Memory contents are never exposed by this panel.</div></div><span id="memoryPill" class="pill">—</span></div>
+<div class="table-wrap"><table><thead><tr><th>Project</th><th>Size</th><th>Updated</th></tr></thead><tbody id="memoryRows"></tbody></table></div>
+</section>
+
+<section class="panel">
+<div class="panel-head"><div><h2>Recent Events</h2><div class="panel-note">Structured runtime and Supervisor events. Framework wiring noise stays in rotated logs.</div></div><div class="filters"><select id="eventFilter"><option>ALL</option><option>INFO</option><option>WARN</option><option>ERROR</option></select><input id="eventSearch" placeholder="Search events"></div></div>
+<div id="eventCounter" class="panel-note" style="margin-bottom:9px"></div><div id="events" class="timeline"></div>
+</section>
+
+<section class="panel">
+<div class="panel-head"><div><h2>Runtime Errors</h2><div class="panel-note">ERROR/FATAL events after known non-fatal cancellation normalization.</div></div><span id="errorPill" class="pill">—</span></div>
+<div id="errors" class="timeline"></div><div id="lastError" class="panel-note" style="margin-top:10px"></div>
+</section>
+
+<section class="panel">
+<div class="panel-head"><div><h2>Raw Logs</h2><div class="panel-note">Bounded in-memory Supervisor/runtime log tail for low-level troubleshooting.</div></div><span class="pill">Last 100</span></div>
+<pre id="rawLogs">No events have been recorded yet.</pre>
+</section>
+
+<div class="footer">ComputerPilot MCP · Local loopback observability and guarded runtime control</div>
 </main>
+
+<div id="jobModal" class="dialog-wrap" aria-hidden="true">
+<div class="backdrop" data-close-job></div>
+<section class="dialog" role="dialog" aria-modal="true" aria-labelledby="jobModalTitle">
+<header class="dialog-head"><div><h2 id="jobModalTitle" class="dialog-title">Job details</h2><div id="jobModalId" class="dialog-sub">—</div></div><div class="actions"><button id="jobCancel" class="danger mini" hidden>Cancel Job</button><button id="jobCopy" class="secondary mini">Copy command</button><button id="jobClose" class="dialog-close">×</button></div></header>
+<div class="dialog-body">
+<div id="jobMeta" class="meta-grid"></div>
+<div class="section-title">Command</div><pre id="jobCommand">—</pre>
+<div class="section-title">Working Directory</div><pre id="jobCwd">—</pre>
+<div id="jobErrorWrap" hidden><div class="section-title issue">Error</div><pre id="jobError">—</pre></div>
+<div class="output-grid">
+<div><div class="section-title">Stdout</div><div class="actions" style="margin-bottom:7px"><button id="jobStdoutMore" class="secondary mini">Load more stdout</button><button id="jobDownloadStdout" class="secondary mini">Download stdout</button></div><pre id="jobStdout">—</pre></div>
+<div><div class="section-title">Stderr</div><div class="actions" style="margin-bottom:7px"><button id="jobStderrMore" class="secondary mini">Load more stderr</button><button id="jobDownloadStderr" class="secondary mini">Download stderr</button></div><pre id="jobStderr">—</pre></div>
+</div>
+</div>
+</section>
+</div>
+
 <script>
 const token='__CONTROL_TOKEN__';
-const el=id=>document.getElementById(id);
-const labels={starting:'Starting',running:'Running',unhealthy:'Unhealthy',retrying:'Waiting to restart',stopped:'Stopped',draining:'Draining',queued:'Queued',succeeded:'Succeeded',failed:'Failed',cancelled:'Cancelled',timed_out:'Timed out',interrupted:'Interrupted',orphaned:'Orphaned'};
-const statusTone=status=>{if(['running','succeeded'].includes(status))return'ok';if(['starting','retrying','queued','orphaned','draining'].includes(status))return'warn';if(['unhealthy','failed','timed_out','interrupted','stopped'].includes(status))return'bad';return''};
-const numberFormat=value=>new Intl.NumberFormat('en-US').format(Number(value||0));
-const timeFmt=new Intl.DateTimeFormat('en-US',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
-const clockFmt=new Intl.DateTimeFormat('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-const formatTime=value=>value?timeFmt.format(new Date(Number(value)*1000)):'—';
-const formatClock=value=>value?clockFmt.format(new Date(Number(value)*1000)):'—';
-const duration=value=>{if(value===null||value===undefined||!Number.isFinite(Number(value)))return'—';let s=Math.max(0,Math.floor(Number(value))),d=Math.floor(s/86400);s%=86400;const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);s%=60;const parts=[];if(d)parts.push(d+'d');if(h||d)parts.push(h+'h');if(m||h||d)parts.push(m+'m');parts.push(s+'s');return parts.slice(0,3).join(' ')};
-const bytes=value=>{let n=Number(value||0);const units=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++}return(i===0?n.toFixed(0):n.toFixed(n>=100?0:n>=10?1:2))+' '+units[i]};
-const shortId=value=>value?String(value).slice(0,8)+'…':'—';const age=timestamp=>timestamp?duration(Date.now()/1000-Number(timestamp)):'—';
-const setPill=(node,text,tone='')=>{node.textContent=text;node.className='mini-pill'+(tone?' '+tone:'')};
-const addCell=(tr,value,className='')=>{const td=document.createElement('td');td.textContent=value;td.className=className;tr.append(td)};
-const emptyRow=(tbody,colspan,text)=>{const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=colspan;td.textContent=text;td.className='muted';tr.append(td);tbody.append(tr)};
-let stopped=false,lastData=null,activeJobId=null,activeJobDetails=null,jobDetailRequest=0;
-const terminalJob=status=>!['queued','running','orphaned'].includes(String(status||''));
-const setText=(id,value)=>{el(id).textContent=value===null||value===undefined||value===''?'—':String(value)};
-const streamMeta=(stream,encoding)=>{if(!stream||stream.missing)return'Not stored';const total=Number(stream.total_bytes||0);if(stream.has_more)return'First '+bytes(stream.bytes||0)+' of '+bytes(total)+' · '+encoding;return bytes(total)+' · '+encoding};
-function setJobModalLoading(message,tone=''){el('jobModalLoading').hidden=false;el('jobModalLoading').textContent=message;el('jobModalContent').hidden=true;setPill(el('jobModalStatus'),tone==='bad'?'Unavailable':'Loading',tone)}
-function renderJobDetail(job){activeJobDetails=job;const status=String(job.status||'unknown'),isTerminal=terminalJob(status),finishedAt=isTerminal?Number(job.updated||job.created):Date.now()/1000;setPill(el('jobModalStatus'),labels[status]||status,statusTone(status));setText('jobModalId',job.job_id);el('jobModalMeta').textContent='Version '+numberFormat(job.version||0)+(job.cancel_requested?' · cancellation requested':' · cancellation not requested');setText('jobDetailCreated',formatTime(job.created));el('jobDetailCreatedSub').textContent=age(job.created)+' ago';setText('jobDetailUpdated',formatTime(job.updated));el('jobDetailUpdatedSub').textContent=age(job.updated)+' ago';setText('jobDetailElapsed',duration(finishedAt-Number(job.created||finishedAt)));el('jobDetailElapsedSub').textContent=isTerminal?'Final recorded lifecycle':'Still active';setText('jobDetailPid',job.pid??'—');el('jobDetailPidSub').textContent=job.pid_created?'Process started '+formatTime(job.pid_created):'No process start metadata';setText('jobDetailWorkerPid',job.worker_pid??'—');el('jobDetailWorkerPidSub').textContent=job.worker_created?'Worker started '+formatTime(job.worker_created):'No worker start metadata';setText('jobDetailExit',job.exit_code??'—');el('jobDetailExitSub').textContent=job.cancel_requested?'Cancellation requested':'Job version '+numberFormat(job.version||0);setText('jobDetailTimeout',job.timeout_sec===null||job.timeout_sec===undefined?'—':duration(job.timeout_sec));setText('jobDetailQueueTimeout',job.queue_timeout_sec===null||job.queue_timeout_sec===undefined?'None':duration(job.queue_timeout_sec));el('jobDetailQueueDeadline').textContent=job.queue_deadline?'Deadline '+formatTime(job.queue_deadline):'No queue deadline';setText('jobDetailCwd',job.cwd);setText('jobDetailCommand',job.command_line||((job.command||[]).map(value=>JSON.stringify(String(value))).join(' ')));const errorBox=el('jobDetailErrorBox');if(job.error){errorBox.classList.remove('hidden');setText('jobDetailError',job.error)}else{errorBox.classList.add('hidden');setText('jobDetailError','—')}const stdout=job.stdout||{},stderr=job.stderr||{};el('jobStdout').textContent=stdout.text||'No stdout captured.';el('jobStderr').textContent=stderr.text||'No stderr captured.';el('jobStdoutMeta').textContent=streamMeta(stdout,job.encoding||'utf-8');el('jobStderrMeta').textContent=streamMeta(stderr,job.encoding||'utf-8');el('jobModalLoading').hidden=true;el('jobModalContent').hidden=false}
-async function loadJobDetail(jobId,silent=false){const request=++jobDetailRequest;if(!silent)setJobModalLoading('Loading job details…');try{const response=await fetch('/api/jobs/'+encodeURIComponent(jobId),{cache:'no-store',headers:{'X-Control-Token':token}});if(!response.ok)throw Error(response.status);const detail=await response.json();if(request!==jobDetailRequest||activeJobId!==jobId)return;renderJobDetail(detail)}catch(error){if(request!==jobDetailRequest||activeJobId!==jobId)return;activeJobDetails=null;setText('jobModalId',jobId);el('jobModalMeta').textContent='The job detail endpoint could not be read.';setJobModalLoading('Unable to load job details. The job may have been pruned from local history.','bad')}}
-function openJobDetail(jobId){activeJobId=jobId;activeJobDetails=null;el('jobModal').classList.add('open');el('jobModal').setAttribute('aria-hidden','false');document.body.classList.add('modal-open');setText('jobModalId',jobId);el('jobModalMeta').textContent='Loading job metadata…';void loadJobDetail(jobId);el('jobModalClose').focus()}
-function closeJobDetail(){activeJobId=null;activeJobDetails=null;jobDetailRequest++;el('jobModal').classList.remove('open');el('jobModal').setAttribute('aria-hidden','true');document.body.classList.remove('modal-open')}
-async function copyJobCommand(){const command=activeJobDetails?.command_line||'';if(!command)return;const button=el('jobCopyCommand'),previous=button.textContent;try{if(navigator.clipboard?.writeText){await navigator.clipboard.writeText(command)}else{const area=document.createElement('textarea');area.value=command;area.style.position='fixed';area.style.opacity='0';document.body.append(area);area.select();document.execCommand('copy');area.remove()}button.textContent='Copied'}catch(error){button.textContent='Copy failed'}setTimeout(()=>{button.textContent=previous},1200)}
-function renderEvents(){if(!lastData)return;const target=el('events'),filter=el('eventFilter').value,query=el('eventSearch').value.trim().toLocaleLowerCase('en-US');const events=[...(lastData.recent_events||[])].reverse().filter(item=>{const level=String(item.level||'INFO').toUpperCase();const levelOk=filter==='ALL'||level===filter||(filter==='ERROR'&&level==='FATAL');const queryOk=!query||String(item.message||'').toLocaleLowerCase('en-US').includes(query)||String(item.component||'').toLocaleLowerCase('en-US').includes(query);return levelOk&&queryOk});target.replaceChildren();if(!events.length){const div=document.createElement('div');div.className='empty';div.textContent='No events match the current filters.';target.append(div);return}for(const item of events.slice(0,80)){const row=document.createElement('div');row.className='event';const t=document.createElement('div');t.className='event-time';t.textContent=formatClock(item.timestamp);const level=document.createElement('div');const normalized=String(item.level||'INFO').toUpperCase();level.className='event-level '+normalized;level.textContent=normalized;const msg=document.createElement('div');msg.className='event-message';msg.textContent=item.message||'—';const comp=document.createElement('span');comp.className='event-component';comp.textContent=item.component||'supervisor';msg.append(comp);row.append(t,level,msg);target.append(row)}}
-function render(data){lastData=data;const state=String(data.state||'unknown'),tone=statusTone(state);el('state').textContent=labels[state]||state;el('stateSub').textContent='PID '+(data.pid??'—')+' · generation '+numberFormat(data.runtime_generation||0);el('mcp').textContent=data.mcp_healthy?'Healthy':'Waiting / no response';el('mcpSub').textContent=data.mcp_healthy?'Fresh heartbeat received':'No valid heartbeat received yet';el('tunnel').textContent=data.tunnel_healthy===null?'Local mode':data.tunnel_healthy?'Healthy':'No response';el('tunnelSub').textContent=data.tunnel_healthy===null?'Tunnel probe is disabled':'Readiness tunnel';el('supervisorUptime').textContent=duration(data.supervisor_uptime_seconds);el('runtimeUptime').textContent=duration(data.runtime_uptime_seconds);el('runtimeGeneration').textContent='Runtime generation: '+numberFormat(data.runtime_generation||0);el('jobTotal').textContent=numberFormat(data.jobs?.total_count||0);el('jobSub').textContent='Active: '+numberFormat(data.jobs?.active_count||0)+' · Problematic: '+numberFormat(data.jobs?.problem_count||0);el('statePill').textContent=labels[state]||state;el('statePill').className='status-pill '+tone;el('liveDot').className='live-dot '+(state==='running'&&data.mcp_healthy?'ok':tone==='bad'?'bad':'');el('connectionText').textContent='Panel connection established';el('updated').textContent='· Last update '+formatClock(data.server_time);
-el('supervisorStarted').textContent=formatTime(data.supervisor_started_at);el('runtimeStarted').textContent=formatTime(data.runtime_started_at||data.last_runtime_started_at);el('stateChanged').textContent=formatTime(data.last_state_change_at);el('lastEvent').textContent=formatTime(data.last_event_at);el('runtimePid').textContent=data.pid??'—';el('restartCount').textContent=numberFormat(data.restart_count||0);el('mutations').textContent=numberFormat(data.active_mutations||0);el('failedProbes').textContent=numberFormat(data.failed_probes||0);setPill(el('lifecyclePill'),data.runtime_lifecycle||'Lifecycle unknown',data.runtime_lifecycle==='RUNNING'?'ok':data.runtime_lifecycle?'warn':'');
-el('exitReason').textContent=data.last_exit_reason||'—';el('exitCode').textContent=data.last_exit_code??'—';el('retryAfter').textContent=data.next_retry_seconds===null||data.next_retry_seconds===undefined?'—':duration(data.next_retry_seconds);el('runtimeStopped').textContent=formatTime(data.last_runtime_stopped_at);const exitTone=data.last_exit_code===0?'ok':data.last_exit_code===null||data.last_exit_code===undefined?'':'bad';setPill(el('exitPill'),data.last_exit_code===null||data.last_exit_code===undefined?'No exit recorded':'Exit '+data.last_exit_code,exitTone);const drain=data.last_drain_result;el('drainSummary').textContent=drain?'Last drain: '+(drain.reason||'—')+' · acknowledged='+(drain.acknowledged?'yes':'no')+' · drained='+(drain.drained?'yes':'no')+' · mutations='+(drain.active_mutations??'—')+' · '+(drain.elapsed_ms??'—')+' ms':'No previous drain has been recorded.';
-const processRows=el('processRows');processRows.replaceChildren();let totalRam=0;for(const p of data.active_processes||[]){totalRam+=Number(p.memory_mb||0);const tr=document.createElement('tr');addCell(tr,p.role==='runtime'?'Runtime':'Child');addCell(tr,p.name||'—');addCell(tr,String(p.pid??'—'),'ltr');addCell(tr,p.status||'—');addCell(tr,(p.memory_mb??0)+' MiB','ltr');addCell(tr,formatTime(p.created_at));processRows.append(tr)}if(!(data.active_processes||[]).length)emptyRow(processRows,6,'No active processes are currently recorded.');setPill(el('processSummary'),numberFormat(data.process_count||0)+' processes · '+totalRam.toFixed(1)+' MiB',data.process_count?'ok':'');
-const chips=el('jobChips');chips.replaceChildren();const counts=data.jobs?.counts||{};const order=['running','queued','succeeded','failed','cancelled','timed_out','interrupted','orphaned'];for(const key of order){if(!counts[key])continue;const chip=document.createElement('span');chip.className='mini-pill '+statusTone(key);chip.textContent=(labels[key]||key)+': '+numberFormat(counts[key]);chips.append(chip)}if(!chips.children.length){const chip=document.createElement('span');chip.className='mini-pill';chip.textContent='No jobs have been recorded yet';chips.append(chip)}
-const jobs=el('jobs');jobs.replaceChildren();for(const job of data.jobs?.items||[]){const tr=document.createElement('tr');tr.className='job-row';tr.tabIndex=0;tr.setAttribute('role','button');tr.setAttribute('aria-label','Open details for job '+job.job_id);const open=()=>openJobDetail(job.job_id);tr.addEventListener('click',open);tr.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();open()}});addCell(tr,shortId(job.job_id),'job-id ltr');const tdStatus=document.createElement('td');const badge=document.createElement('span');badge.className='mini-pill '+statusTone(job.status);badge.textContent=labels[job.status]||job.status;tdStatus.append(badge);tr.append(tdStatus);addCell(tr,age(job.created));addCell(tr,String(job.pid??'—'),'ltr');addCell(tr,String(job.exit_code??'—'),'ltr');addCell(tr,formatTime(job.updated));addCell(tr,job.error||'—',job.error?'issue':'muted');jobs.append(tr)}if(!(data.jobs?.items||[]).length)emptyRow(jobs,7,'No jobs have been recorded yet.');
-const storage=data.storage_bytes||{};el('storageJobs').textContent=bytes(storage.jobs);el('storageArtifacts').textContent=bytes(storage.artifacts);el('storageDb').textContent=bytes(storage.databases);el('storageLogs').textContent=bytes(storage.logs);el('storageOther').textContent=bytes(storage.other);el('storageTotalCard').textContent=bytes(storage.total);setPill(el('storageTotal'),'Total '+bytes(storage.total));
-el('eventCounter').textContent=numberFormat(data.event_count||0)+' events since Supervisor start · '+numberFormat((data.recent_events||[]).length)+' recent events retained in memory';renderEvents();
-el('errorCounter').textContent=numberFormat(data.error_count||0)+' ERROR/FATAL events since Supervisor start';const errors=el('errors');errors.replaceChildren();const recentErrors=[...(data.recent_errors||[])].reverse();if(!recentErrors.length){const div=document.createElement('div');div.className='empty';div.textContent='No ERROR/FATAL events have been recorded.';errors.append(div)}for(const item of recentErrors.slice(0,25)){const box=document.createElement('div');box.className='error-box';const time=document.createElement('time');time.textContent=formatTime(item.timestamp);const p=document.createElement('p');p.textContent=item.message||'—';box.append(time,p);errors.append(box)}el('lastError').textContent=data.last_error?'Last error / recovery reason: '+data.last_error:'No recorded errors.';setPill(el('errorPill'),recentErrors.length?numberFormat(recentErrors.length)+' recent errors':'No recent errors',recentErrors.length?'bad':'ok');el('logs').textContent=(data.logs||[]).join('\n')||'No events have been recorded yet.'}
-async function refresh(){if(stopped)return;try{const response=await fetch('/api/status',{cache:'no-store'});if(!response.ok)throw Error(response.status);render(await response.json());if(activeJobId)void loadJobDetail(activeJobId,true)}catch(error){el('connectionText').textContent='Panel connection lost';el('updated').textContent='· Check the launcher window and port 8766';el('liveDot').className='live-dot bad';el('statePill').textContent='Disconnected';el('statePill').className='status-pill bad'}}
-for(const action of ['restart','stop'])el(action).onclick=async()=>{const question=action==='stop'?'Stop the Supervisor and runtime?':'Restart the runtime?';if(!confirm(question))return;el(action).disabled=true;try{const response=await fetch('/api/'+action,{method:'POST',headers:{'X-Control-Token':token}});if(!response.ok)throw Error(response.status);el('notice').textContent=action==='stop'?'Stop request accepted. Run START_MCP again to start the service.':'Restart request accepted. Follow lifecycle and events below.';if(action==='stop'){stopped=true;el('state').textContent='Stopped';el('statePill').textContent='Stopped';el('statePill').className='status-pill bad'}}catch(error){el('notice').textContent='Request failed. Check the panel connection.'}finally{el(action).disabled=false}};
-el('jobModalClose').addEventListener('click',closeJobDetail);el('jobModal').addEventListener('click',event=>{if(event.target instanceof Element&&event.target.hasAttribute('data-job-close'))closeJobDetail()});el('jobCopyCommand').addEventListener('click',copyJobCommand);document.addEventListener('keydown',event=>{if(event.key==='Escape'&&activeJobId)closeJobDetail()});el('eventFilter').addEventListener('change',renderEvents);el('eventSearch').addEventListener('input',renderEvents);refresh();setInterval(refresh,2500);
+const $=id=>document.getElementById(id);
+const labels={starting:'Starting',running:'Running',unhealthy:'Unhealthy',retrying:'Retrying',stopped:'Stopped',draining:'Draining',queued:'Queued',succeeded:'Succeeded',failed:'Failed',cancelled:'Cancelled',timed_out:'Timed out',interrupted:'Interrupted',orphaned:'Orphaned'};
+const tone=value=>{const v=String(value||'').toLowerCase();if(['healthy','normal','running','succeeded','ok','completed','accepted'].includes(v))return'ok';if(['starting','retrying','queued','draining','warning','warn','degraded','orphaned'].includes(v))return'warn';if(['failed','unhealthy','critical','bad','error','fatal','timed_out','interrupted','stopped'].includes(v))return'bad';return''};
+const fmtNum=v=>new Intl.NumberFormat('en-US').format(Number(v||0));
+const dt=new Intl.DateTimeFormat('en-US',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const tm=new Intl.DateTimeFormat('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const epoch=v=>v?dt.format(new Date(Number(v)*1000)):'—';
+const iso=v=>v?dt.format(new Date(v)):'—';
+const clock=v=>v?tm.format(new Date(Number(v)*1000)):'—';
+const duration=v=>{if(v===null||v===undefined||!Number.isFinite(Number(v)))return'—';let s=Math.max(0,Math.floor(Number(v))),d=Math.floor(s/86400);s%=86400;const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);s%=60;const p=[];if(d)p.push(d+'d');if(h||d)p.push(h+'h');if(m||h||d)p.push(m+'m');p.push(s+'s');return p.slice(0,3).join(' ')};
+const bytes=v=>{let n=Number(v||0),i=0,u=['B','KiB','MiB','GiB','TiB'];while(n>=1024&&i<u.length-1){n/=1024;i++}return(i===0?n.toFixed(0):n.toFixed(n>=100?0:n>=10?1:2))+' '+u[i]};
+const age=v=>v?duration(Date.now()/1000-Number(v)):'—';
+const safe=v=>v===null||v===undefined||v===''?'—':String(v);
+const pill=(node,text,kind='')=>{node.textContent=text;node.className='pill'+(kind?' '+kind:'')};
+const cell=(tr,v,cls='')=>{const td=document.createElement('td');td.textContent=safe(v);if(cls)td.className=cls;tr.append(td)};
+const emptyRow=(body,cols,text)=>{const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=cols;td.className='muted';td.textContent=text;tr.append(td);body.append(tr)};
+async function getJson(path,guarded=true){const r=await fetch(path,{cache:'no-store',headers:guarded?{'X-Control-Token':token}:{}});if(!r.ok)throw Error(path+' '+r.status);return r.json()}
+async function postJson(path){const r=await fetch(path,{method:'POST',headers:{'X-Control-Token':token}});if(!r.ok)throw Error(path+' '+r.status);return r.json()}
+let lastSummary=null,lastEvents=null,lastJobs=null,lastInsights=null,activeJob=null,jobOffset=0,jobLimit=25,stopped=false,panelApiMode=null;
+let jobOutputState={initialized:false,stdout:{next:0,hasMore:false,total:0},stderr:{next:0,hasMore:false,total:0}};
+
+function renderSummary(data){
+  lastSummary=data;const s=String(data.state||'unknown'),st=tone(s);
+  $('state').textContent=labels[s]||s;$('stateSub').textContent='PID '+safe(data.pid)+' · generation '+fmtNum(data.runtime_generation);
+  $('mcp').textContent=data.mcp_healthy?'Healthy':'Waiting';$('mcp').className='card-value '+(data.mcp_healthy?'ok':'warn');$('mcpSub').textContent=data.mcp_healthy?'Fresh runtime heartbeat':'No fresh heartbeat';
+  const th=data.transport_health||{},diag=String(th.diagnosis||data.transport_diagnosis||'UNKNOWN');
+  $('tunnelHealth').textContent=data.tunnel_healthy===null?'Local mode':data.tunnel_healthy?'Healthy':'No response';$('tunnelHealth').className='card-value '+(data.tunnel_healthy===false?'bad':data.tunnel_healthy===true?'ok':'');
+  $('tunnelSub').textContent=diag.replaceAll('_',' ');
+  const p=String(data.resource_pressure||'unknown');$('pressure').textContent=p==='unknown'?'Waiting':p[0].toUpperCase()+p.slice(1);$('pressure').className='card-value '+tone(p);$('pressureSub').textContent=data.runtime_health_status?'Runtime health: '+data.runtime_health_status:'Runtime health snapshot pending';
+  $('supervisorUptime').textContent=duration(data.supervisor_uptime_seconds);$('runtimeUptime').textContent='Runtime: '+duration(data.runtime_uptime_seconds);
+  $('jobTotal').textContent=fmtNum(data.jobs?.total_count);$('jobSub').textContent='Active '+fmtNum(data.jobs?.active_count)+' · Problems '+fmtNum(data.jobs?.problem_count);
+  $('statePill').textContent=labels[s]||s;$('statePill').className='status-pill '+st;$('liveDot').className='live-dot '+(s==='running'&&data.mcp_healthy?'ok':st==='bad'?'bad':'');
+  $('connectionText').textContent='Panel connection established';$('updated').textContent='Last summary '+clock(data.server_time);
+  $('supervisorStarted').textContent=epoch(data.supervisor_started_at);$('runtimeStarted').textContent=epoch(data.runtime_started_at||data.last_runtime_started_at);$('stateChanged').textContent=epoch(data.last_state_change_at);$('lastEvent').textContent=epoch(data.last_event_at);$('runtimePid').textContent=data.pid??'—';$('restartCount').textContent=fmtNum(data.restart_count);$('mutations').textContent=fmtNum(data.active_mutations);$('failedProbes').textContent=fmtNum(data.failed_probes);pill($('lifecyclePill'),data.runtime_lifecycle||'Lifecycle unknown',data.runtime_lifecycle==='RUNNING'?'ok':data.runtime_lifecycle?'warn':'');
+  $('exitReason').textContent=data.last_exit_reason||'—';$('exitCode').textContent=data.last_exit_code??'—';$('retryAfter').textContent=data.next_retry_seconds===null||data.next_retry_seconds===undefined?'—':duration(data.next_retry_seconds);$('runtimeStopped').textContent=epoch(data.last_runtime_stopped_at);pill($('exitPill'),data.last_exit_code===null||data.last_exit_code===undefined?'No exit recorded':'Exit '+data.last_exit_code,data.last_exit_code===0?'ok':data.last_exit_code===null||data.last_exit_code===undefined?'':'bad');const drain=data.last_drain_result;$('drainSummary').textContent=drain?'Last drain: '+safe(drain.reason)+' · acknowledged='+(drain.acknowledged?'yes':'no')+' · drained='+(drain.drained?'yes':'no')+' · mutations='+safe(drain.active_mutations)+' · '+safe(drain.elapsed_ms)+' ms':'No previous drain has been recorded.';
+  renderTransport(data);
+  renderToolActivity(data.tool_activity||(data.transport_health||{}).tool_activity||{});
+  renderProcesses(data.active_processes||[]);
+}
+function renderTransport(data){
+  const t=data.transport_health||{},d=String(t.diagnosis||data.transport_diagnosis||'UNKNOWN'),c=t.control_plane||{},q=t.queue||{},disp=t.dispatcher||{},rd=t.response_delivery||{},a=t.tool_activity||data.tool_activity||{};
+  pill($('transportPill'),d.replaceAll('_',' '),tone(t.severity||d));$('transportDiagnosis').textContent=d.replaceAll('_',' ');
+  $('controlPoll').textContent=[c.status,c.state].filter(Boolean).join(' · ')||'—';
+  $('pollAge').textContent=c.current_poll_age_seconds===undefined?'—':duration(c.current_poll_age_seconds)+' / '+duration(c.stall_threshold_seconds);
+  $('transportQueue').textContent=fmtNum(q.depth)+' / '+safe(q.capacity)+' · '+safe(q.state);
+  $('transportDispatcher').textContent=fmtNum(disp.active)+' / '+safe(disp.pool_limit)+' · '+safe(disp.state);
+  $('responseDelivery').textContent=[rd.status,rd.state].filter(Boolean).join(' · ')||'—';$('lastMcpTool').textContent=a.last_tool_name||'No tool observed';
+  $('lastToolLatency').textContent=a.last_duration_ms===null||a.last_duration_ms===undefined?'—':Number(a.last_duration_ms).toFixed(3)+' ms';
+  const notes=[];if(t.reason)notes.push(t.reason);if(t.restart_confirmed)notes.push('Watchdog recovery confirmed');else if(Number(t.stall_observations||0)>0)notes.push('Stall observations '+fmtNum(t.stall_observations)+' / '+fmtNum(t.required_confirmations));
+  if(c.last_success)notes.push('Last poll '+iso(c.last_success));$('transportReason').textContent=notes.join(' · ')||'Waiting for transport health.';
+}
+function renderToolActivity(a){
+  $('toolTotalCalls').textContent=a.total_calls===undefined?'—':fmtNum(a.total_calls);
+  $('toolActiveCalls').textContent=a.active_calls===undefined?'—':fmtNum(a.active_calls);
+  $('toolLastName').textContent=a.last_tool_name||'No tool observed';
+  $('toolLastDuration').textContent=a.last_duration_ms===null||a.last_duration_ms===undefined?'—':Number(a.last_duration_ms).toFixed(3)+' ms';
+  $('toolLastResult').textContent=a.last_ok===true?'OK':a.last_ok===false?'Failed':'—';
+  $('toolLastResult').className=a.last_ok===true?'ok':a.last_ok===false?'bad':'';
+  $('toolLastReceived').textContent=epoch(a.last_received_at);
+  $('toolLastCompleted').textContent=epoch(a.last_completed_at);
+  $('toolOldestActive').textContent=a.oldest_active_started_at?age(a.oldest_active_started_at)+' ago':'None';
+  pill($('toolActivityPill'),fmtNum(a.active_calls||0)+' active',Number(a.active_calls||0)>0?'warn':'ok');
+}
+function renderProcesses(items){
+  const body=$('processRows');body.replaceChildren();let ram=0;
+  for(const p of items){
+    ram+=Number(p.memory_mb||0);
+    const tr=document.createElement('tr');tr.className='clickable';tr.tabIndex=0;tr.setAttribute('role','button');
+    tr.onclick=()=>inspectProcess(p.pid);
+    tr.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();inspectProcess(p.pid)}};
+    cell(tr,p.role==='runtime'?'Runtime':'Child');cell(tr,p.name);cell(tr,p.pid,'mono');cell(tr,p.status);cell(tr,(p.memory_mb??0)+' MiB','mono');cell(tr,epoch(p.created_at));body.append(tr)
+  }
+  if(!items.length)emptyRow(body,6,'No active runtime processes.');
+  pill($('processSummary'),fmtNum(items.length)+' processes · '+ram.toFixed(1)+' MiB',items.length?'ok':'');
+}
+async function inspectProcess(pid){
+  const box=$('processDetail');
+  try{
+    const p=await getJson('/api/processes/'+encodeURIComponent(pid)),io=p.io||{};
+    box.replaceChildren(
+      metaCard('Name',p.name),metaCard('PID',p.pid),metaCard('Status',p.status),
+      metaCard('CPU',p.cpu_percent===undefined?'—':Number(p.cpu_percent).toFixed(1)+'%'),
+      metaCard('RSS',bytes(p.memory_rss)),metaCard('Threads',p.threads),metaCard('Handles',p.handles??'—'),
+      metaCard('Parent PID',p.parent_pid??'—'),metaCard('Started',epoch(p.created_at)),
+      metaCard('I/O Read',bytes(io.read_bytes)),metaCard('I/O Write',bytes(io.write_bytes)),
+      metaCard('Command',p.command_line||'—')
+    );
+  }catch(e){
+    box.replaceChildren();const m=document.createElement('div');m.className='empty';m.style.gridColumn='1/-1';m.textContent='Unable to inspect this runtime-owned process.';box.append(m)
+  }
+}
+function renderInsights(data){
+  lastInsights=data;const id=data.identity||{},h=data.runtime_health||{},t=data.tunnel||{},sys=data.system||{},stor=data.storage||{},perf=data.performance||{},mem=data.memory||{};
+  $('productName').textContent=id.product||'ComputerPilot MCP';$('productVersion').textContent=id.version||h.version||'—';$('gitBranch').textContent=id.git_branch||'—';$('gitCommit').textContent=id.git_commit||'—';$('pythonVersion').textContent=h.python||id.python||'—';$('platformKey').textContent=h.platform_key||'—';$('toolProfile').textContent=h.tool_profile||'—';$('toolCount').textContent=h.tool_count??'—';pill($('identityPill'),id.git_clean===true?'Working tree clean':id.git_clean===false?'Working tree changed':'Git unavailable',id.git_clean===true?'ok':id.git_clean===false?'warn':'');
+  $('tunnelMode').textContent=t.mode||'—';$('tunnelVersion').textContent=t.version?'v'+String(t.version).replace(/^v/,''):'—';$('tunnelSource').textContent=t.source||'—';$('tunnelPlatform').textContent=t.platform||'—';$('tunnelLatest').textContent=t.latest_seen||'—';$('tunnelChecked').textContent=t.checked_at?epoch(t.checked_at):'—';$('tunnelUpdater').textContent=t.warning?'Fallback · '+t.warning:(t.enabled?'Verified managed runtime':'Not used in local-http mode');$('tunnelBinary').textContent=t.binary_path||'—';pill($('tunnelRuntimePill'),t.mode==='local-http'?'Local HTTP':t.available===false?'Unavailable':'Managed',t.available===false?'bad':t.warning?'warn':'ok');
+  renderRuntimeHealth(h);renderBrowserRuntime(h);renderResources(h);renderHost(sys);renderStorage(stor);renderPerformance(perf);renderCapabilities(h);renderMemory(mem);
+}
+function renderRuntimeHealth(h){
+  const status=String(h.health_status||'pending'),recovery=h.operation_recovery||{},uncertain=Number(recovery.uncertain_count||0),pending=Number(recovery.pending_count||0);
+  $('runtimeRss').textContent=h.rss_mb===undefined?'—':Number(h.rss_mb).toFixed(1)+' MiB';
+  $('runtimeHealthStatus').textContent=status;$('runtimeHealthStatus').className=tone(status);
+  $('toolNamesUnique').textContent=h.unique_tool_names===true?'Yes':h.unique_tool_names===false?'No':'—';
+  $('toolNamesUnique').className=h.unique_tool_names===false?'bad':h.unique_tool_names===true?'ok':'';
+  $('workflowDbBytes').textContent=bytes(h.workflow_db_bytes);$('runningWorkflows').textContent=fmtNum(h.running_workflows);
+  $('unresolvedOperations').textContent=fmtNum(h.unresolved_workflow_operations);
+  $('operationRecovery').textContent=uncertain+' uncertain · '+pending+' pending';$('operationRecovery').className=uncertain||pending?'warn':'ok';
+  const reasons=Array.isArray(h.degraded_reasons)?h.degraded_reasons:[];
+  $('degradedReasons').textContent=reasons.length?'Degraded reasons: '+reasons.join(', '):'No degradation reasons reported.';
+  pill($('runtimeHealthPill'),status,status==='healthy'?'ok':status==='degraded'?'warn':status==='unhealthy'?'bad':'');
+  renderWorkflowStats(h.workflow_health||h);
+}
+function renderBrowserRuntime(h){
+  const sessions=Number(h.active_browser_sessions||0),pending=Number(h.pending_browser_sessions||0),pools=Number(h.active_browser_pools||0),contexts=Number(h.active_browser_contexts||0);
+  const usage=h.resource_usage||{},sessionBudget=usage.browser_sessions||{},poolBudget=usage.browser_pools||{},capable=h.capabilities?.browser===true;
+  $('browserCapability').textContent=capable?'Available':'Unavailable';$('browserCapability').className=capable?'ok':'muted';
+  $('browserSessions').textContent=fmtNum(sessions);$('browserPending').textContent=fmtNum(pending);$('browserPools').textContent=fmtNum(pools);$('browserContexts').textContent=fmtNum(contexts);
+  $('browserSessionBudget').textContent=sessionBudget.max===undefined?'—':fmtNum(sessionBudget.value)+' / '+fmtNum(sessionBudget.max);
+  $('browserPoolBudget').textContent=poolBudget.max===undefined?'—':fmtNum(poolBudget.value)+' / '+fmtNum(poolBudget.max);
+  pill($('browserPill'),capable?fmtNum(sessions+pending)+' sessions':'Optional browser unavailable',pending?'warn':capable?'ok':'');
+}
+function renderResources(h){
+  const body=$('resourceBars');body.replaceChildren();const usage=h.resource_usage||{},entries=Object.entries(usage);pill($('resourcePill'),String(h.resource_pressure||'Waiting'),tone(h.resource_pressure));
+  if(!entries.length){const e=document.createElement('div');e.className='empty';e.textContent='Runtime health snapshot is not available yet.';body.append(e);return}
+  for(const [name,v] of entries){const ratio=v?.usage_ratio,percent=ratio===null||ratio===undefined?0:Math.max(0,Math.min(100,Number(ratio)*100));const row=document.createElement('div');row.className='bar-row';const l=document.createElement('div');l.className='bar-label';l.textContent=name.replaceAll('_',' ');const b=document.createElement('div');b.className='bar';const fill=document.createElement('i');fill.style.width=percent+'%';b.append(fill);const val=document.createElement('div');val.className='bar-value';const unit=v?.unit==='bytes'?bytes(v.value):fmtNum(v?.value);const max=v?.unit==='bytes'?bytes(v.max):fmtNum(v?.max);val.textContent=unit+' / '+max+' · '+percent.toFixed(1)+'%';row.append(l,b,val);body.append(row)}
+}
+function renderHost(s){
+  const m=s.memory||{},sw=s.swap||{},d=s.disk||{};$('hostCpu').textContent=s.cpu_percent===undefined?'—':Number(s.cpu_percent).toFixed(1)+'%';$('hostMemory').textContent=m.percent===undefined?'—':Number(m.percent).toFixed(1)+'% · '+bytes(m.used)+' / '+bytes(m.total);$('hostAvailable').textContent=bytes(m.available);$('hostSwap').textContent=sw.total?Number(sw.percent).toFixed(1)+'% · '+bytes(sw.used)+' / '+bytes(sw.total):'Not configured';$('hostDisk').textContent=d&&d.free!==undefined?bytes(d.free)+' · '+Number(d.percent).toFixed(1)+'% used':'—';$('hostUptime').textContent=duration(s.uptime_seconds);pill($('hostPill'),m.percent>=90?'Memory pressure':d&&d.percent>=95?'Disk pressure':'Host normal',m.percent>=90||d&&d.percent>=95?'warn':'ok');
+}
+function renderStorage(s){
+  const cats=$('storageCategories');cats.replaceChildren();
+  for(const x of (s.categories||[]).slice(0,12)){const p=document.createElement('span');p.className='pill';p.textContent=x.category+': '+bytes(x.bytes);cats.append(p)}
+  if(!cats.children.length){const p=document.createElement('span');p.className='muted';p.textContent='No categorized state yet';cats.append(p)}
+  const body=$('storageRows');body.replaceChildren();
+  for(const x of s.items||[]){const tr=document.createElement('tr');cell(tr,x.name);cell(tr,x.category||'Other');cell(tr,x.type);cell(tr,fmtNum(x.files),'mono');cell(tr,bytes(x.bytes),'mono');body.append(tr)}
+  if(!(s.items||[]).length)emptyRow(body,5,'No state storage entries.');
+  pill($('storagePill'),'Total '+bytes(s.total),s.total?'info':'');
+}
+function renderPerformance(p){const body=$('perfRows');body.replaceChildren();for(const x of p.phases||[]){const tr=document.createElement('tr');cell(tr,x.phase);cell(tr,x.count,'mono');cell(tr,x.p50_ms+' ms','mono');cell(tr,x.p95_ms+' ms','mono');cell(tr,x.p99_ms+' ms','mono');cell(tr,x.max_ms+' ms','mono');body.append(tr)}if(!(p.phases||[]).length)emptyRow(body,6,p.enabled?'No timing samples yet.':'MCP_TIMINGS is not enabled.');const slow=$('slowToolRows');slow.replaceChildren();for(const x of p.tools||[]){const tr=document.createElement('tr');cell(tr,x.tool);cell(tr,x.count,'mono');cell(tr,x.p50_ms+' ms','mono');cell(tr,x.p95_ms+' ms','mono');cell(tr,x.p99_ms+' ms','mono');cell(tr,x.max_ms+' ms','mono');slow.append(tr)}if(!(p.tools||[]).length)emptyRow(slow,6,p.enabled?'No per-tool timing samples yet.':'MCP_TIMINGS is not enabled.');pill($('perfPill'),p.enabled?fmtNum(p.sample_count)+' samples':'Disabled',p.enabled?'info':'')}
+function renderCapabilities(h){const domains=$('domainChips');domains.replaceChildren();for(const name of h.tool_domains||[]){const s=document.createElement('span');s.className='pill ok';s.textContent=name;domains.append(s)}if(!domains.children.length){const s=document.createElement('span');s.className='muted';s.textContent='Runtime snapshot pending';domains.append(s)}const grid=$('capabilityGrid');grid.replaceChildren();for(const [name,value] of Object.entries(h.capabilities||{})){const box=document.createElement('div');box.className='meta';const label=document.createElement('span');label.textContent=name.replaceAll('_',' ');const strong=document.createElement('strong');strong.textContent=String(value);strong.className=value===true?'ok':value===false?'muted':'';box.append(label,strong);grid.append(box)}pill($('capabilityPill'),fmtNum((h.tool_domains||[]).length)+' domains',h.tool_domains?.length?'ok':'')}
+function renderMemory(m){const body=$('memoryRows');body.replaceChildren();for(const x of m.items||[]){const tr=document.createElement('tr');cell(tr,x.project);cell(tr,bytes(x.bytes),'mono');cell(tr,epoch(x.updated_at));body.append(tr)}if(!(m.items||[]).length)emptyRow(body,3,'No project memory metadata.');pill($('memoryPill'),fmtNum(m.count)+' projects',m.count?'info':'')}
+
+function renderJobs(data){
+  lastJobs=data;const counts=data.counts||{},chips=$('jobChips');chips.replaceChildren();
+  for(const key of ['running','queued','succeeded','failed','cancelled','timed_out','interrupted','orphaned']){if(!counts[key])continue;const s=document.createElement('span');s.className='pill '+tone(key);s.textContent=(labels[key]||key)+': '+fmtNum(counts[key]);chips.append(s)}
+  const filter=$('jobFilter').value,q=$('jobSearch').value.trim().toLowerCase(),items=(data.items||[]).filter(j=>(filter==='ALL'||j.status===filter)&&(!q||String(j.job_id).toLowerCase().includes(q)||String(j.error||'').toLowerCase().includes(q)));
+  const body=$('jobs');body.replaceChildren();
+  for(const j of items){const tr=document.createElement('tr');tr.className='clickable';tr.tabIndex=0;tr.setAttribute('role','button');tr.onclick=()=>openJob(j.job_id);tr.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openJob(j.job_id)}};cell(tr,String(j.job_id).slice(0,8)+'…','mono');const td=document.createElement('td'),s=document.createElement('span');s.className='pill '+tone(j.status);s.textContent=labels[j.status]||j.status;td.append(s);tr.append(td);cell(tr,age(j.created));cell(tr,j.pid??'—','mono');cell(tr,j.exit_code??'—','mono');cell(tr,epoch(j.updated));cell(tr,j.error||'—',j.error?'issue':'muted');body.append(tr)}
+  if(!items.length)emptyRow(body,7,'No jobs match this page/filter.');
+  $('jobsPage').textContent='Offset '+fmtNum(data.offset||0)+' · total '+fmtNum(data.total_count||0);$('jobsPrev').disabled=jobOffset<=0;$('jobsNext').disabled=!data.truncated;
+}
+async function refreshJobs(){try{if(panelApiMode==='legacy'){const legacy=await getJson('/api/status',false);if(legacy.jobs)renderJobs(legacy.jobs);return}renderJobs(await getJson('/api/jobs?offset='+jobOffset+'&limit='+jobLimit))}catch(e){}}
+function metaCard(label,value,sub=''){const box=document.createElement('div');box.className='meta';const a=document.createElement('span');a.textContent=label;const b=document.createElement('strong');b.textContent=safe(value);box.append(a,b);if(sub){const c=document.createElement('span');c.style.marginTop='5px';c.textContent=sub;box.append(c)}return box}
+async function openJob(id){
+  activeJob=id;jobOutputState={initialized:false,stdout:{next:0,hasMore:false,total:0},stderr:{next:0,hasMore:false,total:0}};
+  $('jobModal').classList.add('open');$('jobModal').setAttribute('aria-hidden','false');$('jobModalId').textContent=id;await refreshJobDetail()
+}
+function closeJob(){
+  activeJob=null;jobOutputState={initialized:false,stdout:{next:0,hasMore:false,total:0},stderr:{next:0,hasMore:false,total:0}};
+  $('jobModal').classList.remove('open');$('jobModal').setAttribute('aria-hidden','true')
+}
+async function refreshJobDetail(){
+  if(!activeJob)return;
+  try{
+    const j=await getJson('/api/jobs/'+activeJob);
+    $('jobMeta').replaceChildren(metaCard('Status',labels[j.status]||j.status),metaCard('Created',epoch(j.created),age(j.created)+' ago'),metaCard('Updated',epoch(j.updated),age(j.updated)+' ago'),metaCard('PID',j.pid??'—'),metaCard('Worker PID',j.worker_pid??'—'),metaCard('Exit Code',j.exit_code??'—'),metaCard('Timeout',j.timeout_sec===undefined?'—':duration(j.timeout_sec)),metaCard('Version',j.version??'—'));
+    $('jobCommand').textContent=j.command_line||'—';$('jobCwd').textContent=j.cwd||'—';$('jobErrorWrap').hidden=!j.error;$('jobError').textContent=j.error||'—';
+    if(!jobOutputState.initialized){
+      for(const stream of ['stdout','stderr']){const o=j[stream]||{};$(stream==='stdout'?'jobStdout':'jobStderr').textContent=o.text||('No '+stream+' captured.');jobOutputState[stream]={next:Number(o.next_byte||0),hasMore:Boolean(o.has_more),total:Number(o.total_bytes||0)}}
+      jobOutputState.initialized=true;
+    }else{
+      for(const stream of ['stdout','stderr']){const o=j[stream]||{};jobOutputState[stream].total=Number(o.total_bytes||0);jobOutputState[stream].hasMore=jobOutputState[stream].total>jobOutputState[stream].next}
+    }
+    $('jobStdoutMore').disabled=!jobOutputState.stdout.hasMore;$('jobStderrMore').disabled=!jobOutputState.stderr.hasMore;
+    $('jobCancel').hidden=!['queued','running','orphaned'].includes(String(j.status||''));$('jobCopy').dataset.command=j.command_line||'';
+  }catch(e){$('jobCommand').textContent='Unable to load job details.'}
+}
+async function cancelActiveJob(){if(!activeJob||!confirm('Cancel this durable job?'))return;try{await postJson('/api/jobs/'+activeJob+'/cancel');await refreshJobDetail();await refreshJobs()}catch(e){alert('Job cancellation request failed.')}}
+async function copyCommand(){const text=$('jobCopy').dataset.command||'';if(!text)return;try{await navigator.clipboard.writeText(text)}catch(e){}}
+async function loadMoreJobOutput(stream){
+  if(!activeJob)return;
+  const state=jobOutputState[stream],id=stream==='stdout'?'jobStdout':'jobStderr',button=stream==='stdout'?'jobStdoutMore':'jobStderrMore';
+  $(button).disabled=true;
+  try{
+    const query='?stdout_since='+(stream==='stdout'?state.next:jobOutputState.stdout.next)+'&stderr_since='+(stream==='stderr'?state.next:jobOutputState.stderr.next)+'&max_bytes=32768';
+    const data=await getJson('/api/jobs/'+encodeURIComponent(activeJob)+'/output'+query),chunk=data[stream]||{};
+    if(chunk.text){const node=$(id);const empty=node.textContent.startsWith('No '+stream+' captured.');node.textContent=(empty?'':node.textContent)+chunk.text}
+    state.next=Number(chunk.next_byte??state.next);state.total=Number(chunk.total_bytes??state.total);state.hasMore=Boolean(chunk.has_more)||state.total>state.next;
+  }catch(e){alert('Job output refresh failed.')}
+  finally{$(button).disabled=!state.hasMore}
+}
+
+async function downloadJobStream(stream){if(!activeJob)return;try{const response=await fetch('/api/jobs/'+encodeURIComponent(activeJob)+'/output/download?stream='+encodeURIComponent(stream),{cache:'no-store',headers:{'X-Control-Token':token}});if(!response.ok)throw Error(response.status);const blob=await response.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=activeJob+'-'+stream+'.bin';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}catch(e){alert('Job output download failed.')}}
+
+function renderWorkflowStats(h){
+  const chips=$('workflowStats');if(!chips)return;chips.replaceChildren();
+  for(const [label,value] of [['Queued',h.queued_workflows],['Running',h.running_workflows],['Uncertain',h.uncertain_workflows],['Unresolved ops',h.unresolved_workflow_operations??h.unresolved_operation_count]]){const p=document.createElement('span');p.className='pill '+(Number(value||0)>0&&(label==='Uncertain'||label==='Unresolved ops')?'warn':'');p.textContent=label+': '+fmtNum(value);chips.append(p)}
+}
+
+async function openWorkflow(id){
+  const box=$('workflowDetail');box.replaceChildren();const loading=document.createElement('div');loading.className='empty';loading.style.gridColumn='1/-1';loading.textContent='Loading workflow checkpoints…';box.append(loading);
+  try{
+    const w=await getJson('/api/workflows/'+encodeURIComponent(id));
+    const cards=[metaCard('Workflow',w.workflow_id),metaCard('State',w.state),metaCard('Current Step',w.current_step),metaCard('Version',w.version),metaCard('Created',iso(w.created_at)),metaCard('Updated',iso(w.updated_at)),metaCard('Operations',w.operation_count),metaCard('Compatible',w.execution_compatible)];
+    if(w.last_error)cards.push(metaCard('Last Error',w.last_error));
+    for(const s of w.steps||[])cards.push(metaCard('Step '+safe(s.step_index),safe(s.state)+' · attempts '+fmtNum(s.attempts),[s.started_at?'started '+iso(s.started_at):'',s.finished_at?'finished '+iso(s.finished_at):'',s.error||''].filter(Boolean).join(' · ')));
+    for(const o of w.operations||[])cards.push(metaCard('Operation '+safe(o.operation_index),safe(o.action)+' · '+safe(o.state),'step '+safe(o.step_index)+' · attempts '+fmtNum(o.attempts)+(o.error?' · '+o.error:'')));
+    box.replaceChildren(...cards);
+  }catch(e){box.replaceChildren();const m=document.createElement('div');m.className='empty';m.style.gridColumn='1/-1';m.textContent='Unable to load workflow checkpoints.';box.append(m)}
+}
+
+function renderWorkflows(d){
+  const body=$('workflowRows');body.replaceChildren();
+  for(const w of d.items||[]){const tr=document.createElement('tr');tr.className='clickable';tr.tabIndex=0;tr.setAttribute('role','button');tr.onclick=()=>openWorkflow(w.workflow_id);tr.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openWorkflow(w.workflow_id)}};cell(tr,String(w.workflow_id||'').slice(0,10)+'…','mono');cell(tr,w.state);cell(tr,w.current_step,'mono');cell(tr,w.version,'mono');cell(tr,iso(w.updated_at));body.append(tr)}
+  if(!(d.items||[]).length)emptyRow(body,5,'No workflows have been recorded.');
+  pill($('workflowPill'),fmtNum(d.total_count||0)+' workflows',d.total_count?'info':'ok');
+}
+function renderRecovery(d){
+  const summary=$('recoverySummary');summary.replaceChildren();
+  for(const [label,value] of [['Uncertain',d.total_count],['Pending',d.pending_count]]){const p=document.createElement('span');p.className='pill '+(Number(value||0)>0?'warn':'ok');p.textContent=label+': '+fmtNum(value);summary.append(p)}
+  const enabled=document.createElement('span');enabled.className='pill';enabled.textContent=d.enabled===false?'Journal disabled':'Journal enabled';summary.append(enabled);
+  const body=$('recoveryRows');body.replaceChildren();
+  if(!(d.items||[]).length){const e=document.createElement('div');e.className='empty';e.textContent='No unresolved recovery operations.';body.append(e)}
+  for(const x of d.items||[]){const box=document.createElement('div');box.className='meta';const s=document.createElement('span');s.textContent=(x.operation_type||'operation')+' · '+(x.status||x.state||'uncertain');const strong=document.createElement('strong');strong.textContent=(x.operation_id||'')+(x.target?' · '+x.target:'');const sub=document.createElement('span');sub.style.marginTop='6px';sub.textContent=[x.reason,x.started_at?'started '+iso(x.started_at):'',x.marked_at?'marked '+iso(x.marked_at):''].filter(Boolean).join(' · ');box.append(s,strong,sub);body.append(box)}
+  pill($('recoveryPill'),Number(d.total_count||0)||Number(d.pending_count||0)?fmtNum(d.total_count)+' uncertain · '+fmtNum(d.pending_count)+' pending':'Clear',Number(d.total_count||0)||Number(d.pending_count||0)?'warn':'ok');
+}
+function renderTransportHistory(d){
+  $('transportIncidents').textContent=fmtNum(d.incident_count);$('transportStalls').textContent=fmtNum(d.poll_stall_count);$('transportRecoveries').textContent=fmtNum(d.watchdog_recovery_count);$('transportDrops').textContent=fmtNum(d.response_deadline_drop_count);$('transportLongestPoll').textContent=duration(d.longest_poll_age_seconds);
+  const latest=d.latest_incident||{};$('transportLatestIncident').textContent=latest.diagnosis?String(latest.diagnosis).replaceAll('_',' ')+' · '+epoch(latest.time):'None';
+  const body=$('transportHistoryRows');body.replaceChildren();for(const x of d.items||[]){const tr=document.createElement('tr');cell(tr,epoch(x.time));cell(tr,String(x.diagnosis||'').replaceAll('_',' '));cell(tr,x.severity);cell(tr,x.reason||'—');body.append(tr)}
+  if(!(d.items||[]).length)emptyRow(body,4,'No transport history yet.');
+  pill($('transportHistoryPill'),fmtNum(d.count)+' records',d.incident_count?'warn':d.count?'ok':'');
+}
+function renderAudit(d){const body=$('auditRows');body.replaceChildren();for(const x of d.items||[]){const tr=document.createElement('tr');cell(tr,iso(x.time));cell(tr,x.operation);cell(tr,x.outcome);cell(tr,x.pid,'mono');cell(tr,x.target||'—','mono');body.append(tr)}if(!(d.items||[]).length)emptyRow(body,5,'No audit operations yet.');pill($('auditPill'),fmtNum(d.count)+' recent',d.count?'info':'')}
+function renderConfig(d){const grid=$('configGrid');grid.replaceChildren();for(const [k,v] of Object.entries(d||{})){const a=document.createElement('div');a.textContent=k.replaceAll('_',' ');const b=document.createElement('div');b.className='mono';b.textContent=typeof v==='number'&&k.includes('bytes')?bytes(v):String(v);grid.append(a,b)}if(!Object.keys(d||{}).length){const a=document.createElement('div');a.textContent='No config';const b=document.createElement('div');b.textContent='—';grid.append(a,b)}}
+function renderDoctor(d){const body=$('doctorRows');body.replaceChildren();for(const x of d.checks||[]){const box=document.createElement('div');box.className='meta';const label=document.createElement('span');label.textContent=x.name;const strong=document.createElement('strong');strong.textContent=x.summary;strong.className=tone(x.status);box.append(label,strong);body.append(box)}if(!(d.checks||[]).length){const e=document.createElement('div');e.className='empty';e.textContent='Doctor snapshot is not available yet.';body.append(e)}pill($('doctorPill'),d.status||'Pending',d.status==='healthy'?'ok':d.status==='warning'?'warn':d.status==='critical'?'bad':'')}
+function renderEvents(data){lastEvents=data;const target=$('events'),filter=$('eventFilter').value,q=$('eventSearch').value.trim().toLowerCase();const list=[...(data.recent_events||[])].reverse().filter(x=>{const l=String(x.level||'INFO').toUpperCase();return(filter==='ALL'||l===filter||(filter==='ERROR'&&l==='FATAL'))&&(!q||String(x.message||'').toLowerCase().includes(q)||String(x.component||'').toLowerCase().includes(q))});target.replaceChildren();for(const x of list.slice(0,100)){const row=document.createElement('div');row.className='event';const a=document.createElement('div');a.className='event-time';a.textContent=clock(x.timestamp);const b=document.createElement('div');b.className='event-level '+tone(x.level);b.textContent=x.level||'INFO';const c=document.createElement('div');c.className='event-msg';c.textContent=x.message||'—';const comp=document.createElement('span');comp.className='event-comp';comp.textContent=x.component||'supervisor';c.append(comp);row.append(a,b,c);target.append(row)}if(!list.length){const e=document.createElement('div');e.className='empty';e.textContent='No events match the current filters.';target.append(e)}$('eventCounter').textContent=fmtNum(data.event_count)+' events · '+fmtNum((data.recent_events||[]).length)+' retained in memory';const errors=$('errors');errors.replaceChildren();const recent=[...(data.recent_errors||[])].reverse();for(const x of recent.slice(0,30)){const row=document.createElement('div');row.className='event';const a=document.createElement('div');a.className='event-time';a.textContent=clock(x.timestamp);const b=document.createElement('div');b.className='event-level bad';b.textContent=x.level||'ERROR';const c=document.createElement('div');c.className='event-msg';c.textContent=x.message||'—';row.append(a,b,c);errors.append(row)}if(!recent.length){const e=document.createElement('div');e.className='empty';e.textContent='No ERROR/FATAL events have been recorded.';errors.append(e)}pill($('errorPill'),recent.length?fmtNum(recent.length)+' recent errors':'No recent errors',recent.length?'bad':'ok');$('lastError').textContent=data.last_error?'Last error / recovery reason: '+data.last_error:'No recorded errors.';$('rawLogs').textContent=(data.logs||[]).join('\n')||'No events have been recorded yet.'}
+
+async function refreshSummary(){try{if(panelApiMode===null){const status=await getJson('/api/status',false);panelApiMode=Number(status.panel_api_version||1)>=2?'modern':'legacy';if(panelApiMode==='legacy'){$('notice').textContent='Supervisor restart pending · legacy panel API compatibility mode';renderSummary(status);return}}renderSummary(await getJson(panelApiMode==='modern'?'/api/summary':'/api/status',false))}catch(e){$('connectionText').textContent='Panel connection lost';$('liveDot').className='live-dot bad';$('statePill').textContent='Disconnected';$('statePill').className='status-pill bad'}}
+async function refreshInsights(){if(panelApiMode!=='modern')return;try{renderInsights(await getJson('/api/insights'))}catch(e){}}
+async function refreshEvents(){try{renderEvents(await getJson(panelApiMode==='modern'?'/api/events':'/api/status',panelApiMode==='modern'))}catch(e){}}
+async function refreshSecondary(){if(panelApiMode!=='modern')return;const [th,a,w,r,c,d]=await Promise.allSettled([getJson('/api/transport/history?limit=100'),getJson('/api/audit?limit=60'),getJson('/api/workflows'),getJson('/api/recovery'),getJson('/api/config'),getJson('/api/doctor')]);if(th.status==='fulfilled')renderTransportHistory(th.value);if(a.status==='fulfilled')renderAudit(a.value);if(w.status==='fulfilled')renderWorkflows(w.value);if(r.status==='fulfilled')renderRecovery(r.value);if(c.status==='fulfilled')renderConfig(c.value);if(d.status==='fulfilled')renderDoctor(d.value)}
+async function refreshAll(){if(stopped)return;await refreshSummary();await Promise.allSettled([refreshEvents(),refreshJobs(),refreshInsights(),refreshSecondary()]);if(activeJob)await refreshJobDetail()}
+async function exportDiagnostics(){const b=$('downloadDiagnostics'),old=b.textContent;b.disabled=true;b.textContent='Preparing…';try{const data=await getJson('/api/diagnostics');const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='computerpilot-diagnostics-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}catch(e){alert('Diagnostics export failed.')}finally{b.disabled=false;b.textContent=old}}
+async function runtimeAction(action){const q=action==='stop'?'Stop the Supervisor and runtime?':'Restart the runtime?';if(!confirm(q))return;const b=$(action);b.disabled=true;try{await postJson('/api/'+action);$('notice').textContent=action==='stop'?'Stop request accepted. Run the launcher again to restart.':'Restart request accepted. Follow lifecycle and transport sections.';if(action==='stop'){stopped=true}}catch(e){$('notice').textContent='Request failed. Check the panel connection.'}finally{b.disabled=false}}
+
+$('refreshNow').onclick=refreshAll;$('downloadDiagnostics').onclick=exportDiagnostics;$('restart').onclick=()=>runtimeAction('restart');$('stop').onclick=()=>runtimeAction('stop');
+$('jobsPrev').onclick=()=>{jobOffset=Math.max(0,jobOffset-jobLimit);refreshJobs()};$('jobsNext').onclick=()=>{jobOffset+=jobLimit;refreshJobs()};$('jobFilter').onchange=()=>lastJobs&&renderJobs(lastJobs);$('jobSearch').oninput=()=>lastJobs&&renderJobs(lastJobs);
+$('eventFilter').onchange=()=>lastEvents&&renderEvents(lastEvents);$('eventSearch').oninput=()=>lastEvents&&renderEvents(lastEvents);
+$('jobClose').onclick=closeJob;$('jobModal').onclick=e=>{if(e.target instanceof Element&&e.target.hasAttribute('data-close-job'))closeJob()};$('jobCancel').onclick=cancelActiveJob;$('jobCopy').onclick=copyCommand;$('jobStdoutMore').onclick=()=>loadMoreJobOutput('stdout');$('jobStderrMore').onclick=()=>loadMoreJobOutput('stderr');$('jobDownloadStdout').onclick=()=>downloadJobStream('stdout');$('jobDownloadStderr').onclick=()=>downloadJobStream('stderr');document.addEventListener('keydown',e=>{if(e.key==='Escape'&&activeJob)closeJob()});
+refreshAll();setInterval(refreshSummary,2500);setInterval(refreshEvents,5000);setInterval(refreshJobs,5000);setInterval(refreshInsights,10000);setInterval(refreshSecondary,15000);setInterval(()=>{if(activeJob)refreshJobDetail()},2500);
 </script>
 </body>
 </html>

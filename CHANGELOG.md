@@ -7,7 +7,19 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Added
+- Expand the loopback Control Panel into a ComputerPilot observability center with build/Git identity, managed tunnel metadata, resource budgets, host health, top-level state storage consumers, performance timing summaries, capabilities/domains, safe configuration visibility, workflow/recovery status, audit activity, memory metadata, and exportable redacted diagnostics.
+- Publish a generation-scoped, redacted runtime-health snapshot from the live MCP process so the Supervisor panel can show child-process resource, workflow, recovery, browser, capability, and tool-registration state without loading a second MCP server.
+- Add split panel APIs for lightweight summaries, events, paged jobs, incremental/downloadable job output, transport history, audit history, workflows, recovery, process inspection, configuration, System Doctor checks, diagnostics, and combined insights; detailed endpoints remain control-token guarded.
+- Add guarded durable-job cancellation and runtime-owned process inspection to the local panel without exposing arbitrary process control or shell execution.
 - Make Recent Jobs rows in the local control panel open a token-protected detail modal with the stored command, working directory, timeouts, process metadata, exit/error state, bounded stdout/stderr previews, keyboard activation, and command copy.
+- Add generation-scoped, metadata-only MCP tool activity snapshots so the Supervisor can distinguish an upstream command gap from a locally active tool.
+- Add detailed Secure Tunnel transport classification for healthy polling, upstream idle, control-plane backoff, queue backpressure, dispatcher failure, response-delivery failure, MCP stalls, and confirmed poll stalls.
+- Add bounded rotated `.agent_state/transport-health.jsonl` diagnostics plus a Transport Health section in the loopback control panel.
+- Add a conservative poll-stall watchdog that only becomes restart-eligible after the runtime-reported poll deadline plus grace is exceeded for multiple consecutive observations.
+
+### Fixed
+- Stop treating `/readyz == 200` as sufficient evidence that control-plane polling is functional; detailed tunnel component health now participates in Supervisor recovery decisions.
+- Never restart the local runtime merely because no new upstream command has arrived while control-plane polling remains healthy.
 
 ### Documentation
 - Rebuild the repository landing page around verifiable capabilities, platform boundaries, practical workflows, and a shorter first-run path.

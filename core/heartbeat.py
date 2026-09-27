@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -13,10 +14,14 @@ from core.artifact_retention import schedule_artifact_retention
 from core.audit import flush_audit
 from core.backups import BACKUP_RETENTION
 from core.config import SETTINGS
+from core.health_snapshot import collect_server_health
 from core.job_retention import schedule_job_history_retention
 from core.lifecycle import RUNTIME_LIFECYCLE
 from core.recovery import OPERATION_RECOVERY
+from core.tool_activity import TOOL_ACTIVITY
 from core.workflow_retention import schedule_workflow_history_retention
+
+RUNTIME_HEALTH_PUBLISH_INTERVAL_SEC = 10.0
 
 
 @asynccontextmanager
@@ -26,6 +31,21 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
         while True:
             os.utime(path, None)
             await asyncio.sleep(2)
+
+    async def publish_health(path: Path) -> None:
+        while True:
+            try:
+                payload = await collect_server_health(server, settings=SETTINGS)
+                temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                temporary.write_text(
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, path)
+            except Exception:
+                # Panel observability is best-effort and must never kill the publisher task.
+                pass
+            await asyncio.sleep(RUNTIME_HEALTH_PUBLISH_INTERVAL_SEC)
 
     async def watch_lifecycle() -> None:
         while True:
@@ -42,9 +62,12 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
 
     RUNTIME_LIFECYCLE.configure_from_env()
     OPERATION_RECOVERY.configure_from_env(SETTINGS.state_dir)
+    TOOL_ACTIVITY.configure_from_env()
     BACKUP_RETENTION.schedule()
     value = os.environ.get("MCP_HEARTBEAT_FILE")
+    health_value = os.environ.get("MCP_RUNTIME_HEALTH_FILE")
     task = asyncio.create_task(pulse(Path(value))) if value else None
+    health_task = asyncio.create_task(publish_health(Path(health_value))) if health_value else None
     lifecycle_task = asyncio.create_task(watch_lifecycle())
     maintenance_task = asyncio.create_task(maintain_state())
     try:
@@ -57,6 +80,10 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
             await lifecycle_task
         with suppress(asyncio.CancelledError):
             await maintenance_task
+        if health_task:
+            health_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await health_task
         if task:
             task.cancel()
             with suppress(asyncio.CancelledError):
@@ -66,3 +93,4 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
         # repeated in-process MCP server instances isolated from the old lifecycle.
         OPERATION_RECOVERY.configure(None, None)
         RUNTIME_LIFECYCLE.configure(None, None)
+        TOOL_ACTIVITY.configure(None, None)
