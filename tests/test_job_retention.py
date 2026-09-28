@@ -198,6 +198,43 @@ def test_orphan_cleanup_rechecks_database_before_deleting_directory(tmp_path: Pa
     assert result.orphan_dirs_removed == 0
 
 
+def test_noop_cleanup_uses_one_terminal_size_scan_and_one_orphan_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    now = time.time()
+    for index in range(3):
+        _insert_job(store, f"{index:032x}", "succeeded", now - 10, output_bytes=4)
+    for index in range(3, 7):
+        orphan = store.output_dir / f"{index:032x}"
+        orphan.mkdir()
+        os.utime(orphan, (now - 100, now - 100))
+
+    real_connect = retention.sqlite3.connect
+    real_size = retention._directory_size
+    connections = 0
+    scans = 0
+
+    def counted_connect(*args: Any, **kwargs: Any) -> Any:
+        nonlocal connections
+        connections += 1
+        return real_connect(*args, **kwargs)
+
+    def counted_size(path: Path) -> tuple[int, int]:
+        nonlocal scans
+        scans += 1
+        return real_size(path)
+
+    monkeypatch.setattr(retention.sqlite3, "connect", counted_connect)
+    monkeypatch.setattr(retention, "_directory_size", counted_size)
+    result = cleanup_job_history(store.path, store.output_dir, _policy(grace=0), now=now)
+
+    assert result.remaining_terminal_rows == 3
+    assert result.orphan_dirs_removed == 4
+    assert scans == 3
+    assert connections == 2
+
+
 def test_submit_retries_if_terminal_history_is_pruned_between_dedup_and_status_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -118,22 +118,24 @@ def _select_removals(
         survivors = kept
 
     if policy.max_count > 0:
-        while len(survivors) > policy.max_count:
-            removable = next((entry for entry in survivors if entry.job_id != newest_id), None)
-            if removable is None:
-                break
-            reasons[removable.job_id] = "count"
-            survivors.remove(removable)
+        excess = max(len(survivors) - policy.max_count, 0)
+        kept = []
+        for entry in survivors:
+            if excess and entry.job_id != newest_id:
+                reasons[entry.job_id] = "count"
+                excess -= 1
+            else:
+                kept.append(entry)
+        survivors = kept
 
     if policy.max_bytes > 0:
         total = sum(entry.output_bytes for entry in survivors)
-        while total > policy.max_bytes:
-            removable = next((entry for entry in survivors if entry.job_id != newest_id), None)
-            if removable is None:
+        for entry in survivors:
+            if total <= policy.max_bytes:
                 break
-            reasons[removable.job_id] = "quota"
-            total -= removable.output_bytes
-            survivors.remove(removable)
+            if entry.job_id != newest_id:
+                reasons[entry.job_id] = "quota"
+                total -= entry.output_bytes
 
     return reasons, bool(survivors)
 
@@ -190,27 +192,27 @@ def _cleanup_orphan_dirs(db_path: Path, output_dir: Path, *, now: float, grace_s
         return 0, 0
     except OSError:
         return 0, 1
-    for directory in directories:
-        if not directory.is_dir() or not _JOB_ID.fullmatch(directory.name):
-            continue
-        try:
-            if now - directory.stat().st_mtime < grace_sec:
+    with closing(sqlite3.connect(db_path, timeout=10)) as db:
+        for directory in directories:
+            if not directory.is_dir() or not _JOB_ID.fullmatch(directory.name):
                 continue
-        except OSError:
-            errors += 1
-            continue
-        with closing(sqlite3.connect(db_path, timeout=10)) as db:
+            try:
+                if now - directory.stat().st_mtime < grace_sec:
+                    continue
+            except OSError:
+                errors += 1
+                continue
             exists = db.execute("SELECT 1 FROM jobs WHERE id=?", (directory.name,)).fetchone()
-        if exists is not None:
-            continue
-        try:
-            shutil.rmtree(directory)
-        except FileNotFoundError:
-            continue
-        except OSError:
-            errors += 1
-        else:
-            removed += 1
+            if exists is not None:
+                continue
+            try:
+                shutil.rmtree(directory)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                errors += 1
+            else:
+                removed += 1
     return removed, errors
 
 
@@ -231,7 +233,6 @@ def cleanup_job_history(
         entries, errors = _terminal_rows(db, output_dir)
     scanned_bytes = sum(entry.output_bytes for entry in entries)
     reasons, safety_floor = _select_removals(entries, policy, current)
-    by_id = {entry.job_id: entry for entry in entries}
     removed_jobs = 0
     removed_output_bytes = 0
     reason_counts = {"age": 0, "count": 0, "quota": 0}
@@ -256,13 +257,15 @@ def cleanup_job_history(
         grace_sec=policy.orphan_grace_sec,
     )
     errors += orphan_errors
-    with closing(sqlite3.connect(db_path, timeout=10)) as db:
-        db.row_factory = sqlite3.Row
-        remaining, remaining_errors = _terminal_rows(db, output_dir)
+    if selected:
+        with closing(sqlite3.connect(db_path, timeout=10)) as db:
+            db.row_factory = sqlite3.Row
+            remaining, remaining_errors = _terminal_rows(db, output_dir)
+    else:
+        remaining, remaining_errors = entries, 0
     errors += remaining_errors
     remaining_bytes = sum(entry.output_bytes for entry in remaining)
     quota_satisfied = policy.max_bytes <= 0 or remaining_bytes <= policy.max_bytes
-    del by_id
     return JobHistoryCleanupResult(
         len(entries),
         scanned_bytes,
