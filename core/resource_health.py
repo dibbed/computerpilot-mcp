@@ -25,21 +25,45 @@ def _files_usage(root: Path, *, accept: Callable[[Path], bool] | None = None) ->
     count = 0
     total = 0
     try:
-        entries = list(root.iterdir())
+        for entry in root.iterdir():
+            try:
+                if entry.is_dir():
+                    nested_count, nested_bytes = _files_usage(entry, accept=accept)
+                    count += nested_count
+                    total += nested_bytes
+                elif entry.is_file() and (accept is None or accept(entry)):
+                    count += 1
+                    total += entry.stat().st_size
+            except OSError:
+                continue
     except OSError:
-        return 0, 0
-    for entry in entries:
+        pass
+    return count, total
+
+
+def _job_output_usage(root: Path, terminal_ids: set[str]) -> tuple[int, int, int]:
+    if not root.is_dir():
+        return 0, 0, 0
+    count = total = terminal_total = 0
+    stack = [(root, False)]
+    while stack:
+        directory, terminal = stack.pop()
         try:
-            if entry.is_dir():
-                nested_count, nested_bytes = _files_usage(entry, accept=accept)
-                count += nested_count
-                total += nested_bytes
-            elif entry.is_file() and (accept is None or accept(entry)):
-                count += 1
-                total += entry.stat().st_size
+            for entry in directory.iterdir():
+                try:
+                    if entry.is_dir():
+                        stack.append((entry, terminal or (directory == root and entry.name in terminal_ids)))
+                    elif entry.is_file():
+                        size = entry.stat().st_size
+                        count += 1
+                        total += size
+                        if terminal:
+                            terminal_total += size
+                except OSError:
+                    continue
         except OSError:
             continue
-    return count, total
+    return count, total, terminal_total
 
 
 def _single_file_bytes(path: Path) -> int:
@@ -69,12 +93,7 @@ def _job_metrics() -> dict[str, int]:
         except sqlite3.Error:
             counts["query_errors"] += 1
 
-    output_files, output_bytes = _files_usage(output_dir)
-    terminal_output_bytes = 0
-    if output_dir.is_dir() and terminal_ids:
-        for job_id in terminal_ids:
-            _, size = _files_usage(output_dir / job_id)
-            terminal_output_bytes += size
+    output_files, output_bytes, terminal_output_bytes = _job_output_usage(output_dir, terminal_ids)
 
     db_bytes = sum(
         _single_file_bytes(path)
