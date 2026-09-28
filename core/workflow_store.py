@@ -439,12 +439,12 @@ class WorkflowStore:
         for row in connection.execute("SELECT workflow_id FROM workflows ORDER BY created_at").fetchall():
             cls._materialize_workflow(connection, str(row["workflow_id"]), legacy=True)
 
-    def materialize_operations(self, workflow_id: str) -> dict[str, Any]:
+    def materialize_operations(self, workflow_id: str, *, return_operations: bool = True) -> dict[str, Any] | None:
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._materialize_workflow(connection, workflow_id, legacy=True)
             connection.commit()
-        return self.list_operations(workflow_id)
+        return self.list_operations(workflow_id) if return_operations else None
 
     def create(
         self,
