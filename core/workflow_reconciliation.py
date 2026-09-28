@@ -15,6 +15,7 @@ def reconcile_operation(store: WorkflowStore, operation_id: str, *, expected_ver
     operation = store.get_operation_for_reconciliation(operation_id)
     if operation["version"] != expected_version:
         raise ToolError("workflow_operation_version_conflict", "Operation changed; reload it before retrying.")
+    store.materialize_operations(str(operation["workflow_id"]))
     postcondition = operation.get("postcondition")
     if not isinstance(postcondition, dict):
         evidence = {"source": "postcondition", "conclusive": False, "satisfied": False,

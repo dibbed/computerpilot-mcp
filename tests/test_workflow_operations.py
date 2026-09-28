@@ -8,6 +8,7 @@ import pytest
 
 from core.errors import ToolError
 from core.workflow_models import OperationState
+from core.workflow_reconciliation import reconcile_operation
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
@@ -127,3 +128,44 @@ def test_materialization_detects_definition_conflict(tmp_path: Path) -> None:
 
     with pytest.raises(ToolError, match="definition"):
         store.materialize_operations(workflow["workflow_id"])
+
+
+def test_execution_rejects_corrupt_materialized_operation_after_backfill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.workflow_actions import ACTION_HANDLERS
+
+    path = tmp_path / "workflows.db"
+    store = WorkflowStore(path)
+    workflow = store.create(
+        WorkflowDefinition("check", (StepDefinition("check", "check_file", {"path": str(tmp_path)}),)),
+        initial_state=WorkflowState.QUEUED,
+    )
+    workflow_id = str(workflow["workflow_id"])
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE workflow_operations SET definition_hash = ? WHERE workflow_id = ?",
+            ("0" * 64, workflow_id),
+        )
+    monkeypatch.setitem(ACTION_HANDLERS, "check_file", lambda *args: pytest.fail("Corrupt workflow executed"))
+
+    reopened = WorkflowStore(path)
+    with pytest.raises(ToolError, match="definition"):
+        WorkflowExecutor(reopened).execute(workflow_id, owner_id="integrity-test")
+    assert reopened.get(workflow_id)["state"] == "queued"
+
+
+def test_reconciliation_rejects_corrupt_materialized_operation_after_backfill(tmp_path: Path) -> None:
+    path = tmp_path / "workflows.db"
+    store = WorkflowStore(path)
+    workflow = store.create(_definition())
+    operation = store.list_operations(workflow["workflow_id"])["items"][0]
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE workflow_operations SET state = 'uncertain', definition_hash = ? WHERE operation_id = ?",
+            ("0" * 64, operation["operation_id"]),
+        )
+
+    reopened = WorkflowStore(path)
+    with pytest.raises(ToolError, match="definition"):
+        reconcile_operation(reopened, operation["operation_id"], expected_version=operation["version"])

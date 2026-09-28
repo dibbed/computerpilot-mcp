@@ -207,6 +207,7 @@ class WorkflowExecutor:
             raise ToolError("workflow_not_queued", "Only a queued workflow can be executed.")
         if dry_run:
             return {**current, "dry_run": True, "would_execute": current["definition"]["steps"]}
+        self.store.materialize_operations(workflow_id)
         lease = self.store.acquire_lease(workflow_id, owner_id, lease_ttl_sec)
         try:
             current = self.store.transition(
