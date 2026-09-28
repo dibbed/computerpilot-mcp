@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from stat import S_ISREG
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -66,13 +67,15 @@ def _scan(directory: Path) -> tuple[list[ArtifactEntry], int]:
         return entries, 1
     for path in candidates:
         try:
-            if not path.is_file():
+            file_stat = path.stat()
+            if not S_ISREG(file_stat.st_mode):
                 continue
-            stat = path.stat()
+        except FileNotFoundError:
+            continue
         except OSError:
             errors += 1
             continue
-        entries.append(ArtifactEntry(path=path, size=stat.st_size, mtime=stat.st_mtime))
+        entries.append(ArtifactEntry(path=path, size=file_stat.st_size, mtime=file_stat.st_mtime))
     entries.sort(key=lambda entry: (entry.mtime, entry.path.name.casefold()))
     return entries, errors
 
