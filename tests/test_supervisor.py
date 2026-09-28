@@ -354,6 +354,23 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         assert "Copy command" in html
         assert "Download stdout" in html
         assert "/api/jobs/" in html
+        assert 'aria-label="Section navigation"' in html
+        assert 'id="overview"' in html
+        assert 'id="incidentBanner"' in html
+        assert 'aria-live="polite"' in html
+        assert 'aria-label="Close job details"' in html
+        assert 'tabindex="-1"' in html
+        assert "previousFocus" in html
+        assert "modal-open" in html
+        assert "document.visibilityState" in html
+        assert "AbortController" in html
+        assert "singleFlight" in html
+        assert "schedulePoll" in html
+        assert "setInterval(" not in html
+        assert "UPSTREAM_IDLE" in html
+        assert "prefers-reduced-motion" in html
+        assert 'class="workflow-timeline"' in html
+        assert 'class="log-details"' in html
         assert re.search(r"[\u0600-\u06FF]", html) is None
         with urllib.request.urlopen(base + "/api/status") as response:
             status = json.load(response)

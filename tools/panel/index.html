@@ -6,89 +6,258 @@
 <meta name="color-scheme" content="dark">
 <title>ComputerPilot MCP · Local Control Panel</title>
 <style>
+
 :root{
-  --bg:#071019;--panel:#0e1b28;--panel2:#0a1722;--line:#20384b;--line2:#2b4c62;
-  --text:#edf6fb;--muted:#91aabe;--soft:#b9ccd9;--accent:#68e0bd;--info:#7ec8ff;
-  --ok:#65e6a7;--warn:#f6c96b;--bad:#ff8d91;--shadow:0 18px 50px rgba(0,0,0,.28)
+  color-scheme:dark;
+  --bg:#081018;--bg-raised:#0b141d;--surface:#0e1924;--surface-2:#111f2b;--surface-3:#0a151e;
+  --line:#20313f;--line-strong:#334957;--text:#e8f0f5;--text-soft:#c0d0d9;--muted:#8297a5;
+  --accent:#73d6b4;--info:#79bff2;--ok:#72d6a1;--warn:#e5bb67;--bad:#ef7f86;--critical:#ff636d;
+  --ok-bg:rgba(114,214,161,.08);--warn-bg:rgba(229,187,103,.08);--bad-bg:rgba(239,127,134,.08);--info-bg:rgba(121,191,242,.08);
+  --radius-sm:7px;--radius-md:11px;--radius-lg:15px;
+  --space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;--space-5:22px;--space-6:30px;
+  --shadow:0 16px 42px rgba(0,0,0,.24);
+  --mono:"Cascadia Mono","SFMono-Regular",Consolas,"Liberation Mono",monospace;
+  --sans:Inter,"Segoe UI",system-ui,-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
 }
 *{box-sizing:border-box}
-html{background:var(--bg)}
-body{margin:0;min-height:100vh;color:var(--text);font-family:"Segoe UI",Tahoma,Arial,sans-serif;background:
-radial-gradient(circle at 85% -10%,rgba(100,181,255,.16),transparent 34%),
-radial-gradient(circle at 15% 0%,rgba(104,224,189,.12),transparent 30%),
-linear-gradient(180deg,#08131d 0%,#071019 55%,#050b11 100%)}
-body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:
-linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),
-linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);background-size:32px 32px}
-main{position:relative;max-width:1480px;margin:0 auto;padding:30px 22px 70px}
-.topbar{display:flex;justify-content:space-between;align-items:flex-start;gap:22px;flex-wrap:wrap}
-.kicker{display:flex;align-items:center;gap:9px;color:var(--accent);font-size:12px;font-weight:800;letter-spacing:1.35px}
-.live-dot{width:9px;height:9px;border-radius:99px;background:var(--warn);box-shadow:0 0 0 6px rgba(246,201,107,.09)}
-.live-dot.ok{background:var(--ok);box-shadow:0 0 0 6px rgba(101,230,167,.10)}
-.live-dot.bad{background:var(--bad);box-shadow:0 0 0 6px rgba(255,141,145,.10)}
-h1{font-size:clamp(29px,4vw,43px);margin:8px 0 7px;letter-spacing:-.8px}
-.subtitle{margin:0;color:var(--muted);line-height:1.7;max-width:830px}
-.actions{display:flex;gap:9px;flex-wrap:wrap}
-button{border:1px solid transparent;border-radius:10px;padding:10px 15px;cursor:pointer;font:inherit;font-weight:750;background:var(--accent);color:#052018;transition:.16s;box-shadow:0 8px 20px rgba(104,224,189,.12)}
-button:hover{transform:translateY(-1px);filter:brightness(1.04)}
-button.secondary{background:#10283a;color:#c8e3f0;border-color:#2a506b;box-shadow:none}
-button.danger{background:#2b171c;color:#ffc3c5;border-color:#62333a;box-shadow:none}
-button.mini{padding:6px 9px;font-size:11px;border-radius:8px}
-button:disabled{opacity:.45;cursor:wait;transform:none}
-.connection{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:18px 0 18px;padding:11px 14px;border:1px solid var(--line);border-radius:13px;background:linear-gradient(90deg,rgba(104,224,189,.07),rgba(100,181,255,.05));font-size:13px;color:var(--soft)}
-.status-pill,.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:5px 9px;background:#0b1722;color:var(--soft);font-size:11px;white-space:nowrap}
-.ok{color:var(--ok)!important;border-color:rgba(101,230,167,.34)!important}.warn{color:var(--warn)!important;border-color:rgba(246,201,107,.34)!important}.bad{color:var(--bad)!important;border-color:rgba(255,141,145,.34)!important}.info{color:var(--info)!important}
-.grid{display:grid;gap:13px}.overview{grid-template-columns:repeat(6,minmax(0,1fr));margin-bottom:15px}.two{grid-template-columns:1fr 1fr}.three{grid-template-columns:repeat(3,minmax(0,1fr))}
-.card,.panel{background:linear-gradient(180deg,rgba(18,35,51,.95),rgba(12,26,39,.95));border:1px solid var(--line);border-radius:15px;box-shadow:var(--shadow)}
-.card{padding:16px;min-height:118px}.card-label{font-size:11px;color:var(--muted);font-weight:700}.card-value{font-size:23px;font-weight:850;margin-top:13px;line-height:1.3;overflow-wrap:anywhere}.card-sub{font-size:11px;color:var(--muted);margin-top:7px;line-height:1.45}
-.panel{padding:18px;margin-top:13px;overflow:hidden}.panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:14px}.panel h2{font-size:17px;margin:0}.panel-note{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.5}
-.meta-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.meta{background:var(--panel2);border:1px solid #1b3447;border-radius:11px;padding:11px;min-height:70px}.meta span{display:block;color:var(--muted);font-size:10px;margin-bottom:6px}.meta strong{display:block;font-size:12px;line-height:1.45;overflow-wrap:anywhere}
-.table-wrap{overflow:auto;border:1px solid #1c3446;border-radius:11px}table{width:100%;border-collapse:collapse;min-width:700px}th,td{padding:10px 11px;border-bottom:1px solid #1b3142;text-align:left;font-size:12px;vertical-align:middle}th{position:sticky;top:0;background:#0b1824;color:#91aabe;font-size:10px;z-index:1}tr:last-child td{border-bottom:0}tbody tr:hover{background:rgba(126,200,255,.035)}.clickable{cursor:pointer}
-.mono{font-family:Consolas,monospace;font-variant-numeric:tabular-nums}.muted{color:var(--muted)}.issue{color:var(--bad)}
-.bar-row{display:grid;grid-template-columns:minmax(120px,1fr) 2fr 92px;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid #1a3041}.bar-row:last-child{border-bottom:0}.bar-label{font-size:11px;color:var(--soft)}.bar{height:8px;border-radius:99px;background:#08131d;overflow:hidden;border:1px solid #1d394d}.bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--info));border-radius:99px}.bar-value{font:10px Consolas,monospace;color:var(--muted);text-align:right}
-.chips{display:flex;gap:7px;flex-wrap:wrap}.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center}input,select{background:#091722;color:var(--text);border:1px solid #29465b;border-radius:8px;padding:8px 9px;font:12px inherit}input{min-width:170px}
-.timeline{display:flex;flex-direction:column;gap:7px;max-height:500px;overflow:auto}.event{display:grid;grid-template-columns:74px 78px 1fr;gap:9px;padding:9px 10px;border:1px solid #1a3245;border-radius:10px;background:#0b1824}.event-time{font:10px Consolas,monospace;color:var(--muted)}.event-level{font-size:9px;font-weight:850;text-align:center;padding:3px 5px;border-radius:999px}.event-msg{font-size:12px;line-height:1.55;overflow-wrap:anywhere}.event-comp{display:block;color:var(--muted);font-size:9px;margin-top:3px}
-.empty{padding:22px;text-align:center;color:var(--muted);border:1px dashed #284356;border-radius:10px;background:rgba(255,255,255,.01)}
-.kv{display:grid;grid-template-columns:minmax(150px,.65fr) 1.35fr;gap:0;border:1px solid #1c3446;border-radius:11px;overflow:hidden}.kv div{padding:9px 11px;border-bottom:1px solid #1b3142;font-size:11px;overflow-wrap:anywhere}.kv div:nth-child(odd){color:var(--muted);background:#0b1824}.kv div:nth-last-child(-n+2){border-bottom:0}
-pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;font:11px/1.55 Consolas,monospace;color:#b8cfdd;background:#061018;border:1px solid #183044;border-radius:9px;padding:11px}
-.dialog-wrap{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;padding:20px}.dialog-wrap.open{display:flex}.backdrop{position:absolute;inset:0;background:rgba(2,8,13,.8);backdrop-filter:blur(8px)}.dialog{position:relative;width:min(1040px,100%);max-height:90vh;overflow:auto;background:linear-gradient(180deg,#102333,#091722);border:1px solid #2b4b61;border-radius:18px;box-shadow:0 30px 90px rgba(0,0,0,.6)}.dialog-head{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;gap:12px;align-items:flex-start;padding:18px;background:#102130ee;border-bottom:1px solid #213e52;backdrop-filter:blur(12px)}.dialog-body{padding:17px}.dialog-close{width:36px;height:36px;padding:0;border-radius:9px;background:#0b1824;color:#c8d8e2;border-color:#2a475b;box-shadow:none;font-size:20px}.dialog-title{margin:0;font-size:19px}.dialog-sub{font:10px Consolas,monospace;color:var(--muted);margin-top:5px;overflow-wrap:anywhere}.output-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.section-title{font-size:12px;margin:15px 0 8px;color:#d7e8f1}.footer{margin-top:24px;text-align:center;color:#6f899d;font-size:10px}
-@media(max-width:1200px){.overview{grid-template-columns:repeat(3,1fr)}.meta-grid{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:860px){main{padding:20px 12px 45px}.two,.three{grid-template-columns:1fr}.output-grid{grid-template-columns:1fr}.overview{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:560px){.meta-grid,.overview{grid-template-columns:1fr}.event{grid-template-columns:60px 62px 1fr}.actions{width:100%}.actions button{flex:1}.bar-row{grid-template-columns:1fr}.bar-value{text-align:left}}
+html{background:var(--bg);scroll-behavior:smooth;scroll-padding-top:62px}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45}
+body.modal-open{overflow:hidden}
+a{color:inherit}
+button,input,select{font:inherit}
+button{min-height:36px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);padding:7px 11px;background:#142837;color:var(--text-soft);font-weight:700;cursor:pointer;transition:background-color .12s,border-color .12s,color .12s,transform .12s}
+button:hover{background:#193244;border-color:#496276;color:var(--text)}
+button:active{transform:translateY(1px)}
+button.primary{background:#123229;border-color:#2e6d58;color:#c9f5e4}
+button.secondary{background:#101f2b;color:var(--text-soft)}
+button.danger{background:#2a171b;color:#ffd4d6;border-color:#70373e}
+button.danger:hover{background:#3a1d22;border-color:#93505a}
+button.mini{min-height:30px;padding:4px 8px;font-size:11px}
+button:disabled{opacity:.46;cursor:not-allowed;transform:none}
+button[aria-busy="true"]{cursor:progress}
+input,select{min-height:36px;background:#09141d;color:var(--text);border:1px solid var(--line-strong);border-radius:var(--radius-sm);padding:7px 9px;font-size:12px}
+input{min-width:180px}
+input::placeholder{color:#6f8492}
+:focus-visible{outline:2px solid var(--info);outline-offset:2px}
+.skip-link{position:fixed;left:12px;top:10px;z-index:150;transform:translateY(-150%);padding:8px 12px;border-radius:8px;background:var(--text);color:var(--bg);font-weight:800}
+.skip-link:focus{transform:none}
+.shell{max-width:1500px;margin:0 auto;padding:22px 22px 64px}
+.topbar{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:28px;align-items:start}
+.brand-row{display:flex;align-items:center;gap:9px;color:var(--accent);font-size:11px;font-weight:800;letter-spacing:1.1px;text-transform:uppercase}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--warn);box-shadow:0 0 0 4px rgba(229,187,103,.08)}
+.live-dot.ok{background:var(--ok);box-shadow:0 0 0 4px rgba(114,214,161,.08)}
+.live-dot.bad{background:var(--bad);box-shadow:0 0 0 4px rgba(239,127,134,.08)}
+h1{margin:7px 0 5px;font-size:clamp(25px,3vw,35px);line-height:1.15;letter-spacing:-.45px}
+.subtitle{max-width:830px;margin:0;color:var(--muted);font-size:13px;line-height:1.55}
+.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.top-actions{justify-content:flex-end;max-width:520px}
+.connection{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:12px;align-items:center;margin:17px 0 10px;padding:9px 12px;border:1px solid var(--line);border-radius:var(--radius-md);background:var(--surface-3);color:var(--text-soft);font-size:12px}
+.connection strong{color:var(--text)}
+.connection-meta{color:var(--muted)}
+.status-pill,.pill{display:inline-flex;align-items:center;gap:6px;max-width:100%;border:1px solid var(--line);border-radius:999px;padding:4px 8px;background:#0b151e;color:var(--text-soft);font-size:10px;font-weight:700;line-height:1.2;white-space:nowrap}
+.status-pill::before,.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:#647986;flex:none}
+.ok{color:var(--ok)!important;border-color:rgba(114,214,161,.38)!important}
+.warn{color:var(--warn)!important;border-color:rgba(229,187,103,.42)!important}
+.bad{color:var(--bad)!important;border-color:rgba(239,127,134,.45)!important}
+.info{color:var(--info)!important;border-color:rgba(121,191,242,.38)!important}
+.status-pill.ok::before,.pill.ok::before{background:var(--ok)}
+.status-pill.warn::before,.pill.warn::before{background:var(--warn)}
+.status-pill.bad::before,.pill.bad::before{background:var(--bad)}
+.status-pill.info::before,.pill.info::before{background:var(--info)}
+.incident-banner{display:none;margin:10px 0 14px;padding:11px 13px;border:1px solid rgba(239,127,134,.48);border-left:4px solid var(--bad);border-radius:var(--radius-md);background:var(--bad-bg)}
+.incident-banner.visible{display:flex;gap:12px;align-items:flex-start;justify-content:space-between}
+.incident-banner strong{display:block;font-size:12px}
+.incident-banner p{margin:2px 0 0;color:var(--text-soft);font-size:11px}
+.section-nav{position:sticky;top:0;z-index:40;margin:0 -8px 14px;padding:7px 8px;border-bottom:1px solid var(--line);background:rgba(8,16,24,.94);backdrop-filter:blur(12px);overflow:auto;scrollbar-width:thin}
+.section-nav-list{display:flex;gap:4px;min-width:max-content}
+.section-nav a{display:inline-flex;align-items:center;min-height:30px;padding:5px 9px;border-radius:7px;color:var(--muted);font-size:11px;font-weight:700;text-decoration:none}
+.section-nav a:hover,.section-nav a.active{background:var(--surface-2);color:var(--text)}
+.section-anchor{display:flex;align-items:center;gap:10px;margin:28px 0 9px;scroll-margin-top:60px}
+.section-anchor::after{content:"";height:1px;background:var(--line);flex:1}
+.section-anchor span{color:#9fb3bf;font-size:10px;font-weight:800;letter-spacing:1.1px;text-transform:uppercase}
+.grid{display:grid;gap:12px}
+.overview{grid-template-columns:repeat(12,minmax(0,1fr));margin-bottom:4px}
+.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+.three{grid-template-columns:repeat(3,minmax(0,1fr))}
+.card,.panel{min-width:0;border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--surface);box-shadow:var(--shadow)}
+.card{grid-column:span 4;min-height:92px;padding:14px 15px}
+.signal-card.primary-signal{min-height:126px;padding:16px 17px;background:linear-gradient(180deg,#10202c,var(--surface))}
+.signal-card.secondary-signal{box-shadow:none;background:var(--surface-3)}
+.card-label{color:var(--muted);font-size:10px;font-weight:800;letter-spacing:.45px;text-transform:uppercase}
+.card-value{margin-top:10px;font-size:22px;font-weight:820;line-height:1.22;overflow-wrap:anywhere}
+.primary-signal .card-value{font-size:27px}
+.card-sub{margin-top:5px;color:var(--muted);font-size:10.5px;line-height:1.4}
+.signal-card[data-tone="ok"]{border-top-color:rgba(114,214,161,.64)}
+.signal-card[data-tone="warn"]{border-top-color:rgba(229,187,103,.72);background:linear-gradient(180deg,rgba(229,187,103,.06),var(--surface))}
+.signal-card[data-tone="bad"]{border-top-color:rgba(239,127,134,.78);background:linear-gradient(180deg,rgba(239,127,134,.07),var(--surface))}
+.panel{margin-top:12px;padding:16px;overflow:hidden}
+.panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.panel h2{margin:0;font-size:15px;line-height:1.3;letter-spacing:-.1px}
+.panel-note{margin-top:3px;color:var(--muted);font-size:10.5px;line-height:1.5}
+.transport-panel{border-color:#2a4558}
+.transport-diagnosis{display:grid;grid-template-columns:minmax(180px,.7fr) minmax(0,1.3fr);gap:10px;margin-bottom:10px;padding:11px;border:1px solid var(--line-strong);border-radius:var(--radius-md);background:var(--surface-3)}
+.transport-diagnosis-label{color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.5px}
+.transport-diagnosis-value{font-size:17px;font-weight:850}
+.transport-diagnosis-reason{grid-column:1/-1;margin:0;color:var(--text-soft);font-size:11px;line-height:1.5}
+.meta-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.meta{min-width:0;min-height:62px;padding:9px 10px;border:1px solid #1c3140;border-radius:9px;background:var(--surface-3)}
+.meta span{display:block;margin-bottom:5px;color:var(--muted);font-size:9.5px;line-height:1.25}
+.meta strong{display:block;font-size:11.5px;line-height:1.45;overflow-wrap:anywhere}
+.meta.diagnostic-primary{grid-column:span 2;border-color:var(--line-strong);background:#0c1b26}
+.table-wrap{max-width:100%;overflow:auto;border:1px solid #1c3140;border-radius:9px;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse;min-width:680px;font-variant-numeric:tabular-nums}
+th,td{padding:8px 10px;border-bottom:1px solid #1a2b37;text-align:left;font-size:11px;vertical-align:middle}
+th{position:sticky;top:0;z-index:1;background:#0a151e;color:var(--muted);font-size:9.5px;font-weight:800;letter-spacing:.35px;text-transform:uppercase}
+tr:last-child td{border-bottom:0}
+tbody tr:hover{background:rgba(121,191,242,.035)}
+.clickable{cursor:pointer}
+.clickable:focus-visible{outline:2px solid var(--info);outline-offset:-2px}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.muted{color:var(--muted)}
+.issue{color:var(--bad)}
+.bar-row{display:grid;grid-template-columns:minmax(118px,.9fr) 2fr minmax(92px,.7fr);align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #172a37}
+.bar-row:last-child{border-bottom:0}
+.bar-label{color:var(--text-soft);font-size:10.5px}
+.bar{height:7px;overflow:hidden;border:1px solid #243947;border-radius:999px;background:#071019}
+.bar>i{display:block;height:100%;width:0;border-radius:inherit;background:var(--info);transition:width .2s}
+.bar.warn>i{background:var(--warn)}
+.bar.bad>i{background:var(--bad)}
+.bar-value{text-align:right;color:var(--muted);font:9.5px var(--mono)}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.filters{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.filters .spacer{margin-left:auto}
+.timeline{display:flex;max-height:500px;flex-direction:column;gap:5px;overflow:auto}
+.event{display:grid;grid-template-columns:76px 70px minmax(0,1fr);gap:8px;padding:7px 9px;border:1px solid #1a2f3d;border-left:3px solid #36505f;border-radius:8px;background:var(--surface-3)}
+.event.level-warn{border-left-color:var(--warn);background:rgba(229,187,103,.035)}
+.event.level-error,.event.level-fatal{border-left-color:var(--bad);background:rgba(239,127,134,.045)}
+.event-time{color:var(--muted);font:9.5px var(--mono)}
+.event-level{font-size:9px;font-weight:850;letter-spacing:.3px;text-align:left}
+.event-msg{min-width:0;font-size:11px;line-height:1.45;overflow-wrap:anywhere}
+.event-comp{display:block;margin-top:2px;color:var(--muted);font-size:9px}
+.empty{padding:18px;border:1px dashed #29404e;border-radius:9px;background:rgba(255,255,255,.012);color:var(--muted);font-size:11px;text-align:center}
+.kv{display:grid;grid-template-columns:minmax(160px,.75fr) minmax(0,1.25fr);overflow:hidden;border:1px solid #1c3140;border-radius:9px}
+.kv div{padding:8px 10px;border-bottom:1px solid #1a2b37;font-size:10.5px;overflow-wrap:anywhere}
+.kv div:nth-child(odd){background:var(--surface-3);color:var(--muted)}
+.kv div:nth-last-child(-n+2){border-bottom:0}
+pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #19303f;border-radius:8px;background:#061019;color:#c1d0d8;padding:10px;font:10.5px/1.55 var(--mono);tab-size:2}
+.section-title{margin:14px 0 7px;color:#d8e5ec;font-size:11px;font-weight:750}
+.doctor-list{display:flex;flex-direction:column;border:1px solid #1b303e;border-radius:9px;overflow:hidden}
+.doctor-check{display:grid;grid-template-columns:minmax(130px,.6fr) minmax(0,1.4fr);gap:12px;padding:8px 10px;border-bottom:1px solid #1a2b37;background:var(--surface-3)}
+.doctor-check:last-child{border-bottom:0}
+.doctor-check[data-status="ok"]{opacity:.76}
+.doctor-check[data-status="warning"],.doctor-check[data-status="critical"]{opacity:1;background:rgba(229,187,103,.035)}
+.doctor-name{font-size:10px;font-weight:800}
+.doctor-summary{color:var(--text-soft);font-size:10.5px}
+.workflow-timeline{display:flex;flex-direction:column;gap:7px;margin-top:10px}
+.workflow-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}
+.workflow-entry{position:relative;padding:9px 10px 9px 29px;border:1px solid #1b3241;border-radius:9px;background:var(--surface-3)}
+.workflow-entry::before{content:"";position:absolute;left:12px;top:14px;width:7px;height:7px;border-radius:50%;background:#617786}
+.workflow-entry.ok::before{background:var(--ok)}
+.workflow-entry.warn::before{background:var(--warn)}
+.workflow-entry.bad::before{background:var(--bad)}
+.workflow-entry-title{font-size:10.5px;font-weight:800}
+.workflow-entry-meta{margin-top:3px;color:var(--muted);font-size:9.5px;line-height:1.45}
+.log-details{margin-top:12px;border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--surface)}
+.log-details>summary{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px;cursor:pointer;list-style:none;font-weight:800}
+.log-details>summary::-webkit-details-marker{display:none}
+.log-details>summary::after{content:"Show";color:var(--muted);font-size:10px;font-weight:700}
+.log-details[open]>summary::after{content:"Hide"}
+.log-details-body{padding:0 16px 16px}
+.dialog-wrap{position:fixed;inset:0;z-index:100;display:none;align-items:center;justify-content:center;padding:18px}
+.dialog-wrap.open{display:flex}
+.backdrop{position:absolute;inset:0;background:rgba(2,7,11,.82);backdrop-filter:blur(5px)}
+.dialog{position:relative;width:min(1040px,100%);max-height:90vh;overflow:auto;border:1px solid #375163;border-radius:14px;background:#0b1822;box-shadow:0 30px 100px rgba(0,0,0,.58)}
+.dialog-head{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;gap:12px;align-items:flex-start;padding:14px 15px;border-bottom:1px solid #223947;background:rgba(11,24,34,.96);backdrop-filter:blur(10px)}
+.dialog-body{padding:14px}
+.dialog-close{width:34px;height:34px;min-height:34px;padding:0;border-radius:8px;background:#0c1923;color:var(--text-soft);font-size:19px}
+.dialog-title{margin:0;font-size:17px}
+.dialog-sub{margin-top:4px;color:var(--muted);font:9.5px var(--mono);overflow-wrap:anywhere}
+.output-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.footer{margin-top:26px;color:#627987;font-size:9.5px;text-align:center}
+@media(max-width:1200px){
+  .overview{grid-template-columns:repeat(6,minmax(0,1fr))}
+  .card{grid-column:span 2}.primary-signal{grid-column:span 2}
+  .meta-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .workflow-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:900px){
+  .shell{padding:18px 12px 44px}
+  .topbar{grid-template-columns:1fr}.top-actions{justify-content:flex-start;max-width:none}
+  .connection{grid-template-columns:1fr auto}.connection-meta{grid-column:1/-1}
+  .two,.three{grid-template-columns:1fr}
+  .output-grid{grid-template-columns:1fr}
+  .transport-diagnosis{grid-template-columns:1fr}.transport-diagnosis-reason{grid-column:1}
+}
+@media(max-width:640px){
+  html{scroll-padding-top:54px}
+  .shell{padding:14px 10px 36px}
+  .overview{grid-template-columns:1fr}.card,.primary-signal{grid-column:1;min-height:auto}
+  .primary-signal .card-value{font-size:23px}
+  .meta-grid,.workflow-summary{grid-template-columns:1fr}
+  .meta.diagnostic-primary{grid-column:1}
+  .connection{grid-template-columns:1fr}.connection .status-pill{justify-self:start}
+  .top-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%}.top-actions button{width:100%}
+  .filters{align-items:stretch}.filters input,.filters select{width:100%;min-width:0}.filters .spacer{margin-left:0}
+  .event{grid-template-columns:62px 60px minmax(0,1fr)}
+  .bar-row{grid-template-columns:1fr}.bar-value{text-align:left}
+  .dialog-wrap{align-items:stretch;padding:0}.dialog{width:100%;max-height:100vh;border-radius:0}.dialog-head{padding:12px}.dialog-body{padding:12px}
+  .doctor-check{grid-template-columns:1fr;gap:3px}
+  .section-nav{margin-left:-10px;margin-right:-10px;padding-left:10px;padding-right:10px}
+  button,input,select{min-height:44px}
+  button.mini{min-height:38px}
+  .dialog-close{width:44px;height:44px;min-height:44px}
+}
+@media(prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{transition-duration:.001ms!important;animation-duration:.001ms!important;animation-iteration-count:1!important}
+}
+
 </style>
 </head>
 <body>
-<main>
+<a class="skip-link" href="#overview">Skip to system overview</a>
+<main id="mainContent" class="shell">
 <header class="topbar">
 <div>
-<div class="kicker"><span id="liveDot" class="live-dot"></span> COMPUTERPILOT · LOCAL CONTROL</div>
+<div class="brand-row"><span id="liveDot" class="live-dot" aria-hidden="true"></span> ComputerPilot · Local Operations</div>
 <h1>ComputerPilot MCP Control Panel</h1>
 <p class="subtitle">Runtime, Secure Tunnel, resources, workflows, recovery, jobs, operations and performance on this machine.</p>
 </div>
-<div class="actions">
+<div class="actions top-actions" aria-label="Control actions">
 <button id="refreshNow" class="secondary">Refresh</button>
 <button id="downloadDiagnostics" class="secondary">Export Diagnostics</button>
-<button id="restart">Restart Runtime</button>
+<button id="restart" class="primary">Restart Runtime</button>
 <button id="stop" class="danger">Stop Supervisor</button>
 </div>
 </header>
 
-<div class="connection">
-<div><strong id="connectionText">Connecting…</strong> <span id="updated">—</span></div>
+<div class="connection" aria-live="polite" aria-atomic="true">
+<div><strong id="connectionText">Connecting…</strong> <span id="updated" class="muted">Waiting for first refresh</span></div>
 <span id="statePill" class="status-pill">Unknown</span>
-<span id="notice">Loopback-only control surface · 127.0.0.1:8766</span>
+<span id="notice" class="connection-meta">Loopback-only · 127.0.0.1:8766</span>
 </div>
 
-<div class="grid overview">
-<article class="card"><div class="card-label">Runtime Status</div><div id="state" class="card-value">—</div><div id="stateSub" class="card-sub">Waiting for summary</div></article>
-<article class="card"><div class="card-label">MCP Health</div><div id="mcp" class="card-value">—</div><div id="mcpSub" class="card-sub">Heartbeat</div></article>
-<article class="card"><div class="card-label">Tunnel Health</div><div id="tunnelHealth" class="card-value">—</div><div id="tunnelSub" class="card-sub">Control-plane polling</div></article>
-<article class="card"><div class="card-label">Resource Pressure</div><div id="pressure" class="card-value">—</div><div id="pressureSub" class="card-sub">Runtime budgets</div></article>
-<article class="card"><div class="card-label">Supervisor Uptime</div><div id="supervisorUptime" class="card-value mono">—</div><div id="runtimeUptime" class="card-sub">Runtime: —</div></article>
-<article class="card"><div class="card-label">Jobs</div><div id="jobTotal" class="card-value">0</div><div id="jobSub" class="card-sub">Active 0 · Problems 0</div></article>
+<div id="incidentBanner" class="incident-banner" role="status" aria-live="polite">
+<div><strong id="incidentTitle">Operational issue detected</strong><p id="incidentText">Waiting for subsystem diagnosis.</p></div>
+<a id="incidentLink" href="#transport">Open diagnostics</a>
 </div>
 
+<nav class="section-nav" aria-label="Section navigation">
+<div class="section-nav-list">
+<a href="#overview">Overview</a><a href="#runtime">Runtime</a><a href="#transport">Transport</a><a href="#resources">Resources</a><a href="#work">Work</a><a href="#recovery">Recovery</a><a href="#state-config">State &amp; Config</a><a href="#diagnostics">Diagnostics</a>
+</div>
+</nav>
+
+<div id="overview" class="grid overview">
+<article id="runtimeSignal" class="card signal-card primary-signal" data-tone="neutral"><div class="card-label">Runtime Status</div><div id="state" class="card-value">—</div><div id="stateSub" class="card-sub">Waiting for summary</div></article>
+<article id="mcpSignal" class="card signal-card primary-signal" data-tone="neutral"><div class="card-label">MCP Health</div><div id="mcp" class="card-value">—</div><div id="mcpSub" class="card-sub">Heartbeat</div></article>
+<article id="tunnelSignal" class="card signal-card primary-signal" data-tone="neutral"><div class="card-label">Tunnel Health</div><div id="tunnelHealth" class="card-value">—</div><div id="tunnelSub" class="card-sub">Control-plane polling</div></article>
+<article id="resourceSignal" class="card signal-card secondary-signal" data-tone="neutral"><div class="card-label">Resource Pressure</div><div id="pressure" class="card-value">—</div><div id="pressureSub" class="card-sub">Runtime budgets</div></article>
+<article class="card signal-card secondary-signal"><div class="card-label">Supervisor Uptime</div><div id="supervisorUptime" class="card-value mono">—</div><div id="runtimeUptime" class="card-sub">Runtime: —</div></article>
+<article id="jobSignal" class="card signal-card secondary-signal" data-tone="neutral"><div class="card-label">Jobs</div><div id="jobTotal" class="card-value">0</div><div id="jobSub" class="card-sub">Active 0 · Problems 0</div></article>
+</div>
+
+<div id="runtime" class="section-anchor"><span>Runtime</span></div>
 <div class="grid two">
 <section class="panel">
 <div class="panel-head"><div><h2>System & Build Identity</h2><div class="panel-note">Product version, Git state, runtime profile and active tool surface.</div></div><span id="identityPill" class="pill">—</span></div>
@@ -144,10 +313,15 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;f
 </section>
 </div>
 
-<section class="panel">
-<div class="panel-head"><div><h2>Transport Health</h2><div class="panel-note">Live control-plane polling, queue, dispatcher, response delivery and MCP activity.</div></div><span id="transportPill" class="pill">—</span></div>
+<div id="transport" class="section-anchor"><span>Transport</span></div>
+<section class="panel transport-panel">
+<div class="panel-head"><div><h2>Transport Health</h2><div class="panel-note">Control-plane diagnosis first, with queue, dispatcher, response delivery and MCP evidence below.</div></div><span id="transportPill" class="pill">Pending</span></div>
+<div class="transport-diagnosis">
+<div><div class="transport-diagnosis-label">Current diagnosis</div><div id="transportDiagnosis" class="transport-diagnosis-value">Loading</div></div>
+<div><div class="transport-diagnosis-label">Interpretation</div><div id="transportMeaning" class="transport-diagnosis-value muted">Waiting for transport telemetry</div></div>
+<p id="transportReason" class="transport-diagnosis-reason">No transport evidence loaded yet.</p>
+</div>
 <div class="meta-grid">
-<div class="meta"><span>Diagnosis</span><strong id="transportDiagnosis">—</strong></div>
 <div class="meta"><span>Control Plane</span><strong id="controlPoll">—</strong></div>
 <div class="meta"><span>Poll Age / Threshold</span><strong id="pollAge" class="mono">—</strong></div>
 <div class="meta"><span>Queue</span><strong id="transportQueue" class="mono">—</strong></div>
@@ -156,9 +330,9 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;f
 <div class="meta"><span>Last MCP Tool</span><strong id="lastMcpTool">—</strong></div>
 <div class="meta"><span>Last Tool Latency</span><strong id="lastToolLatency" class="mono">—</strong></div>
 </div>
-<div id="transportReason" class="panel-note" style="margin-top:12px">Waiting for transport health.</div>
 </section>
 
+<div id="resources" class="section-anchor"><span>Resources</span></div>
 <div class="grid two">
 <section class="panel">
 <div class="panel-head"><div><h2>Resource Budgets</h2><div class="panel-note">Live child-runtime usage against configured ceilings.</div></div><span id="resourcePill" class="pill">—</span></div>
@@ -221,7 +395,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;f
 </section>
 <section class="panel">
 <div class="panel-head"><div><h2>System Doctor</h2><div class="panel-note">Read-only synthesized health checks. No diagnostic commands are executed here.</div></div><span id="doctorPill" class="pill">—</span></div>
-<div id="doctorRows"></div>
+<div id="doctorRows" class="doctor-list"></div>
 </section>
 </div>
 
@@ -231,11 +405,12 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;f
 <div id="processDetail" class="meta-grid" style="margin-top:10px"><div class="empty" style="grid-column:1/-1">Select a process to inspect it.</div></div>
 </section>
 
+<div id="work" class="section-anchor"><span>Work</span></div>
 <section class="panel">
 <div class="panel-head"><div><h2>Recent Jobs</h2><div class="panel-note">Paged durable jobs with local filtering. Click a row for command, output and lifecycle details.</div></div><div id="jobChips" class="chips"></div></div>
 <div class="filters" style="margin-bottom:10px">
-<select id="jobFilter"><option value="ALL">All statuses</option><option value="running">Running</option><option value="queued">Queued</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="timed_out">Timed out</option><option value="interrupted">Interrupted</option><option value="orphaned">Orphaned</option></select>
-<input id="jobSearch" placeholder="Search job ID or error">
+<select id="jobFilter" aria-label="Filter jobs by status"><option value="ALL">All statuses</option><option value="running">Running</option><option value="queued">Queued</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="timed_out">Timed out</option><option value="interrupted">Interrupted</option><option value="orphaned">Orphaned</option></select>
+<input id="jobSearch" aria-label="Search jobs" placeholder="Search job ID or error">
 <button id="jobsPrev" class="secondary mini">Previous</button><button id="jobsNext" class="secondary mini">Next</button><span id="jobsPage" class="muted"></span>
 </div>
 <div class="table-wrap"><table><thead><tr><th>ID</th><th>Status</th><th>Age</th><th>PID</th><th>Exit</th><th>Updated</th><th>Error</th></tr></thead><tbody id="jobs"></tbody></table></div>
@@ -246,15 +421,16 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;f
 <div class="panel-head"><div><h2>Workflow Dashboard</h2><div class="panel-note">Recent durable workflows and read-only step/operation checkpoints. Select a row for safe details.</div></div><span id="workflowPill" class="pill">—</span></div>
 <div id="workflowStats" class="chips" style="margin-bottom:10px"></div>
 <div class="table-wrap"><table><thead><tr><th>Workflow</th><th>State</th><th>Step</th><th>Version</th><th>Updated</th></tr></thead><tbody id="workflowRows"></tbody></table></div>
-<div id="workflowDetail" class="meta-grid" style="margin-top:10px"><div class="empty" style="grid-column:1/-1">Select a workflow to inspect safe checkpoints.</div></div>
+<div id="workflowDetail" class="workflow-timeline"><div class="empty">Select a workflow to inspect safe checkpoints.</div></div>
 </section>
-<section class="panel">
+<section id="recovery" class="panel">
 <div class="panel-head"><div><h2>Recovery Center</h2><div class="panel-note">Uncertain or pending operations surfaced without blind replay. This view is read only.</div></div><span id="recoveryPill" class="pill">—</span></div>
 <div id="recoverySummary" class="chips" style="margin-bottom:10px"></div>
 <div id="recoveryRows"></div>
 </section>
 </div>
 
+<div id="state-config" class="section-anchor"><span>State &amp; Configuration</span></div>
 <div class="grid two">
 <section class="panel">
 <div class="panel-head"><div><h2>State Storage</h2><div class="panel-note">Categorized .agent_state consumers and top entries, so large operational state is not hidden under a generic Other bucket.</div></div><span id="storagePill" class="pill">—</span></div>
@@ -282,6 +458,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;f
 </div>
 
 <div class="grid two">
+<div id="diagnostics" class="section-anchor"><span>Diagnostics</span></div>
 <section class="panel">
 <div class="panel-head"><div><h2>Transport History</h2><div class="panel-note">Persisted classifications plus incident counts, watchdog recoveries and response-deadline drops.</div></div><span id="transportHistoryPill" class="pill">—</span></div>
 <div class="meta-grid" style="margin-bottom:10px">
@@ -306,7 +483,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;f
 </section>
 
 <section class="panel">
-<div class="panel-head"><div><h2>Recent Events</h2><div class="panel-note">Structured runtime and Supervisor events. Framework wiring noise stays in rotated logs.</div></div><div class="filters"><select id="eventFilter"><option>ALL</option><option>INFO</option><option>WARN</option><option>ERROR</option></select><input id="eventSearch" placeholder="Search events"></div></div>
+<div class="panel-head"><div><h2>Recent Events</h2><div class="panel-note">Structured runtime and Supervisor events. Warnings and failures remain visually distinct from routine activity.</div></div><div class="filters"><select id="eventFilter" aria-label="Filter events by severity"><option>ALL</option><option>INFO</option><option>WARN</option><option>ERROR</option><option>FATAL</option></select><input id="eventSearch" aria-label="Search recent events" placeholder="Search events"></div></div>
 <div id="eventCounter" class="panel-note" style="margin-bottom:9px"></div><div id="events" class="timeline"></div>
 </section>
 
@@ -315,18 +492,18 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;f
 <div id="errors" class="timeline"></div><div id="lastError" class="panel-note" style="margin-top:10px"></div>
 </section>
 
-<section class="panel">
-<div class="panel-head"><div><h2>Raw Logs</h2><div class="panel-note">Bounded in-memory Supervisor/runtime log tail for low-level troubleshooting.</div></div><span class="pill">Last 100</span></div>
-<pre id="rawLogs">No events have been recorded yet.</pre>
-</section>
+<details class="log-details">
+<summary><span>Raw Logs <span class="panel-note">Bounded low-level Supervisor/runtime tail</span></span></summary>
+<div class="log-details-body"><div class="actions" style="margin-bottom:8px"><span class="pill">Last 100</span><button id="copyRawLogs" class="secondary mini">Copy logs</button></div><pre id="rawLogs">No events have been recorded yet.</pre></div>
+</details>
 
 <div class="footer">ComputerPilot MCP · Local loopback observability and guarded runtime control</div>
 </main>
 
 <div id="jobModal" class="dialog-wrap" aria-hidden="true">
 <div class="backdrop" data-close-job></div>
-<section class="dialog" role="dialog" aria-modal="true" aria-labelledby="jobModalTitle">
-<header class="dialog-head"><div><h2 id="jobModalTitle" class="dialog-title">Job details</h2><div id="jobModalId" class="dialog-sub">—</div></div><div class="actions"><button id="jobCancel" class="danger mini" hidden>Cancel Job</button><button id="jobCopy" class="secondary mini">Copy command</button><button id="jobClose" class="dialog-close">×</button></div></header>
+<section id="jobDialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="jobModalTitle" tabindex="-1">
+<header class="dialog-head"><div><h2 id="jobModalTitle" class="dialog-title">Job details</h2><div id="jobModalId" class="dialog-sub">—</div></div><div class="actions"><button id="jobCancel" class="danger mini" hidden>Cancel Job</button><button id="jobCopy" class="secondary mini">Copy command</button><button id="jobClose" class="dialog-close" aria-label="Close job details">×</button></div></header>
 <div class="dialog-body">
 <div id="jobMeta" class="meta-grid"></div>
 <div class="section-title">Command</div><pre id="jobCommand">—</pre>
@@ -345,53 +522,107 @@ const token='__CONTROL_TOKEN__';
 const $=id=>document.getElementById(id);
 const labels={starting:'Starting',running:'Running',unhealthy:'Unhealthy',retrying:'Retrying',stopped:'Stopped',draining:'Draining',queued:'Queued',succeeded:'Succeeded',failed:'Failed',cancelled:'Cancelled',timed_out:'Timed out',interrupted:'Interrupted',orphaned:'Orphaned'};
 const tone=value=>{const v=String(value||'').toLowerCase();if(['healthy','normal','running','succeeded','ok','completed','accepted'].includes(v))return'ok';if(['starting','retrying','queued','draining','warning','warn','degraded','orphaned'].includes(v))return'warn';if(['failed','unhealthy','critical','bad','error','fatal','timed_out','interrupted','stopped'].includes(v))return'bad';return''};
-const fmtNum=v=>new Intl.NumberFormat('en-US').format(Number(v||0));
+const fmtNum=v=>v===null||v===undefined||v===''||!Number.isFinite(Number(v))?'—':new Intl.NumberFormat('en-US').format(Number(v));
 const dt=new Intl.DateTimeFormat('en-US',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
 const tm=new Intl.DateTimeFormat('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
 const epoch=v=>v?dt.format(new Date(Number(v)*1000)):'—';
 const iso=v=>v?dt.format(new Date(v)):'—';
 const clock=v=>v?tm.format(new Date(Number(v)*1000)):'—';
 const duration=v=>{if(v===null||v===undefined||!Number.isFinite(Number(v)))return'—';let s=Math.max(0,Math.floor(Number(v))),d=Math.floor(s/86400);s%=86400;const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);s%=60;const p=[];if(d)p.push(d+'d');if(h||d)p.push(h+'h');if(m||h||d)p.push(m+'m');p.push(s+'s');return p.slice(0,3).join(' ')};
-const bytes=v=>{let n=Number(v||0),i=0,u=['B','KiB','MiB','GiB','TiB'];while(n>=1024&&i<u.length-1){n/=1024;i++}return(i===0?n.toFixed(0):n.toFixed(n>=100?0:n>=10?1:2))+' '+u[i]};
+const bytes=v=>{if(v===null||v===undefined||v===''||!Number.isFinite(Number(v)))return'Not available';let n=Number(v),i=0,u=['B','KiB','MiB','GiB','TiB'];while(Math.abs(n)>=1024&&i<u.length-1){n/=1024;i++}return(i===0?n.toFixed(0):n.toFixed(Math.abs(n)>=100?0:Math.abs(n)>=10?1:2))+' '+u[i]};
 const age=v=>v?duration(Date.now()/1000-Number(v)):'—';
 const safe=v=>v===null||v===undefined||v===''?'—':String(v);
 const pill=(node,text,kind='')=>{node.textContent=text;node.className='pill'+(kind?' '+kind:'')};
 const cell=(tr,v,cls='')=>{const td=document.createElement('td');td.textContent=safe(v);if(cls)td.className=cls;tr.append(td)};
 const emptyRow=(body,cols,text)=>{const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=cols;td.className='muted';td.textContent=text;tr.append(td);body.append(tr)};
-async function getJson(path,guarded=true){const r=await fetch(path,{cache:'no-store',headers:guarded?{'X-Control-Token':token}:{}});if(!r.ok)throw Error(path+' '+r.status);return r.json()}
-async function postJson(path){const r=await fetch(path,{method:'POST',headers:{'X-Control-Token':token}});if(!r.ok)throw Error(path+' '+r.status);return r.json()}
+const setSignalTone=(id,kind)=>{const node=$(id);if(node)node.dataset.tone=kind||'neutral'};
+const transportMeaning={
+  HEALTHY:'Polling and response delivery are operating normally.',
+  UPSTREAM_IDLE:'The control plane is healthy and currently has no command to deliver.',
+  POLL_STALLED:'Control-plane polling exceeded its expected deadline.',
+  CONTROL_PLANE_BACKOFF:'The tunnel is backing off after a control-plane failure.',
+  QUEUE_BACKPRESSURE:'Local command intake is constrained by queue pressure.',
+  DISPATCH_STALLED:'A queued command is not progressing through dispatch.',
+  RESPONSE_DELIVERY_STALLED:'A completed command response is not being delivered upstream.',
+  MCP_STALLED:'The local MCP runtime is not completing tool work as expected.'
+};
+const inFlight=new Set();
+let lastSuccessfulRefresh=0,previousFocus=null;
+async function getJson(path,guarded=true){
+  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),8000);
+  try{
+    const r=await fetch(path,{cache:'no-store',headers:guarded?{'X-Control-Token':token}:{},signal:controller.signal});
+    if(!r.ok)throw Error(path+' '+r.status);
+    const data=await r.json();lastSuccessfulRefresh=Date.now();return data;
+  }finally{clearTimeout(timeout)}
+}
+async function postJson(path){
+  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),10000);
+  try{const r=await fetch(path,{method:'POST',headers:{'X-Control-Token':token},signal:controller.signal});if(!r.ok)throw Error(path+' '+r.status);return r.json()}
+  finally{clearTimeout(timeout)}
+}
+async function singleFlight(key,fn){if(inFlight.has(key)||stopped)return;inFlight.add(key);try{return await fn()}finally{inFlight.delete(key)}}
 let lastSummary=null,lastEvents=null,lastJobs=null,lastInsights=null,activeJob=null,jobOffset=0,jobLimit=25,stopped=false,panelApiMode=null;
 let jobOutputState={initialized:false,stdout:{next:0,hasMore:false,total:0},stderr:{next:0,hasMore:false,total:0}};
+function setIncident(title='',message='',href='#diagnostics'){
+  const banner=$('incidentBanner');
+  if(!title){banner.classList.remove('visible');return}
+  $('incidentTitle').textContent=title;$('incidentText').textContent=message;$('incidentLink').href=href;banner.classList.add('visible');
+}
 
 function renderSummary(data){
-  lastSummary=data;const s=String(data.state||'unknown'),st=tone(s);
-  $('state').textContent=labels[s]||s;$('stateSub').textContent='PID '+safe(data.pid)+' · generation '+fmtNum(data.runtime_generation);
-  $('mcp').textContent=data.mcp_healthy?'Healthy':'Waiting';$('mcp').className='card-value '+(data.mcp_healthy?'ok':'warn');$('mcpSub').textContent=data.mcp_healthy?'Fresh runtime heartbeat':'No fresh heartbeat';
-  const th=data.transport_health||{},diag=String(th.diagnosis||data.transport_diagnosis||'UNKNOWN');
-  $('tunnelHealth').textContent=data.tunnel_healthy===null?'Local mode':data.tunnel_healthy?'Healthy':'No response';$('tunnelHealth').className='card-value '+(data.tunnel_healthy===false?'bad':data.tunnel_healthy===true?'ok':'');
-  $('tunnelSub').textContent=diag.replaceAll('_',' ');
-  const p=String(data.resource_pressure||'unknown');$('pressure').textContent=p==='unknown'?'Waiting':p[0].toUpperCase()+p.slice(1);$('pressure').className='card-value '+tone(p);$('pressureSub').textContent=data.runtime_health_status?'Runtime health: '+data.runtime_health_status:'Runtime health snapshot pending';
+  lastSummary=data;
+  const s=String(data.state||'unknown'),st=tone(s),th=data.transport_health||{},diag=String(th.diagnosis||data.transport_diagnosis||'UNKNOWN');
+  const mcpTone=data.mcp_healthy===true?'ok':data.mcp_healthy===false?'bad':'warn';
+  const tunnelTone=data.tunnel_healthy===false?'bad':data.tunnel_healthy===true?'ok':'';
+  const pressure=String(data.resource_pressure||'unknown'),pressureTone=tone(pressure);
+  const jobProblems=Number(data.jobs?.problem_count||0),jobActive=Number(data.jobs?.active_count||0);
+
+  $('state').textContent=labels[s]||s;$('stateSub').textContent='PID '+safe(data.pid)+' · generation '+fmtNum(data.runtime_generation);$('state').className='card-value '+st;setSignalTone('runtimeSignal',st);
+  $('mcp').textContent=data.mcp_healthy===true?'Healthy':data.mcp_healthy===false?'Unhealthy':'Waiting';$('mcp').className='card-value '+mcpTone;$('mcpSub').textContent=data.mcp_healthy===true?'Fresh runtime heartbeat':data.mcp_healthy===false?'Heartbeat or health probe failed':'Health snapshot pending';setSignalTone('mcpSignal',mcpTone);
+  $('tunnelHealth').textContent=data.tunnel_healthy===null?'Local mode':data.tunnel_healthy?'Healthy':'Unhealthy';$('tunnelHealth').className='card-value '+tunnelTone;$('tunnelSub').textContent=diag.replaceAll('_',' ');setSignalTone('tunnelSignal',tunnelTone);
+  $('pressure').textContent=pressure==='unknown'?'Waiting':pressure[0].toUpperCase()+pressure.slice(1);$('pressure').className='card-value '+pressureTone;$('pressureSub').textContent=data.runtime_health_status?'Runtime health: '+data.runtime_health_status:'Runtime health snapshot pending';setSignalTone('resourceSignal',pressureTone);
   $('supervisorUptime').textContent=duration(data.supervisor_uptime_seconds);$('runtimeUptime').textContent='Runtime: '+duration(data.runtime_uptime_seconds);
-  $('jobTotal').textContent=fmtNum(data.jobs?.total_count);$('jobSub').textContent='Active '+fmtNum(data.jobs?.active_count)+' · Problems '+fmtNum(data.jobs?.problem_count);
+  $('jobTotal').textContent=fmtNum(data.jobs?.total_count);$('jobSub').textContent='Active '+fmtNum(jobActive)+' · Historical problems '+fmtNum(jobProblems);setSignalTone('jobSignal',jobActive?'warn':'');
   $('statePill').textContent=labels[s]||s;$('statePill').className='status-pill '+st;$('liveDot').className='live-dot '+(s==='running'&&data.mcp_healthy?'ok':st==='bad'?'bad':'');
-  $('connectionText').textContent='Panel connection established';$('updated').textContent='Last summary '+clock(data.server_time);
+  $('connectionText').textContent='Panel connected';$('updated').textContent='Summary '+clock(data.server_time);
+
   $('supervisorStarted').textContent=epoch(data.supervisor_started_at);$('runtimeStarted').textContent=epoch(data.runtime_started_at||data.last_runtime_started_at);$('stateChanged').textContent=epoch(data.last_state_change_at);$('lastEvent').textContent=epoch(data.last_event_at);$('runtimePid').textContent=data.pid??'—';$('restartCount').textContent=fmtNum(data.restart_count);$('mutations').textContent=fmtNum(data.active_mutations);$('failedProbes').textContent=fmtNum(data.failed_probes);pill($('lifecyclePill'),data.runtime_lifecycle||'Lifecycle unknown',data.runtime_lifecycle==='RUNNING'?'ok':data.runtime_lifecycle?'warn':'');
-  $('exitReason').textContent=data.last_exit_reason||'—';$('exitCode').textContent=data.last_exit_code??'—';$('retryAfter').textContent=data.next_retry_seconds===null||data.next_retry_seconds===undefined?'—':duration(data.next_retry_seconds);$('runtimeStopped').textContent=epoch(data.last_runtime_stopped_at);pill($('exitPill'),data.last_exit_code===null||data.last_exit_code===undefined?'No exit recorded':'Exit '+data.last_exit_code,data.last_exit_code===0?'ok':data.last_exit_code===null||data.last_exit_code===undefined?'':'bad');const drain=data.last_drain_result;$('drainSummary').textContent=drain?'Last drain: '+safe(drain.reason)+' · acknowledged='+(drain.acknowledged?'yes':'no')+' · drained='+(drain.drained?'yes':'no')+' · mutations='+safe(drain.active_mutations)+' · '+safe(drain.elapsed_ms)+' ms':'No previous drain has been recorded.';
+  $('exitReason').textContent=data.last_exit_reason||'—';$('exitCode').textContent=data.last_exit_code??'—';$('retryAfter').textContent=data.next_retry_seconds===null||data.next_retry_seconds===undefined?'—':duration(data.next_retry_seconds);$('runtimeStopped').textContent=epoch(data.last_runtime_stopped_at);pill($('exitPill'),data.last_exit_code===null||data.last_exit_code===undefined?'No exit recorded':'Exit '+data.last_exit_code,data.last_exit_code===0?'ok':data.last_exit_code===null||data.last_exit_code===undefined?'':'bad');
+  const drain=data.last_drain_result;$('drainSummary').textContent=drain?'Last drain: '+safe(drain.reason)+' · acknowledged='+(drain.acknowledged?'yes':'no')+' · drained='+(drain.drained?'yes':'no')+' · mutations='+safe(drain.active_mutations)+' · '+safe(drain.elapsed_ms)+' ms':'No previous drain has been recorded.';
+
+  const transportProblem=!['HEALTHY','UPSTREAM_IDLE','UNKNOWN'].includes(diag);
+  if(st==='bad')setIncident('Runtime requires attention','Runtime state is '+(labels[s]||s)+'. Inspect lifecycle and recent errors.','#runtime');
+  else if(data.mcp_healthy===false)setIncident('MCP health check failed','The supervised MCP runtime is not reporting healthy.','#runtime');
+  else if(data.tunnel_healthy===false||transportProblem)setIncident('Transport degraded',(transportMeaning[diag]||th.reason||'Secure Tunnel transport requires investigation.'),'#transport');
+  else if(String(data.runtime_health_status||'').toLowerCase()==='degraded')setIncident('Runtime health is degraded','The runtime health snapshot reports one or more degraded conditions.','#runtime');
+  else if(pressureTone==='warn'||pressureTone==='bad')setIncident('Resource pressure detected','Runtime resource budgets are reporting '+pressure+'.','#resources');
+  else setIncident();
+
   renderTransport(data);
   renderToolActivity(data.tool_activity||(data.transport_health||{}).tool_activity||{});
   renderProcesses(data.active_processes||[]);
 }
 function renderTransport(data){
   const t=data.transport_health||{},d=String(t.diagnosis||data.transport_diagnosis||'UNKNOWN'),c=t.control_plane||{},q=t.queue||{},disp=t.dispatcher||{},rd=t.response_delivery||{},a=t.tool_activity||data.tool_activity||{};
-  pill($('transportPill'),d.replaceAll('_',' '),tone(t.severity||d));$('transportDiagnosis').textContent=d.replaceAll('_',' ');
-  $('controlPoll').textContent=[c.status,c.state].filter(Boolean).join(' · ')||'—';
-  $('pollAge').textContent=c.current_poll_age_seconds===undefined?'—':duration(c.current_poll_age_seconds)+' / '+duration(c.stall_threshold_seconds);
-  $('transportQueue').textContent=fmtNum(q.depth)+' / '+safe(q.capacity)+' · '+safe(q.state);
-  $('transportDispatcher').textContent=fmtNum(disp.active)+' / '+safe(disp.pool_limit)+' · '+safe(disp.state);
-  $('responseDelivery').textContent=[rd.status,rd.state].filter(Boolean).join(' · ')||'—';$('lastMcpTool').textContent=a.last_tool_name||'No tool observed';
-  $('lastToolLatency').textContent=a.last_duration_ms===null||a.last_duration_ms===undefined?'—':Number(a.last_duration_ms).toFixed(3)+' ms';
-  const notes=[];if(t.reason)notes.push(t.reason);if(t.restart_confirmed)notes.push('Watchdog recovery confirmed');else if(Number(t.stall_observations||0)>0)notes.push('Stall observations '+fmtNum(t.stall_observations)+' / '+fmtNum(t.required_confirmations));
-  if(c.last_success)notes.push('Last poll '+iso(c.last_success));$('transportReason').textContent=notes.join(' · ')||'Waiting for transport health.';
+  const kind=d==='HEALTHY'?'ok':d==='UPSTREAM_IDLE'?'info':tone(t.severity||d);
+  const diagnosisText=d.replaceAll('_',' ');
+  pill($('transportPill'),diagnosisText,kind);
+  $('transportDiagnosis').textContent=diagnosisText;$('transportDiagnosis').className='transport-diagnosis-value '+kind;
+  $('transportMeaning').textContent=transportMeaning[d]||'Transport state is not classified yet.';$('transportMeaning').className='transport-diagnosis-value '+(kind||'muted');
+  $('controlPoll').textContent=[c.status,c.state].filter(Boolean).join(' · ')||'Not available';
+  $('pollAge').textContent=c.current_poll_age_seconds===undefined?'Not available':duration(c.current_poll_age_seconds)+' / '+duration(c.stall_threshold_seconds);
+  $('transportQueue').textContent=q.depth===undefined?'Not available':fmtNum(q.depth)+' / '+safe(q.capacity)+' · '+safe(q.state);
+  $('transportDispatcher').textContent=disp.active===undefined?'Not available':fmtNum(disp.active)+' / '+safe(disp.pool_limit)+' · '+safe(disp.state);
+  $('responseDelivery').textContent=[rd.status,rd.state].filter(Boolean).join(' · ')||'Not available';
+  $('lastMcpTool').textContent=a.last_tool_name||'No tool observed';
+  $('lastToolLatency').textContent=a.last_duration_ms===null||a.last_duration_ms===undefined?'Not available':Number(a.last_duration_ms).toFixed(3)+' ms';
+  const notes=[];
+  if(t.reason)notes.push(t.reason);
+  if(t.restart_confirmed)notes.push('Watchdog recovery confirmed');
+  else if(Number(t.stall_observations||0)>0)notes.push('Stall observations '+fmtNum(t.stall_observations)+' / '+fmtNum(t.required_confirmations));
+  if(c.last_success)notes.push('Last successful poll '+iso(c.last_success));
+  $('transportReason').textContent=notes.join(' · ')||transportMeaning[d]||'Waiting for transport health.';
 }
 function renderToolActivity(a){
   $('toolTotalCalls').textContent=a.total_calls===undefined?'—':fmtNum(a.total_calls);
@@ -465,7 +696,16 @@ function renderBrowserRuntime(h){
 function renderResources(h){
   const body=$('resourceBars');body.replaceChildren();const usage=h.resource_usage||{},entries=Object.entries(usage);pill($('resourcePill'),String(h.resource_pressure||'Waiting'),tone(h.resource_pressure));
   if(!entries.length){const e=document.createElement('div');e.className='empty';e.textContent='Runtime health snapshot is not available yet.';body.append(e);return}
-  for(const [name,v] of entries){const ratio=v?.usage_ratio,percent=ratio===null||ratio===undefined?0:Math.max(0,Math.min(100,Number(ratio)*100));const row=document.createElement('div');row.className='bar-row';const l=document.createElement('div');l.className='bar-label';l.textContent=name.replaceAll('_',' ');const b=document.createElement('div');b.className='bar';const fill=document.createElement('i');fill.style.width=percent+'%';b.append(fill);const val=document.createElement('div');val.className='bar-value';const unit=v?.unit==='bytes'?bytes(v.value):fmtNum(v?.value);const max=v?.unit==='bytes'?bytes(v.max):fmtNum(v?.max);val.textContent=unit+' / '+max+' · '+percent.toFixed(1)+'%';row.append(l,b,val);body.append(row)}
+  for(const [name,v] of entries){
+    const ratio=v?.usage_ratio,percent=ratio===null||ratio===undefined?0:Math.max(0,Math.min(100,Number(ratio)*100));
+    const level=percent>=90?'bad':percent>=75?'warn':'';
+    const row=document.createElement('div');row.className='bar-row';
+    const l=document.createElement('div');l.className='bar-label';l.textContent=name.replaceAll('_',' ');
+    const b=document.createElement('div');b.className='bar'+(level?' '+level:'');b.setAttribute('role','meter');b.setAttribute('aria-label',name.replaceAll('_',' ')+' usage');b.setAttribute('aria-valuemin','0');b.setAttribute('aria-valuemax','100');b.setAttribute('aria-valuenow',percent.toFixed(1));
+    const fill=document.createElement('i');fill.style.width=percent+'%';b.append(fill);
+    const val=document.createElement('div');val.className='bar-value '+level;const unit=v?.unit==='bytes'?bytes(v.value):fmtNum(v?.value);const max=v?.unit==='bytes'?bytes(v.max):fmtNum(v?.max);val.textContent=unit+' / '+max+' · '+percent.toFixed(1)+'%';
+    row.append(l,b,val);body.append(row)
+  }
 }
 function renderHost(s){
   const m=s.memory||{},sw=s.swap||{},d=s.disk||{};$('hostCpu').textContent=s.cpu_percent===undefined?'—':Number(s.cpu_percent).toFixed(1)+'%';$('hostMemory').textContent=m.percent===undefined?'—':Number(m.percent).toFixed(1)+'% · '+bytes(m.used)+' / '+bytes(m.total);$('hostAvailable').textContent=bytes(m.available);$('hostSwap').textContent=sw.total?Number(sw.percent).toFixed(1)+'% · '+bytes(sw.used)+' / '+bytes(sw.total):'Not configured';$('hostDisk').textContent=d&&d.free!==undefined?bytes(d.free)+' · '+Number(d.percent).toFixed(1)+'% used':'—';$('hostUptime').textContent=duration(s.uptime_seconds);pill($('hostPill'),m.percent>=90?'Memory pressure':d&&d.percent>=95?'Disk pressure':'Host normal',m.percent>=90||d&&d.percent>=95?'warn':'ok');
@@ -495,12 +735,16 @@ function renderJobs(data){
 async function refreshJobs(){try{if(panelApiMode==='legacy'){const legacy=await getJson('/api/status',false);if(legacy.jobs)renderJobs(legacy.jobs);return}renderJobs(await getJson('/api/jobs?offset='+jobOffset+'&limit='+jobLimit))}catch(e){}}
 function metaCard(label,value,sub=''){const box=document.createElement('div');box.className='meta';const a=document.createElement('span');a.textContent=label;const b=document.createElement('strong');b.textContent=safe(value);box.append(a,b);if(sub){const c=document.createElement('span');c.style.marginTop='5px';c.textContent=sub;box.append(c)}return box}
 async function openJob(id){
+  previousFocus=document.activeElement instanceof HTMLElement?document.activeElement:null;
   activeJob=id;jobOutputState={initialized:false,stdout:{next:0,hasMore:false,total:0},stderr:{next:0,hasMore:false,total:0}};
-  $('jobModal').classList.add('open');$('jobModal').setAttribute('aria-hidden','false');$('jobModalId').textContent=id;await refreshJobDetail()
+  document.body.classList.add('modal-open');$('jobModal').classList.add('open');$('jobModal').setAttribute('aria-hidden','false');$('jobModalId').textContent=id;
+  requestAnimationFrame(()=>$('jobDialog').focus());
+  await refreshJobDetail()
 }
 function closeJob(){
   activeJob=null;jobOutputState={initialized:false,stdout:{next:0,hasMore:false,total:0},stderr:{next:0,hasMore:false,total:0}};
-  $('jobModal').classList.remove('open');$('jobModal').setAttribute('aria-hidden','true')
+  $('jobModal').classList.remove('open');$('jobModal').setAttribute('aria-hidden','true');document.body.classList.remove('modal-open');
+  const restore=previousFocus;previousFocus=null;if(restore&&document.contains(restore))restore.focus()
 }
 async function refreshJobDetail(){
   if(!activeJob)return;
@@ -518,7 +762,13 @@ async function refreshJobDetail(){
     $('jobCancel').hidden=!['queued','running','orphaned'].includes(String(j.status||''));$('jobCopy').dataset.command=j.command_line||'';
   }catch(e){$('jobCommand').textContent='Unable to load job details.'}
 }
-async function cancelActiveJob(){if(!activeJob||!confirm('Cancel this durable job?'))return;try{await postJson('/api/jobs/'+activeJob+'/cancel');await refreshJobDetail();await refreshJobs()}catch(e){alert('Job cancellation request failed.')}}
+async function cancelActiveJob(){
+  if(!activeJob||!confirm('Cancel this durable job? The request may stop active process work.'))return;
+  const b=$('jobCancel'),old=b.textContent;b.disabled=true;b.setAttribute('aria-busy','true');b.textContent='Cancelling…';
+  try{await postJson('/api/jobs/'+activeJob+'/cancel');await refreshJobDetail();await refreshJobs();$('notice').textContent='Job cancellation request accepted.'}
+  catch(e){$('notice').textContent='Job cancellation request failed. Check job state before retrying.'}
+  finally{b.disabled=false;b.removeAttribute('aria-busy');b.textContent=old}
+}
 async function copyCommand(){const text=$('jobCopy').dataset.command||'';if(!text)return;try{await navigator.clipboard.writeText(text)}catch(e){}}
 async function loadMoreJobOutput(stream){
   if(!activeJob)return;
@@ -541,15 +791,17 @@ function renderWorkflowStats(h){
 }
 
 async function openWorkflow(id){
-  const box=$('workflowDetail');box.replaceChildren();const loading=document.createElement('div');loading.className='empty';loading.style.gridColumn='1/-1';loading.textContent='Loading workflow checkpoints…';box.append(loading);
+  const box=$('workflowDetail');box.replaceChildren();const loading=document.createElement('div');loading.className='empty';loading.textContent='Loading workflow checkpoints…';box.append(loading);
   try{
-    const w=await getJson('/api/workflows/'+encodeURIComponent(id));
-    const cards=[metaCard('Workflow',w.workflow_id),metaCard('State',w.state),metaCard('Current Step',w.current_step),metaCard('Version',w.version),metaCard('Created',iso(w.created_at)),metaCard('Updated',iso(w.updated_at)),metaCard('Operations',w.operation_count),metaCard('Compatible',w.execution_compatible)];
-    if(w.last_error)cards.push(metaCard('Last Error',w.last_error));
-    for(const s of w.steps||[])cards.push(metaCard('Step '+safe(s.step_index),safe(s.state)+' · attempts '+fmtNum(s.attempts),[s.started_at?'started '+iso(s.started_at):'',s.finished_at?'finished '+iso(s.finished_at):'',s.error||''].filter(Boolean).join(' · ')));
-    for(const o of w.operations||[])cards.push(metaCard('Operation '+safe(o.operation_index),safe(o.action)+' · '+safe(o.state),'step '+safe(o.step_index)+' · attempts '+fmtNum(o.attempts)+(o.error?' · '+o.error:'')));
-    box.replaceChildren(...cards);
-  }catch(e){box.replaceChildren();const m=document.createElement('div');m.className='empty';m.style.gridColumn='1/-1';m.textContent='Unable to load workflow checkpoints.';box.append(m)}
+    const w=await getJson('/api/workflows/'+encodeURIComponent(id)),nodes=[];
+    const summary=document.createElement('div');summary.className='workflow-summary';
+    for(const [label,value] of [['State',w.state],['Current step',w.current_step],['Version',w.version],['Operations',w.operation_count]])summary.append(metaCard(label,value));
+    nodes.push(summary);
+    const identity=document.createElement('div');identity.className='workflow-entry '+tone(w.state);identity.innerHTML='<div class="workflow-entry-title"></div><div class="workflow-entry-meta"></div>';identity.querySelector('.workflow-entry-title').textContent='Workflow '+safe(w.workflow_id);identity.querySelector('.workflow-entry-meta').textContent=[iso(w.created_at)+' created',iso(w.updated_at)+' updated',w.execution_compatible===false?'execution incompatible':'execution compatible',w.last_error||''].filter(Boolean).join(' · ');nodes.push(identity);
+    for(const s of w.steps||[]){const item=document.createElement('div');item.className='workflow-entry '+tone(s.state);const title=document.createElement('div');title.className='workflow-entry-title';title.textContent='Step '+safe(s.step_index)+' · '+safe(s.state);const meta=document.createElement('div');meta.className='workflow-entry-meta';meta.textContent=['attempts '+fmtNum(s.attempts),s.started_at?'started '+iso(s.started_at):'',s.finished_at?'finished '+iso(s.finished_at):'',s.error||''].filter(Boolean).join(' · ');item.append(title,meta);nodes.push(item)}
+    for(const o of w.operations||[]){const item=document.createElement('div');item.className='workflow-entry '+tone(o.state);const title=document.createElement('div');title.className='workflow-entry-title';title.textContent='Operation '+safe(o.operation_index)+' · '+safe(o.action);const meta=document.createElement('div');meta.className='workflow-entry-meta';meta.textContent=['state '+safe(o.state),'step '+safe(o.step_index),'attempts '+fmtNum(o.attempts),o.error||''].filter(Boolean).join(' · ');item.append(title,meta);nodes.push(item)}
+    box.replaceChildren(...nodes);
+  }catch(e){box.replaceChildren();const m=document.createElement('div');m.className='empty';m.textContent='Unable to load workflow checkpoints.';box.append(m)}
 }
 
 function renderWorkflows(d){
@@ -576,22 +828,138 @@ function renderTransportHistory(d){
 }
 function renderAudit(d){const body=$('auditRows');body.replaceChildren();for(const x of d.items||[]){const tr=document.createElement('tr');cell(tr,iso(x.time));cell(tr,x.operation);cell(tr,x.outcome);cell(tr,x.pid,'mono');cell(tr,x.target||'—','mono');body.append(tr)}if(!(d.items||[]).length)emptyRow(body,5,'No audit operations yet.');pill($('auditPill'),fmtNum(d.count)+' recent',d.count?'info':'')}
 function renderConfig(d){const grid=$('configGrid');grid.replaceChildren();for(const [k,v] of Object.entries(d||{})){const a=document.createElement('div');a.textContent=k.replaceAll('_',' ');const b=document.createElement('div');b.className='mono';b.textContent=typeof v==='number'&&k.includes('bytes')?bytes(v):String(v);grid.append(a,b)}if(!Object.keys(d||{}).length){const a=document.createElement('div');a.textContent='No config';const b=document.createElement('div');b.textContent='—';grid.append(a,b)}}
-function renderDoctor(d){const body=$('doctorRows');body.replaceChildren();for(const x of d.checks||[]){const box=document.createElement('div');box.className='meta';const label=document.createElement('span');label.textContent=x.name;const strong=document.createElement('strong');strong.textContent=x.summary;strong.className=tone(x.status);box.append(label,strong);body.append(box)}if(!(d.checks||[]).length){const e=document.createElement('div');e.className='empty';e.textContent='Doctor snapshot is not available yet.';body.append(e)}pill($('doctorPill'),d.status||'Pending',d.status==='healthy'?'ok':d.status==='warning'?'warn':d.status==='critical'?'bad':'')}
-function renderEvents(data){lastEvents=data;const target=$('events'),filter=$('eventFilter').value,q=$('eventSearch').value.trim().toLowerCase();const list=[...(data.recent_events||[])].reverse().filter(x=>{const l=String(x.level||'INFO').toUpperCase();return(filter==='ALL'||l===filter||(filter==='ERROR'&&l==='FATAL'))&&(!q||String(x.message||'').toLowerCase().includes(q)||String(x.component||'').toLowerCase().includes(q))});target.replaceChildren();for(const x of list.slice(0,100)){const row=document.createElement('div');row.className='event';const a=document.createElement('div');a.className='event-time';a.textContent=clock(x.timestamp);const b=document.createElement('div');b.className='event-level '+tone(x.level);b.textContent=x.level||'INFO';const c=document.createElement('div');c.className='event-msg';c.textContent=x.message||'—';const comp=document.createElement('span');comp.className='event-comp';comp.textContent=x.component||'supervisor';c.append(comp);row.append(a,b,c);target.append(row)}if(!list.length){const e=document.createElement('div');e.className='empty';e.textContent='No events match the current filters.';target.append(e)}$('eventCounter').textContent=fmtNum(data.event_count)+' events · '+fmtNum((data.recent_events||[]).length)+' retained in memory';const errors=$('errors');errors.replaceChildren();const recent=[...(data.recent_errors||[])].reverse();for(const x of recent.slice(0,30)){const row=document.createElement('div');row.className='event';const a=document.createElement('div');a.className='event-time';a.textContent=clock(x.timestamp);const b=document.createElement('div');b.className='event-level bad';b.textContent=x.level||'ERROR';const c=document.createElement('div');c.className='event-msg';c.textContent=x.message||'—';row.append(a,b,c);errors.append(row)}if(!recent.length){const e=document.createElement('div');e.className='empty';e.textContent='No ERROR/FATAL events have been recorded.';errors.append(e)}pill($('errorPill'),recent.length?fmtNum(recent.length)+' recent errors':'No recent errors',recent.length?'bad':'ok');$('lastError').textContent=data.last_error?'Last error / recovery reason: '+data.last_error:'No recorded errors.';$('rawLogs').textContent=(data.logs||[]).join('\n')||'No events have been recorded yet.'}
+function renderDoctor(d){
+  const body=$('doctorRows');body.replaceChildren();
+  for(const x of d.checks||[]){
+    const row=document.createElement('div');row.className='doctor-check';row.dataset.status=String(x.status||'pending');
+    const name=document.createElement('div');name.className='doctor-name '+tone(x.status);name.textContent=x.name||'Check';
+    const summary=document.createElement('div');summary.className='doctor-summary';summary.textContent=[x.summary,x.reason].filter(Boolean).join(' · ')||'No summary available.';
+    row.append(name,summary);body.append(row)
+  }
+  if(!(d.checks||[]).length){const e=document.createElement('div');e.className='empty';e.textContent='Doctor snapshot is not available yet.';body.append(e)}
+  pill($('doctorPill'),d.status||'Pending',d.status==='healthy'?'ok':d.status==='warning'?'warn':d.status==='critical'?'bad':'')
+}
+function eventRow(x){
+  const level=String(x.level||'INFO').toUpperCase(),row=document.createElement('div');row.className='event level-'+level.toLowerCase();
+  const a=document.createElement('div');a.className='event-time';a.textContent=clock(x.timestamp);
+  const b=document.createElement('div');b.className='event-level '+tone(level);b.textContent=level;
+  const c=document.createElement('div');c.className='event-msg';c.textContent=x.message||'No message';
+  const comp=document.createElement('span');comp.className='event-comp';comp.textContent=x.component||'supervisor';c.append(comp);row.append(a,b,c);return row
+}
+function renderEvents(data){
+  lastEvents=data;const target=$('events'),filter=$('eventFilter').value,q=$('eventSearch').value.trim().toLowerCase();
+  const list=[...(data.recent_events||[])].reverse().filter(x=>{const l=String(x.level||'INFO').toUpperCase();return(filter==='ALL'||l===filter||(filter==='ERROR'&&l==='FATAL'))&&(!q||String(x.message||'').toLowerCase().includes(q)||String(x.component||'').toLowerCase().includes(q))});
+  target.replaceChildren(...list.slice(0,100).map(eventRow));
+  if(!list.length){const e=document.createElement('div');e.className='empty';e.textContent='No events match the current filters.';target.append(e)}
+  $('eventCounter').textContent=fmtNum(data.event_count)+' events · '+fmtNum((data.recent_events||[]).length)+' retained · '+fmtNum(list.length)+' visible';
+  const errors=$('errors'),recent=[...(data.recent_errors||[])].reverse();errors.replaceChildren(...recent.slice(0,30).map(eventRow));
+  if(!recent.length){const e=document.createElement('div');e.className='empty';e.textContent='No ERROR/FATAL events have been recorded.';errors.append(e)}
+  pill($('errorPill'),recent.length?fmtNum(recent.length)+' recent errors':'No recent errors',recent.length?'bad':'ok');
+  $('lastError').textContent=data.last_error?'Last error / recovery reason: '+data.last_error:'No recorded errors.';
+  $('rawLogs').textContent=(data.logs||[]).join('\n')||'No events have been recorded yet.'
+}
 
-async function refreshSummary(){try{if(panelApiMode===null){const status=await getJson('/api/status',false);panelApiMode=Number(status.panel_api_version||1)>=2?'modern':'legacy';if(panelApiMode==='legacy'){$('notice').textContent='Supervisor restart pending · legacy panel API compatibility mode';renderSummary(status);return}}renderSummary(await getJson(panelApiMode==='modern'?'/api/summary':'/api/status',false))}catch(e){$('connectionText').textContent='Panel connection lost';$('liveDot').className='live-dot bad';$('statePill').textContent='Disconnected';$('statePill').className='status-pill bad'}}
-async function refreshInsights(){if(panelApiMode!=='modern')return;try{renderInsights(await getJson('/api/insights'))}catch(e){}}
-async function refreshEvents(){try{renderEvents(await getJson(panelApiMode==='modern'?'/api/events':'/api/status',panelApiMode==='modern'))}catch(e){}}
-async function refreshSecondary(){if(panelApiMode!=='modern')return;const [th,a,w,r,c,d]=await Promise.allSettled([getJson('/api/transport/history?limit=100'),getJson('/api/audit?limit=60'),getJson('/api/workflows'),getJson('/api/recovery'),getJson('/api/config'),getJson('/api/doctor')]);if(th.status==='fulfilled')renderTransportHistory(th.value);if(a.status==='fulfilled')renderAudit(a.value);if(w.status==='fulfilled')renderWorkflows(w.value);if(r.status==='fulfilled')renderRecovery(r.value);if(c.status==='fulfilled')renderConfig(c.value);if(d.status==='fulfilled')renderDoctor(d.value)}
-async function refreshAll(){if(stopped)return;await refreshSummary();await Promise.allSettled([refreshEvents(),refreshJobs(),refreshInsights(),refreshSecondary()]);if(activeJob)await refreshJobDetail()}
-async function exportDiagnostics(){const b=$('downloadDiagnostics'),old=b.textContent;b.disabled=true;b.textContent='Preparing…';try{const data=await getJson('/api/diagnostics');const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='computerpilot-diagnostics-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}catch(e){alert('Diagnostics export failed.')}finally{b.disabled=false;b.textContent=old}}
-async function runtimeAction(action){const q=action==='stop'?'Stop the Supervisor and runtime?':'Restart the runtime?';if(!confirm(q))return;const b=$(action);b.disabled=true;try{await postJson('/api/'+action);$('notice').textContent=action==='stop'?'Stop request accepted. Run the launcher again to restart.':'Restart request accepted. Follow lifecycle and transport sections.';if(action==='stop'){stopped=true}}catch(e){$('notice').textContent='Request failed. Check the panel connection.'}finally{b.disabled=false}}
+async function refreshSummary(){
+  try{
+    if(panelApiMode===null){
+      const status=await getJson('/api/status',false);panelApiMode=Number(status.panel_api_version||1)>=2?'modern':'legacy';
+      if(panelApiMode==='legacy'){$('notice').textContent='Supervisor restart pending · legacy panel API compatibility mode';renderSummary(status);return}
+    }
+    renderSummary(await getJson(panelApiMode==='modern'?'/api/summary':'/api/status',false))
+  }catch(e){
+    $('connectionText').textContent='Panel connection lost';$('liveDot').className='live-dot bad';$('statePill').textContent='Disconnected';$('statePill').className='status-pill bad';
+    $('updated').textContent=lastSuccessfulRefresh?'Last successful refresh '+tm.format(new Date(lastSuccessfulRefresh)):'No successful refresh yet';
+    setIncident('Panel data is unavailable','The loopback panel cannot refresh runtime state. Live values may be stale.','#diagnostics')
+  }
+}
+async function refreshInsights(){if(panelApiMode!=='modern')return;try{renderInsights(await getJson('/api/insights'))}catch(e){pill($('runtimeHealthPill'),'Temporarily unavailable','warn')}}
+async function refreshEvents(){try{renderEvents(await getJson(panelApiMode==='modern'?'/api/events':'/api/status',panelApiMode==='modern'))}catch(e){$('eventCounter').textContent='Events temporarily unavailable.'}}
+async function refreshSecondary(){
+  if(panelApiMode!=='modern')return;
+  const [th,a,w,r,c,d]=await Promise.allSettled([getJson('/api/transport/history?limit=100'),getJson('/api/audit?limit=60'),getJson('/api/workflows'),getJson('/api/recovery'),getJson('/api/config'),getJson('/api/doctor')]);
+  if(th.status==='fulfilled')renderTransportHistory(th.value);else pill($('transportHistoryPill'),'Unavailable','warn');
+  if(a.status==='fulfilled')renderAudit(a.value);else pill($('auditPill'),'Unavailable','warn');
+  if(w.status==='fulfilled')renderWorkflows(w.value);else pill($('workflowPill'),'Unavailable','warn');
+  if(r.status==='fulfilled')renderRecovery(r.value);else pill($('recoveryPill'),'Unavailable','warn');
+  if(c.status==='fulfilled')renderConfig(c.value);
+  if(d.status==='fulfilled')renderDoctor(d.value);else pill($('doctorPill'),'Unavailable','warn')
+}
+async function refreshAll(manual=false){
+  if(stopped)return;
+  const b=$('refreshNow');
+  if(manual){b.disabled=true;b.setAttribute('aria-busy','true');b.textContent='Refreshing…'}
+  try{
+    await singleFlight('summary',refreshSummary);
+    await Promise.allSettled([
+      singleFlight('events',refreshEvents),
+      singleFlight('jobs',refreshJobs),
+      singleFlight('insights',refreshInsights),
+      singleFlight('secondary',refreshSecondary)
+    ]);
+    if(activeJob)await singleFlight('job-detail',refreshJobDetail)
+  }finally{
+    if(manual){b.disabled=false;b.removeAttribute('aria-busy');b.textContent='Refresh'}
+  }
+}
+async function exportDiagnostics(){
+  const b=$('downloadDiagnostics'),old=b.textContent;b.disabled=true;b.setAttribute('aria-busy','true');b.textContent='Preparing…';
+  try{
+    const data=await getJson('/api/diagnostics'),blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download='computerpilot-diagnostics-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+    $('notice').textContent='Redacted diagnostics export prepared successfully.'
+  }catch(e){$('notice').textContent='Diagnostics export failed. No file was downloaded.'}
+  finally{b.disabled=false;b.removeAttribute('aria-busy');b.textContent=old}
+}
+async function runtimeAction(action){
+  const q=action==='stop'?'Stop the Supervisor and runtime? You will need the launcher to start it again.':'Restart the runtime? Active mutations remain protected by the supervisor drain contract.';
+  if(!confirm(q))return;
+  const b=$(action),old=b.textContent;b.disabled=true;b.setAttribute('aria-busy','true');b.textContent=action==='stop'?'Stopping…':'Restarting…';
+  try{
+    await postJson('/api/'+action);$('notice').textContent=action==='stop'?'Stop request accepted. Run the launcher again to restart.':'Restart request accepted. Watch lifecycle and transport recovery.';
+    if(action==='stop')stopped=true
+  }catch(e){$('notice').textContent='Control request failed. Check panel connection before retrying.'}
+  finally{b.disabled=false;b.removeAttribute('aria-busy');b.textContent=old}
+}
+async function copyRawLogs(){try{await navigator.clipboard.writeText($('rawLogs').textContent||'');$('notice').textContent='Raw log tail copied.'}catch(e){$('notice').textContent='Unable to copy raw logs.'}}
+function handleModalKeys(e){
+  if(!activeJob)return;
+  if(e.key==='Escape'){e.preventDefault();closeJob();return}
+  if(e.key!=='Tab')return;
+  const focusable=[...$('jobDialog').querySelectorAll('button:not([disabled]):not([hidden]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')].filter(node=>node.offsetParent!==null);
+  if(!focusable.length){e.preventDefault();$('jobDialog').focus();return}
+  const first=focusable[0],last=focusable[focusable.length-1];
+  if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}
+  else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}
+}
+function schedulePoll(key,delay,fn){
+  const tick=async()=>{if(!stopped&&document.visibilityState!=='hidden')await singleFlight(key,fn);setTimeout(tick,delay)};
+  setTimeout(tick,delay)
+}
+function setupSectionNavigation(){
+  const links=[...document.querySelectorAll('.section-nav a')],targets=links.map(link=>document.querySelector(link.getAttribute('href'))).filter(Boolean);
+  if(!('IntersectionObserver' in window))return;
+  const observer=new IntersectionObserver(entries=>{
+    const visible=entries.filter(entry=>entry.isIntersecting).sort((a,b)=>a.boundingClientRect.top-b.boundingClientRect.top)[0];
+    if(!visible)return;
+    for(const link of links)link.classList.toggle('active',link.getAttribute('href')==='#'+visible.target.id)
+  },{rootMargin:'-70px 0px -70% 0px',threshold:[0,1]});
+  targets.forEach(target=>observer.observe(target))
+}
 
-$('refreshNow').onclick=refreshAll;$('downloadDiagnostics').onclick=exportDiagnostics;$('restart').onclick=()=>runtimeAction('restart');$('stop').onclick=()=>runtimeAction('stop');
-$('jobsPrev').onclick=()=>{jobOffset=Math.max(0,jobOffset-jobLimit);refreshJobs()};$('jobsNext').onclick=()=>{jobOffset+=jobLimit;refreshJobs()};$('jobFilter').onchange=()=>lastJobs&&renderJobs(lastJobs);$('jobSearch').oninput=()=>lastJobs&&renderJobs(lastJobs);
+$('refreshNow').onclick=()=>refreshAll(true);$('downloadDiagnostics').onclick=exportDiagnostics;$('restart').onclick=()=>runtimeAction('restart');$('stop').onclick=()=>runtimeAction('stop');
+$('jobsPrev').onclick=()=>{jobOffset=Math.max(0,jobOffset-jobLimit);singleFlight('jobs',refreshJobs)};$('jobsNext').onclick=()=>{jobOffset+=jobLimit;singleFlight('jobs',refreshJobs)};$('jobFilter').onchange=()=>lastJobs&&renderJobs(lastJobs);$('jobSearch').oninput=()=>lastJobs&&renderJobs(lastJobs);
 $('eventFilter').onchange=()=>lastEvents&&renderEvents(lastEvents);$('eventSearch').oninput=()=>lastEvents&&renderEvents(lastEvents);
-$('jobClose').onclick=closeJob;$('jobModal').onclick=e=>{if(e.target instanceof Element&&e.target.hasAttribute('data-close-job'))closeJob()};$('jobCancel').onclick=cancelActiveJob;$('jobCopy').onclick=copyCommand;$('jobStdoutMore').onclick=()=>loadMoreJobOutput('stdout');$('jobStderrMore').onclick=()=>loadMoreJobOutput('stderr');$('jobDownloadStdout').onclick=()=>downloadJobStream('stdout');$('jobDownloadStderr').onclick=()=>downloadJobStream('stderr');document.addEventListener('keydown',e=>{if(e.key==='Escape'&&activeJob)closeJob()});
-refreshAll();setInterval(refreshSummary,2500);setInterval(refreshEvents,5000);setInterval(refreshJobs,5000);setInterval(refreshInsights,10000);setInterval(refreshSecondary,15000);setInterval(()=>{if(activeJob)refreshJobDetail()},2500);
+$('jobClose').onclick=closeJob;$('jobModal').onclick=e=>{if(e.target instanceof Element&&e.target.hasAttribute('data-close-job'))closeJob()};$('jobCancel').onclick=cancelActiveJob;$('jobCopy').onclick=copyCommand;$('jobStdoutMore').onclick=()=>loadMoreJobOutput('stdout');$('jobStderrMore').onclick=()=>loadMoreJobOutput('stderr');$('jobDownloadStdout').onclick=()=>downloadJobStream('stdout');$('jobDownloadStderr').onclick=()=>downloadJobStream('stderr');$('copyRawLogs').onclick=copyRawLogs;
+document.addEventListener('keydown',handleModalKeys);
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&!stopped)refreshAll()});
+setupSectionNavigation();
+refreshAll();
+schedulePoll('summary',2500,refreshSummary);
+schedulePoll('events',5000,refreshEvents);
+schedulePoll('jobs',5000,refreshJobs);
+schedulePoll('insights',10000,refreshInsights);
+schedulePoll('secondary',15000,refreshSecondary);
+schedulePoll('job-detail',2500,async()=>{if(activeJob)await refreshJobDetail()});
 </script>
 </body>
 </html>
