@@ -672,7 +672,8 @@ class JobStore:
             if same_process(pid, created):
                 from core.executor import terminate_process_tree
                 assert pid is not None
-                terminate_process_tree(pid, force=True)
+                assert created is not None
+                terminate_process_tree(pid, force=True, expected_created=created)
             with closing(self.connect()) as db, db:
                 db.execute(
                     "UPDATE jobs SET status='cancelled',updated=?,version=version+1 "

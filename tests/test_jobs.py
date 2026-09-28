@@ -112,10 +112,11 @@ def test_orphan_cancel_wins_race_with_interrupted_reconciliation(
     def same_process(pid: int | None, created: float | None) -> bool:
         return alive and pid == 12345 and created == 1
 
-    def terminate(pid: int, *, force: bool = True) -> dict[str, object]:
+    def terminate(pid: int, *, force: bool = True, expected_created: float) -> dict[str, object]:
         nonlocal alive
         assert pid == 12345
         assert force is True
+        assert expected_created == 1
         alive = False
         assert store.get(job_id)["status"] == "interrupted"
         return {"targeted_pids": [pid], "terminated_pids": [pid], "alive_pids": []}

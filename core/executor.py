@@ -184,13 +184,23 @@ def _process_env(extra: dict[str, str] | None) -> dict[str, str]:
     return env
 
 
-def terminate_process_tree(pid: int, *, force: bool, include_children: bool = True) -> dict[str, Any]:
+def terminate_process_tree(
+    pid: int, *, force: bool, include_children: bool = True, expected_created: float | None = None,
+) -> dict[str, Any]:
     """Terminate one process tree and report exactly which PIDs were affected."""
 
     try:
         parent = psutil.Process(pid)
     except psutil.NoSuchProcess as exc:
         raise ToolError("process_not_found", f"Process {pid} does not exist.") from exc
+    if expected_created is not None:
+        try:
+            if abs(parent.create_time() - expected_created) >= 0.01 or not parent.is_running():
+                return {"targeted_pids": [], "terminated_pids": [], "alive_pids": []}
+        except psutil.NoSuchProcess:
+            return {"targeted_pids": [], "terminated_pids": [], "alive_pids": []}
+        except psutil.Error as exc:
+            raise ToolError("process_identity_unavailable", f"Cannot verify process {pid} before termination.") from exc
     processes = parent.children(recursive=True) if include_children else []
     processes.append(parent)
     targeted = [process.pid for process in processes]

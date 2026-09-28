@@ -200,6 +200,21 @@ def test_background_output_is_unlimited_by_default(tmp_path: Path) -> None:
     assert caught.value.code == "output_unavailable"
 
 
+def test_process_tree_termination_skips_reused_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ReusedProcess:
+        def create_time(self) -> float:
+            return 2.0
+
+        def children(self, recursive: bool = False) -> list[object]:
+            pytest.fail("Replacement process must not be inspected or killed")
+
+    monkeypatch.setattr("core.executor.psutil.Process", lambda pid: ReusedProcess())
+
+    result = terminate_process_tree(12345, force=True, expected_created=1.0)
+
+    assert result == {"targeted_pids": [], "terminated_pids": [], "alive_pids": []}
+
+
 def test_read_window_uses_lines_offsets_and_limits(tmp_path: Path) -> None:
     target = tmp_path / "lines.txt"
     target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8", newline="")
