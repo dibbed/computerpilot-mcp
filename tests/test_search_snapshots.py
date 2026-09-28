@@ -340,6 +340,27 @@ def test_store_rejects_malformed_and_out_of_range_cursors(tmp_path: Path) -> Non
     assert outside.value.code == "search_cursor_out_of_range"
 
 
+def test_truncated_snapshot_does_not_repeat_an_empty_continuation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    fingerprint = _fingerprint(tmp_path)
+    handle = store.create(
+        [{"path": "a"}, {"path": "b"}, {"path": "c"}],
+        fingerprint=fingerprint,
+        count_mode="exact",
+        result_order="path",
+        scan_truncated=False,
+        total_count=3,
+    )
+    snapshot = store.directory / f"{handle.snapshot_id}.jsonl"
+    lines = snapshot.read_bytes().splitlines(keepends=True)
+    snapshot.write_bytes(b"".join(lines[:2]))
+
+    with pytest.raises(ToolError) as caught:
+        store.read_page(store.cursor(handle.snapshot_id, 1), fingerprint=fingerprint, limit=1)
+    assert caught.value.code == "search_snapshot_corrupt"
+    assert not snapshot.exists()
+
+
 def test_snapshot_publish_leaves_no_temporary_files(tmp_path: Path) -> None:
     store = _store(tmp_path)
     fingerprint = _fingerprint(tmp_path)

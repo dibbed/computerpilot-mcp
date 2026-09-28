@@ -193,6 +193,8 @@ class SearchSnapshotStore:
                         if not isinstance(value, dict):
                             raise ValueError("snapshot row is not an object")
                         items.append(value)
+                if len(items) < min(limit, item_count - offset):
+                    raise ValueError("snapshot ends before its declared item count")
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError, StopIteration) as exc:
                 path.unlink(missing_ok=True)
                 raise ToolError("search_snapshot_corrupt", "Search snapshot is unreadable; run the search again.") from exc
