@@ -148,6 +148,9 @@ class WorkflowStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_workflows_state ON workflows(state, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_workflows_queue ON workflows(state, created_at);
+                CREATE TABLE IF NOT EXISTS workflow_maintenance (
+                    key TEXT PRIMARY KEY
+                );
                 """
             )
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -175,10 +178,32 @@ class WorkflowStore:
                     "workflow_schema_too_new",
                     f"Workflow database schema {version} is newer than supported version {SCHEMA_VERSION}.",
                 )
-            connection.execute("BEGIN IMMEDIATE")
-            self._redact_stored_definitions(connection)
-            self._materialize_all(connection)
-            connection.commit()
+            backfill_key = "definition_redaction_and_operations_v1"
+            complete = connection.execute(
+                "SELECT 1 FROM workflow_maintenance WHERE key = ?", (backfill_key,),
+            ).fetchone()
+            if complete is None:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM workflow_maintenance WHERE key = ?", (backfill_key,),
+                ).fetchone() is None:
+                    self._redact_stored_definitions(connection)
+                    self._materialize_all(connection)
+                    connection.execute("INSERT INTO workflow_maintenance(key) VALUES (?)", (backfill_key,))
+                connection.commit()
+            else:
+                missing_sql = (
+                    "SELECT DISTINCT steps.workflow_id FROM workflow_steps AS steps "
+                    "LEFT JOIN workflow_operations AS operations "
+                    "ON operations.workflow_id = steps.workflow_id "
+                    "AND operations.step_index = steps.step_index AND operations.operation_index = 0 "
+                    "WHERE operations.operation_id IS NULL"
+                )
+                if connection.execute(f"{missing_sql} LIMIT 1").fetchone() is not None:
+                    connection.execute("BEGIN IMMEDIATE")
+                    for row in connection.execute(missing_sql).fetchall():
+                        self._materialize_workflow(connection, str(row["workflow_id"]), legacy=True)
+                    connection.commit()
 
     @staticmethod
     def _migrate_v1(connection: sqlite3.Connection) -> None:

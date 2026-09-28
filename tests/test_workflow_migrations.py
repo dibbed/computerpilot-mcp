@@ -143,6 +143,45 @@ def test_migration_reopen_is_idempotent(tmp_path: Path) -> None:
         assert connection.execute("SELECT COUNT(*) FROM workflow_events").fetchone()[0] == 1
 
 
+def test_completed_backfill_skips_history_scan_but_repairs_missing_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _seed_v024_database(path)
+    WorkflowStore(path)
+
+    def unexpected_scan(*args: object) -> None:
+        raise AssertionError("Current schema should not rescan complete history")
+
+    monkeypatch.setattr(WorkflowStore, "_redact_stored_definitions", staticmethod(unexpected_scan))
+    monkeypatch.setattr(WorkflowStore, "_materialize_all", staticmethod(unexpected_scan))
+    reopened = WorkflowStore(path)
+    assert reopened.list_operations("legacy-workflow")["total_count"] == 1
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM workflow_operations WHERE workflow_id = 'legacy-workflow'")
+    repaired = WorkflowStore(path)
+    assert repaired.list_operations("legacy-workflow")["total_count"] == 1
+
+
+def test_failed_backfill_is_retried_after_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "legacy.db"
+    _seed_v024_database(path)
+    def crash_after_redaction(connection: sqlite3.Connection) -> None:
+        raise RuntimeError("simulated crash")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(WorkflowStore, "_materialize_all", staticmethod(crash_after_redaction))
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            WorkflowStore(path)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM workflow_maintenance").fetchone()[0] == 0
+    reopened = WorkflowStore(path)
+    assert reopened.list_operations("legacy-workflow")["total_count"] == 1
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM workflow_maintenance").fetchone()[0] == 1
+
+
 def test_simultaneous_old_schema_open_serializes_version_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
