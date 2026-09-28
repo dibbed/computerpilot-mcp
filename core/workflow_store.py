@@ -615,14 +615,7 @@ class WorkflowStore:
         }
 
     def get_operation(self, operation_id: str) -> dict[str, Any]:
-        with closing(self._connect()) as connection:
-            row = connection.execute(
-                "SELECT workflow_id FROM workflow_operations WHERE operation_id = ?", (operation_id,),
-            ).fetchone()
-        if row is None:
-            raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
-        operations = self.list_operations(str(row["workflow_id"]))["items"]
-        return next(item for item in operations if item["operation_id"] == operation_id)
+        return self.get_operation_for_reconciliation(operation_id)
 
     def get_operation_for_reconciliation(self, operation_id: str) -> dict[str, Any]:
         """Return exact durable recovery fields for one operation."""
@@ -856,7 +849,7 @@ class WorkflowStore:
                 ),
             )
             connection.commit()
-        return next(item for item in self.list_operations(workflow_id)["items"] if item["operation_id"] == operation_id)
+        return self.get_operation(operation_id)
 
     def acquire_lease(self, workflow_id: str, owner_id: str, ttl_sec: float) -> WorkflowLease:
         owner_id = owner_id.strip()

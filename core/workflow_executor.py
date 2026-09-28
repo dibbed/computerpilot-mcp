@@ -212,7 +212,12 @@ class WorkflowExecutor:
                 workflow_id, current["version"], WorkflowState.RUNNING, lease_token=lease.lease_token,
             )
             definition = self.store.execution_definition(workflow_id)
-            operations = self.store.list_operations(workflow_id)["items"]
+            operations: list[dict[str, Any]] = []
+            while True:
+                page = self.store.list_operations(workflow_id, offset=len(operations), limit=500)
+                operations.extend(page["items"])
+                if not page["has_more"]:
+                    break
             for index in range(int(current["current_step"]), len(definition.steps)):
                 step, operation = definition.steps[index], operations[index]
                 if operation["state"] == OperationState.SUCCEEDED.value:

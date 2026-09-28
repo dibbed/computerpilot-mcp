@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from core.errors import ToolError
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowStore
+from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
 def _definition() -> WorkflowDefinition:
@@ -28,6 +28,24 @@ def _definition() -> WorkflowDefinition:
             ),
         ),
     )
+
+
+def test_direct_store_operations_beyond_first_page_are_retrievable_and_executable(tmp_path: Path) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db")
+    workflow = store.create(
+        WorkflowDefinition(
+            "many-steps",
+            tuple(StepDefinition(f"check-{index}", "check_file", {"path": str(tmp_path)}) for index in range(101)),
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+    workflow_id = str(workflow["workflow_id"])
+    last = store.list_operations(workflow_id, offset=100, limit=1)["items"][0]
+
+    assert store.get_operation(last["operation_id"])["step_index"] == 100
+    result = WorkflowExecutor(store).execute(workflow_id, owner_id="many-steps-test")
+    assert result["state"] == "completed"
+    assert result["current_step"] == 101
 
 
 def test_create_materializes_one_operation_per_legacy_step(tmp_path: Path) -> None:
