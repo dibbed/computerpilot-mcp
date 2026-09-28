@@ -1409,7 +1409,7 @@ class WorkflowStore:
                 SELECT workflow_id, state, current_step, version, created_at, updated_at
                 FROM workflows
                 WHERE state = 'queued'
-                ORDER BY created_at ASC, workflow_id ASC
+                ORDER BY created_at ASC, rowid ASC
                 LIMIT ?
                 """,
                 (limit,),
