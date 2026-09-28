@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from core.errors import ToolError
+from core.file_lock import exclusive_file_lock
 from core.workflow_models import (
     OperationState,
     WorkflowDefinition,
@@ -150,25 +151,30 @@ class WorkflowStore:
                 """
             )
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version < SCHEMA_VERSION:
+                # executescript commits its caller's transaction; serialize the
+                # version check and all migration stages across processes.
+                with exclusive_file_lock(self.path.with_name(f"{self.path.name}.migration.lock")):
+                    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                    if version < 1:
+                        self._migrate_v1(connection)
+                        version = 1
+                    if version < 2:
+                        self._migrate_v2(connection)
+                        version = 2
+                    if version < 3:
+                        self._migrate_v3(connection)
+                        version = 3
+                    if version < 4:
+                        self._migrate_v4(connection)
+                        version = 4
+                    if version < 5:
+                        self._migrate_v5(connection)
             if version > SCHEMA_VERSION:
                 raise ToolError(
                     "workflow_schema_too_new",
                     f"Workflow database schema {version} is newer than supported version {SCHEMA_VERSION}.",
                 )
-            if version < 1:
-                self._migrate_v1(connection)
-                version = 1
-            if version < 2:
-                self._migrate_v2(connection)
-                version = 2
-            if version < 3:
-                self._migrate_v3(connection)
-                version = 3
-            if version < 4:
-                self._migrate_v4(connection)
-                version = 4
-            if version < 5:
-                self._migrate_v5(connection)
             connection.execute("BEGIN IMMEDIATE")
             self._redact_stored_definitions(connection)
             self._materialize_all(connection)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -139,3 +141,32 @@ def test_migration_reopen_is_idempotent(tmp_path: Path) -> None:
     assert first[0]["operation_id"] == second[0]["operation_id"]
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM workflow_events").fetchone()[0] == 1
+
+
+def test_simultaneous_old_schema_open_serializes_version_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _seed_v024_database(path)
+    with sqlite3.connect(path) as connection:
+        WorkflowStore._migrate_v1(connection)
+    barrier = threading.Barrier(2)
+    original = WorkflowStore._migrate_v2
+
+    def synchronized_migration(connection: sqlite3.Connection) -> None:
+        try:
+            barrier.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            # A correctly serialized migration lets only one opener reach this point.
+            pass
+        original(connection)
+
+    monkeypatch.setattr(WorkflowStore, "_migrate_v2", staticmethod(synchronized_migration))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(WorkflowStore, path) for _ in range(2)]
+        for future in futures:
+            assert future.result(timeout=12).get("legacy-workflow")["state"] == "completed"
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
