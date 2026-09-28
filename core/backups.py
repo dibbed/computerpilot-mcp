@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from stat import S_ISREG
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,8 @@ def backup_created_at(path: Path, fallback_mtime: float) -> float:
     """Use the backup-event timestamp encoded in the filename, falling back for legacy names."""
 
     stamp = path.name.split("_", 1)[0]
+    if len(stamp) < 17 or stamp[8] != "T" or not stamp.endswith("Z"):
+        return fallback_mtime
     try:
         return datetime.strptime(stamp, "%Y%m%dT%H%M%S%fZ").replace(tzinfo=timezone.utc).timestamp()
     except ValueError:
@@ -75,17 +78,19 @@ def _scan_backups(directory: Path) -> tuple[list[BackupEntry], int]:
         return entries, 1
     for path in candidates:
         try:
-            if not path.is_file():
+            file_stat = path.stat()
+            if not S_ISREG(file_stat.st_mode):
                 continue
-            stat = path.stat()
+        except FileNotFoundError:
+            continue
         except OSError:
             errors += 1
             continue
         entries.append(
             BackupEntry(
                 path=path,
-                size=stat.st_size,
-                created_at=backup_created_at(path, stat.st_mtime),
+                size=file_stat.st_size,
+                created_at=backup_created_at(path, file_stat.st_mtime),
             )
         )
     entries.sort(key=lambda entry: (entry.created_at, entry.path.name.casefold()))
