@@ -28,6 +28,8 @@ def _files_usage(root: Path, *, accept: Callable[[Path], bool] | None = None) ->
         for entry in root.iterdir():
             try:
                 if entry.is_dir():
+                    if entry.is_symlink():
+                        continue
                     nested_count, nested_bytes = _files_usage(entry, accept=accept)
                     count += nested_count
                     total += nested_bytes
@@ -52,6 +54,8 @@ def _job_output_usage(root: Path, terminal_ids: set[str]) -> tuple[int, int, int
             for entry in directory.iterdir():
                 try:
                     if entry.is_dir():
+                        if entry.is_symlink():
+                            continue
                         stack.append((entry, terminal or (directory == root and entry.name in terminal_ids)))
                     elif entry.is_file():
                         size = entry.stat().st_size

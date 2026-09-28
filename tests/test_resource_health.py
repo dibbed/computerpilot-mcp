@@ -43,3 +43,25 @@ def test_job_metrics_account_for_terminal_output_in_one_tree_walk(
     assert output["job_output_bytes"] == 7
     assert output["job_history_output_bytes"] == 3
     assert scans == 3
+
+
+@pytest.mark.parametrize("job_tree", [False, True])
+def test_health_usage_does_not_follow_directory_symlink_cycles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, job_tree: bool,
+) -> None:
+    (tmp_path / "payload.bin").write_bytes(b"abc")
+    (tmp_path / "loop").symlink_to(tmp_path, target_is_directory=True)
+    original_iterdir = Path.iterdir
+    scans = 0
+
+    def bounded_iterdir(path: Path) -> Iterator[Path]:
+        nonlocal scans
+        scans += 1
+        assert scans <= 2, "health accounting revisited a directory symlink"
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", bounded_iterdir)
+    if job_tree:
+        assert resource_health._job_output_usage(tmp_path, set())[:2] == (1, 3)
+    else:
+        assert resource_health._files_usage(tmp_path) == (1, 3)
