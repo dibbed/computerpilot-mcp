@@ -391,12 +391,16 @@ def start_background(
         encoding=chosen_encoding,
     )
     with _BACKGROUND_LOCK:
+        previous = _BACKGROUND.get(process.pid)
         _BACKGROUND[process.pid] = record
         finished = [pid for pid, item in _BACKGROUND.items() if item.process.poll() is not None]
+        retired = [previous] if previous is not None else []
         for old_pid in finished[:-50]:
             old_record = _BACKGROUND.pop(old_pid, None)
             if old_record is not None:
-                _close_background_record(old_record)
+                retired.append(old_record)
+    for old_record in retired:
+        _close_background_record(old_record)
     return {
         "ok": True,
         "pid": process.pid,
