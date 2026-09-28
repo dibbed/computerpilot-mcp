@@ -97,7 +97,11 @@ def _files_all_sha256(expected: dict[str, Any]) -> Evidence:
             satisfied = False
             continue
         try:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            hasher = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1_048_576), b""):
+                    hasher.update(chunk)
+            digest = hasher.hexdigest()
         except OSError as exc:
             return Evidence(
                 "filesystem",

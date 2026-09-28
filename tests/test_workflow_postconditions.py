@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import tracemalloc
 from pathlib import Path
 
 from core.reconcilers import evaluate_postcondition, get_postcondition_descriptor
@@ -14,6 +15,26 @@ def test_filesystem_hash_evidence_is_conclusive(tmp_path: Path) -> None:
     evidence = evaluate_postcondition(Postcondition("file_sha256", {"path": str(target), "sha256": digest}))
     assert evidence.data["conclusive"] is True
     assert evidence.data["satisfied"] is True
+
+
+def test_multifile_hash_does_not_buffer_large_files(tmp_path: Path) -> None:
+    target = tmp_path / "large.bin"
+    chunk = b"x" * 1_048_576
+    digest = hashlib.sha256()
+    with target.open("wb") as handle:
+        for _ in range(8):
+            handle.write(chunk)
+            digest.update(chunk)
+    tracemalloc.start()
+    try:
+        evidence = evaluate_postcondition(Postcondition(
+            "files_all_sha256", {"files": [{"path": str(target), "sha256": digest.hexdigest()}]},
+        ))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert evidence.data["satisfied"] is True
+    assert peak < 4_000_000
 
 
 def test_package_version_uses_active_python_environment() -> None:
