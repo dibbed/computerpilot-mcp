@@ -284,7 +284,9 @@ class OwnedProcess:
             try:
                 parent = psutil.Process(self.pid)
                 processes = [*parent.children(recursive=True), parent]
-            except psutil.NoSuchProcess:
+            except (psutil.Error, OSError):
+                # The Job Object owns the tree even when process-table inspection
+                # fails; diagnostics must not prevent termination.
                 processes = []
             targeted = [process.pid for process in processes]
             job.terminate(1)
