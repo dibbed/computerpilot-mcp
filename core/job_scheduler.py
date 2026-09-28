@@ -96,7 +96,7 @@ class JobScheduler:
                 _start_worker_reaper(process)
             try:
                 created = psutil.Process(process.pid).create_time()
-            except psutil.NoSuchProcess:
+            except psutil.Error:
                 created = None
             self.store.record_worker_launch(
                 job_id,

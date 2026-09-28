@@ -158,6 +158,37 @@ def test_stale_launch_reservation_is_recovered_and_replaced(tmp_path: Path) -> N
     assert store.raw(job_id)["launch_token"] == reservations[0][1]
 
 
+def test_successful_worker_launch_survives_process_metadata_denial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id = _seed(store, 1)[0]
+    reservations, _ = store.reserve_worker_launches(max_running=1)
+    token = reservations[0][1]
+
+    class LaunchedProcess:
+        pid = 12345
+
+    class DeniedProcess:
+        def __init__(self, pid: int) -> None:
+            assert pid == LaunchedProcess.pid
+
+        def create_time(self) -> float:
+            raise psutil.AccessDenied(pid=LaunchedProcess.pid)
+
+    monkeypatch.setattr(job_scheduler.subprocess, "Popen", lambda *args, **kwargs: LaunchedProcess())
+    monkeypatch.setattr(job_scheduler, "_start_worker_reaper", lambda process: None)
+    monkeypatch.setattr(job_scheduler.psutil, "Process", DeniedProcess)
+
+    job_scheduler.JobScheduler(store)._launch_worker(job_id, token)
+
+    row = store.raw(job_id)
+    assert row["status"] == "queued"
+    assert row["launch_token"] == token
+    assert row["worker_pid"] == LaunchedProcess.pid
+    assert row["worker_created"] is None
+
+
 def test_submit_tolerates_scheduler_precreated_output_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
