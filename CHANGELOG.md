@@ -17,6 +17,11 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - Add bounded rotated `.agent_state/transport-health.jsonl` diagnostics plus a Transport Health section in the loopback control panel.
 - Add a conservative poll-stall watchdog that only becomes restart-eligible after the runtime-reported poll deadline plus grace is exceeded for multiple consecutive observations.
 
+### Changed
+- Redesign the local Control Panel as a dense operations console with incident-first health hierarchy, sticky section navigation, explicit transport diagnosis, checklist-style Doctor output, workflow timelines, collapsible raw logs, and clearer status semantics.
+- Make panel polling visibility-aware and single-flight guarded, with bounded fetch timeouts and explicit stale/unavailable feedback instead of overlapping background refreshes.
+- Improve Control Panel accessibility and responsive behavior with semantic navigation, focus-visible states, modal focus trapping/restoration, scroll locking, reduced-motion handling, accessible filters, and mobile touch targets.
+
 ### Fixed
 - Stop treating `/readyz == 200` as sufficient evidence that control-plane polling is functional; detailed tunnel component health now participates in Supervisor recovery decisions.
 - Never restart the local runtime merely because no new upstream command has arrived while control-plane polling remains healthy.
