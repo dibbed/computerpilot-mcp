@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -27,15 +28,16 @@ def _files_usage(root: Path, *, accept: Callable[[Path], bool] | None = None) ->
     try:
         for entry in root.iterdir():
             try:
-                if entry.is_dir():
+                file_stat = entry.stat()
+                if stat.S_ISDIR(file_stat.st_mode):
                     if entry.is_symlink():
                         continue
                     nested_count, nested_bytes = _files_usage(entry, accept=accept)
                     count += nested_count
                     total += nested_bytes
-                elif entry.is_file() and (accept is None or accept(entry)):
+                elif stat.S_ISREG(file_stat.st_mode) and (accept is None or accept(entry)):
                     count += 1
-                    total += entry.stat().st_size
+                    total += file_stat.st_size
             except OSError:
                 continue
     except OSError:
@@ -53,12 +55,13 @@ def _job_output_usage(root: Path, terminal_ids: set[str]) -> tuple[int, int, int
         try:
             for entry in directory.iterdir():
                 try:
-                    if entry.is_dir():
+                    file_stat = entry.stat()
+                    if stat.S_ISDIR(file_stat.st_mode):
                         if entry.is_symlink():
                             continue
                         stack.append((entry, terminal or (directory == root and entry.name in terminal_ids)))
-                    elif entry.is_file():
-                        size = entry.stat().st_size
+                    elif stat.S_ISREG(file_stat.st_mode):
+                        size = file_stat.st_size
                         count += 1
                         total += size
                         if terminal:
