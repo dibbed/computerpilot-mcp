@@ -72,6 +72,27 @@ def _running_checkpoint(store: WorkflowStore) -> tuple[dict[str, object], str, s
     return workflow, operation_id, lease.lease_token
 
 
+def test_restart_pauses_before_first_action_checkpoint(tmp_path: Path) -> None:
+    path = tmp_path / "workflows.db"
+    store = WorkflowStore(path)
+    workflow = store.create(
+        WorkflowDefinition("not-started", (StepDefinition("check", "check_file", {"path": str(tmp_path)}),)),
+        initial_state=WorkflowState.QUEUED,
+    )
+    workflow_id = str(workflow["workflow_id"])
+    lease = store.acquire_lease(workflow_id, "worker-a", 30)
+    store.transition(workflow_id, int(workflow["version"]), WorkflowState.RUNNING, lease_token=lease.lease_token)
+    _expire_lease(path, workflow_id)
+
+    reopened = WorkflowStore(path)
+    current = reopened.get(workflow_id)
+
+    assert current["state"] == "paused"
+    assert current["current_step"] == 0
+    assert current["steps"][0]["state"] == "created"
+    assert reopened.list_operations(workflow_id)["items"][0]["state"] == "created"
+
+
 def test_restart_finishes_aggregate_when_operation_result_was_persisted(tmp_path: Path) -> None:
     path = tmp_path / "workflows.db"
     store = WorkflowStore(path)

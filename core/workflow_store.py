@@ -1194,7 +1194,7 @@ class WorkflowStore:
                 workflow_state = str(row["state"])
                 operation = connection.execute(
                     """
-                    SELECT operation_id, state, evidence_json, error
+                    SELECT operation_id, state, attempts, started_at, evidence_json, error
                     FROM workflow_operations
                     WHERE workflow_id = ? AND step_index = ? AND operation_index = 0
                     """,
@@ -1272,6 +1272,26 @@ class WorkflowStore:
                         SET state = 'cancelled', version = version + 1, updated_at = ?
                         WHERE workflow_id = ?
                         """,
+                        (now, workflow_id),
+                    )
+                elif (
+                    workflow_state == WorkflowState.RUNNING.value
+                    and row["cancel_requested_at"] is None
+                    and operation is not None
+                    and str(operation["state"]) == OperationState.CREATED.value
+                    and int(operation["attempts"]) == 0
+                    and operation["started_at"] is None
+                    and connection.execute(
+                        "SELECT 1 FROM workflow_steps WHERE workflow_id = ? AND step_index = ? "
+                        "AND state = 'created' AND attempts = 0 AND started_at IS NULL",
+                        (workflow_id, step_index),
+                    ).fetchone() is not None
+                ):
+                    # The executor checkpoints the operation before running an action.
+                    # A created step with no attempt can be queued again safely.
+                    connection.execute(
+                        "UPDATE workflows SET state = 'paused', version = version + 1, updated_at = ? "
+                        "WHERE workflow_id = ?",
                         (now, workflow_id),
                     )
                 else:
