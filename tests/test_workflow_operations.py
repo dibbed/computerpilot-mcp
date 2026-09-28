@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from core.errors import ToolError
+from core.workflow_models import OperationState
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
@@ -88,6 +89,30 @@ def test_operation_listing_is_paginated_and_redacted(tmp_path: Path) -> None:
     assert "execution_definition_json" in workflow_columns
     assert "secret-one" in execution_definition
     assert "secret-two" in execution_definition
+
+
+def test_checkpoint_can_skip_unneeded_post_commit_operation_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db")
+    workflow = store.create(_definition(), initial_state=WorkflowState.QUEUED)
+    workflow_id = str(workflow["workflow_id"])
+    operation_id = store.list_operations(workflow_id)["items"][0]["operation_id"]
+    lease = store.acquire_lease(workflow_id, "worker", 30)
+    selects: list[str] = []
+    connect = store._connect
+
+    def traced() -> sqlite3.Connection:
+        connection = connect()
+        connection.set_trace_callback(lambda sql: selects.append(sql) if sql.startswith("SELECT") else None)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", traced)
+    result = store.checkpoint_operation(
+        operation_id, OperationState.RUNNING, lease_token=lease.lease_token,
+        increment_attempt=True, return_operation=False,
+    )
+
+    assert result is None
+    assert len(selects) == 2  # Operation state and lease ownership only.
 
 
 def test_materialization_detects_definition_conflict(tmp_path: Path) -> None:

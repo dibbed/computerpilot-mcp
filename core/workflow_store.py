@@ -807,7 +807,8 @@ class WorkflowStore:
         postcondition: dict[str, Any] | None = None,
         error: str | None = None,
         increment_attempt: bool = False,
-    ) -> dict[str, Any]:
+        return_operation: bool = True,
+    ) -> dict[str, Any] | None:
         now = _now()
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -855,7 +856,7 @@ class WorkflowStore:
                 ),
             )
             connection.commit()
-        return self.get_operation(operation_id)
+        return self.get_operation(operation_id) if return_operation else None
 
     def acquire_lease(self, workflow_id: str, owner_id: str, ttl_sec: float) -> WorkflowLease:
         owner_id = owner_id.strip()

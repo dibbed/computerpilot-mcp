@@ -172,6 +172,7 @@ class WorkflowExecutor:
                 OperationState.CANCELLED,
                 lease_token=lease_token,
                 error=error,
+                return_operation=False,
             )
         self.store.checkpoint_step(
             workflow_id,
@@ -243,6 +244,7 @@ class WorkflowExecutor:
                             OperationState.RUNNING,
                             lease_token=lease.lease_token,
                             increment_attempt=True,
+                            return_operation=False,
                         )
                         self.store.checkpoint_step(
                             workflow_id, index, "running", increment_attempt=True, lease_token=lease.lease_token,
@@ -252,6 +254,7 @@ class WorkflowExecutor:
                             OperationState.FAILED,
                             lease_token=lease.lease_token,
                             error=str(exc),
+                            return_operation=False,
                         )
                         return self._fail(workflow_id, index, lease.lease_token, str(exc), uncertain=False)
                     execution_step = StepDefinition(
@@ -269,6 +272,7 @@ class WorkflowExecutor:
                         increment_attempt=True,
                         intent_evidence=intent_evidence,
                         postcondition=canonical_postcondition,
+                        return_operation=False,
                     )
                     self.store.checkpoint_step(
                         workflow_id, index, "running", increment_attempt=True, lease_token=lease.lease_token,
@@ -288,6 +292,7 @@ class WorkflowExecutor:
                         self.store.checkpoint_operation(
                             operation["operation_id"], OperationState.SUCCEEDED,
                             lease_token=lease.lease_token, result=result, evidence=evidence,
+                            return_operation=False,
                         )
                         self.store.checkpoint_step(
                             workflow_id, index, "completed",
@@ -322,6 +327,7 @@ class WorkflowExecutor:
                         self.store.checkpoint_operation(
                             operation["operation_id"], OperationState.FAILED,
                             lease_token=lease.lease_token, error=str(exc),
+                            return_operation=False,
                         )
                         if self.store.cancel_requested(workflow_id):
                             return self._cancel_operation(
@@ -345,12 +351,14 @@ class WorkflowExecutor:
                         self.store.checkpoint_operation(
                             operation["operation_id"], OperationState.UNCERTAIN,
                             lease_token=lease.lease_token, error=str(exc),
+                            return_operation=False,
                         )
                         return self._fail(workflow_id, index, lease.lease_token, str(exc), uncertain=True)
                     except Exception as exc:
                         self.store.checkpoint_operation(
                             operation["operation_id"], OperationState.FAILED,
                             lease_token=lease.lease_token, error=str(exc),
+                            return_operation=False,
                         )
                         return self._fail(workflow_id, index, lease.lease_token, str(exc), uncertain=False)
                 lease = self.store.renew_lease(workflow_id, lease.lease_token, lease_ttl_sec)
