@@ -56,6 +56,21 @@ def test_concurrent_reservation_never_launches_above_capacity(tmp_path: Path) ->
     assert running == 0
 
 
+def test_scheduler_queries_use_status_and_ordered_queue_indexes(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    _seed(store, 20)
+    queries = (
+        "SELECT count(*) FROM jobs WHERE status IN ('running','orphaned')",
+        "SELECT count(*) FROM jobs WHERE status='queued' AND launch_token IS NOT NULL",
+        "SELECT id FROM jobs WHERE status='queued' AND launch_token IS NULL AND cancel_requested=0 "
+        "AND (queue_deadline IS NULL OR queue_deadline>0) ORDER BY created,id LIMIT 4",
+    )
+    with closing(store.connect()) as db:
+        plans = [[str(row[3]) for row in db.execute("EXPLAIN QUERY PLAN " + query)] for query in queries]
+    assert all(any("USING" in detail and "INDEX" in detail for detail in plan) for plan in plans)
+    assert all("USE TEMP B-TREE FOR ORDER BY" not in detail for detail in plans[2])
+
+
 def test_cross_process_reservations_do_not_exceed_capacity(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
     _seed(store, 20)

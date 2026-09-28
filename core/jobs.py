@@ -110,6 +110,10 @@ class JobStore:
                     db.execute("ALTER TABLE jobs ADD COLUMN launch_token TEXT")
                 if "launch_started" not in columns:
                     db.execute("ALTER TABLE jobs ADD COLUMN launch_started REAL")
+                db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_jobs_status_launch_queue "
+                    "ON jobs(status, launch_token, created, id)"
+                )
                 db.execute(f"PRAGMA user_version={JOB_SCHEMA_VERSION}")
                 db.commit()
             except BaseException:
