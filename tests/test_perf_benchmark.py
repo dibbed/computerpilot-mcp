@@ -403,6 +403,140 @@ def test_failed_report_publish_preserves_previous_output(
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_managed_benchmark_reports_expire_but_explicit_outputs_remain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import perf_benchmark
+
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    managed = perf_benchmark._default_output()
+    managed.parent.mkdir(parents=True)
+    managed.write_text("old report")
+    os.utime(managed, (1, 1))
+    explicit = tmp_path / "benchmarks" / "custom-report.json"
+    explicit.write_text("user report")
+    os.utime(explicit, (1, 1))
+    assert perf_benchmark._cleanup_managed_reports(now=40 * 86_400) == 1
+    assert not managed.exists()
+    assert explicit.read_text() == "user report"
+    assert perf_benchmark._cleanup_managed_reports(now=40 * 86_400) == 0
+
+
+def test_managed_benchmark_reports_keep_recent_and_reject_linked_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import perf_benchmark
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=outside))
+    recent = perf_benchmark._default_output()
+    recent.parent.mkdir(parents=True)
+    recent.write_text("recent")
+    os.utime(recent, (40 * 86_400 - 100, 40 * 86_400 - 100))
+    assert perf_benchmark._cleanup_managed_reports(now=40 * 86_400) == 0
+    assert recent.exists()
+
+    linked = tmp_path / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=linked))
+    assert perf_benchmark._cleanup_managed_reports(now=100 * 86_400) == 0
+    assert recent.read_text() == "recent"
+
+
+def test_managed_benchmark_reports_have_count_and_byte_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import perf_benchmark
+
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    files = [perf_benchmark._default_output() for _ in range(4)]
+    files[0].parent.mkdir(parents=True)
+    for index, path in enumerate(files):
+        path.write_text("x" * 10)
+        os.utime(path, (index + 1, index + 1))
+    assert perf_benchmark._cleanup_managed_reports(
+        now=3 * 86_400, max_count=2, max_bytes=20,
+    ) == 2
+    assert [path.exists() for path in files] == [False, False, True, True]
+
+
+def test_managed_report_startup_sweep_and_active_publish_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.file_lock import exclusive_file_lock
+    from scripts import perf_benchmark
+
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    stale = perf_benchmark._default_output()
+    stale.parent.mkdir(parents=True)
+    stale.write_text("crashed prior run")
+    os.utime(stale, (1, 1))
+    monkeypatch.setattr(perf_benchmark, "run_benchmarks", lambda **kwargs: {"results": []})
+
+    assert perf_benchmark.main([]) == 0
+    assert not stale.exists()
+    reports = list(stale.parent.glob("benchmark-*.json"))
+    assert len(reports) == 1
+    assert reports[0].read_text().startswith("{")
+
+    import threading
+
+    removed: list[int] = []
+    with exclusive_file_lock(stale.parent / ".retention.lock"):
+        pending = perf_benchmark._default_output()
+        thread = threading.Thread(
+            target=lambda: removed.append(perf_benchmark._cleanup_managed_reports()),
+        )
+        thread.start()
+        pending.write_text("publishing")
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert removed == [0]
+    assert pending.read_text() == "publishing"
+
+
+def test_managed_report_cleanup_does_not_follow_report_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import perf_benchmark
+
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    name = perf_benchmark._default_output()
+    name.parent.mkdir(parents=True)
+    outside = tmp_path / "valuable.json"
+    outside.write_text("keep")
+    name.symlink_to(outside)
+    assert perf_benchmark._cleanup_managed_reports(now=100 * 86_400) == 0
+    assert name.is_symlink()
+    assert outside.read_text() == "keep"
+
+
+def test_managed_report_cleanup_reclaims_only_stale_regular_temporary_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import perf_benchmark
+
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    report = perf_benchmark._default_output()
+    report.parent.mkdir(parents=True)
+    stale = report.parent / f".{report.name}.abc123.tmp"
+    recent = report.parent / f".{report.name}.def456.tmp"
+    unrelated = report.parent / ".custom-report.json.abc123.tmp"
+    outside = tmp_path / "outside"
+    outside.write_text("important")
+    linked = report.parent / f".{report.name}.linked.tmp"
+    for path in (stale, recent, unrelated):
+        path.write_text("partial")
+    linked.symlink_to(outside)
+    os.utime(stale, (1, 1))
+    os.utime(recent, (2 * 86_400 - 100, 2 * 86_400 - 100))
+    assert perf_benchmark._cleanup_managed_reports(now=2 * 86_400) == 1
+    assert not stale.exists()
+    assert recent.exists() and unrelated.exists() and linked.is_symlink()
+    assert outside.read_text() == "important"
+
+
 def test_stale_benchmark_cleanup_preserves_active_work_and_external_links(tmp_path: Path) -> None:
     from core.file_lock import exclusive_file_lock
 

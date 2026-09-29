@@ -21,7 +21,7 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -36,7 +36,7 @@ from core.backups import BackupPolicy, backup_created_at, cleanup_backups
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
 from core.file_lock import exclusive_file_lock
-from core.state_paths import unlinked_directory_tree
+from core.state_paths import unlinked_directory_tree, unlinked_regular_file
 from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
 from core.recovery import OperationRecoveryJournal
@@ -85,6 +85,13 @@ SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser"
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
 _GC_STAGING = re.compile(r"^\.gc-[0-9a-f]{32}$")
+_MANAGED_REPORT = re.compile(r"^benchmark-[0-9]{8}T[0-9]{12}Z-[0-9a-f]{32}\.json$")
+_MANAGED_REPORT_TEMP = re.compile(r"^\.benchmark-[0-9]{8}T[0-9]{12}Z-[0-9a-f]{32}\.json\.[a-zA-Z0-9_-]+\.tmp$")
+REPORT_MAX_AGE_SEC = 30 * 86_400
+REPORT_RECENT_GRACE_SEC = 86_400
+REPORT_TEMP_MAX_AGE_SEC = 86_400
+REPORT_MAX_COUNT = 100
+REPORT_MAX_BYTES = 64 * MiB
 
 
 class BenchmarkSkip(RuntimeError):
@@ -1889,7 +1896,74 @@ def run_benchmarks(
 
 def _default_output() -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    return SETTINGS.state_dir / "benchmarks" / f"benchmark-{stamp}-{uuid.uuid4().hex}.json"
+    return SETTINGS.state_dir / "benchmarks" / "reports" / f"benchmark-{stamp}-{uuid.uuid4().hex}.json"
+
+
+def _cleanup_managed_reports(
+    *, now: float | None = None, max_count: int = REPORT_MAX_COUNT,
+    max_bytes: int = REPORT_MAX_BYTES,
+) -> int:
+    """Prune only completed, auto-named reports; never touch explicit output paths."""
+    root = SETTINGS.state_dir / "benchmarks" / "reports"
+    if not unlinked_directory_tree(root):
+        return 0
+    current = time.time() if now is None else now
+    removed = 0
+    try:
+        with exclusive_file_lock(root / ".retention.lock", timeout_sec=1):
+            if not unlinked_directory_tree(root):
+                return 0
+            entries: list[tuple[float, Path, os.stat_result]] = []
+            temporary_entries: list[tuple[Path, os.stat_result]] = []
+            for path in root.iterdir():
+                is_report = bool(_MANAGED_REPORT.fullmatch(path.name))
+                is_temporary = bool(_MANAGED_REPORT_TEMP.fullmatch(path.name))
+                if not (is_report or is_temporary) or not unlinked_regular_file(path):
+                    continue
+                try:
+                    info = path.lstat()
+                except OSError:
+                    continue
+                if is_temporary:
+                    temporary_entries.append((path, info))
+                else:
+                    entries.append((info.st_mtime, path, info))
+            entries.sort(key=lambda entry: (entry[0], entry[1].name))
+            total_bytes = sum(info.st_size for _, _, info in entries)
+            remaining_count = len(entries)
+            for modified, path, info in entries:
+                if current - modified < REPORT_RECENT_GRACE_SEC:
+                    continue
+                if current - modified < REPORT_MAX_AGE_SEC and remaining_count <= max_count and total_bytes <= max_bytes:
+                    continue
+                try:
+                    latest = path.lstat()
+                    if not unlinked_regular_file(path) or (
+                        latest.st_dev, latest.st_ino, latest.st_mtime_ns, latest.st_size
+                    ) != (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size):
+                        continue
+                    path.unlink()
+                except OSError:
+                    continue
+                removed += 1
+                remaining_count -= 1
+                total_bytes -= info.st_size
+            for path, info in temporary_entries:
+                if current - info.st_mtime < REPORT_TEMP_MAX_AGE_SEC:
+                    continue
+                try:
+                    latest = path.lstat()
+                    if not unlinked_regular_file(path) or (
+                        latest.st_dev, latest.st_ino, latest.st_mtime_ns, latest.st_size
+                    ) != (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size):
+                        continue
+                    path.unlink()
+                except OSError:
+                    continue
+                removed += 1
+    except (OSError, TimeoutError):
+        pass  # Retention must not prevent publishing a benchmark result.
+    return removed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1906,6 +1980,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.output is None:
+        _cleanup_managed_reports()  # Also recover reports left by an earlier process.
     suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "resilience", "workflow"))
     report = run_benchmarks(
         profile=args.profile,
@@ -1918,17 +1994,21 @@ def main(argv: list[str] | None = None) -> int:
     if not output.is_absolute():
         output = PROJECT_ROOT / output
     output.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(report, stream, indent=2, ensure_ascii=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, output)
-    finally:
-        temporary.unlink(missing_ok=True)
+    publication_lock = exclusive_file_lock(output.parent / ".retention.lock") if args.output is None else nullcontext()
+    with publication_lock:
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(report, stream, indent=2, ensure_ascii=False)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, output)
+        finally:
+            temporary.unlink(missing_ok=True)
+    if args.output is None:
+        _cleanup_managed_reports()
     if args.stdout:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"benchmark_report={output}")
