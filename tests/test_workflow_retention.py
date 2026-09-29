@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from mcp import Client
@@ -92,7 +93,7 @@ def test_retention_rechecks_lease_acquired_after_eligibility_scan(
     inserted = False
 
     class InjectLease(sqlite3.Connection):
-        def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
             nonlocal inserted
             if sql == "BEGIN IMMEDIATE" and not inserted:
                 inserted = True

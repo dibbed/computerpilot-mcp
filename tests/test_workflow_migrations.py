@@ -5,6 +5,7 @@ import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -222,7 +223,7 @@ def test_transient_wal_lock_during_open_is_retried_without_leaking_connection(
     connections: list[sqlite3.Connection] = []
 
     class ContendedConnection(sqlite3.Connection):
-        def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
             nonlocal attempts
             if sql == "PRAGMA journal_mode=WAL":
                 attempts += 1
@@ -230,7 +231,7 @@ def test_transient_wal_lock_during_open_is_retried_without_leaking_connection(
                     raise sqlite3.OperationalError("database is locked")
             return super().execute(sql, parameters)
 
-    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+    def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
         connection = original_connect(*args, factory=ContendedConnection, **kwargs)
         connections.append(connection)
         return connection
@@ -252,13 +253,13 @@ def test_wal_is_configured_at_startup_and_not_repeated_on_each_read(
     wal_setups = 0
 
     class TrackedConnection(sqlite3.Connection):
-        def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
             nonlocal wal_setups
             if sql == "PRAGMA journal_mode=WAL":
                 wal_setups += 1
             return super().execute(sql, parameters)
 
-    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+    def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
         return original_connect(*args, factory=TrackedConnection, **kwargs)
 
     monkeypatch.setattr(workflow_store.sqlite3, "connect", connect)
