@@ -18,35 +18,47 @@ from tools.filesystem.search_snapshots import SEARCH_SNAPSHOTS
 from tools.project.index import PYTHON_METADATA_CACHE
 
 _TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
+_REPARSE_POINT = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def _unlinked_lstat(path: Path) -> os.stat_result | None:
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return None
+    if _REPARSE_POINT and int(getattr(info, "st_file_attributes", 0)) & _REPARSE_POINT:
+        return None
+    return info
 
 
 def _files_usage(root: Path, *, accept: Callable[[Path], bool] | None = None) -> tuple[int, int]:
-    if not root.is_dir():
+    root_stat = _unlinked_lstat(root)
+    if root_stat is None or not stat.S_ISDIR(root_stat.st_mode):
         return 0, 0
     count = 0
     total = 0
     try:
         for entry in root.iterdir():
-            try:
-                file_stat = entry.stat()
-                if stat.S_ISDIR(file_stat.st_mode):
-                    if entry.is_symlink():
-                        continue
-                    nested_count, nested_bytes = _files_usage(entry, accept=accept)
-                    count += nested_count
-                    total += nested_bytes
-                elif stat.S_ISREG(file_stat.st_mode) and (accept is None or accept(entry)):
-                    count += 1
-                    total += file_stat.st_size
-            except OSError:
+            file_stat = _unlinked_lstat(entry)
+            if file_stat is None:
                 continue
+            if stat.S_ISDIR(file_stat.st_mode):
+                nested_count, nested_bytes = _files_usage(entry, accept=accept)
+                count += nested_count
+                total += nested_bytes
+            elif stat.S_ISREG(file_stat.st_mode) and (accept is None or accept(entry)):
+                count += 1
+                total += file_stat.st_size
     except OSError:
         pass
     return count, total
 
 
 def _job_output_usage(root: Path, terminal_ids: set[str]) -> tuple[int, int, int]:
-    if not root.is_dir():
+    root_stat = _unlinked_lstat(root)
+    if root_stat is None or not stat.S_ISDIR(root_stat.st_mode):
         return 0, 0, 0
     count = total = terminal_total = 0
     stack = [(root, False)]
@@ -54,30 +66,25 @@ def _job_output_usage(root: Path, terminal_ids: set[str]) -> tuple[int, int, int
         directory, terminal = stack.pop()
         try:
             for entry in directory.iterdir():
-                try:
-                    file_stat = entry.stat()
-                    if stat.S_ISDIR(file_stat.st_mode):
-                        if entry.is_symlink():
-                            continue
-                        stack.append((entry, terminal or (directory == root and entry.name in terminal_ids)))
-                    elif stat.S_ISREG(file_stat.st_mode):
-                        size = file_stat.st_size
-                        count += 1
-                        total += size
-                        if terminal:
-                            terminal_total += size
-                except OSError:
+                file_stat = _unlinked_lstat(entry)
+                if file_stat is None:
                     continue
+                if stat.S_ISDIR(file_stat.st_mode):
+                    stack.append((entry, terminal or (directory == root and entry.name in terminal_ids)))
+                elif stat.S_ISREG(file_stat.st_mode):
+                    size = file_stat.st_size
+                    count += 1
+                    total += size
+                    if terminal:
+                        terminal_total += size
         except OSError:
             continue
     return count, total, terminal_total
 
 
 def _single_file_bytes(path: Path) -> int:
-    try:
-        return path.stat().st_size if path.is_file() else 0
-    except OSError:
-        return 0
+    info = _unlinked_lstat(path)
+    return info.st_size if info is not None and stat.S_ISREG(info.st_mode) else 0
 
 
 def _job_metrics() -> dict[str, int]:
@@ -85,7 +92,8 @@ def _job_metrics() -> dict[str, int]:
     output_dir = SETTINGS.state_dir / "jobs"
     counts: Counter[str] = Counter()
     terminal_ids: set[str] = set()
-    if db_path.is_file():
+    db_stat = _unlinked_lstat(db_path)
+    if db_stat is not None and stat.S_ISREG(db_stat.st_mode):
         try:
             with sqlite3.connect(db_path, timeout=1.0) as db:
                 db.execute("PRAGMA query_only=ON")
@@ -123,15 +131,18 @@ def _job_metrics() -> dict[str, int]:
 
 def _audit_usage() -> tuple[int, int]:
     state = SETTINGS.state_dir
-    if not state.is_dir():
+    state_stat = _unlinked_lstat(state)
+    if state_stat is None or not stat.S_ISDIR(state_stat.st_mode):
         return 0, 0
     files: list[Path] = []
     active = SETTINGS.audit_log
-    if active.is_file():
+    active_stat = _unlinked_lstat(active)
+    if active_stat is not None and stat.S_ISREG(active_stat.st_mode):
         files.append(active)
     for index in range(1, SETTINGS.audit_keep_files + 1):
         candidate = state / f"audit.{index}.jsonl"
-        if candidate.is_file():
+        candidate_stat = _unlinked_lstat(candidate)
+        if candidate_stat is not None and stat.S_ISREG(candidate_stat.st_mode):
             files.append(candidate)
     return len(files), sum(_single_file_bytes(path) for path in files)
 

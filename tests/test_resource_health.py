@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,3 +70,34 @@ def test_health_usage_does_not_follow_directory_symlink_cycles(
         assert resource_health._job_output_usage(tmp_path, set())[:2] == (1, 3)
     else:
         assert resource_health._files_usage(tmp_path) == (1, 3)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics only")
+@pytest.mark.parametrize("job_tree", [False, True])
+def test_health_usage_does_not_follow_windows_junctions(
+    tmp_path: Path, job_tree: bool,
+) -> None:
+    inside = tmp_path / "inside"
+    outside = tmp_path / "outside"
+    inside.mkdir()
+    outside.mkdir()
+    (inside / "local.bin").write_bytes(b"abc")
+    (outside / "outside.bin").write_bytes(b"outside")
+    junction = inside / "junction"
+
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"Could not create Windows junction: {result.stderr.strip()}")
+
+    try:
+        if job_tree:
+            assert resource_health._job_output_usage(inside, set())[:2] == (1, 3)
+        else:
+            assert resource_health._files_usage(inside) == (1, 3)
+    finally:
+        junction.rmdir()
