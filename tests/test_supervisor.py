@@ -332,6 +332,14 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         assert "Recovery Center" in html
         assert "Workflow Dashboard" in html
         assert "Recent Operations" in html
+        assert 'id="auditFilter"' in html
+        assert 'id="auditSearch"' in html
+        assert 'id="auditPrev"' in html
+        assert 'id="auditNext"' in html
+        assert 'id="auditModal"' in html
+        diagnostics_index = html.index('<div id="diagnostics" class="section-anchor">')
+        transport_index = html.index('<section class="panel">', diagnostics_index)
+        assert '<div class="grid two">' not in html[diagnostics_index:transport_index]
         assert "Runtime Health" in html
         assert "Tool Activity" in html
         assert "Browser Runtime" in html

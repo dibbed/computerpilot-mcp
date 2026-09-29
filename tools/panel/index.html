@@ -112,6 +112,8 @@ tr:last-child td{border-bottom:0}
 tbody tr:hover{background:rgba(121,191,242,.035)}
 .clickable{cursor:pointer}
 .clickable:focus-visible{outline:2px solid var(--info);outline-offset:-2px}
+.audit-target{max-width:520px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.audit-operation{font-weight:750;color:var(--text-soft)}
 .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .muted{color:var(--muted)}
 .issue{color:var(--bad)}
@@ -457,7 +459,6 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 </section>
 </div>
 
-<div class="grid two">
 <div id="diagnostics" class="section-anchor"><span>Diagnostics</span></div>
 <section class="panel">
 <div class="panel-head"><div><h2>Transport History</h2><div class="panel-note">Persisted classifications plus incident counts, watchdog recoveries and response-deadline drops.</div></div><span id="transportHistoryPill" class="pill">—</span></div>
@@ -471,11 +472,16 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 </div>
 <div class="table-wrap"><table><thead><tr><th>Time</th><th>Diagnosis</th><th>Severity</th><th>Reason</th></tr></thead><tbody id="transportHistoryRows"></tbody></table></div>
 </section>
+
 <section class="panel">
-<div class="panel-head"><div><h2>Recent Operations</h2><div class="panel-note">Metadata-only audit trail for local MCP mutations and process actions.</div></div><span id="auditPill" class="pill">—</span></div>
+<div class="panel-head"><div><h2>Recent Operations</h2><div class="panel-note">Metadata-only audit trail for local MCP mutations and process actions. Click a row for the full target and safe operation metadata.</div></div><div class="chips"><div id="auditChips" class="chips"></div><span id="auditPill" class="pill">—</span></div></div>
+<div class="filters" style="margin-bottom:10px">
+<select id="auditFilter" aria-label="Filter operations by outcome"><option value="ALL">All outcomes</option><option value="attempted">Attempted</option><option value="started">Started</option><option value="queued">Queued</option><option value="accepted">Accepted</option><option value="completed">Completed</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="timed_out">Timed out</option><option value="interrupted">Interrupted</option></select>
+<input id="auditSearch" aria-label="Search recent operations" placeholder="Search operation, target or PID">
+<button id="auditPrev" class="secondary mini">Previous</button><button id="auditNext" class="secondary mini">Next</button><span id="auditPage" class="muted"></span>
+</div>
 <div class="table-wrap"><table><thead><tr><th>Time</th><th>Operation</th><th>Outcome</th><th>PID</th><th>Target</th></tr></thead><tbody id="auditRows"></tbody></table></div>
 </section>
-</div>
 
 <section class="panel">
 <div class="panel-head"><div><h2>Project Memory Metadata</h2><div class="panel-note">File metadata only. Memory contents are never exposed by this panel.</div></div><span id="memoryPill" class="pill">—</span></div>
@@ -513,6 +519,18 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 <div><div class="section-title">Stdout</div><div class="actions" style="margin-bottom:7px"><button id="jobStdoutMore" class="secondary mini">Load more stdout</button><button id="jobDownloadStdout" class="secondary mini">Download stdout</button></div><pre id="jobStdout">—</pre></div>
 <div><div class="section-title">Stderr</div><div class="actions" style="margin-bottom:7px"><button id="jobStderrMore" class="secondary mini">Load more stderr</button><button id="jobDownloadStderr" class="secondary mini">Download stderr</button></div><pre id="jobStderr">—</pre></div>
 </div>
+</div>
+</section>
+</div>
+
+<div id="auditModal" class="dialog-wrap" aria-hidden="true">
+<div class="backdrop" data-close-audit></div>
+<section id="auditDialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="auditModalTitle" tabindex="-1">
+<header class="dialog-head"><div><h2 id="auditModalTitle" class="dialog-title">Operation details</h2><div id="auditModalId" class="dialog-sub">—</div></div><button id="auditClose" class="dialog-close" aria-label="Close operation details">×</button></header>
+<div class="dialog-body">
+<div id="auditMeta" class="meta-grid"></div>
+<div class="section-title">Target</div><pre id="auditTarget">—</pre>
+<div class="section-title">Safe metadata</div><pre id="auditDetails">—</pre>
 </div>
 </section>
 </div>
@@ -562,7 +580,7 @@ async function postJson(path){
   finally{clearTimeout(timeout)}
 }
 async function singleFlight(key,fn){if(inFlight.has(key)||stopped)return;inFlight.add(key);try{return await fn()}finally{inFlight.delete(key)}}
-let lastSummary=null,lastEvents=null,lastJobs=null,lastInsights=null,activeJob=null,jobOffset=0,jobLimit=25,stopped=false,panelApiMode=null;
+let lastSummary=null,lastEvents=null,lastJobs=null,lastAudit=null,lastInsights=null,activeJob=null,activeAudit=null,jobOffset=0,jobLimit=25,auditOffset=0,auditLimit=25,stopped=false,panelApiMode=null;
 let jobOutputState={initialized:false,stdout:{next:0,hasMore:false,total:0},stderr:{next:0,hasMore:false,total:0}};
 function setIncident(title='',message='',href='#diagnostics'){
   const banner=$('incidentBanner');
@@ -826,7 +844,67 @@ function renderTransportHistory(d){
   if(!(d.items||[]).length)emptyRow(body,4,'No transport history yet.');
   pill($('transportHistoryPill'),fmtNum(d.count)+' records',d.incident_count?'warn':d.count?'ok':'');
 }
-function renderAudit(d){const body=$('auditRows');body.replaceChildren();for(const x of d.items||[]){const tr=document.createElement('tr');cell(tr,iso(x.time));cell(tr,x.operation);cell(tr,x.outcome);cell(tr,x.pid,'mono');cell(tr,x.target||'—','mono');body.append(tr)}if(!(d.items||[]).length)emptyRow(body,5,'No audit operations yet.');pill($('auditPill'),fmtNum(d.count)+' recent',d.count?'info':'')}
+function auditTone(value){
+  const v=String(value||'').toLowerCase();
+  if(['completed','succeeded','accepted','ok'].includes(v))return'ok';
+  if(['failed','error','timed_out','interrupted'].includes(v))return'bad';
+  if(['cancelled'].includes(v))return'warn';
+  if(['attempted','started','queued','pending'].includes(v))return'info';
+  return'info'
+}
+function renderAudit(d){
+  lastAudit=d;
+  const all=d.items||[],counts={};
+  for(const x of all){const key=String(x.outcome||'unknown').toLowerCase();counts[key]=(counts[key]||0)+1}
+  const chips=$('auditChips');chips.replaceChildren();
+  for(const key of ['attempted','started','accepted','completed','succeeded','failed','cancelled','timed_out','interrupted']){
+    if(!counts[key])continue;
+    const badge=document.createElement('span');badge.className='pill '+auditTone(key);badge.textContent=key.replaceAll('_',' ') + ': '+fmtNum(counts[key]);chips.append(badge)
+  }
+  const filter=$('auditFilter').value,q=$('auditSearch').value.trim().toLowerCase();
+  const filtered=all.filter(x=>{
+    const outcome=String(x.outcome||'').toLowerCase();
+    if(filter!=='ALL'&&outcome!==filter)return false;
+    if(!q)return true;
+    const haystack=[x.operation,x.outcome,x.pid,x.target,JSON.stringify(x.details||{})].map(v=>String(v??'').toLowerCase()).join(' ');
+    return haystack.includes(q)
+  });
+  if(auditOffset>=filtered.length&&auditOffset>0)auditOffset=filtered.length?Math.floor((filtered.length-1)/auditLimit)*auditLimit:0;
+  const page=filtered.slice(auditOffset,auditOffset+auditLimit),body=$('auditRows');body.replaceChildren();
+  for(const x of page){
+    const tr=document.createElement('tr');tr.className='clickable';tr.tabIndex=0;tr.setAttribute('role','button');tr.setAttribute('aria-label','Inspect '+safe(x.operation)+' operation from '+iso(x.time));tr.onclick=()=>openAudit(x);tr.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openAudit(x)}};
+    cell(tr,iso(x.time));
+    cell(tr,x.operation,'audit-operation');
+    const outcome=document.createElement('td'),badge=document.createElement('span');badge.className='pill '+auditTone(x.outcome);badge.textContent=safe(x.outcome);outcome.append(badge);tr.append(outcome);
+    cell(tr,x.pid,'mono');
+    const target=document.createElement('td');target.textContent=safe(x.target||'—');target.className='mono audit-target';target.title=safe(x.target||'');tr.append(target);
+    body.append(tr)
+  }
+  if(!page.length)emptyRow(body,5,'No operations match the current filters.');
+  const start=filtered.length?auditOffset+1:0,end=Math.min(auditOffset+auditLimit,filtered.length);
+  $('auditPage').textContent='Showing '+fmtNum(start)+'–'+fmtNum(end)+' of '+fmtNum(filtered.length)+' · '+fmtNum(all.length)+' loaded';
+  $('auditPrev').disabled=auditOffset<=0;$('auditNext').disabled=auditOffset+auditLimit>=filtered.length;
+  pill($('auditPill'),fmtNum(all.length)+' recent',all.length?'info':'')
+}
+function openAudit(item){
+  previousFocus=document.activeElement instanceof HTMLElement?document.activeElement:null;
+  activeAudit=item;
+  document.body.classList.add('modal-open');$('auditModal').classList.add('open');$('auditModal').setAttribute('aria-hidden','false');
+  $('auditModalId').textContent=safe(item.operation)+' · '+iso(item.time);
+  $('auditMeta').replaceChildren(
+    metaCard('Outcome',safe(item.outcome)),
+    metaCard('PID',item.pid??'—'),
+    metaCard('Time',iso(item.time)),
+    metaCard('Metadata fields',fmtNum(Object.keys(item.details||{}).length))
+  );
+  $('auditTarget').textContent=item.target||'No target recorded.';
+  $('auditDetails').textContent=Object.keys(item.details||{}).length?JSON.stringify(item.details,null,2):'No additional metadata.';
+  requestAnimationFrame(()=>$('auditDialog').focus())
+}
+function closeAudit(){
+  activeAudit=null;$('auditModal').classList.remove('open');$('auditModal').setAttribute('aria-hidden','true');document.body.classList.remove('modal-open');
+  const restore=previousFocus;previousFocus=null;if(restore&&document.contains(restore))restore.focus()
+}
 function renderConfig(d){const grid=$('configGrid');grid.replaceChildren();for(const [k,v] of Object.entries(d||{})){const a=document.createElement('div');a.textContent=k.replaceAll('_',' ');const b=document.createElement('div');b.className='mono';b.textContent=typeof v==='number'&&k.includes('bytes')?bytes(v):String(v);grid.append(a,b)}if(!Object.keys(d||{}).length){const a=document.createElement('div');a.textContent='No config';const b=document.createElement('div');b.textContent='—';grid.append(a,b)}}
 function renderDoctor(d){
   const body=$('doctorRows');body.replaceChildren();
@@ -876,7 +954,7 @@ async function refreshInsights(){if(panelApiMode!=='modern')return;try{renderIns
 async function refreshEvents(){try{renderEvents(await getJson(panelApiMode==='modern'?'/api/events':'/api/status',panelApiMode==='modern'))}catch(e){$('eventCounter').textContent='Events temporarily unavailable.'}}
 async function refreshSecondary(){
   if(panelApiMode!=='modern')return;
-  const [th,a,w,r,c,d]=await Promise.allSettled([getJson('/api/transport/history?limit=100'),getJson('/api/audit?limit=60'),getJson('/api/workflows'),getJson('/api/recovery'),getJson('/api/config'),getJson('/api/doctor')]);
+  const [th,a,w,r,c,d]=await Promise.allSettled([getJson('/api/transport/history?limit=100'),getJson('/api/audit?limit=200'),getJson('/api/workflows'),getJson('/api/recovery'),getJson('/api/config'),getJson('/api/doctor')]);
   if(th.status==='fulfilled')renderTransportHistory(th.value);else pill($('transportHistoryPill'),'Unavailable','warn');
   if(a.status==='fulfilled')renderAudit(a.value);else pill($('auditPill'),'Unavailable','warn');
   if(w.status==='fulfilled')renderWorkflows(w.value);else pill($('workflowPill'),'Unavailable','warn');
@@ -922,11 +1000,13 @@ async function runtimeAction(action){
 }
 async function copyRawLogs(){try{await navigator.clipboard.writeText($('rawLogs').textContent||'');$('notice').textContent='Raw log tail copied.'}catch(e){$('notice').textContent='Unable to copy raw logs.'}}
 function handleModalKeys(e){
-  if(!activeJob)return;
-  if(e.key==='Escape'){e.preventDefault();closeJob();return}
+  const dialog=activeJob?$('jobDialog'):activeAudit?$('auditDialog'):null;
+  const close=activeJob?closeJob:activeAudit?closeAudit:null;
+  if(!dialog||!close)return;
+  if(e.key==='Escape'){e.preventDefault();close();return}
   if(e.key!=='Tab')return;
-  const focusable=[...$('jobDialog').querySelectorAll('button:not([disabled]):not([hidden]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')].filter(node=>node.offsetParent!==null);
-  if(!focusable.length){e.preventDefault();$('jobDialog').focus();return}
+  const focusable=[...dialog.querySelectorAll('button:not([disabled]):not([hidden]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')].filter(node=>node.offsetParent!==null);
+  if(!focusable.length){e.preventDefault();dialog.focus();return}
   const first=focusable[0],last=focusable[focusable.length-1];
   if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}
   else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}
@@ -948,8 +1028,10 @@ function setupSectionNavigation(){
 
 $('refreshNow').onclick=()=>refreshAll(true);$('downloadDiagnostics').onclick=exportDiagnostics;$('restart').onclick=()=>runtimeAction('restart');$('stop').onclick=()=>runtimeAction('stop');
 $('jobsPrev').onclick=()=>{jobOffset=Math.max(0,jobOffset-jobLimit);singleFlight('jobs',refreshJobs)};$('jobsNext').onclick=()=>{jobOffset+=jobLimit;singleFlight('jobs',refreshJobs)};$('jobFilter').onchange=()=>lastJobs&&renderJobs(lastJobs);$('jobSearch').oninput=()=>lastJobs&&renderJobs(lastJobs);
+$('auditPrev').onclick=()=>{auditOffset=Math.max(0,auditOffset-auditLimit);lastAudit&&renderAudit(lastAudit)};$('auditNext').onclick=()=>{auditOffset+=auditLimit;lastAudit&&renderAudit(lastAudit)};$('auditFilter').onchange=()=>{auditOffset=0;lastAudit&&renderAudit(lastAudit)};$('auditSearch').oninput=()=>{auditOffset=0;lastAudit&&renderAudit(lastAudit)};
 $('eventFilter').onchange=()=>lastEvents&&renderEvents(lastEvents);$('eventSearch').oninput=()=>lastEvents&&renderEvents(lastEvents);
-$('jobClose').onclick=closeJob;$('jobModal').onclick=e=>{if(e.target instanceof Element&&e.target.hasAttribute('data-close-job'))closeJob()};$('jobCancel').onclick=cancelActiveJob;$('jobCopy').onclick=copyCommand;$('jobStdoutMore').onclick=()=>loadMoreJobOutput('stdout');$('jobStderrMore').onclick=()=>loadMoreJobOutput('stderr');$('jobDownloadStdout').onclick=()=>downloadJobStream('stdout');$('jobDownloadStderr').onclick=()=>downloadJobStream('stderr');$('copyRawLogs').onclick=copyRawLogs;
+$('jobClose').onclick=closeJob;$('jobModal').onclick=e=>{if(e.target instanceof Element&&e.target.hasAttribute('data-close-job'))closeJob()};$('jobCancel').onclick=cancelActiveJob;$('jobCopy').onclick=copyCommand;$('jobStdoutMore').onclick=()=>loadMoreJobOutput('stdout');$('jobStderrMore').onclick=()=>loadMoreJobOutput('stderr');$('jobDownloadStdout').onclick=()=>downloadJobStream('stdout');$('jobDownloadStderr').onclick=()=>downloadJobStream('stderr');
+$('auditClose').onclick=closeAudit;$('auditModal').onclick=e=>{if(e.target instanceof Element&&e.target.hasAttribute('data-close-audit'))closeAudit()};$('copyRawLogs').onclick=copyRawLogs;
 document.addEventListener('keydown',handleModalKeys);
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&!stopped)refreshAll()});
 setupSectionNavigation();
