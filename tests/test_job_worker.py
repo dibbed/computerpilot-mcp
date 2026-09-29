@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
+import sys
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.jobs import JobStore
+from core.process_ownership import PosixOwnedProcess
 from scripts import job_worker
 
 
@@ -32,6 +35,25 @@ def test_poll_interval_backs_off_for_long_jobs() -> None:
     assert job_worker._poll_interval(2.0) == 0.5
     assert job_worker._poll_interval(29.99) == 0.5
     assert job_worker._poll_interval(30.0) == 1.0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group ownership only")
+def test_worker_spawn_owns_descendants_through_posix_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_POSIX_PROCESS_GROUPS", "1")
+    process = job_worker.spawn_owned_process(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        cwd=tmp_path, env=None, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0,
+    )
+    try:
+        assert isinstance(process, PosixOwnedProcess)
+        assert os.getpgid(process.pid) == process.pid
+    finally:
+        process.process.kill()
+        process.process.wait(timeout=5)
+        process.close_ownership()
 
 
 def test_worker_reuses_one_runtime_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

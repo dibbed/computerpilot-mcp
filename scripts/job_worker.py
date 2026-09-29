@@ -18,7 +18,7 @@ from core.audit import audit_action
 from core.config import SETTINGS
 from core.executor import _creation_flags
 from core.jobs import JobStore
-from core.windows_job import OwnedProcess, spawn_owned_process
+from core.process_ownership import OwnedProcess, spawn_owned_process
 
 
 def _poll_interval(elapsed: float) -> float:
