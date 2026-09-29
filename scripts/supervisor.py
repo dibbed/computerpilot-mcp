@@ -1110,8 +1110,11 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
                 "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
                 "connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'",
             )
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.end_headers()
+                self.wfile.write(data)
+            except ConnectionError:
+                self.close_connection = True
 
         def send_json(self, value: Any, status: int = 200) -> None:
             self.send(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), status=status)
@@ -1132,12 +1135,15 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("X-Frame-Options", "DENY")
                 self.send_header("Referrer-Policy", "no-referrer")
-                self.end_headers()
-                while True:
-                    chunk = source.read(64 * 1024)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+                try:
+                    self.end_headers()
+                    while True:
+                        chunk = source.read(64 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                except ConnectionError:
+                    self.close_connection = True
 
         @staticmethod
         def _job_id(value: str) -> str | None:

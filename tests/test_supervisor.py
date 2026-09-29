@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import socket
+import socketserver
 import subprocess
 import sys
 import threading
@@ -311,6 +312,33 @@ while True:
         thread.join(timeout=10)
     assert not thread.is_alive()
     assert not supervisor.heartbeat.exists()
+
+
+def test_panel_suppresses_expected_client_disconnect_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    panel = make_panel(supervisor, 0)
+    thread = threading.Thread(target=panel.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{panel.server_port}"
+
+    def aborting_write(_writer: Any, _data: bytes) -> int:
+        raise ConnectionAbortedError(10053, "client disconnected")
+
+    writer_type = vars(socketserver)["_SocketWriter"]
+    monkeypatch.setattr(writer_type, "write", aborting_write)
+    try:
+        with pytest.raises(ConnectionError):
+            urllib.request.urlopen(base + "/api/summary", timeout=2)
+        assert "ConnectionAbortedError" not in capsys.readouterr().err
+    finally:
+        panel.shutdown()
+        thread.join(timeout=5)
+        panel.server_close()
+        close_logger(supervisor)
 
 
 def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
