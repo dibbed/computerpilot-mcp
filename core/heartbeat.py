@@ -75,16 +75,21 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     health_value = os.environ.get("MCP_RUNTIME_HEALTH_FILE")
     task = asyncio.create_task(pulse(Path(value))) if value else None
     health_task = asyncio.create_task(publish_health(Path(health_value))) if health_value else None
-    lifecycle_task = asyncio.create_task(watch_lifecycle())
+    lifecycle_task = (
+        asyncio.create_task(watch_lifecycle())
+        if RUNTIME_LIFECYCLE.snapshot()["managed"] else None
+    )
     maintenance_task = asyncio.create_task(maintain_state())
     try:
         yield {}
     finally:
         RUNTIME_LIFECYCLE.mark_stopping()
-        lifecycle_task.cancel()
+        if lifecycle_task:
+            lifecycle_task.cancel()
         maintenance_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await lifecycle_task
+        if lifecycle_task:
+            with suppress(asyncio.CancelledError):
+                await lifecycle_task
         with suppress(asyncio.CancelledError):
             await maintenance_task
         if health_task:

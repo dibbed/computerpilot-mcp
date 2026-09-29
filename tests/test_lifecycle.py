@@ -114,6 +114,39 @@ def test_unmanaged_lifecycle_preserves_standalone_behavior() -> None:
     assert lifecycle.snapshot()["active_mutations"] == 0
 
 
+def test_unmanaged_server_does_not_wake_for_supervisor_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from core import heartbeat
+
+    monkeypatch.delenv("MCP_LIFECYCLE_CONTROL_FILE", raising=False)
+    monkeypatch.delenv("MCP_LIFECYCLE_STATUS_FILE", raising=False)
+    monkeypatch.setattr(heartbeat, "SETTINGS", replace(heartbeat.SETTINGS, state_dir=tmp_path))
+    for name in (
+        "schedule_artifact_retention", "schedule_job_history_retention",
+        "schedule_workflow_history_retention", "flush_audit",
+    ):
+        monkeypatch.setattr(heartbeat, name, lambda **kwargs: None)
+    monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
+    polls = 0
+
+    def count_poll() -> str:
+        nonlocal polls
+        polls += 1
+        return "RUNNING"
+
+    monkeypatch.setattr(heartbeat.RUNTIME_LIFECYCLE, "poll_control", count_poll)
+
+    async def scenario() -> None:
+        async with heartbeat.lifespan(None):
+            await asyncio.sleep(0.13)
+
+    asyncio.run(scenario())
+    assert polls == 0
+
+
 def test_mcp_drain_rejects_mutations_but_allows_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     control = tmp_path / "control.json"
     status = tmp_path / "status.json"
