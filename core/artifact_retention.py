@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import stat
 import threading
 import time
-from stat import S_ISREG
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -67,8 +68,10 @@ def _scan(directory: Path) -> tuple[list[ArtifactEntry], int]:
         return entries, 1
     for path in candidates:
         try:
-            file_stat = path.stat()
-            if not S_ISREG(file_stat.st_mode):
+            file_stat = path.lstat()
+            if not stat.S_ISREG(file_stat.st_mode) or (
+                os.name == "nt" and file_stat.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
                 continue
         except FileNotFoundError:
             continue
@@ -90,6 +93,11 @@ def cleanup_artifacts(
     """Apply age/count/byte limits while preserving the newest artifact."""
 
     directory.mkdir(parents=True, exist_ok=True)
+    directory_info = directory.lstat()
+    if not stat.S_ISDIR(directory_info.st_mode) or (
+        os.name == "nt" and directory_info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        return ArtifactCleanupResult(0, 0, 0, 0, 0, 0, 0, 0, 0, True, False, 1)
     entries, errors = _scan(directory)
     scanned_files = len(entries)
     scanned_bytes = sum(entry.size for entry in entries)

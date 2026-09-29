@@ -4,6 +4,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from core.artifact_retention import ArtifactPolicy, cleanup_artifacts
 
 
@@ -99,6 +101,27 @@ def test_artifact_retention_ignores_non_artifact_files(tmp_path: Path) -> None:
     cleanup_artifacts(tmp_path, _policy(max_bytes=100, max_count=1), now=3)
 
     assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_artifact_cleanup_never_enters_linked_state_or_linked_artifact(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    old = _artifact(outside, "old.bin", 100, 100)
+    _artifact(outside, "new.bin", 100, 200)
+    link = tmp_path / "artifacts"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory links are unavailable")
+    assert cleanup_artifacts(link, _policy(max_age_sec=10), now=1_000).removed_files == 0
+    assert old.exists()
+    link.unlink()
+    link.mkdir()
+    linked_artifact = link / "old.bin"
+    linked_artifact.symlink_to(old)
+    _artifact(link, "new.bin", 100, 200)
+    assert cleanup_artifacts(link, _policy(max_age_sec=10), now=1_000).removed_files == 0
+    assert linked_artifact.is_symlink() and old.exists()
 
 
 def test_artifact_retention_preserves_newest_when_single_file_exceeds_quota(tmp_path: Path) -> None:
