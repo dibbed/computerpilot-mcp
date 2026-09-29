@@ -96,7 +96,12 @@ class JobScheduler:
                 _start_worker_reaper(process)
             try:
                 created = psutil.Process(process.pid).create_time()
-            except psutil.Error:
+                # The worker may exit and its PID be reused during the psutil
+                # lookup. Popen still refers to the original child, so discard
+                # metadata if that child is already gone.
+                if process.poll() is not None:
+                    created = None
+            except (psutil.Error, OSError):
                 created = None
             self.store.record_worker_launch(
                 job_id,
