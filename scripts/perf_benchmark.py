@@ -1888,8 +1888,8 @@ def run_benchmarks(
 
 
 def _default_output() -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return SETTINGS.state_dir / "benchmarks" / f"benchmark-{stamp}.json"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return SETTINGS.state_dir / "benchmarks" / f"benchmark-{stamp}-{uuid.uuid4().hex}.json"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1918,7 +1918,17 @@ def main(argv: list[str] | None = None) -> int:
     if not output.is_absolute():
         output = PROJECT_ROOT / output
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(report, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
     if args.stdout:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"benchmark_report={output}")

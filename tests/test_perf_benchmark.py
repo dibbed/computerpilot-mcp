@@ -373,6 +373,36 @@ def test_stale_benchmark_cleanup_refuses_symlinked_state_parent(tmp_path: Path) 
     assert (victim / "valuable").read_text() == "keep"
 
 
+def test_default_benchmark_reports_have_distinct_paths_within_one_second(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import perf_benchmark
+
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    assert perf_benchmark._default_output() != perf_benchmark._default_output()
+
+
+def test_failed_report_publish_preserves_previous_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import perf_benchmark
+
+    output = tmp_path / "report.json"
+    output.write_text("previous complete report")
+    monkeypatch.setattr(perf_benchmark, "run_benchmarks", lambda **kwargs: {"results": []})
+
+    def interrupted_replace(source: Path, destination: Path) -> None:
+        if destination == output:
+            raise OSError("simulated publish failure")
+        raise AssertionError("unexpected replacement")
+
+    monkeypatch.setattr(perf_benchmark.os, "replace", interrupted_replace)
+    with pytest.raises(OSError, match="publish failure"):
+        perf_benchmark.main(["--output", str(output)])
+    assert output.read_text() == "previous complete report"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_stale_benchmark_cleanup_preserves_active_work_and_external_links(tmp_path: Path) -> None:
     from core.file_lock import exclusive_file_lock
 
