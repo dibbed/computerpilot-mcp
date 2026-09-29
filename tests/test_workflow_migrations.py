@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from core.errors import ToolError
+from core import workflow_store
 from core.workflow_store import SCHEMA_VERSION
 from core.workflows import WorkflowStore
 
@@ -209,3 +210,35 @@ def test_simultaneous_old_schema_open_serializes_version_check(
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_transient_wal_lock_during_open_is_retried_without_leaking_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _seed_v024_database(path)
+    original_connect = sqlite3.connect
+    attempts = 0
+    connections: list[sqlite3.Connection] = []
+
+    class ContendedConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+            nonlocal attempts
+            if sql == "PRAGMA journal_mode=WAL":
+                attempts += 1
+                if attempts == 1:
+                    raise sqlite3.OperationalError("database is locked")
+            return super().execute(sql, parameters)
+
+    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = original_connect(*args, factory=ContendedConnection, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(workflow_store.sqlite3, "connect", connect)
+    store = WorkflowStore(path)
+    assert store.get("legacy-workflow")["state"] == "completed"
+    assert attempts >= 2
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")

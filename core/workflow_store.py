@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import closing
 from dataclasses import asdict
@@ -113,11 +114,22 @@ class WorkflowStore:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=10000")
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout=10000")
+            for attempt in range(50):
+                try:
+                    connection.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).casefold() or attempt == 49:
+                        raise
+                    time.sleep(0.05)
+            connection.execute("PRAGMA foreign_keys=ON")
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     def _initialize(self) -> None:
         with self._lock, closing(self._connect()) as connection:
