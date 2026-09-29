@@ -55,7 +55,10 @@ def test_old_unbounded_timing_log_is_trimmed_without_touching_durable_state(
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "valuable").write_text("keep")
-    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+    try:
+        (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory symlinks are unavailable in this test environment")
     monkeypatch.setattr(timings, "TIMING_MAX_FILE_BYTES", 256)
     monkeypatch.setattr(timings, "TIMING_KEEP_FILES", 2)
 

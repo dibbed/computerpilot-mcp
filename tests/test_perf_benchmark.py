@@ -52,6 +52,13 @@ from scripts.perf_benchmark import (
 )
 
 
+def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except (NotImplementedError, OSError):
+        pytest.skip("Symlink creation is unavailable in this test environment")
+
+
 def test_benchmark_profiles_cover_planned_scale_points() -> None:
     full = PROFILE_LIMITS["full"]
     assert full["output_sizes"] == [1_024, 1_048_576, 100 * 1_048_576]
@@ -354,7 +361,7 @@ def test_stale_benchmark_cleanup_refuses_symlinked_root(tmp_path: Path) -> None:
     (victim / "valuable").write_text("keep")
     os.utime(victim, (1, 1))
     linked_root = tmp_path / "linked-root"
-    linked_root.symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(linked_root, outside, target_is_directory=True)
     assert _cleanup_stale_temp_roots(linked_root, now=1_000, max_age_sec=100) == 0
     assert (victim / "valuable").read_text() == "keep"
 
@@ -368,7 +375,7 @@ def test_stale_benchmark_cleanup_refuses_symlinked_state_parent(tmp_path: Path) 
     (victim / "valuable").write_text("keep")
     os.utime(victim, (1, 1))
     link = tmp_path / ".agent_state"
-    link.symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(link, outside, target_is_directory=True)
     assert _cleanup_stale_temp_roots(link / "benchmarks" / "tmp", now=1_000, max_age_sec=100) == 0
     assert (victim / "valuable").read_text() == "keep"
 
@@ -438,7 +445,7 @@ def test_managed_benchmark_reports_keep_recent_and_reject_linked_parent(
     assert recent.exists()
 
     linked = tmp_path / "linked"
-    linked.symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(linked, outside, target_is_directory=True)
     monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=linked))
     assert perf_benchmark._cleanup_managed_reports(now=100 * 86_400) == 0
     assert recent.read_text() == "recent"
@@ -506,7 +513,7 @@ def test_managed_report_cleanup_does_not_follow_report_symlink(
     name.parent.mkdir(parents=True)
     outside = tmp_path / "valuable.json"
     outside.write_text("keep")
-    name.symlink_to(outside)
+    _symlink_or_skip(name, outside)
     assert perf_benchmark._cleanup_managed_reports(now=100 * 86_400) == 0
     assert name.is_symlink()
     assert outside.read_text() == "keep"
@@ -528,7 +535,7 @@ def test_managed_report_cleanup_reclaims_only_stale_regular_temporary_files(
     linked = report.parent / f".{report.name}.linked.tmp"
     for path in (stale, recent, unrelated):
         path.write_text("partial")
-    linked.symlink_to(outside)
+    _symlink_or_skip(linked, outside)
     os.utime(stale, (1, 1))
     os.utime(recent, (2 * 86_400 - 100, 2 * 86_400 - 100))
     assert perf_benchmark._cleanup_managed_reports(now=2 * 86_400) == 1
@@ -546,7 +553,7 @@ def test_stale_benchmark_cleanup_preserves_active_work_and_external_links(tmp_pa
     for directory in (active, crashed, outside):
         directory.mkdir()
     (outside / "valuable.txt").write_text("keep")
-    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(tmp_path / "linked", outside, target_is_directory=True)
     for directory in (active, crashed):
         (directory / ".active.lock").touch()
         (directory / "state.txt").write_text("data")

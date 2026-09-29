@@ -50,7 +50,10 @@ def test_health_usage_does_not_follow_directory_symlink_cycles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, job_tree: bool,
 ) -> None:
     (tmp_path / "payload.bin").write_bytes(b"abc")
-    (tmp_path / "loop").symlink_to(tmp_path, target_is_directory=True)
+    try:
+        (tmp_path / "loop").symlink_to(tmp_path, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory symlinks are unavailable in this test environment")
     original_iterdir = Path.iterdir
     scans = 0
 
