@@ -24,7 +24,7 @@ def unlinked_directory_tree(path: Path, *, allow_missing: bool = False) -> bool:
         except OSError:
             return False
         if not stat.S_ISDIR(info.st_mode) or (
-            os.name == "nt" and info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            os.name == "nt" and int(getattr(info, "st_file_attributes", 0)) & stat.FILE_ATTRIBUTE_REPARSE_POINT
         ):
             return False
         if current.parent == current:
@@ -38,5 +38,5 @@ def unlinked_regular_file(path: Path) -> bool:
     except OSError:
         return False
     return stat.S_ISREG(info.st_mode) and not (
-        os.name == "nt" and info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        os.name == "nt" and int(getattr(info, "st_file_attributes", 0)) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     )

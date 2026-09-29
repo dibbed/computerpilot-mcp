@@ -1600,7 +1600,7 @@ def _cleanup_stale_temp_roots(
         except OSError:
             continue
         if not stat.S_ISDIR(info.st_mode) or (
-            os.name == "nt" and info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            os.name == "nt" and int(getattr(info, "st_file_attributes", 0)) & stat.FILE_ATTRIBUTE_REPARSE_POINT
         ):
             continue
         if _GC_STAGING.fullmatch(child.name):

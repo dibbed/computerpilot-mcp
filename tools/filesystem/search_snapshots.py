@@ -33,7 +33,7 @@ def _unlinked_type(path: Path, *, directory: bool) -> bool:
         info = path.lstat()
     except OSError:
         return False
-    if os.name == "nt" and info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+    if os.name == "nt" and int(getattr(info, "st_file_attributes", 0)) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
         return False
     return stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
 

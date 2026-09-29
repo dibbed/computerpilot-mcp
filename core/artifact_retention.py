@@ -71,7 +71,7 @@ def _scan(directory: Path) -> tuple[list[ArtifactEntry], int]:
         try:
             file_stat = path.lstat()
             if not stat.S_ISREG(file_stat.st_mode) or (
-                os.name == "nt" and file_stat.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                os.name == "nt" and int(getattr(file_stat, "st_file_attributes", 0)) & stat.FILE_ATTRIBUTE_REPARSE_POINT
             ):
                 continue
         except FileNotFoundError:
