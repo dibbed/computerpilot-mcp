@@ -112,19 +112,20 @@ class WorkflowStore:
         self._initialize()
         self.recover_interrupted()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, *, setup_wal: bool = False) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout=10000")
-            for attempt in range(50):
-                try:
-                    connection.execute("PRAGMA journal_mode=WAL")
-                    break
-                except sqlite3.OperationalError as exc:
-                    if "locked" not in str(exc).casefold() or attempt == 49:
-                        raise
-                    time.sleep(0.05)
+            if setup_wal:
+                for attempt in range(50):
+                    try:
+                        connection.execute("PRAGMA journal_mode=WAL")
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).casefold() or attempt == 49:
+                            raise
+                        time.sleep(0.05)
             connection.execute("PRAGMA foreign_keys=ON")
             return connection
         except BaseException:
@@ -132,7 +133,7 @@ class WorkflowStore:
             raise
 
     def _initialize(self) -> None:
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, closing(self._connect(setup_wal=True)) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS workflows (

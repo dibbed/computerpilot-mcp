@@ -242,3 +242,29 @@ def test_transient_wal_lock_during_open_is_retried_without_leaking_connection(
     for connection in connections:
         with pytest.raises(sqlite3.ProgrammingError, match="closed"):
             connection.execute("SELECT 1")
+
+
+def test_wal_is_configured_at_startup_and_not_repeated_on_each_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "workflow.db"
+    original_connect = sqlite3.connect
+    wal_setups = 0
+
+    class TrackedConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+            nonlocal wal_setups
+            if sql == "PRAGMA journal_mode=WAL":
+                wal_setups += 1
+            return super().execute(sql, parameters)
+
+    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        return original_connect(*args, factory=TrackedConnection, **kwargs)
+
+    monkeypatch.setattr(workflow_store.sqlite3, "connect", connect)
+    store = WorkflowStore(path)
+    for _ in range(5):
+        store.health_summary()
+    assert wal_setups == 1
+    with original_connect(path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
