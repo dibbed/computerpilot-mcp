@@ -1,5 +1,5 @@
-import sys
 import io
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import BinaryIO, cast

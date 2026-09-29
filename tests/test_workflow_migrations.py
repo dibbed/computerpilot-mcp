@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from core.errors import ToolError
 from core import workflow_store
+from core.errors import ToolError
 from core.workflow_store import SCHEMA_VERSION
 from core.workflows import WorkflowStore
 

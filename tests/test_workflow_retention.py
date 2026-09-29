@@ -9,8 +9,7 @@ from pathlib import Path
 import pytest
 from mcp import Client
 
-from core import heartbeat, registry, resource_health
-from core import workflow_retention
+from core import heartbeat, registry, resource_health, workflow_retention
 from core.config import SETTINGS
 from core.registry import create_server
 from core.workflow_retention import WorkflowHistoryPolicy, cleanup_workflow_history

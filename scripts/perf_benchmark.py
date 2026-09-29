@@ -11,22 +11,22 @@ import platform
 import re
 import shutil
 import sqlite3
-import statistics
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Literal
 
 import psutil
 
@@ -36,11 +36,11 @@ from core.backups import BackupPolicy, backup_created_at, cleanup_backups
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
 from core.file_lock import exclusive_file_lock
-from core.state_paths import unlinked_directory_tree, unlinked_regular_file
 from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
 from core.recovery import OperationRecoveryJournal
 from core.registry import create_server
+from core.state_paths import unlinked_directory_tree, unlinked_regular_file
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 from tools.desktop.uia import ElementLocator, UIAutomationService, WindowLocator
 from tools.filesystem.patches import PatchLimits, apply_patch_transaction
