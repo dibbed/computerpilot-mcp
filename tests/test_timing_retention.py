@@ -11,6 +11,20 @@ import pytest
 from core import timings
 
 
+def test_configured_timing_path_does_not_resolve_rotating_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = tmp_path / "timings.jsonl"
+    monkeypatch.setenv("MCP_TIMINGS_FILE", str(configured))
+
+    def unstable_resolve(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        return configured.with_name("timings.1.jsonl")
+
+    monkeypatch.setattr(Path, "resolve", unstable_resolve)
+    assert timings.timing_file() == configured.absolute()
+
+
 def test_completed_timing_history_is_bounded_and_latest_records_survive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

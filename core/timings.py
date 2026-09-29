@@ -15,7 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from pydantic import BaseModel
@@ -51,7 +51,7 @@ def timings_enabled() -> bool:
 def timing_file() -> Path:
     configured = os.getenv("MCP_TIMINGS_FILE")
     if configured:
-        return Path(configured).expanduser().resolve(strict=False)
+        return Path(os.path.abspath(Path(configured).expanduser()))
     return SETTINGS.state_dir / "timings.jsonl"
 
 
@@ -144,28 +144,28 @@ def _append_timing_records(target: Path, records: list[dict[str, Any]]) -> None:
                 handle.write(payload)
             return
 
-        handle = None
+        segment_handle: BinaryIO | None = None
         try:
             for line in lines:
                 if len(line) > TIMING_MAX_FILE_BYTES:
                     continue
                 if size and size + len(line) > TIMING_MAX_FILE_BYTES:
-                    if handle is not None:
-                        handle.close()
-                        handle = None
+                    if segment_handle is not None:
+                        segment_handle.close()
+                        segment_handle = None
                     for index in range(TIMING_KEEP_FILES, 1, -1):
                         previous = _rotation_path(target, index - 1)
                         if previous.exists():
                             os.replace(previous, _rotation_path(target, index))
                     os.replace(target, _rotation_path(target, 1))
                     size = 0
-                if handle is None:
-                    handle = target.open("ab")
-                handle.write(line)
+                if segment_handle is None:
+                    segment_handle = target.open("ab")
+                segment_handle.write(line)
                 size += len(line)
         finally:
-            if handle is not None:
-                handle.close()
+            if segment_handle is not None:
+                segment_handle.close()
 
 
 def _ensure_writer() -> None:
