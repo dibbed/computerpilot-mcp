@@ -1,7 +1,7 @@
 # گزارش کامل Backend Audit + Windows Integration
 
-تاریخ: 2026-09-29  
-پروژه: ComputerPilot MCP  
+تاریخ: 2026-09-29
+پروژه: ComputerPilot MCP
 مسیر محلی:
 
 ```text
