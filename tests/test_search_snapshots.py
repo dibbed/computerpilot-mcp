@@ -361,6 +361,39 @@ def test_truncated_snapshot_does_not_repeat_an_empty_continuation(tmp_path: Path
     assert not snapshot.exists()
 
 
+def test_runtime_maintenance_expires_snapshots_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from core import heartbeat
+
+    now = [100.0]
+    store = _store(tmp_path, clock=lambda: now[0])
+    handle = store.create(
+        [{"path": "old"}], fingerprint="fingerprint", count_mode="exact",
+        result_order="path", scan_truncated=False, total_count=1,
+    )
+    now[0] = 161.0
+    snapshot = store.directory / f"{handle.snapshot_id}.jsonl"
+    assert snapshot.exists()
+    monkeypatch.setattr(heartbeat, "SEARCH_SNAPSHOTS", store, raising=False)
+    monkeypatch.setattr(heartbeat, "SETTINGS", replace(heartbeat.SETTINGS, state_dir=tmp_path))
+    for name in (
+        "schedule_artifact_retention", "schedule_job_history_retention",
+        "schedule_workflow_history_retention", "flush_audit",
+    ):
+        monkeypatch.setattr(heartbeat, name, lambda **kwargs: None)
+    monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
+
+    async def start() -> None:
+        async with heartbeat.lifespan(None):
+            await asyncio.sleep(0.01)
+
+    asyncio.run(start())
+    assert not snapshot.exists()
+
+
 def test_snapshot_publish_leaves_no_temporary_files(tmp_path: Path) -> None:
     store = _store(tmp_path)
     fingerprint = _fingerprint(tmp_path)

@@ -20,6 +20,7 @@ from core.lifecycle import RUNTIME_LIFECYCLE
 from core.recovery import OPERATION_RECOVERY
 from core.tool_activity import TOOL_ACTIVITY
 from core.workflow_retention import schedule_workflow_history_retention
+from tools.filesystem.search_snapshots import SEARCH_SNAPSHOTS
 
 RUNTIME_HEALTH_PUBLISH_INTERVAL_SEC = 10.0
 
@@ -55,6 +56,12 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     async def maintain_state() -> None:
         interval = max(1.0, min(float(SETTINGS.job_history_cleanup_interval_sec), 300.0))
         while True:
+            try:
+                SEARCH_SNAPSHOTS.cleanup()
+            except Exception:
+                # Expired search snapshots are disposable; maintenance must
+                # continue even if their directory is temporarily unavailable.
+                pass
             schedule_artifact_retention(settings=SETTINGS)
             schedule_job_history_retention(settings=SETTINGS)
             schedule_workflow_history_retention(settings=SETTINGS)
