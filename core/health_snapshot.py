@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import threading
 from typing import Any
 
 from core.config import SETTINGS, Settings
@@ -14,6 +15,8 @@ from core.resource_health import collect_resource_metrics
 from core.tool_profiles import resolve_profile
 from core.workflow_store import workflow_store
 from tools.browser.manager import MANAGER as BROWSER_MANAGER
+
+_HEALTH_SYNC_LOCK = threading.Lock()
 
 
 async def collect_server_health(
@@ -37,14 +40,17 @@ async def collect_server_health(
         # File walks, psutil and SQLite operations are synchronous. The health
         # publisher runs periodically on the MCP loop, so keep them together
         # in a worker thread without changing their read order.
-        resources = resource_collector(browser_stats)
-        workflows = workflow_store_factory(settings.workflow_db)
-        return (
-            resources,
-            workflows.health_summary(),
-            workflows.list(offset=0, limit=20),
-            recovery.summary(max_items=20),
-        )
+        # These reads used to execute serially on the event loop. Retain that
+        # order for the shared workflow-store singleton across health requests.
+        with _HEALTH_SYNC_LOCK:
+            resources = resource_collector(browser_stats)
+            workflows = workflow_store_factory(settings.workflow_db)
+            return (
+                resources,
+                workflows.health_summary(),
+                workflows.list(offset=0, limit=20),
+                recovery.summary(max_items=20),
+            )
 
     resources, workflow_health, recent_workflows, operation_recovery = await asyncio.to_thread(collect_durable_metrics)
     resource_usage = resources.pop("budgets")
