@@ -263,8 +263,7 @@ class SearchSnapshotStore:
             self.directory.mkdir(parents=True, exist_ok=True)
             if not unlinked_directory_tree(self.directory):
                 return {"removed": 0, "count": 0, "bytes": 0}
-            removed = self._cleanup_expired_locked(now)
-            self._enforce_quota_locked(protect=None, now=now)
+            removed = self._enforce_quota_locked(protect=None, now=now)
             files = self._snapshot_files_locked()
             return {
                 "removed": removed,
@@ -316,8 +315,8 @@ class SearchSnapshotStore:
                 removed += 1
         return removed
 
-    def _enforce_quota_locked(self, *, protect: Path | None, now: float) -> None:
-        self._cleanup_expired_locked(now, exclude={protect} if protect is not None else None)
+    def _enforce_quota_locked(self, *, protect: Path | None, now: float) -> int:
+        expired = self._cleanup_expired_locked(now, exclude={protect} if protect is not None else None)
         files = self._snapshot_files_locked()
         records: list[tuple[float, str, Path, int]] = []
         for path in files:
@@ -344,6 +343,7 @@ class SearchSnapshotStore:
             _, _, path, size = records.pop(removable_index)
             path.unlink(missing_ok=True)
             total_bytes -= size
+        return expired
 
     @staticmethod
     def public_page(page: SnapshotPage) -> dict[str, Any]:
