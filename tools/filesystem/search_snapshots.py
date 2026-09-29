@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -24,6 +25,16 @@ from core.resource_locks import canonical_path
 SNAPSHOT_SCHEMA_VERSION = 1
 _CURSOR_RE = re.compile(r"^s1\.([0-9a-f]{32})\.(0|[1-9][0-9]{0,9})$")
 _SNAPSHOT_RE = re.compile(r"^[0-9a-f]{32}\.jsonl$")
+
+
+def _unlinked_type(path: Path, *, directory: bool) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    if os.name == "nt" and info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        return False
+    return stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +174,7 @@ class SearchSnapshotStore:
         now = self._clock()
         with self._lock:
             path = self.directory / f"{snapshot_id}.jsonl"
-            if not path.is_file():
+            if not _unlinked_type(path, directory=False):
                 raise ToolError("search_cursor_not_found", "Search cursor snapshot no longer exists.")
             header = self._read_header_locked(path)
             expires_at = float(header["expires_at"])
@@ -247,6 +258,8 @@ class SearchSnapshotStore:
         now = self._clock()
         with self._lock:
             self.directory.mkdir(parents=True, exist_ok=True)
+            if not _unlinked_type(self.directory, directory=True):
+                return {"removed": 0, "count": 0, "bytes": 0}
             removed = self._cleanup_expired_locked(now)
             self._enforce_quota_locked(protect=None, now=now)
             files = self._snapshot_files_locked()
@@ -279,7 +292,10 @@ class SearchSnapshotStore:
     def _snapshot_files_locked(self) -> list[Path]:
         if not self.directory.is_dir():
             return []
-        return [path for path in self.directory.iterdir() if path.is_file() and _SNAPSHOT_RE.fullmatch(path.name)]
+        return [
+            path for path in self.directory.iterdir()
+            if _SNAPSHOT_RE.fullmatch(path.name) and _unlinked_type(path, directory=False)
+        ]
 
     def _cleanup_expired_locked(self, now: float, *, exclude: set[Path] | None = None) -> int:
         excluded = exclude or set()

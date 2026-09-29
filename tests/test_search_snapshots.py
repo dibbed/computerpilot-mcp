@@ -394,6 +394,34 @@ def test_runtime_maintenance_expires_snapshots_after_restart(
     assert not snapshot.exists()
 
 
+def test_cleanup_does_not_follow_linked_snapshot_directory_or_entry(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = _store(tmp_path)
+    handle = SearchSnapshotStore(outside, ttl_sec=60, clock=lambda: 100.0).create(
+        [{"path": "keep"}], fingerprint="fingerprint", count_mode="exact",
+        result_order="path", scan_truncated=False, total_count=1,
+    )
+    file = outside / f"{handle.snapshot_id}.jsonl"
+    link = store.directory
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory symlinks are unavailable on this platform")
+    expired = SearchSnapshotStore(link, ttl_sec=60, clock=lambda: 200.0)
+    assert expired.cleanup()["removed"] == 0
+    assert file.exists()
+    assert link.is_symlink()
+
+    link.unlink()
+    link.mkdir()
+    entry = link / file.name
+    entry.symlink_to(file)
+    assert expired.cleanup()["removed"] == 0
+    assert entry.is_symlink()
+    assert file.exists()
+
+
 def test_snapshot_publish_leaves_no_temporary_files(tmp_path: Path) -> None:
     store = _store(tmp_path)
     fingerprint = _fingerprint(tmp_path)
