@@ -13,6 +13,7 @@ from pathlib import Path
 
 from core.config import SETTINGS, Settings
 from core.resource_locks import RESOURCE_LOCKS
+from core.state_paths import unlinked_directory_tree, unlinked_regular_file
 
 TERMINAL_JOB_STATUSES = ("succeeded", "failed", "cancelled", "timed_out", "interrupted")
 _JOB_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -225,7 +226,9 @@ def cleanup_job_history(
 ) -> JobHistoryCleanupResult:
     """Prune terminal rows first, then their output; orphan directories are recovered later."""
 
-    if not db_path.is_file():
+    if not unlinked_directory_tree(db_path.parent, allow_missing=True) or not unlinked_directory_tree(output_dir, allow_missing=True):
+        return JobHistoryCleanupResult(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, True, False, 1)
+    if not unlinked_regular_file(db_path):
         return JobHistoryCleanupResult(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, True, False, 0)
     current = time.time() if now is None else now
     with closing(sqlite3.connect(db_path, timeout=10)) as db:

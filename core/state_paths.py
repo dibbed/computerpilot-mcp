@@ -30,3 +30,13 @@ def unlinked_directory_tree(path: Path, *, allow_missing: bool = False) -> bool:
         if current.parent == current:
             return True
         current = current.parent
+
+
+def unlinked_regular_file(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and not (
+        os.name == "nt" and info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )

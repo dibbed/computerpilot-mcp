@@ -104,6 +104,24 @@ def test_job_retention_preserves_newest_terminal_as_safety_floor(tmp_path: Path)
     assert result.safety_floor_preserved is True
 
 
+def test_job_history_cleanup_skips_linked_state_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    store = JobStore(outside / "jobs.sqlite3")
+    old, newest = "a" * 32, "b" * 32
+    _insert_job(store, old, "succeeded", 100, output_bytes=100)
+    _insert_job(store, newest, "succeeded", 200, output_bytes=100)
+    link = tmp_path / ".agent_state"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory links are unavailable")
+
+    result = cleanup_job_history(link / "jobs.sqlite3", link / "jobs", _policy(age=10), now=1_000)
+    assert result.removed_jobs == result.orphan_dirs_removed == 0
+    assert old in _ids(store)
+    assert (store.output_dir / old / "stdout.bin").exists()
+
+
 def test_job_retention_crash_order_leaves_recoverable_orphan_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
