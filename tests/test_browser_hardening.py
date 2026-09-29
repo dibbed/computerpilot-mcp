@@ -288,3 +288,27 @@ def test_disconnect_during_context_attach_does_not_publish_session() -> None:
         assert not manager._pools
 
     asyncio.run(run())
+
+
+def test_disconnected_stale_session_does_not_consume_session_budget() -> None:
+    async def run() -> None:
+        old_context = _context()
+        new_context = _context()
+        old_browser = FakeBrowser([old_context])
+        new_browser = FakeBrowser([new_context])
+        launch = AsyncMock(side_effect=[old_browser, new_browser])
+        manager = BrowserManager(max_sessions=1, session_idle_sec=60, pool_idle_sec=60)
+        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+
+        await manager.open("a", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        old_browser.disconnect()
+
+        result = await manager.open("b", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+
+        assert result["ok"] is True
+        assert "a" not in manager._sessions
+        assert "b" in manager._sessions
+        old_context.close.assert_awaited_once()
+        assert launch.await_count == 2
+
+    asyncio.run(run())

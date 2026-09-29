@@ -183,7 +183,7 @@ class BrowserManager:
 
     async def _cleanup_loop(self) -> None:
         try:
-            while self._pools:
+            while self._pools or self._sessions:
                 await asyncio.sleep(self._cleanup_interval_sec)
                 await self.cleanup_idle()
         except asyncio.CancelledError:
@@ -360,6 +360,8 @@ class BrowserManager:
 
             reserved_slot = False
             if existing is None:
+                if len(self._sessions) + self._pending_sessions >= self._max_sessions:
+                    await self.cleanup_idle()
                 async with self._capacity_lock:
                     if len(self._sessions) + self._pending_sessions >= self._max_sessions:
                         raise ToolError(
@@ -437,13 +439,15 @@ class BrowserManager:
             now = self._clock()
 
             for session_id, candidate in list(self._sessions.items()):
-                if now - candidate.last_used < self._session_idle_sec:
+                stale = not self._session_usable(candidate)
+                if not stale and now - candidate.last_used < self._session_idle_sec:
                     continue
                 async with self.session(session_id, touch=False):
                     current = self._sessions.get(session_id)
                     if current is not candidate:
                         continue
-                    if self._clock() - current.last_used < self._session_idle_sec:
+                    stale = not self._session_usable(current)
+                    if not stale and self._clock() - current.last_used < self._session_idle_sec:
                         continue
                     self._sessions.pop(session_id, None)
                     await self._close_session_context(current, suppress_errors=True)
