@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import platform
 from typing import Any
@@ -31,12 +32,22 @@ async def collect_server_health(
     active_domains = available_domains(profile.domains, capabilities)
     tools = await server.list_tools()
     browser_stats = await browser_manager.stats()
-    resources = resource_collector(browser_stats)
+
+    def collect_durable_metrics() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        # File walks, psutil and SQLite operations are synchronous. The health
+        # publisher runs periodically on the MCP loop, so keep them together
+        # in a worker thread without changing their read order.
+        resources = resource_collector(browser_stats)
+        workflows = workflow_store_factory(settings.workflow_db)
+        return (
+            resources,
+            workflows.health_summary(),
+            workflows.list(offset=0, limit=20),
+            recovery.summary(max_items=20),
+        )
+
+    resources, workflow_health, recent_workflows, operation_recovery = await asyncio.to_thread(collect_durable_metrics)
     resource_usage = resources.pop("budgets")
-    workflows = workflow_store_factory(settings.workflow_db)
-    workflow_health = workflows.health_summary()
-    recent_workflows = workflows.list(offset=0, limit=20)
-    operation_recovery = recovery.summary(max_items=20)
     degraded_reasons: list[str] = []
     if int(operation_recovery["uncertain_count"]) > 0:
         degraded_reasons.append("operation_recovery_uncertain")
