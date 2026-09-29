@@ -9,6 +9,7 @@ from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
 from core.jobs import JobStore
@@ -49,7 +50,9 @@ def test_worker_spawn_owns_descendants_through_posix_process_group(
     )
     try:
         assert isinstance(process, PosixOwnedProcess)
-        assert os.getpgid(process.pid) == process.pid
+        getpgid = getattr(os, "getpgid", None)
+        assert getpgid is not None
+        assert getpgid(process.pid) == process.pid
     finally:
         process.process.kill()
         process.process.wait(timeout=5)
@@ -131,6 +134,45 @@ def test_exited_command_cannot_record_reused_pid_identity(
         return SimpleNamespace(create_time=lambda: 999.0 if pid is not None else 1.0)
 
     monkeypatch.setattr(job_worker, "spawn_owned_process", lambda *args, **kwargs: ExitedCommand())
+    monkeypatch.setattr(job_worker.psutil, "Process", process_metadata)
+
+    job_worker.run(path, job_id)
+
+    row = store.raw(job_id)
+    assert row["status"] == "succeeded"
+    assert row["pid"] == 4321
+    assert row["pid_created"] is None
+
+
+def test_command_launch_survives_process_metadata_denial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "jobs.sqlite3"
+    store = JobStore(path)
+    job_id = "e" * 32
+    _seed(store, job_id, tmp_path)
+
+    class CompletedCommand:
+        pid = 4321
+
+        def poll(self) -> int | None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def close_ownership(self) -> None:
+            pass
+
+        def terminate_tree(self, *, force: bool = True) -> dict[str, object]:
+            raise AssertionError("metadata lookup failure must not terminate a launched command")
+
+    def process_metadata(pid: int | None = None) -> SimpleNamespace:
+        if pid is None:
+            return SimpleNamespace(create_time=lambda: 1.0)
+        raise psutil.AccessDenied(pid=pid)
+
+    monkeypatch.setattr(job_worker, "spawn_owned_process", lambda *args, **kwargs: CompletedCommand())
     monkeypatch.setattr(job_worker.psutil, "Process", process_metadata)
 
     job_worker.run(path, job_id)

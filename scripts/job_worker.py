@@ -111,7 +111,7 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                     # during lookup, psutil may have observed a reused PID.
                     if process.poll() is not None:
                         created = None
-                except psutil.NoSuchProcess:
+                except (psutil.Error, OSError):
                     created = None
                 _update(db, job_id, pid=process.pid, pid_created=created)
                 started = time.monotonic()
