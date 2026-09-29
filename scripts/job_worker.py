@@ -107,6 +107,10 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 )
                 try:
                     created = psutil.Process(process.pid).create_time()
+                    # Popen still identifies the original child. If it exited
+                    # during lookup, psutil may have observed a reused PID.
+                    if process.poll() is not None:
+                        created = None
                 except psutil.NoSuchProcess:
                     created = None
                 _update(db, job_id, pid=process.pid, pid_created=created)

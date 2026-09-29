@@ -107,6 +107,40 @@ def test_worker_reuses_one_runtime_connection(tmp_path: Path, monkeypatch: pytes
     assert seed_store.raw(job_id)["status"] == "succeeded"
 
 
+def test_exited_command_cannot_record_reused_pid_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "jobs.sqlite3"
+    store = JobStore(path)
+    job_id = "d" * 32
+    _seed(store, job_id, tmp_path)
+
+    class ExitedCommand:
+        pid = 4321
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def close_ownership(self) -> None:
+            pass
+
+    def process_metadata(pid: int | None = None) -> SimpleNamespace:
+        return SimpleNamespace(create_time=lambda: 999.0 if pid is not None else 1.0)
+
+    monkeypatch.setattr(job_worker, "spawn_owned_process", lambda *args, **kwargs: ExitedCommand())
+    monkeypatch.setattr(job_worker.psutil, "Process", process_metadata)
+
+    job_worker.run(path, job_id)
+
+    row = store.raw(job_id)
+    assert row["status"] == "succeeded"
+    assert row["pid"] == 4321
+    assert row["pid_created"] is None
+
+
 def test_worker_sees_external_cancel_on_persistent_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "jobs.sqlite3"
     external = JobStore(path)
