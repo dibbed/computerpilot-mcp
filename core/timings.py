@@ -136,6 +136,14 @@ def _append_timing_records(target: Path, records: list[dict[str, Any]]) -> None:
                 temporary.unlink(missing_ok=True)
             size = len(tail)
 
+        payload = b"".join(lines)
+        if payload and size + len(payload) <= TIMING_MAX_FILE_BYTES:
+            # Normal batches fit in the current segment. One buffered append
+            # avoids a write call for each individual timing record.
+            with target.open("ab") as handle:
+                handle.write(payload)
+            return
+
         handle = None
         try:
             for line in lines:
