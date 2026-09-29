@@ -120,8 +120,13 @@ def cleanup_workflow_history(
                               WHERE o.workflow_id = workflows.workflow_id
                                 AND o.state IN ('uncertain','reconciling','unresolvable')
                           )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM workflow_leases l
+                              WHERE l.workflow_id = workflows.workflow_id
+                                AND l.expires_at > ?
+                          )
                         """,
-                        (workflow_id,),
+                        (workflow_id, current.isoformat(timespec="milliseconds")),
                     ).rowcount
                     if deleted:
                         if reason == "age":

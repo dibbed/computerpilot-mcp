@@ -10,6 +10,7 @@ import pytest
 from mcp import Client
 
 from core import heartbeat, registry, resource_health
+from core import workflow_retention
 from core.config import SETTINGS
 from core.registry import create_server
 from core.workflow_retention import WorkflowHistoryPolicy, cleanup_workflow_history
@@ -58,6 +59,44 @@ def test_workflow_retention_prunes_only_safe_terminal_history(tmp_path: Path) ->
         assert connection.execute(
             "SELECT COUNT(*) FROM workflow_events WHERE workflow_id NOT IN (SELECT workflow_id FROM workflows)"
         ).fetchone()[0] == 0
+
+
+def test_retention_rechecks_lease_acquired_after_eligibility_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "workflows.sqlite3"
+    store = WorkflowStore(path)
+    protected = str(store.create(_definition(), initial_state=WorkflowState.COMPLETED)["workflow_id"])
+    store.create(_definition(), initial_state=WorkflowState.COMPLETED)
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE workflows SET updated_at='2020-01-01T00:00:00.000+00:00' WHERE workflow_id=?", (protected,))
+
+    real_connect = sqlite3.connect
+    inserted = False
+
+    class InjectLease(sqlite3.Connection):
+        def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+            nonlocal inserted
+            if sql == "BEGIN IMMEDIATE" and not inserted:
+                inserted = True
+                with real_connect(path) as other:
+                    other.execute(
+                        "INSERT INTO workflow_leases VALUES (?,?,?,?,?,?,?)",
+                        (
+                            protected, "another-worker", "token", "2026-09-29T00:00:00+00:00",
+                            "2026-09-29T00:00:00+00:00", "2030-01-01T00:00:00+00:00", 1,
+                        ),
+                    )
+            return super().execute(sql, parameters)
+
+    monkeypatch.setattr(workflow_retention.sqlite3, "connect", lambda *args, **kwargs: real_connect(*args, factory=InjectLease, **kwargs))
+    cleanup_workflow_history(
+        path, WorkflowHistoryPolicy(max_age_days=1, max_count=0, cleanup_interval_sec=1),
+        now=datetime(2026, 9, 29, tzinfo=timezone.utc),
+    )
+
+    assert inserted
+    assert store.get(protected)["state"] == "completed"
 
 
 def test_workflow_health_exposes_bounded_state_metrics(tmp_path: Path) -> None:
