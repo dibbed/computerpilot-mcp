@@ -62,7 +62,7 @@ def same_process(pid: int | None, created: float | None) -> bool:
     try:
         process = psutil.Process(pid)
         return abs(process.create_time() - created) < 0.01 and process.is_running()
-    except psutil.NoSuchProcess:
+    except psutil.Error:
         return False
 
 

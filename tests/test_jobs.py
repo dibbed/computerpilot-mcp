@@ -198,3 +198,12 @@ def test_output_reconciliation_keeps_concurrent_completion(
     assert result["exit_code"] == 0
     assert result["version"] == store.raw(job_id)["version"]
     assert result["stdout"]["text"] == "done"
+
+
+def test_same_process_fails_closed_when_process_metadata_is_inaccessible(monkeypatch: pytest.MonkeyPatch) -> None:
+    def denied(pid: int) -> object:
+        raise jobs.psutil.AccessDenied(pid=pid)
+
+    monkeypatch.setattr(jobs.psutil, "Process", denied)
+
+    assert jobs.same_process(12345, 1.0) is False
