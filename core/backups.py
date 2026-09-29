@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import stat
 import threading
 import time
-from stat import S_ISREG
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,8 +79,10 @@ def _scan_backups(directory: Path) -> tuple[list[BackupEntry], int]:
         return entries, 1
     for path in candidates:
         try:
-            file_stat = path.stat()
-            if not S_ISREG(file_stat.st_mode):
+            file_stat = path.lstat()
+            if not stat.S_ISREG(file_stat.st_mode) or (
+                os.name == "nt" and file_stat.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
                 continue
         except FileNotFoundError:
             continue
@@ -107,6 +110,11 @@ def cleanup_backups(
     """Apply age and byte quotas while preserving at least the newest backup."""
 
     directory.mkdir(parents=True, exist_ok=True)
+    directory_info = directory.lstat()
+    if not stat.S_ISDIR(directory_info.st_mode) or (
+        os.name == "nt" and directory_info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        return BackupCleanupResult(0, 0, 0, 0, 0, 0, 0, 0, True, False, 1)
     entries, errors = _scan_backups(directory)
     scanned_files = len(entries)
     scanned_bytes = sum(entry.size for entry in entries)
@@ -175,11 +183,11 @@ def cleanup_backups(
     actual_remaining_bytes = 0
     for entry in survivors:
         try:
-            stat = entry.path.stat()
+            file_info = entry.path.stat()
         except OSError:
             continue
         remaining_files += 1
-        actual_remaining_bytes += stat.st_size
+        actual_remaining_bytes += file_info.st_size
     quota_satisfied = policy.max_bytes <= 0 or actual_remaining_bytes <= policy.max_bytes
 
     return BackupCleanupResult(

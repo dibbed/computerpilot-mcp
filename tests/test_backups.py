@@ -121,6 +121,28 @@ def test_cleanup_ignores_non_backup_files(tmp_path: Path) -> None:
     assert marker.read_text(encoding="utf-8") == "metadata"
 
 
+def test_backup_cleanup_never_enters_linked_state_or_linked_backup(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    old = outside / "old.bak"
+    _backup(old, 100, 100)
+    _backup(outside / "new.bak", 100, 200)
+    link = tmp_path / "backups"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory links are unavailable")
+    assert cleanup_backups(link, _policy(max_age_sec=10), now=1_000).removed_files == 0
+    assert old.exists()
+    link.unlink()
+    link.mkdir()
+    linked_backup = link / "old.bak"
+    linked_backup.symlink_to(old)
+    _backup(link / "new.bak", 100, 200)
+    assert cleanup_backups(link, _policy(max_age_sec=10), now=1_000).removed_files == 0
+    assert linked_backup.is_symlink() and old.exists()
+
+
 def test_retention_age_uses_backup_event_timestamp_not_copied_source_mtime(tmp_path: Path) -> None:
     old_stamp = "20250101T000000000000Z"
     new_stamp = "20260915T000000000000Z"
