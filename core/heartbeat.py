@@ -57,7 +57,7 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
         interval = max(1.0, min(float(SETTINGS.job_history_cleanup_interval_sec), 300.0))
         while True:
             try:
-                SEARCH_SNAPSHOTS.cleanup()
+                await asyncio.to_thread(SEARCH_SNAPSHOTS.cleanup)
             except Exception:
                 # Expired search snapshots are disposable; maintenance must
                 # continue even if their directory is temporarily unavailable.

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -392,6 +394,43 @@ def test_runtime_maintenance_expires_snapshots_after_restart(
 
     asyncio.run(start())
     assert not snapshot.exists()
+
+
+def test_runtime_snapshot_cleanup_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from core import heartbeat
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_cleanup() -> None:
+        entered.set()
+        release.wait(0.4)
+
+    monkeypatch.setattr(heartbeat, "SEARCH_SNAPSHOTS", SimpleNamespace(cleanup=slow_cleanup))
+    monkeypatch.setattr(heartbeat, "SETTINGS", replace(heartbeat.SETTINGS, state_dir=tmp_path))
+    for name in (
+        "schedule_artifact_retention", "schedule_job_history_retention",
+        "schedule_workflow_history_retention", "flush_audit",
+    ):
+        monkeypatch.setattr(heartbeat, name, lambda **kwargs: None)
+    monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
+
+    async def scenario() -> None:
+        async with heartbeat.lifespan(None):
+            started = time.perf_counter()
+            try:
+                await asyncio.sleep(0.02)
+                assert entered.is_set()
+                assert time.perf_counter() - started < 0.2
+            finally:
+                release.set()
+
+    asyncio.run(scenario())
 
 
 def test_cleanup_does_not_follow_linked_snapshot_directory_or_entry(tmp_path: Path) -> None:
