@@ -124,6 +124,21 @@ def test_artifact_cleanup_never_enters_linked_state_or_linked_artifact(tmp_path:
     assert linked_artifact.is_symlink() and old.exists()
 
 
+def test_artifact_cleanup_skips_linked_state_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    artifacts = outside / "artifacts"
+    artifacts.mkdir(parents=True)
+    old = _artifact(artifacts, "old.bin", 100, 100)
+    _artifact(artifacts, "new.bin", 100, 200)
+    try:
+        (tmp_path / ".agent_state").symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory links are unavailable")
+    result = cleanup_artifacts(tmp_path / ".agent_state" / "artifacts", _policy(max_age_sec=10), now=1_000)
+    assert result.removed_files == 0
+    assert old.exists()
+
+
 def test_artifact_retention_preserves_newest_when_single_file_exceeds_quota(tmp_path: Path) -> None:
     newest = _artifact(tmp_path, "huge.bin", 2_000, time.time())
 

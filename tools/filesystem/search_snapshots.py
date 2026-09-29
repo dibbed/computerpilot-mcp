@@ -21,6 +21,7 @@ from typing import Any
 from core.config import SETTINGS
 from core.errors import ToolError
 from core.resource_locks import canonical_path
+from core.state_paths import unlinked_directory_tree
 
 SNAPSHOT_SCHEMA_VERSION = 1
 _CURSOR_RE = re.compile(r"^s1\.([0-9a-f]{32})\.(0|[1-9][0-9]{0,9})$")
@@ -257,8 +258,10 @@ class SearchSnapshotStore:
     def cleanup(self) -> dict[str, int]:
         now = self._clock()
         with self._lock:
+            if not unlinked_directory_tree(self.directory, allow_missing=True):
+                return {"removed": 0, "count": 0, "bytes": 0}
             self.directory.mkdir(parents=True, exist_ok=True)
-            if not _unlinked_type(self.directory, directory=True):
+            if not unlinked_directory_tree(self.directory):
                 return {"removed": 0, "count": 0, "bytes": 0}
             removed = self._cleanup_expired_locked(now)
             self._enforce_quota_locked(protect=None, now=now)

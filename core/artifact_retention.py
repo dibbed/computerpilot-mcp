@@ -11,6 +11,7 @@ from pathlib import Path
 
 from core.config import SETTINGS, Settings
 from core.resource_locks import RESOURCE_LOCKS
+from core.state_paths import unlinked_directory_tree
 
 ARTIFACT_RECENT_GRACE_SEC = 60.0
 
@@ -92,11 +93,10 @@ def cleanup_artifacts(
 ) -> ArtifactCleanupResult:
     """Apply age/count/byte limits while preserving the newest artifact."""
 
+    if not unlinked_directory_tree(directory, allow_missing=True):
+        return ArtifactCleanupResult(0, 0, 0, 0, 0, 0, 0, 0, 0, True, False, 1)
     directory.mkdir(parents=True, exist_ok=True)
-    directory_info = directory.lstat()
-    if not stat.S_ISDIR(directory_info.st_mode) or (
-        os.name == "nt" and directory_info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
-    ):
+    if not unlinked_directory_tree(directory):
         return ArtifactCleanupResult(0, 0, 0, 0, 0, 0, 0, 0, 0, True, False, 1)
     entries, errors = _scan(directory)
     scanned_files = len(entries)

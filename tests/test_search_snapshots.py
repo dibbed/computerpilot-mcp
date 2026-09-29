@@ -422,6 +422,24 @@ def test_cleanup_does_not_follow_linked_snapshot_directory_or_entry(tmp_path: Pa
     assert file.exists()
 
 
+def test_snapshot_cleanup_skips_linked_state_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    snapshots = outside / "snapshots"
+    snapshots.mkdir(parents=True)
+    created = SearchSnapshotStore(snapshots, ttl_sec=60, clock=lambda: 100.0).create(
+        [{"path": "keep"}], fingerprint="fingerprint", count_mode="exact",
+        result_order="path", scan_truncated=False, total_count=1,
+    )
+    file = snapshots / f"{created.snapshot_id}.jsonl"
+    try:
+        (tmp_path / ".agent_state").symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory links are unavailable")
+    store = SearchSnapshotStore(tmp_path / ".agent_state" / "snapshots", ttl_sec=60, clock=lambda: 200.0)
+    assert store.cleanup()["removed"] == 0
+    assert file.exists()
+
+
 def test_snapshot_publish_leaves_no_temporary_files(tmp_path: Path) -> None:
     store = _store(tmp_path)
     fingerprint = _fingerprint(tmp_path)

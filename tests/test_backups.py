@@ -143,6 +143,22 @@ def test_backup_cleanup_never_enters_linked_state_or_linked_backup(tmp_path: Pat
     assert linked_backup.is_symlink() and old.exists()
 
 
+def test_backup_cleanup_skips_linked_state_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    backups = outside / "backups"
+    backups.mkdir(parents=True)
+    old = backups / "old.bak"
+    _backup(old, 100, 100)
+    _backup(backups / "new.bak", 100, 200)
+    try:
+        (tmp_path / ".agent_state").symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory links are unavailable")
+    result = cleanup_backups(tmp_path / ".agent_state" / "backups", _policy(max_age_sec=10), now=1_000)
+    assert result.removed_files == 0
+    assert old.exists()
+
+
 def test_retention_age_uses_backup_event_timestamp_not_copied_source_mtime(tmp_path: Path) -> None:
     old_stamp = "20250101T000000000000Z"
     new_stamp = "20260915T000000000000Z"

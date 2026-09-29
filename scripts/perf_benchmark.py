@@ -36,6 +36,7 @@ from core.backups import BackupPolicy, backup_created_at, cleanup_backups
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
 from core.file_lock import exclusive_file_lock
+from core.state_paths import unlinked_directory_tree
 from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
 from core.recovery import OperationRecoveryJournal
@@ -1582,13 +1583,7 @@ def _cleanup_stale_temp_roots(
     max_age_sec: float = STALE_TEMP_MAX_AGE_SEC,
 ) -> int:
     root = parent or SETTINGS.state_dir / "benchmarks" / "tmp"
-    try:
-        root_info = root.lstat()
-    except OSError:
-        return 0
-    if not stat.S_ISDIR(root_info.st_mode) or (
-        os.name == "nt" and root_info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
-    ):
+    if not unlinked_directory_tree(root):
         return 0
     current = time.time() if now is None else now
     removed = 0

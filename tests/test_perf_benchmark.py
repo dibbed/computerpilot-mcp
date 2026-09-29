@@ -359,6 +359,20 @@ def test_stale_benchmark_cleanup_refuses_symlinked_root(tmp_path: Path) -> None:
     assert (victim / "valuable").read_text() == "keep"
 
 
+def test_stale_benchmark_cleanup_refuses_symlinked_state_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    root = outside / "benchmarks" / "tmp"
+    victim = root / "victim"
+    victim.mkdir(parents=True)
+    (victim / ".active.lock").touch()
+    (victim / "valuable").write_text("keep")
+    os.utime(victim, (1, 1))
+    link = tmp_path / ".agent_state"
+    link.symlink_to(outside, target_is_directory=True)
+    assert _cleanup_stale_temp_roots(link / "benchmarks" / "tmp", now=1_000, max_age_sec=100) == 0
+    assert (victim / "valuable").read_text() == "keep"
+
+
 def test_stale_benchmark_cleanup_preserves_active_work_and_external_links(tmp_path: Path) -> None:
     from core.file_lock import exclusive_file_lock
 
