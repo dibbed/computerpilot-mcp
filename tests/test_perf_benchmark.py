@@ -316,12 +316,74 @@ def test_stale_benchmark_temp_cleanup_is_age_bounded(tmp_path: Path) -> None:
     recent = tmp_path / "recent"
     stale.mkdir()
     recent.mkdir()
+    (stale / ".active.lock").touch()
+    (recent / ".active.lock").touch()
     os.utime(stale, (1, 1))
     os.utime(recent, (950, 950))
     removed = _cleanup_stale_temp_roots(tmp_path, now=1_000, max_age_sec=100)
     assert removed == 1
     assert stale.exists() is False
     assert recent.is_dir()
+
+
+def test_stale_benchmark_cleanup_recovers_half_deleted_staging(tmp_path: Path) -> None:
+    staging = tmp_path / (".gc-" + "a" * 32)
+    staging.mkdir()
+    (staging / "leftover").write_text("crash")
+    assert _cleanup_stale_temp_roots(tmp_path, now=1_000, max_age_sec=100) == 1
+    assert not staging.exists()
+
+
+def test_completed_benchmark_temporary_root_is_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import perf_benchmark
+
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    with perf_benchmark._temporary_root("complete") as directory:
+        path = Path(directory)
+        assert (path / ".active.lock").is_file()
+        (path / "intermediate.json").write_text("temporary")
+    assert not path.exists()
+
+
+def test_stale_benchmark_cleanup_refuses_symlinked_root(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.mkdir()
+    (victim / ".active.lock").touch()
+    (victim / "valuable").write_text("keep")
+    os.utime(victim, (1, 1))
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(outside, target_is_directory=True)
+    assert _cleanup_stale_temp_roots(linked_root, now=1_000, max_age_sec=100) == 0
+    assert (victim / "valuable").read_text() == "keep"
+
+
+def test_stale_benchmark_cleanup_preserves_active_work_and_external_links(tmp_path: Path) -> None:
+    from core.file_lock import exclusive_file_lock
+
+    active = tmp_path / "active"
+    crashed = tmp_path / "crashed"
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    for directory in (active, crashed, outside):
+        directory.mkdir()
+    (outside / "valuable.txt").write_text("keep")
+    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+    for directory in (active, crashed):
+        (directory / ".active.lock").touch()
+        (directory / "state.txt").write_text("data")
+        os.utime(directory, (1, 1))
+
+    with exclusive_file_lock(active / ".active.lock"):
+        removed = _cleanup_stale_temp_roots(tmp_path, now=1_000, max_age_sec=100)
+        assert removed == 1
+        assert (active / "state.txt").exists()
+        assert not crashed.exists()
+        assert (outside / "valuable.txt").read_text() == "keep"
+        assert (tmp_path / "linked").is_symlink()
+    assert _cleanup_stale_temp_roots(tmp_path, now=1_000, max_age_sec=100) == 1
+    assert not active.exists()
+    assert _cleanup_stale_temp_roots(tmp_path, now=1_000, max_age_sec=100) == 0
 
 
 def test_audit_benchmark_preserves_all_records_and_reports_caller_latency(tmp_path: Path) -> None:

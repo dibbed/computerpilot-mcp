@@ -8,22 +8,25 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import statistics
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 import psutil
 
@@ -32,6 +35,7 @@ from core.audit import AuditPolicy, AuditWriter
 from core.backups import BackupPolicy, backup_created_at, cleanup_backups
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
+from core.file_lock import exclusive_file_lock
 from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
 from core.recovery import OperationRecoveryJournal
@@ -79,6 +83,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
 SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "backups", "retention", "resilience", "workflow")
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
+_GC_STAGING = re.compile(r"^\.gc-[0-9a-f]{32}$")
 
 
 class BenchmarkSkip(RuntimeError):
@@ -1577,31 +1582,61 @@ def _cleanup_stale_temp_roots(
     max_age_sec: float = STALE_TEMP_MAX_AGE_SEC,
 ) -> int:
     root = parent or SETTINGS.state_dir / "benchmarks" / "tmp"
-    if not root.is_dir():
+    try:
+        root_info = root.lstat()
+    except OSError:
+        return 0
+    if not stat.S_ISDIR(root_info.st_mode) or (
+        os.name == "nt" and root_info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
         return 0
     current = time.time() if now is None else now
     removed = 0
     for child in root.iterdir():
-        if not child.is_dir():
-            continue
         try:
-            age = current - child.stat().st_mtime
+            info = child.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or (
+            os.name == "nt" and info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            continue
+        if _GC_STAGING.fullmatch(child.name):
+            try:
+                shutil.rmtree(child)
+            except OSError:
+                continue
+            removed += 1
+            continue
+        owner = child / ".active.lock"
+        try:
+            if not stat.S_ISREG(owner.lstat().st_mode):
+                continue
+            age = current - info.st_mtime
         except OSError:
             continue
         if age < max_age_sec:
             continue
         try:
-            shutil.rmtree(child)
-        except OSError:
+            with exclusive_file_lock(owner, timeout_sec=0):
+                if current - child.stat().st_mtime < max_age_sec:
+                    continue
+            staging = root / f".gc-{uuid.uuid4().hex}"
+            os.replace(child, staging)
+            shutil.rmtree(staging)
+        except (OSError, TimeoutError):
             continue
         removed += 1
     return removed
 
 
-def _temporary_root(name: str) -> tempfile.TemporaryDirectory[str]:
+@contextmanager
+def _temporary_root(name: str) -> Iterator[str]:
     parent = SETTINGS.state_dir / "benchmarks" / "tmp"
     parent.mkdir(parents=True, exist_ok=True)
-    return tempfile.TemporaryDirectory(prefix=f"{name}-", dir=parent)
+    with tempfile.TemporaryDirectory(prefix=f"{name}-", dir=parent) as directory:
+        with exclusive_file_lock(Path(directory) / ".active.lock"):
+            yield directory
 
 
 def run_benchmarks(
