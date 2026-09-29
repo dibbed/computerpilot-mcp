@@ -61,6 +61,24 @@ def test_workflow_retention_prunes_only_safe_terminal_history(tmp_path: Path) ->
         ).fetchone()[0] == 0
 
 
+def test_workflow_history_cleanup_skips_linked_state_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    store = WorkflowStore(outside / "workflows.sqlite3")
+    old = str(store.create(_definition(), initial_state=WorkflowState.COMPLETED)["workflow_id"])
+    store.create(_definition(), initial_state=WorkflowState.COMPLETED)
+    link = tmp_path / ".agent_state"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory links are unavailable")
+
+    result = cleanup_workflow_history(
+        link / "workflows.sqlite3", WorkflowHistoryPolicy(0, 1, 1),
+    )
+    assert result.removed_rows == 0
+    assert store.get(old)["state"] == "completed"
+
+
 def test_retention_rechecks_lease_acquired_after_eligibility_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

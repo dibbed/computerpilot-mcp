@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from core.config import SETTINGS, Settings
+from core.state_paths import unlinked_directory_tree, unlinked_regular_file
 
 _TERMINAL_WORKFLOW_STATES = ("completed", "cancelled")
 _UNRESOLVED_OPERATION_STATES = ("uncertain", "reconciling", "unresolvable")
@@ -51,7 +52,9 @@ def cleanup_workflow_history(
     *,
     now: datetime | None = None,
 ) -> WorkflowHistoryCleanupResult:
-    if not db_path.is_file():
+    if not unlinked_directory_tree(db_path.parent, allow_missing=True):
+        return WorkflowHistoryCleanupResult(0, 0, 0, 0, 0, 0, 1)
+    if not unlinked_regular_file(db_path):
         return WorkflowHistoryCleanupResult(0, 0, 0, 0, 0, 0, 0)
     current = now or datetime.now(timezone.utc)
     cutoff = (
