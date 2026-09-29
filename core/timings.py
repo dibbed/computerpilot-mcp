@@ -21,8 +21,11 @@ from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from pydantic import BaseModel
 
 from core.config import SETTINGS
+from core.file_lock import exclusive_file_lock
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+TIMING_MAX_FILE_BYTES = 8 * 1_024 * 1_024
+TIMING_KEEP_FILES = 3
 _CURRENT_TOOL: ContextVar[str | None] = ContextVar("mcp_current_tool", default=None)
 
 
@@ -92,21 +95,69 @@ def _writer_loop() -> None:
         try:
             for target, payloads in batch.items():
                 try:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with target.open("a", encoding="utf-8", newline="") as handle:
-                        handle.write(
-                            "".join(
-                                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-                                for record in payloads
-                            )
-                        )
-                except OSError:
+                    _append_timing_records(target, payloads)
+                except (OSError, TimeoutError):
                     pass
         finally:
             for _ in range(consumed):
                 _WRITER_QUEUE.task_done()
         if stop_after_batch:
             return
+
+
+def _rotation_path(target: Path, index: int) -> Path:
+    return target.with_name(f"{target.stem}.{index}{target.suffix}")
+
+
+def _append_timing_records(target: Path, records: list[dict[str, Any]]) -> None:
+    """Bound diagnostic history; serialize file replacement across MCP processes."""
+
+    lines = [
+        (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        for record in records
+    ]
+    with exclusive_file_lock(target.with_name(f".{target.name}.lock"), timeout_sec=2):
+        try:
+            size = target.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        if size > TIMING_MAX_FILE_BYTES:
+            # Older installs may have one unbounded file. Keep only its complete
+            # newest lines before the first rotation on this version.
+            with target.open("rb") as source:
+                source.seek(size - TIMING_MAX_FILE_BYTES)
+                tail = source.read(TIMING_MAX_FILE_BYTES)
+            tail = tail.partition(b"\n")[2]
+            temporary = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            try:
+                temporary.write_bytes(tail)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            size = len(tail)
+
+        handle = None
+        try:
+            for line in lines:
+                if len(line) > TIMING_MAX_FILE_BYTES:
+                    continue
+                if size and size + len(line) > TIMING_MAX_FILE_BYTES:
+                    if handle is not None:
+                        handle.close()
+                        handle = None
+                    for index in range(TIMING_KEEP_FILES, 1, -1):
+                        previous = _rotation_path(target, index - 1)
+                        if previous.exists():
+                            os.replace(previous, _rotation_path(target, index))
+                    os.replace(target, _rotation_path(target, 1))
+                    size = 0
+                if handle is None:
+                    handle = target.open("ab")
+                handle.write(line)
+                size += len(line)
+        finally:
+            if handle is not None:
+                handle.close()
 
 
 def _ensure_writer() -> None:
