@@ -157,6 +157,14 @@ Check:
 
 Long-running jobs are designed to be observed incrementally rather than requiring one giant output response.
 
+## The panel previously printed `WinError 10053`
+
+On Windows, a browser/tab refresh or another client can close the loopback HTTP connection while the Supervisor is writing a response. That can surface as `ConnectionAbortedError: [WinError 10053]`.
+
+v0.4.0 treats disconnects during response/header/download writes as a normal client lifecycle event, closes that connection, and avoids printing a server traceback. The catch is scoped to socket response delivery so unrelated Supervisor/backend exceptions are still visible.
+
+If `WinError 10053` appears from a different subsystem or repeatedly without any client disconnect/refresh, capture the surrounding component/log context instead of assuming it is the handled panel case.
+
 ## Windows reports `WinError 1455`
 
 Windows can return this while process-table APIs are under commit/pagefile pressure.

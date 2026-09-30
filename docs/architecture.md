@@ -63,6 +63,21 @@ The supervisor owns runtime lifecycle concerns such as:
 
 The runtime tracks lifecycle state so new mutations can be blocked while a controlled drain is in progress.
 
+### Observability and local operations console
+
+The Supervisor also owns the loopback operations surface at `http://127.0.0.1:8766/`. The panel is local-only and reads bounded, redacted state rather than exposing arbitrary shell/process control.
+
+Its data model is split so frequent refreshes stay lightweight while detailed views are fetched on demand:
+
+- summary/build/Git identity and runtime health;
+- resource budgets, storage consumers, performance timing, capabilities, and safe configuration;
+- transport diagnosis/history plus confirmed poll-stall recovery state;
+- Recent Jobs with bounded incremental/downloadable output and guarded cancellation;
+- Recent Operations with searchable/filterable audit metadata and full-target inspection;
+- workflow, recovery, tool-activity, process, Doctor, and diagnostics views.
+
+Generation-scoped runtime-health and tool-activity snapshots let the Supervisor observe the live MCP process without constructing a second MCP server. Audit/transport records are metadata-only and are bounded by retention/rotation settings.
+
 ## Durable jobs
 
 Long-running commands can be moved out of a single MCP request.

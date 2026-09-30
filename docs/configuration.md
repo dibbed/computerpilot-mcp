@@ -58,6 +58,19 @@ Queued/running/orphaned jobs and unresolved workflow evidence are protected from
 | `MCP_SUPERVISOR_WATCHDOG_DRAIN_SEC` | watchdog best-effort drain | `2` seconds |
 | `MCP_WINDOWS_JOB_OBJECTS` | Windows Job Object ownership | enabled |
 
+## Transport observability and watchdog
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `MCP_TRANSPORT_UPSTREAM_IDLE_SEC` | classify a healthy but command-idle upstream period | `300` seconds |
+| `MCP_TUNNEL_POLL_STALL_GRACE_SEC` | grace beyond the runtime-reported poll deadline | `15` seconds |
+| `MCP_TUNNEL_POLL_STALL_CONFIRMATIONS` | consecutive confirmed stall observations before recovery eligibility | `3` |
+| `MCP_TUNNEL_POLL_WATCHDOG` | allow conservative restart after confirmed poll stall | enabled |
+| `MCP_TOOL_STALL_SEC` | diagnostic threshold for a long-running local MCP tool | `3600` seconds |
+| `MCP_TRANSPORT_HISTORY_INTERVAL_SEC` | minimum persisted transport-history interval | `60` seconds |
+
+These controls distinguish healthy upstream idleness from a confirmed control-plane poll stall. Upstream idle alone never triggers automatic restart.
+
 ## Search and project caches
 
 | Variable | Purpose | Default |

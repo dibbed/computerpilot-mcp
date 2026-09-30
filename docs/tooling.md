@@ -209,6 +209,20 @@ Project memory stores compact versioned facts with provenance and optimistic rev
 
 It is intended for bounded project context such as architecture decisions, important paths, user preferences, and previous fixes. It is not a raw transcript store and does not override runtime safety/policy decisions.
 
+## Local operations console
+
+The loopback Control Panel at `http://127.0.0.1:8766/` is the operator-facing view of Supervisor/runtime state.
+
+Use it to inspect:
+
+- incident-first runtime and Secure Tunnel health;
+- resource/storage budgets and performance summaries;
+- Recent Jobs, including status, command/cwd metadata, bounded stdout/stderr, and guarded cancellation;
+- Recent Operations, including search, outcome filters, paging, target inspection, and safe audit metadata;
+- transport history, workflow/recovery state, tool activity, Doctor checks, and redacted diagnostics export.
+
+Detailed panel endpoints are control-token guarded. The panel is intended for loopback use, not direct untrusted-network exposure.
+
 ## Health and discovery
 
 `server_health` reports runtime/platform capability state plus resource/job/browser/workflow/recovery summaries.
