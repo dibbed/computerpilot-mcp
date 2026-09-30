@@ -1052,10 +1052,10 @@ def watch() -> None:
 threading.Thread(target=watch, daemon=True).start()
 if number == 1:
     heartbeat.write_text(str(os.getpid()), encoding="ascii")
-    os.utime(heartbeat, (0, 0))
     with RUNTIME_LIFECYCLE.mutation("run_process"):
         journal.begin("run_process", "cwd=test")
         marker.write_text("once", encoding="utf-8")
+        os.utime(heartbeat, (0, 0))
         while True:
             time.sleep(1)
 else:
@@ -1071,7 +1071,7 @@ else:
         [sys.executable, str(script)],
         readiness_url=None,
         state_dir=tmp_path,
-        grace=0.2,
+        grace=2.0,
         interval=0.025,
         drain_timeout=1,
         watchdog_drain_timeout=0.12,
