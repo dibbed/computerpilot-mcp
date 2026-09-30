@@ -9,8 +9,8 @@ ComputerPilot MCP uses capability detection rather than registering every tool o
 | Windows amd64 | Supported | Python 3.10 + 3.12 | Yes | Yes |
 | Linux amd64 | Preview | Python 3.10 + 3.12 | Yes | No |
 | macOS arm64 | Preview | Python 3.10 + 3.12 | Yes | No |
-| Linux arm64 | Preview package target | No dedicated claim for v0.3.0 | Yes | No |
-| macOS amd64 | Preview package target | No dedicated claim for v0.3.0 | Yes | No |
+| Linux arm64 | Preview package target | No dedicated claim for v0.4.0 | Yes | No |
+| macOS amd64 | Preview package target | No dedicated claim for v0.4.0 | Yes | No |
 
 The CI matrix runs on `windows-latest`, `ubuntu-latest`, and `macos-latest` for Python 3.10 and 3.12. Platform Release Validation runs the three hosted OS targets on Python 3.12.
 
@@ -59,7 +59,7 @@ Native Windows desktop/UIA tools are not emulated on POSIX hosts. Browser automa
 
 A package being generated for an architecture is not the same as that architecture receiving dedicated hosted-runner execution.
 
-For v0.3.0:
+For v0.4.0:
 
 - Linux arm64 and macOS amd64 are deterministic package/updater targets.
 - The project does not claim dedicated native hosted-runner validation for those two architecture combinations.
