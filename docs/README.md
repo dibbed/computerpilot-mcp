@@ -18,7 +18,12 @@ This directory contains the public technical documentation and release evidence 
 
 ## Release evidence
 
-Versioned files such as `V0.3.0-RELEASE-NOTES.md` and `V0.3.0-VALIDATION.md` are immutable evidence for a specific release. They may contain version-specific counts or platform claims that should not be copied forward without re-validation.
+Current release evidence:
+
+- [v0.4.0 release notes](V0.4.0-RELEASE-NOTES.md)
+- [v0.4.0 validation](V0.4.0-VALIDATION.md)
+
+Versioned files such as `V0.4.0-RELEASE-NOTES.md` and `V0.4.0-VALIDATION.md` are immutable evidence for a specific release. They may contain version-specific counts or platform claims that should not be copied forward without re-validation.
 
 ## Internal development material
 

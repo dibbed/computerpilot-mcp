@@ -108,8 +108,8 @@ A deeper component map is in [Architecture](docs/architecture.md).
 | Windows amd64 | Supported | Python 3.10 + 3.12 | Yes | Full portable core plus Windows desktop capabilities |
 | Linux amd64 | Preview | Python 3.10 + 3.12 | No | Portable filesystem/terminal/browser/Git/testing/jobs/recovery/workflows |
 | macOS arm64 | Preview | Python 3.10 + 3.12 | No | Portable core; browser is the UI automation path |
-| Linux arm64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed for v0.3.0 |
-| macOS amd64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed for v0.3.0 |
+| Linux arm64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed for v0.4.0 |
+| macOS amd64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed for v0.4.0 |
 
 The release workflow builds five target archives from the same tracked source. Platform claims and limitations are documented in [Platform support](docs/platform-support.md).
 
@@ -250,7 +250,7 @@ Release preparation also has:
 - **Release Packaging Smoke** that builds all five archives and validates `SHA256SUMS.txt`;
 - exact-SHA publication gates for release commits.
 
-Release-specific evidence is stored under `docs/V*-VALIDATION.md`. For v0.3.0, see [release validation](docs/V0.3.0-VALIDATION.md).
+Release-specific evidence is stored under `docs/V*-VALIDATION.md`. For v0.4.0, see [release validation](docs/V0.4.0-VALIDATION.md).
 
 Run the common checks locally:
 
@@ -300,7 +300,7 @@ Historical release notes and validation records remain under `docs/`. Internal l
 
 - Native desktop screenshot/input and semantic UI Automation are Windows-only.
 - Linux and macOS support is still labeled preview.
-- Linux arm64 and macOS amd64 are package targets without a dedicated native hosted-runner claim in v0.3.0.
+- Linux arm64 and macOS amd64 are package targets without a dedicated native hosted-runner claim in v0.4.0.
 - Browser automation requires Playwright and installed browser runtimes.
 - LSP tools require a trusted `pyright-langserver --stdio` command already available on `PATH`; the MCP does not install it implicitly.
 - The local HTTP endpoint and control panel are intended for loopback use, not direct exposure to untrusted networks.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import socket
+import socketserver
 import subprocess
 import sys
 import threading
@@ -313,6 +314,33 @@ while True:
     assert not supervisor.heartbeat.exists()
 
 
+def test_panel_suppresses_expected_client_disconnect_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    panel = make_panel(supervisor, 0)
+    thread = threading.Thread(target=panel.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{panel.server_port}"
+
+    def aborting_write(_writer: Any, _data: bytes) -> int:
+        raise ConnectionAbortedError(10053, "client disconnected")
+
+    writer_type = vars(socketserver)["_SocketWriter"]
+    monkeypatch.setattr(writer_type, "write", aborting_write)
+    try:
+        with pytest.raises(ConnectionError):
+            urllib.request.urlopen(base + "/api/summary", timeout=2)
+        assert "ConnectionAbortedError" not in capsys.readouterr().err
+    finally:
+        panel.shutdown()
+        thread.join(timeout=5)
+        panel.server_close()
+        close_logger(supervisor)
+
+
 def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
     panel = make_panel(supervisor, 0)
@@ -332,6 +360,14 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         assert "Recovery Center" in html
         assert "Workflow Dashboard" in html
         assert "Recent Operations" in html
+        assert 'id="auditFilter"' in html
+        assert 'id="auditSearch"' in html
+        assert 'id="auditPrev"' in html
+        assert 'id="auditNext"' in html
+        assert 'id="auditModal"' in html
+        diagnostics_index = html.index('<div id="diagnostics" class="section-anchor">')
+        transport_index = html.index('<section class="panel">', diagnostics_index)
+        assert '<div class="grid two">' not in html[diagnostics_index:transport_index]
         assert "Runtime Health" in html
         assert "Tool Activity" in html
         assert "Browser Runtime" in html
@@ -1016,10 +1052,10 @@ def watch() -> None:
 threading.Thread(target=watch, daemon=True).start()
 if number == 1:
     heartbeat.write_text(str(os.getpid()), encoding="ascii")
-    os.utime(heartbeat, (0, 0))
     with RUNTIME_LIFECYCLE.mutation("run_process"):
         journal.begin("run_process", "cwd=test")
         marker.write_text("once", encoding="utf-8")
+        os.utime(heartbeat, (0, 0))
         while True:
             time.sleep(1)
 else:
@@ -1035,7 +1071,7 @@ else:
         [sys.executable, str(script)],
         readiness_url=None,
         state_dir=tmp_path,
-        grace=0.2,
+        grace=2.0,
         interval=0.025,
         drain_timeout=1,
         watchdog_drain_timeout=0.12,
