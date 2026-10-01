@@ -16,8 +16,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from core.config import resolve_path
 from core.errors import ToolError
+from core.execution_models import ExecutionIntent
 from core.job_scheduler import ensure_job_scheduler
 from core.jobs import JobStore
+from core.tool_catalog import intent_route_rules
 from core.workflow_models import WorkflowDefinition
 from tools.filesystem.patches import apply_patch_transaction
 from tools.testing.impact import select_affected_tests
@@ -443,6 +445,15 @@ def validate_operation(
 def validate_workflow_definition(definition: WorkflowDefinition) -> None:
     for step in definition.steps:
         validate_operation(step.action, step.arguments, step.postcondition)
+        if step.execution_intent is not None:
+            try:
+                intent = ExecutionIntent(**step.execution_intent)
+            except (TypeError, ValueError) as exc:
+                raise ToolError(
+                    "invalid_execution_intent",
+                    f"Invalid execution intent for step {step.name!r}: {exc}",
+                ) from exc
+            intent_route_rules(intent.name)
 
 
 def prepare_action_intent(

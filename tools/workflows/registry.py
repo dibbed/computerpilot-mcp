@@ -22,6 +22,17 @@ from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor,
 from tools.workflows.builtins import builtin_workflow
 
 
+class ExecutionIntentInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=200)
+    destructive: bool = False
+    semantic_ambiguous: bool = False
+    semantic_stale: bool = False
+    requires_macro_preservation: bool = False
+    allow_raw_desktop: bool = False
+    preferred_tool: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 class StepInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=200)
@@ -30,6 +41,7 @@ class StepInput(BaseModel):
     timeout_sec: float = Field(default=300, gt=0, le=3_600)
     max_retries: int = Field(default=0, ge=0, le=10)
     postcondition: dict[str, Any] | None = None
+    execution_intent: ExecutionIntentInput | None = None
 
 
 class WorkflowInput(BaseModel):
