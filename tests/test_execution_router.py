@@ -144,6 +144,22 @@ def test_router_metrics_are_bounded_and_classify_route_families() -> None:
     assert set(snapshot["route_distribution"]) == {"native.filesystem", "semantic.browser"}
 
 
+def test_router_metrics_accumulate_rejected_candidates() -> None:
+    from core.router_metrics import RouterMetrics
+
+    metrics = RouterMetrics(max_recent=2)
+    router = _router({"mouse_click"})
+    router.metrics = metrics
+
+    result = router.recommend(ExecutionIntent("desktop.raw.interact"))
+    assert result["ok"] is False
+
+    snapshot = metrics.snapshot()
+    assert snapshot["decision_count"] == 1
+    assert snapshot["no_route_count"] == 1
+    assert snapshot["rejected_candidate_count"] == 1
+
+
 def test_raw_desktop_requires_permission_and_is_forbidden_for_destructive_intents() -> None:
     router = _router({"mouse_click"})
 

@@ -12,6 +12,7 @@ from core.config import SETTINGS, Settings
 from core.platform import available_domains, detect_capabilities
 from core.recovery import OPERATION_RECOVERY
 from core.resource_health import collect_resource_metrics
+from core.router_metrics import ROUTER_METRICS
 from core.tool_profiles import resolve_profile
 from core.workflow_store import workflow_store
 from tools.browser.manager import MANAGER as BROWSER_MANAGER
@@ -27,6 +28,7 @@ async def collect_server_health(
     resource_collector: Any = collect_resource_metrics,
     recovery: Any = OPERATION_RECOVERY,
     workflow_store_factory: Any = workflow_store,
+    router_metrics: Any = ROUTER_METRICS,
 ) -> dict[str, Any]:
     """Return the redacted runtime health payload from the live MCP process."""
 
@@ -35,6 +37,7 @@ async def collect_server_health(
     active_domains = available_domains(profile.domains, capabilities)
     tools = await server.list_tools()
     browser_stats = await browser_manager.stats()
+    router_snapshot = router_metrics.snapshot()
 
     def collect_durable_metrics() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
         # File walks, psutil and SQLite operations are synchronous. The health
@@ -89,6 +92,11 @@ async def collect_server_health(
         "browser_optional_installed": capabilities.browser,
         "semantic_desktop_available": capabilities.semantic_ui,
         "audit_log": str(settings.audit_log),
+        "execution_router": {
+            "enabled": settings.execution_router_enabled,
+            "policy_version": settings.execution_router_policy,
+            **router_snapshot,
+        },
         "operation_recovery": operation_recovery,
         "health_status": health_status,
         "degraded_reasons": degraded_reasons,

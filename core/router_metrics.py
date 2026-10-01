@@ -15,6 +15,7 @@ class RouterMetrics:
         self._max_recent = max_recent
         self._decision_count = 0
         self._no_route_count = 0
+        self._rejected_candidate_count = 0
         self._fallback_count = 0
         self._route_distribution: Counter[str] = Counter()
         self._usage: Counter[str] = Counter()
@@ -52,7 +53,8 @@ class RouterMetrics:
             self._decision_count += 1
             if selected_route is None:
                 self._no_route_count += 1
-            else:
+            self._rejected_candidate_count += max(int(rejected_candidate_count), 0)
+            if selected_route is not None:
                 self._route_distribution[selected_route] += 1
                 family = self._family(selected_route)
                 if family is not None:
@@ -78,6 +80,7 @@ class RouterMetrics:
             return {
                 "decision_count": count,
                 "no_route_count": self._no_route_count,
+                "rejected_candidate_count": self._rejected_candidate_count,
                 "fallback_count": self._fallback_count,
                 "fallback_rate": (self._fallback_count / count) if count else 0.0,
                 "route_distribution": dict(sorted(self._route_distribution.items())),
