@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import importlib.util
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -259,4 +261,45 @@ def test_excel_mutation_tools_are_registered_and_recovery_guarded() -> None:
     names = {tool.name for tool in asyncio.run(create_server().list_tools())}
     assert expected <= names
     assert expected <= MUTATING_TOOL_OPERATIONS
+
+
+def test_xlsm_mutation_preserves_vba_bytes_and_xlsx_macro_mismatch_fails_closed(tmp_path: Path) -> None:
+    excel = importlib.import_module("tools.documents.excel")
+    payload = b"synthetic-vba-payload"
+
+    macro_path = tmp_path / "macro.xlsm"
+    _workbook(macro_path)
+    with ZipFile(macro_path, "a") as archive:
+        archive.writestr("xl/vbaProject.bin", payload)
+    before_digest = hashlib.sha256(payload).hexdigest()
+
+    result = excel.write_range(
+        macro_path,
+        sheet="Summary",
+        cell_range="A3:A3",
+        values=[["MacroSafe"]],
+        backup=True,
+    )
+    assert result["macro_preserved"] is True
+    assert result["macro_sha256"] == before_digest
+    with ZipFile(macro_path, "r") as archive:
+        after_digest = hashlib.sha256(archive.read("xl/vbaProject.bin")).hexdigest()
+    assert after_digest == before_digest
+
+    mismatch = tmp_path / "mismatch.xlsx"
+    _workbook(mismatch)
+    with ZipFile(mismatch, "a") as archive:
+        archive.writestr("xl/vbaProject.bin", payload)
+    original = mismatch.read_bytes()
+
+    with pytest.raises(ToolError) as error:
+        excel.set_formula(
+            mismatch,
+            sheet="Summary",
+            cell="B2",
+            formula="=7+7",
+            backup=True,
+        )
+    assert error.value.code == "macro_extension_mismatch"
+    assert mismatch.read_bytes() == original
 
