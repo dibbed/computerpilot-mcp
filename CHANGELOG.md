@@ -10,10 +10,19 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - Add a structure-first semantic browser surface with bounded snapshots, targeted semantic queries, and generation-scoped node references that fail closed after navigation or mutation.
 - Add semantic click, fill, select, structured waits, explicit tab management, bounded page extraction, controlled file upload, and sanitized byte-limited browser downloads.
 - Expose semantic browser snapshot/action/stale-ref counters and accumulated download bytes through runtime health.
+- Add a portable native-document domain with structured XLSX/XLSM inspection, bounded range/search/formula/table reads, and guarded workbook mutations without launching Excel.
+- Add DOCX structure/metadata inspection, bounded paragraph/table reads and search, conservative run-aware text replacement, paragraph/table-cell mutation, and simple document creation without launching Word.
+- Add PDF metadata/page inspection, bounded text extraction with artifact-backed delivery, and deterministic plain-text/Markdown PDF creation.
+- Add document artifact descriptors, per-target process/inter-process write locks, staged validation, optional SHA-256 preconditions, backups, and durable file-hash recovery checkpoints before atomic publication.
 
 ### Changed
 - Keep selector-based browser actions for compatibility while allowing agents to prefer semantic role/name/label/test-id targeting before screenshots or coordinates.
 - Add explicit semantic snapshot/extraction and browser-download resource budgets to runtime configuration.
+- Preserve XLSM VBA projects only when staged serialization keeps the VBA bytes identical; reject macro-bearing XLSX files instead of risking silent macro loss.
+- Validate OOXML archive paths, duplicate members, encryption flags, CRC integrity, entry/expanded-size budgets, and excessive compression before document-library parsing.
+- Keep DOCX formatting mutations fail-closed when a replacement crosses runs with different formatting, and document unsupported DOCM/comments/tracked-changes/header-footer/arbitrary-XML operations explicitly.
+- Keep PDF extraction page/character bounded and reject encrypted text extraction; PDF creation intentionally supports a limited Markdown subset rather than arbitrary existing-PDF editing.
+- Extend standalone operation recovery with durable pre-publication file-hash checkpoints so an interrupted document replacement can be reconciled without blind replay.
 
 ## [0.4.0] - 2026-09-30
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import date, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -168,30 +169,32 @@ def inspect_document(path: str | Path) -> dict[str, Any]:
     }
 
 
-def _document_items(document: Any) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
+def _document_item_count(document: Any) -> int:
+    return len(document.paragraphs) + sum(
+        len(row.cells)
+        for table in document.tables
+        for row in table.rows
+    )
+
+
+def _iter_document_items(document: Any) -> Iterator[dict[str, Any]]:
     for index, paragraph in enumerate(document.paragraphs):
-        items.append(
-            {
-                "kind": "paragraph",
-                "index": index,
-                "text": paragraph.text,
-                "style": paragraph.style.name if paragraph.style is not None else None,
-            }
-        )
+        yield {
+            "kind": "paragraph",
+            "index": index,
+            "text": paragraph.text,
+            "style": paragraph.style.name if paragraph.style is not None else None,
+        }
     for table_index, table in enumerate(document.tables):
         for row_index, row in enumerate(table.rows):
             for column_index, cell in enumerate(row.cells):
-                items.append(
-                    {
-                        "kind": "table_cell",
-                        "table_index": table_index,
-                        "row": row_index,
-                        "column": column_index,
-                        "text": cell.text,
-                    }
-                )
-    return items
+                yield {
+                    "kind": "table_cell",
+                    "table_index": table_index,
+                    "row": row_index,
+                    "column": column_index,
+                    "text": cell.text,
+                }
 
 
 def read_document(
@@ -209,12 +212,15 @@ def read_document(
         raise ToolError("invalid_max_chars", "max_chars must be between 1 and 2000000.")
 
     target, document = _load_document(path)
-    all_items = _document_items(document)
-    selected = all_items[offset : offset + max_items]
+    total = _document_item_count(document)
     bounded: list[dict[str, Any]] = []
     remaining = max_chars
     text_truncated = False
-    for item in selected:
+    for position, item in enumerate(_iter_document_items(document)):
+        if position < offset:
+            continue
+        if len(bounded) >= max_items:
+            break
         if remaining <= 0:
             text_truncated = True
             break
@@ -232,7 +238,6 @@ def read_document(
     paragraphs = [item for item in bounded if item["kind"] == "paragraph"]
     table_cells = [item for item in bounded if item["kind"] == "table_cell"]
     count = len(bounded)
-    total = len(all_items)
     truncated = text_truncated or offset + count < total
     return {
         "ok": True,
@@ -270,7 +275,7 @@ def find_text(
     matches: list[dict[str, Any]] = []
     scanned = 0
     truncated = False
-    for item in _document_items(document):
+    for item in _iter_document_items(document):
         if scanned >= max_items_scanned:
             truncated = True
             break

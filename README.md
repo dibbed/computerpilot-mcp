@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-ComputerPilot MCP gives MCP-capable AI agents a local runtime for **files, terminal and process execution, Git, testing, code intelligence, browser automation, durable jobs, crash recovery, and multi-step workflows**. On Windows it also exposes native screenshots, input, and semantic UI Automation.
+ComputerPilot MCP gives MCP-capable AI agents a local runtime for **files, native document intelligence, terminal and process execution, Git, testing, code intelligence, browser automation, durable jobs, crash recovery, and multi-step workflows**. On Windows it also exposes native screenshots, input, and semantic UI Automation.
 
 It is designed for developers who want an agent to do real work on a machine without collapsing everything into one unstructured shell tool. Capabilities are exposed as typed MCP tools, platform-specific features are registered only when supported, long-running work can survive MCP restarts, and ambiguous mutations are never replayed blindly.
 
@@ -59,6 +59,7 @@ For Secure Tunnel mode, browser setup, release archives, and platform-specific n
 | Code intelligence | project summaries, Python AST metadata, dependency graphs, consolidated code context, LSP definition/references/symbols/hover/call hierarchy/diagnostics |
 | Git & verification | status/diff/show/blame/merge-base, guarded branch/stage/commit/restore, affected-test selection, pytest, Ruff, mypy, change-aware verification |
 | Terminal & processes | native process execution, background processes, durable jobs, Windows CMD, PowerShell where available, POSIX shell on Linux/macOS |
+| Documents | native XLSX/XLSM inspection and guarded edits, DOCX inspection/search/conservative mutation, bounded PDF metadata/text extraction, deterministic text/Markdown PDF creation |
 | Browser | Playwright sessions, bounded semantic snapshots/queries, generation-scoped refs, semantic click/fill/select/waits, tabs, extraction, controlled upload/download, screenshots, isolated contexts, shared compatible browser processes |
 | Windows desktop | native screenshots, mouse/keyboard input, semantic UI Automation with bounded locators |
 | Recovery & workflows | mutation journal, evidence-based reconciliation, durable workflow plans, optimistic versions, leases, restart recovery, bounded retries |
@@ -81,6 +82,7 @@ flowchart TD
     D --> P[Terminal / process / system]
     D --> G[Git / testing]
     D --> R[Jobs / recovery / workflows]
+    D --> O[Documents: Excel / DOCX / PDF]
     D --> U[Browser / desktop]
 
     B --> S[Supervisor + lifecycle]
@@ -97,6 +99,7 @@ Key runtime invariants:
 - uncertain side effects are not automatically replayed;
 - Windows process ownership uses Job Objects, while POSIX uses sessions/process groups;
 - browser sessions use isolated contexts with bounded pool/session lifetimes;
+- document mutations use scoped same-file locks, optional SHA-256 preconditions, staged validation, backups, atomic publication, and durable file-hash recovery checkpoints;
 - generated runtime state lives under `.agent_state/` and is excluded from Git.
 
 A deeper component map is in [Architecture](docs/architecture.md).
@@ -106,7 +109,7 @@ A deeper component map is in [Architecture](docs/architecture.md).
 | Platform | Release status | Native CI | Native desktop / UIA | Notes |
 | --- | --- | --- | --- | --- |
 | Windows amd64 | Supported | Python 3.10 + 3.12 | Yes | Full portable core plus Windows desktop capabilities |
-| Linux amd64 | Preview | Python 3.10 + 3.12 | No | Portable filesystem/terminal/browser/Git/testing/jobs/recovery/workflows |
+| Linux amd64 | Preview | Python 3.10 + 3.12 | No | Portable filesystem/documents/terminal/browser/Git/testing/jobs/recovery/workflows |
 | macOS arm64 | Preview | Python 3.10 + 3.12 | No | Portable core; browser is the UI automation path |
 | Linux arm64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed for v0.4.0 |
 | macOS amd64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed for v0.4.0 |
@@ -171,7 +174,7 @@ Built-in workflows include `implement_and_verify`, `safe_git_commit`, and `prepa
 
 The default `full` profile preserves the complete catalog. Smaller profiles reduce the active domain set for specialized agents:
 
-`minimal`, `coding`, `git`, `testing`, `desktop`, `browser`, `operations`, `full`.
+`minimal`, `coding`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, `full`.
 
 `discover_tool_domains` reports the current profile and platform capabilities. `recommend_tools` ranks tools that are actually registered in the active profile.
 
@@ -228,6 +231,18 @@ browser_wait_for
 
 Snapshot node refs are generation-scoped. Navigation, semantic mutations, or tab changes invalidate old refs, so stale targets fail closed instead of silently acting on a changed page. `browser_extract` returns bounded text, links, tables, form fields, or a selected subtree. Uploads require an explicit local file, and downloads are saved under controlled runtime storage with filename sanitization and a configured byte limit.
 
+## Native Document Intelligence
+
+The portable `documents` domain works directly with files and does not launch Microsoft Office or another GUI.
+
+Excel tools support `.xlsx` and `.xlsm` inspection, sheet/range reads, bounded search, formulas, tables, range writes/clears, and guarded sheet/table mutations. Macro-enabled workbooks are mutated only when the staged output preserves the VBA project bytes exactly; an `.xlsx` file that unexpectedly contains VBA is rejected instead of risking macro loss.
+
+DOCX tools support structure/metadata inspection, bounded paragraph/table-cell reads and search, conservative text replacement, paragraph insertion, simple table-cell replacement, and simple document creation. `.docm`, tracked changes, comments, headers/footers, arbitrary WordprocessingML edits, and ambiguous mixed-format replacements are intentionally unsupported.
+
+PDF tools support metadata/page inspection, bounded text extraction with inline or file-backed delivery, and deterministic creation from plain text or a documented Markdown subset. They do not provide arbitrary existing-PDF editing. Encrypted PDFs can be inspected for encryption state, but text extraction requires a decrypted input.
+
+Document mutations share the recovery model: same-file writes are serialized, unrelated files can proceed independently, optional SHA-256 preconditions reject stale writes, output is staged and validated before atomic publication, backups are retained by the existing backup policy, and the expected final file hash is checkpointed durably before replacement.
+
 ## Local State
 
 Generated machine-local state is kept out of Git.
@@ -240,6 +255,7 @@ Generated machine-local state is kept out of Git.
 | `.agent_state/backups/` | recoverable edit backups |
 | `.agent_state/screenshots/` | browser/desktop screenshots |
 | `.agent_state/browser_downloads/` | controlled browser downloads |
+| `.agent_state/document_locks/` | cross-process coordination tokens for document mutations |
 | `.agent_state/search_snapshots/` | bounded search continuation snapshots |
 | `.agent_state/tunnel-runtime/` | verified managed Secure Tunnel runtime |
 | `.agent_state/audit.jsonl` | metadata-oriented audit trail |
@@ -317,6 +333,9 @@ Historical release notes and validation records remain under `docs/`. Internal l
 - Linux and macOS support is still labeled preview.
 - Linux arm64 and macOS amd64 are package targets without a dedicated native hosted-runner claim in v0.4.0.
 - Browser automation requires Playwright and installed browser runtimes.
+- Excel document tools support `.xlsx` and `.xlsm`; macro mutation is accepted only when VBA bytes can be verified unchanged.
+- DOCX mutation is intentionally conservative: `.docm`, tracked changes, comments, headers/footers, arbitrary XML edits, and ambiguous mixed-format replacements are not supported.
+- PDF creation uses built-in PDF fonts and a limited Markdown subset; complex-script shaping and arbitrary editing of existing PDFs are not supported.
 - LSP tools require a trusted `pyright-langserver --stdio` command already available on `PATH`; the MCP does not install it implicitly.
 - The local HTTP endpoint and control panel are intended for loopback use, not direct exposure to untrusted networks.
 - Built-in workflows deliberately avoid blind push/tag/deploy behavior.

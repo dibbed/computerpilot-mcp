@@ -13,6 +13,8 @@ This page highlights the settings most users are likely to change.
 | `CONTROL_PLANE_API_KEY` | tunnel control-plane credential | unset |
 | `MCP_TUNNEL_PROFILE` | explicit tunnel profile | auto-detected / `default` |
 
+Named tool profiles are `minimal`, `coding`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, and `full`. The `documents` profile keeps filesystem, native document, recovery, and workflow domains together.
+
 ## Managed tunnel runtime
 
 | Variable | Purpose | Default |

@@ -10,6 +10,7 @@ Available profiles:
 - `coding`
 - `git`
 - `testing`
+- `documents`
 - `desktop`
 - `browser`
 - `operations`
@@ -177,6 +178,32 @@ Built-in plans:
 - `prepare_release`
 
 `deploy_and_healthcheck` requires an explicit project adapter and otherwise fails closed.
+
+## Native documents
+
+The portable `documents` profile/domain provides structured file-native operations without launching Office applications.
+
+Excel:
+- `excel_inspect` and `excel_list_sheets` for workbook/sheet metadata;
+- `excel_read_range`, `excel_find`, `excel_get_formula`, and `excel_table_info` for bounded reads;
+- `excel_write_range`, `excel_clear_range`, sheet add/rename/delete, formula assignment, and table creation for guarded mutations.
+
+Excel mutations accept optional SHA-256 preconditions and use staged validation, backup, and atomic publication. `.xlsm` mutations preserve the VBA project only when the staged archive contains byte-identical VBA content. A macro-bearing `.xlsx` is rejected. Workbook ZIP structure and expansion are bounded before OpenPyXL parsing.
+
+DOCX:
+- `docx_inspect`, `docx_read`, and `docx_find`;
+- `docx_replace_text`, `docx_insert_paragraph`, `docx_replace_table_cell`, and `docx_create`.
+
+DOCX mutation is deliberately conservative. `.docm`, comments, tracked changes, headers/footers, arbitrary WordprocessingML mutation, and replacements that span differently formatted runs fail closed rather than guessing a formatting result. DOCX archives are validated for traversal, duplicate members, encryption, CRC failure, expansion, and required package members.
+
+PDF:
+- `pdf_inspect` and `pdf_metadata`;
+- `pdf_page_text` and `pdf_extract_text` with explicit page/character bounds and optional file-backed delivery;
+- `pdf_create_from_text` and `pdf_create_from_markdown` for deterministic new PDFs.
+
+Encrypted PDFs expose encryption state but are rejected for text extraction. PDF creation supports A4/Letter, built-in PDF fonts, and a documented Markdown subset; it is not an arbitrary editor for existing PDFs.
+
+All document mutations use per-target process/inter-process locking. Same-file writes serialize while unrelated document paths can proceed independently. Before atomic publication, the expected final SHA-256 is durably checkpointed into operation recovery so a crash after replacement can be reconciled without blind replay.
 
 ## Browser
 
