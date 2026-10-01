@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
@@ -47,7 +48,7 @@ def _selector_audit(selector: str) -> dict[str, Any]:
     }
 
 
-async def _resolve_semantic_locator(
+def _make_semantic_locator(
     page: Any,
     *,
     node: dict[str, Any] | None = None,
@@ -56,7 +57,6 @@ async def _resolve_semantic_locator(
     label: str | None = None,
     text: str | None = None,
     test_id: str | None = None,
-    match_index: int | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     target = dict(node or {})
     role = str(target.get("role") or role or "") or None
@@ -92,6 +92,33 @@ async def _resolve_semantic_locator(
             hint="Use node_ref+generation, role+name, label, text, or test_id.",
         )
 
+    return locator, {
+        "target_kind": kind,
+        "target_chars": len(target_value),
+        "target_sha256": hashlib.sha256(target_value.encode("utf-8", errors="replace")).hexdigest(),
+    }
+
+
+async def _resolve_semantic_locator(
+    page: Any,
+    *,
+    node: dict[str, Any] | None = None,
+    role: str | None = None,
+    name: str | None = None,
+    label: str | None = None,
+    text: str | None = None,
+    test_id: str | None = None,
+    match_index: int | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    locator, evidence = _make_semantic_locator(
+        page,
+        node=node,
+        role=role,
+        name=name,
+        label=label,
+        text=text,
+        test_id=test_id,
+    )
     count = int(await locator.count())
     if count < 1:
         code = "browser_stale_ref" if node is not None else "browser_target_not_found"
@@ -102,7 +129,7 @@ async def _resolve_semantic_locator(
         )
 
     if node is not None:
-        index = int(target.get("ordinal", 0))
+        index = int(node.get("ordinal", 0))
         if index >= count:
             raise ToolError(
                 "browser_stale_ref",
@@ -127,11 +154,9 @@ async def _resolve_semantic_locator(
             )
 
     return locator.nth(index), {
-        "target_kind": kind,
+        **evidence,
         "match_count": count,
         "match_index": index,
-        "target_chars": len(target_value),
-        "target_sha256": hashlib.sha256(target_value.encode("utf-8", errors="replace")).hexdigest(),
     }
 
 
@@ -365,6 +390,111 @@ def register(mcp: MCPServer) -> None:
                 "value_chars": len(value),
                 "generation": new_generation,
                 "evidence": evidence,
+                **_url_result(page.url),
+            }
+
+    @mcp.tool(annotations=OPEN_WORLD_READ, structured_output=True)
+    @compact_errors("browser_wait_for")
+    async def browser_wait_for(
+        condition: Literal["exists", "visible", "enabled", "hidden", "text", "url", "network_idle", "generation_change"],
+        session_id: SessionArg = "default",
+        node_ref: Annotated[str | None, Field(max_length=100)] = None,
+        generation: Annotated[int | None, Field(ge=0)] = None,
+        role: Annotated[str | None, Field(max_length=100)] = None,
+        name: Annotated[str | None, Field(max_length=2_000)] = None,
+        label: Annotated[str | None, Field(max_length=2_000)] = None,
+        text: Annotated[str | None, Field(max_length=4_000)] = None,
+        test_id: Annotated[str | None, Field(max_length=500)] = None,
+        match_index: Annotated[int | None, Field(ge=0, le=10_000)] = None,
+        url_pattern: Annotated[str | None, Field(max_length=8_192)] = None,
+        after_generation: Annotated[int | None, Field(ge=0)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+    ) -> dict[str, Any]:
+        """Wait for a bounded browser condition instead of sleeping blindly."""
+
+        timeout_ms = timeout_sec * 1_000
+        if condition == "generation_change":
+            if after_generation is None:
+                raise ToolError(
+                    "browser_wait_invalid",
+                    "after_generation is required for generation_change.",
+                    hint="Pass the generation you previously observed.",
+                )
+            deadline = asyncio.get_running_loop().time() + timeout_sec
+            while True:
+                current = MANAGER.semantic_generation(session_id)
+                if current != after_generation:
+                    return {"ok": True, "session_id": session_id, "condition": condition, "generation": current}
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ToolError("browser_wait_timeout", "Browser generation did not change before timeout.")
+                await asyncio.sleep(min(0.05, max(0.001, timeout_sec / 20)))
+
+        async with MANAGER.session(session_id):
+            page = MANAGER.page(session_id)
+            if condition == "url":
+                if url_pattern is None:
+                    raise ToolError("browser_wait_invalid", "url_pattern is required for url waits.")
+                await page.wait_for_url(url_pattern, timeout=timeout_ms)
+                evidence: dict[str, Any] = {"url_pattern_chars": len(url_pattern)}
+            elif condition == "network_idle":
+                await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+                evidence = {}
+            else:
+                node = None
+                if node_ref is not None:
+                    if generation is None:
+                        raise ToolError(
+                            "browser_generation_required",
+                            "generation is required when node_ref is used.",
+                            hint="Pass the generation returned by browser_snapshot/browser_query.",
+                        )
+                    node = MANAGER.semantic_ref(session_id, node_ref, generation)
+                locator, target_evidence = _make_semantic_locator(
+                    page,
+                    node=node,
+                    role=role,
+                    name=name,
+                    label=label,
+                    text=text,
+                    test_id=test_id,
+                )
+                if match_index is not None:
+                    locator = locator.nth(match_index)
+                elif node is not None:
+                    locator = locator.nth(int(node.get("ordinal", 0)))
+                elif condition not in {"hidden"}:
+                    count = int(await locator.count())
+                    if count > 1:
+                        raise ToolError(
+                            "browser_ambiguous_target",
+                            f"Semantic target matched {count} elements.",
+                            hint="Narrow the target or provide match_index.",
+                        )
+                if condition == "exists":
+                    await locator.wait_for(state="attached", timeout=timeout_ms)
+                elif condition == "visible" or condition == "text":
+                    await locator.wait_for(state="visible", timeout=timeout_ms)
+                elif condition == "hidden":
+                    await locator.wait_for(state="hidden", timeout=timeout_ms)
+                elif condition == "enabled":
+                    deadline = asyncio.get_running_loop().time() + timeout_sec
+                    while not await locator.is_enabled():
+                        if asyncio.get_running_loop().time() >= deadline:
+                            raise ToolError("browser_wait_timeout", "Semantic target did not become enabled before timeout.")
+                        await asyncio.sleep(0.05)
+                evidence = target_evidence
+
+            current_generation = MANAGER.semantic_generation(session_id)
+            audit_action(
+                "browser_wait_for",
+                target=_safe_url_target(page.url),
+                details={"session_id": session_id, "condition": condition, **evidence},
+            )
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "condition": condition,
+                "generation": current_generation,
                 **_url_result(page.url),
             }
 

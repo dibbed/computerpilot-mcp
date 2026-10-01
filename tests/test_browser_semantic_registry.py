@@ -147,3 +147,58 @@ def test_semantic_fill_uses_label_and_redacts_value_from_result(monkeypatch: pyt
         assert result["generation"] == 10
 
     asyncio.run(run())
+
+
+def test_browser_wait_for_visible_uses_semantic_locator(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        locator = SimpleNamespace(wait_for=AsyncMock(), count=AsyncMock(return_value=1))
+        locator.nth = lambda _: locator
+        page = SimpleNamespace(url="https://example.test/", get_by_role=lambda role, **kwargs: locator)
+        manager = BrowserManager()
+        manager._sessions["s"] = Session(PoolKey("chromium", True), SimpleNamespace(), page, "chromium", True, generation=2)
+        monkeypatch.setattr(registry, "MANAGER", manager)
+        monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+        capture = Capture()
+        registry.register(cast(Any, capture))
+
+        result = await capture.functions["browser_wait_for"](
+            condition="visible",
+            session_id="s",
+            role="button",
+            name="Continue",
+            timeout_sec=2,
+        )
+
+        assert result["ok"] is True
+        locator.wait_for.assert_awaited_once_with(state="visible", timeout=2000.0)
+
+    asyncio.run(run())
+
+
+def test_browser_wait_for_generation_change_observes_invalidation(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        page = SimpleNamespace(url="https://example.test/")
+        manager = BrowserManager()
+        manager._sessions["s"] = Session(PoolKey("chromium", True), SimpleNamespace(), page, "chromium", True, generation=4)
+        monkeypatch.setattr(registry, "MANAGER", manager)
+        monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+        capture = Capture()
+        registry.register(cast(Any, capture))
+
+        async def mutate() -> None:
+            await asyncio.sleep(0.02)
+            manager.invalidate_semantics("s")
+
+        task = asyncio.create_task(mutate())
+        result = await capture.functions["browser_wait_for"](
+            condition="generation_change",
+            session_id="s",
+            after_generation=4,
+            timeout_sec=1,
+        )
+        await task
+
+        assert result["ok"] is True
+        assert result["generation"] == 5
+
+    asyncio.run(run())
