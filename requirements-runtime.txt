@@ -3,4 +3,8 @@ pydantic>=2.12,<3
 psutil>=7.0,<8
 charset-normalizer>=3.4,<4
 Pillow>=11,<13
+openpyxl>=3.1,<4
+python-docx>=1.2,<2
+pypdf>=4.2,<7
+reportlab>=4.2,<5
 uiautomation>=2.0.29,<3; sys_platform == "win32"
