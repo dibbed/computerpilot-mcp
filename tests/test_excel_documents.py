@@ -5,10 +5,13 @@ import importlib
 import importlib.util
 from pathlib import Path
 
+import pytest
 from openpyxl import Workbook, load_workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
+from core.errors import ToolError
 from core.registry import create_server
+from core.tooling import MUTATING_TOOL_OPERATIONS
 
 
 def _workbook(path: Path) -> None:
@@ -137,3 +140,123 @@ def test_excel_read_tools_are_registered() -> None:
         "excel_get_formula",
         "excel_table_info",
     } <= names
+
+
+def test_excel_guarded_mutations_round_trip_and_preserve_original_on_rejection(tmp_path: Path) -> None:
+    excel = importlib.import_module("tools.documents.excel")
+    write_range = getattr(excel, "write_range", None)
+    clear_range = getattr(excel, "clear_range", None)
+    add_sheet = getattr(excel, "add_sheet", None)
+    rename_sheet = getattr(excel, "rename_sheet", None)
+    delete_sheet = getattr(excel, "delete_sheet", None)
+    set_formula = getattr(excel, "set_formula", None)
+    create_table = getattr(excel, "create_table", None)
+    for operation in (
+        write_range,
+        clear_range,
+        add_sheet,
+        rename_sheet,
+        delete_sheet,
+        set_formula,
+        create_table,
+    ):
+        assert callable(operation)
+
+    path = tmp_path / "mutations.xlsx"
+    _workbook(path)
+
+    written = write_range(
+        path,
+        sheet="Summary",
+        cell_range="A3:B3",
+        values=[["Beta", 7]],
+        backup=True,
+    )
+    assert written["changed"] is True
+    assert written["cells_written"] == 2
+    assert Path(written["backup"]).is_file()
+    digest = written["sha256"]
+
+    cleared = clear_range(
+        path,
+        sheet="Summary",
+        cell_range="B3:B3",
+        backup=True,
+        expected_sha256=digest,
+    )
+    assert cleared["cells_cleared"] == 1
+
+    formula = set_formula(
+        path,
+        sheet="Summary",
+        cell="B2",
+        formula="=2+2",
+        backup=True,
+    )
+    assert formula["formula"] == "=2+2"
+
+    added = add_sheet(path, name="Temp", index=1, backup=True)
+    assert added["sheet"] == "Temp"
+    renamed = rename_sheet(path, sheet="Temp", new_name="Renamed", backup=True)
+    assert renamed["sheet"] == "Renamed"
+    deleted = delete_sheet(path, sheet="Renamed", backup=True)
+    assert deleted["deleted_sheet"] == "Renamed"
+
+    table = create_table(
+        path,
+        sheet="Summary",
+        cell_range="A1:B3",
+        table_name="SummaryTable",
+        style_name="TableStyleMedium2",
+        backup=True,
+    )
+    assert table["table"]["name"] == "SummaryTable"
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        assert workbook["Summary"]["A3"].value == "Beta"
+        assert workbook["Summary"]["B3"].value is None
+        assert workbook["Summary"]["B2"].value == "=2+2"
+        assert workbook.sheetnames == ["Summary", "Data"]
+        assert "SummaryTable" in workbook["Summary"].tables
+    finally:
+        workbook.close()
+
+    before = path.read_bytes()
+    with pytest.raises(ToolError) as error:
+        write_range(
+            path,
+            sheet="Summary",
+            cell_range="D1:E1",
+            values=[["Merged", "unsafe"]],
+            backup=True,
+        )
+    assert error.value.code == "merged_cell_target"
+    assert path.read_bytes() == before
+
+    with pytest.raises(ToolError) as stale:
+        set_formula(
+            path,
+            sheet="Summary",
+            cell="B2",
+            formula="=9+9",
+            expected_sha256="0" * 64,
+        )
+    assert stale.value.code == "stale_file"
+    assert path.read_bytes() == before
+
+
+def test_excel_mutation_tools_are_registered_and_recovery_guarded() -> None:
+    expected = {
+        "excel_write_range",
+        "excel_clear_range",
+        "excel_add_sheet",
+        "excel_rename_sheet",
+        "excel_delete_sheet",
+        "excel_set_formula",
+        "excel_create_table",
+    }
+    names = {tool.name for tool in asyncio.run(create_server().list_tools())}
+    assert expected <= names
+    assert expected <= MUTATING_TOOL_OPERATIONS
+

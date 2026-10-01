@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 from zipfile import BadZipFile, ZipFile
 
 from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
 from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 from openpyxl.utils.exceptions import InvalidFileException
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from core.config import resolve_path
 from core.errors import ToolError
 from core.response import page
-from tools.documents.common import artifact_descriptor
+from tools.documents.common import artifact_descriptor, publish_document
 
 EXCEL_MEDIA_TYPES = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -352,3 +356,371 @@ def table_info(
         }
     finally:
         workbook.close()
+
+
+ExcelMutator = Callable[[Any], dict[str, Any]]
+_INVALID_SHEET_CHARS = re.compile(r"[\\/*?:\[\]]")
+_TABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+
+
+def _validate_mutation_format(target: Path) -> None:
+    if target.suffix.casefold() == ".xlsm":
+        raise ToolError(
+            "macro_preservation_unverified",
+            "XLSM mutation is disabled until VBA preservation is verified.",
+        )
+
+
+def _validate_sheet_name(workbook: Any, name: str, *, current: str | None = None) -> None:
+    if not name or len(name) > 31 or _INVALID_SHEET_CHARS.search(name):
+        raise ToolError(
+            "invalid_sheet_name",
+            "Worksheet names must be 1-31 characters and exclude \\ / * ? : [ ].",
+        )
+    wanted = name.casefold()
+    for existing in workbook.sheetnames:
+        if current is not None and existing == current:
+            continue
+        if existing.casefold() == wanted:
+            raise ToolError("sheet_exists", f"Worksheet already exists: {name!r}.")
+
+
+def _range_bounds(cell_range: str, *, max_cells: int) -> tuple[int, int, int, int, int]:
+    try:
+        min_col, min_row, max_col, max_row = range_boundaries(cell_range)
+    except (TypeError, ValueError) as exc:
+        raise ToolError("invalid_cell_range", f"Invalid Excel range: {cell_range!r}.") from exc
+    count = (max_row - min_row + 1) * (max_col - min_col + 1)
+    if count > max_cells:
+        raise ToolError(
+            "range_too_large",
+            f"Requested range contains {count} cells; maximum is {max_cells}.",
+        )
+    return min_col, min_row, max_col, max_row, count
+
+
+def _reject_merged_subcells(
+    worksheet: Any,
+    *,
+    min_col: int,
+    min_row: int,
+    max_col: int,
+    max_row: int,
+) -> None:
+    for row in range(min_row, max_row + 1):
+        for column in range(min_col, max_col + 1):
+            if isinstance(worksheet.cell(row=row, column=column), MergedCell):
+                raise ToolError(
+                    "merged_cell_target",
+                    "Mutation intersects a non-anchor merged cell; unmerge or target only safe cells.",
+                )
+
+
+def _validate_cell_value(value: Any) -> None:
+    if value is not None and not isinstance(value, (str, int, float, bool)):
+        raise ToolError(
+            "unsupported_cell_value",
+            "Excel writes support null, string, integer, number, and boolean cell values.",
+        )
+    if isinstance(value, str) and len(value) > 32_767:
+        raise ToolError("cell_value_too_long", "Excel cell strings may not exceed 32767 characters.")
+
+
+def _validate_saved_workbook(staged: Path) -> None:
+    _, workbook = load_excel(staged)
+    workbook.close()
+
+
+def _mutate_workbook(
+    path: str | Path,
+    mutator: ExcelMutator,
+    *,
+    backup: bool,
+    expected_sha256: str | None,
+) -> dict[str, Any]:
+    target = excel_path(path)
+    _validate_mutation_format(target)
+    metadata: dict[str, Any] = {}
+
+    def writer(staged: Path) -> None:
+        _, workbook = load_excel(target)
+        try:
+            metadata.update(mutator(workbook))
+            workbook.save(staged)
+        finally:
+            workbook.close()
+
+    result = publish_document(
+        target,
+        writer=writer,
+        validator=_validate_saved_workbook,
+        media_type=media_type(target),
+        backup=backup,
+        expected_sha256=expected_sha256,
+    )
+    return {**result, **metadata}
+
+
+def write_range(
+    path: str | Path,
+    *,
+    sheet: str,
+    cell_range: str,
+    values: list[list[Any]],
+    backup: bool = True,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    min_col, min_row, max_col, max_row, count = _range_bounds(cell_range, max_cells=10_000)
+    expected_rows = max_row - min_row + 1
+    expected_columns = max_col - min_col + 1
+    if len(values) != expected_rows or any(len(row) != expected_columns for row in values):
+        raise ToolError(
+            "range_shape_mismatch",
+            f"values must be exactly {expected_rows} rows by {expected_columns} columns.",
+        )
+    for row in values:
+        for value in row:
+            _validate_cell_value(value)
+
+    def apply(workbook: Any) -> dict[str, Any]:
+        worksheet = _worksheet(workbook, sheet)
+        _reject_merged_subcells(
+            worksheet,
+            min_col=min_col,
+            min_row=min_row,
+            max_col=max_col,
+            max_row=max_row,
+        )
+        for row_offset, row_values in enumerate(values):
+            for column_offset, value in enumerate(row_values):
+                worksheet.cell(
+                    row=min_row + row_offset,
+                    column=min_col + column_offset,
+                ).value = value
+        return {"sheet": sheet, "range": cell_range, "cells_written": count}
+
+    return _mutate_workbook(
+        path,
+        apply,
+        backup=backup,
+        expected_sha256=expected_sha256,
+    )
+
+
+def clear_range(
+    path: str | Path,
+    *,
+    sheet: str,
+    cell_range: str,
+    backup: bool = True,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    min_col, min_row, max_col, max_row, count = _range_bounds(cell_range, max_cells=50_000)
+
+    def apply(workbook: Any) -> dict[str, Any]:
+        worksheet = _worksheet(workbook, sheet)
+        _reject_merged_subcells(
+            worksheet,
+            min_col=min_col,
+            min_row=min_row,
+            max_col=max_col,
+            max_row=max_row,
+        )
+        for row in range(min_row, max_row + 1):
+            for column in range(min_col, max_col + 1):
+                worksheet.cell(row=row, column=column).value = None
+        return {"sheet": sheet, "range": cell_range, "cells_cleared": count}
+
+    return _mutate_workbook(
+        path,
+        apply,
+        backup=backup,
+        expected_sha256=expected_sha256,
+    )
+
+
+def add_sheet(
+    path: str | Path,
+    *,
+    name: str,
+    index: int | None = None,
+    backup: bool = True,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    def apply(workbook: Any) -> dict[str, Any]:
+        _validate_sheet_name(workbook, name)
+        if index is not None and not 0 <= index <= len(workbook.worksheets):
+            raise ToolError("invalid_sheet_index", "index is outside the valid worksheet insertion range.")
+        worksheet = workbook.create_sheet(title=name, index=index)
+        return {"sheet": worksheet.title, "index": workbook.index(worksheet)}
+
+    return _mutate_workbook(
+        path,
+        apply,
+        backup=backup,
+        expected_sha256=expected_sha256,
+    )
+
+
+def rename_sheet(
+    path: str | Path,
+    *,
+    sheet: str,
+    new_name: str,
+    backup: bool = True,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    def apply(workbook: Any) -> dict[str, Any]:
+        worksheet = _worksheet(workbook, sheet)
+        _validate_sheet_name(workbook, new_name, current=sheet)
+        worksheet.title = new_name
+        return {"previous_sheet": sheet, "sheet": worksheet.title}
+
+    return _mutate_workbook(
+        path,
+        apply,
+        backup=backup,
+        expected_sha256=expected_sha256,
+    )
+
+
+def delete_sheet(
+    path: str | Path,
+    *,
+    sheet: str,
+    backup: bool = True,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    def apply(workbook: Any) -> dict[str, Any]:
+        worksheet = _worksheet(workbook, sheet)
+        if len(workbook.worksheets) <= 1:
+            raise ToolError("last_sheet", "The last worksheet cannot be deleted.")
+        index = workbook.index(worksheet)
+        workbook.remove(worksheet)
+        return {"deleted_sheet": sheet, "index": index}
+
+    return _mutate_workbook(
+        path,
+        apply,
+        backup=backup,
+        expected_sha256=expected_sha256,
+    )
+
+
+def set_formula(
+    path: str | Path,
+    *,
+    sheet: str,
+    cell: str,
+    formula: str,
+    backup: bool = True,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    if not formula.startswith("=") or len(formula) > 32_767:
+        raise ToolError(
+            "invalid_formula",
+            "formula must start with '=' and be no longer than 32767 characters.",
+        )
+    try:
+        coordinate_to_tuple(cell)
+    except (TypeError, ValueError) as exc:
+        raise ToolError("invalid_cell", f"Invalid Excel cell coordinate: {cell!r}.") from exc
+
+    def apply(workbook: Any) -> dict[str, Any]:
+        worksheet = _worksheet(workbook, sheet)
+        resolved = worksheet[cell]
+        if isinstance(resolved, MergedCell):
+            raise ToolError("merged_cell_target", "Cannot set a formula on a non-anchor merged cell.")
+        resolved.value = formula
+        return {"sheet": sheet, "cell": resolved.coordinate, "formula": formula}
+
+    return _mutate_workbook(
+        path,
+        apply,
+        backup=backup,
+        expected_sha256=expected_sha256,
+    )
+
+
+def _ranges_overlap(left: str, right: str) -> bool:
+    l_min_col, l_min_row, l_max_col, l_max_row = range_boundaries(left)
+    r_min_col, r_min_row, r_max_col, r_max_row = range_boundaries(right)
+    return not (
+        l_max_col < r_min_col
+        or r_max_col < l_min_col
+        or l_max_row < r_min_row
+        or r_max_row < l_min_row
+    )
+
+
+def create_table(
+    path: str | Path,
+    *,
+    sheet: str,
+    cell_range: str,
+    table_name: str,
+    style_name: str = "TableStyleMedium2",
+    backup: bool = True,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    min_col, min_row, max_col, max_row, _ = _range_bounds(cell_range, max_cells=100_000)
+    if min_row == max_row:
+        raise ToolError("table_requires_data", "Excel tables require a header row and at least one data row.")
+    if not _TABLE_NAME.fullmatch(table_name):
+        raise ToolError(
+            "invalid_table_name",
+            "table_name must start with a letter or underscore and contain only letters, numbers, dot, or underscore.",
+        )
+
+    def apply(workbook: Any) -> dict[str, Any]:
+        worksheet = _worksheet(workbook, sheet)
+        _reject_merged_subcells(
+            worksheet,
+            min_col=min_col,
+            min_row=min_row,
+            max_col=max_col,
+            max_row=max_row,
+        )
+        existing_names = {
+            table.displayName.casefold()
+            for item in workbook.worksheets
+            for table in item.tables.values()
+        }
+        if table_name.casefold() in existing_names:
+            raise ToolError("table_exists", f"Excel table already exists: {table_name!r}.")
+        for table in worksheet.tables.values():
+            if _ranges_overlap(cell_range, table.ref):
+                raise ToolError(
+                    "table_overlap",
+                    f"Requested range overlaps existing table {table.displayName!r}.",
+                )
+        headers = [
+            worksheet.cell(row=min_row, column=column).value
+            for column in range(min_col, max_col + 1)
+        ]
+        if (
+            any(not isinstance(value, str) or not value.strip() for value in headers)
+            or len({str(value).casefold() for value in headers}) != len(headers)
+        ):
+            raise ToolError(
+                "invalid_table_headers",
+                "Table header cells must contain unique non-empty strings.",
+            )
+        table = Table(displayName=table_name, ref=cell_range)
+        table.tableStyleInfo = TableStyleInfo(name=style_name, showRowStripes=True)
+        worksheet.add_table(table)
+        return {
+            "sheet": sheet,
+            "table": {
+                "name": table_name,
+                "range": cell_range,
+                "style": style_name,
+            },
+        }
+
+    return _mutate_workbook(
+        path,
+        apply,
+        backup=backup,
+        expected_sha256=expected_sha256,
+    )
