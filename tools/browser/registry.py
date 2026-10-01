@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
@@ -46,6 +48,30 @@ def _selector_audit(selector: str) -> dict[str, Any]:
         "selector_chars": len(selector),
         "selector_sha256": hashlib.sha256(selector.encode("utf-8", errors="replace")).hexdigest(),
     }
+
+
+_WINDOWS_RESERVED_NAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+
+
+def _sanitize_download_filename(value: str) -> str:
+    name = Path(value).name.strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    if not name:
+        name = "download.bin"
+    stem = name.split(".", 1)[0].casefold()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
+    if len(name) > 180:
+        suffix = Path(name).suffix[:20]
+        name = f"{Path(name).stem[: max(1, 180 - len(suffix))]}{suffix}"
+    return name
 
 
 def _make_semantic_locator(
@@ -481,6 +507,167 @@ def register(mcp: MCPServer) -> None:
                 "session_id": session_id,
                 "selected": True,
                 "selection_mode": selection_mode,
+                "generation": new_generation,
+                "evidence": evidence,
+                **_url_result(page.url),
+            }
+
+    @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
+    @compact_errors("browser_upload")
+    async def browser_upload(
+        path: Annotated[str, Field(min_length=1, max_length=32_767)],
+        session_id: SessionArg = "default",
+        node_ref: Annotated[str | None, Field(max_length=100)] = None,
+        generation: Annotated[int | None, Field(ge=0)] = None,
+        role: Annotated[str | None, Field(max_length=100)] = None,
+        name: Annotated[str | None, Field(max_length=2_000)] = None,
+        label: Annotated[str | None, Field(max_length=2_000)] = None,
+        test_id: Annotated[str | None, Field(max_length=500)] = None,
+        match_index: Annotated[int | None, Field(ge=0, le=10_000)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+    ) -> dict[str, Any]:
+        """Attach one explicitly named local file to a semantic file input."""
+
+        source = resolve_path(path)
+        if not source.exists():
+            raise ToolError(
+                "browser_upload_not_found",
+                f"Upload source does not exist: {source}",
+                hint="Provide an explicit path to an existing regular file.",
+            )
+        if not source.is_file():
+            raise ToolError(
+                "browser_upload_not_file",
+                f"Upload source is not a regular file: {source}",
+                hint="Directories and implicit file discovery are not allowed.",
+            )
+        size = source.stat().st_size
+
+        async with MANAGER.session(session_id):
+            page = MANAGER.page(session_id)
+            node = None
+            if node_ref is not None:
+                if generation is None:
+                    raise ToolError(
+                        "browser_generation_required",
+                        "generation is required when node_ref is used.",
+                        hint="Pass the generation returned by browser_snapshot/browser_query.",
+                    )
+                node = MANAGER.semantic_ref(session_id, node_ref, generation)
+            locator, evidence = await _resolve_semantic_locator(
+                page,
+                node=node,
+                role=role,
+                name=name,
+                label=label,
+                test_id=test_id,
+                match_index=match_index,
+            )
+            audit_action(
+                "browser_upload",
+                target=_safe_url_target(page.url),
+                details={
+                    "session_id": session_id,
+                    "file_bytes": size,
+                    "path_chars": len(str(source)),
+                    "path_sha256": hashlib.sha256(str(source).encode("utf-8", errors="replace")).hexdigest(),
+                    **evidence,
+                },
+            )
+            await locator.set_input_files(str(source), timeout=timeout_sec * 1_000)
+            new_generation = MANAGER.invalidate_semantics(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "uploaded": True,
+                "path": str(source),
+                "file_name": source.name,
+                "bytes": size,
+                "generation": new_generation,
+                "evidence": evidence,
+                **_url_result(page.url),
+            }
+
+    @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
+    @compact_errors("browser_download")
+    async def browser_download(
+        session_id: SessionArg = "default",
+        node_ref: Annotated[str | None, Field(max_length=100)] = None,
+        generation: Annotated[int | None, Field(ge=0)] = None,
+        role: Annotated[str | None, Field(max_length=100)] = None,
+        name: Annotated[str | None, Field(max_length=2_000)] = None,
+        label: Annotated[str | None, Field(max_length=2_000)] = None,
+        text: Annotated[str | None, Field(max_length=4_000)] = None,
+        test_id: Annotated[str | None, Field(max_length=500)] = None,
+        match_index: Annotated[int | None, Field(ge=0, le=10_000)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+    ) -> dict[str, Any]:
+        """Click a semantic target and save the resulting download under controlled state storage."""
+
+        output: Path | None = None
+        async with MANAGER.session(session_id):
+            page = MANAGER.page(session_id)
+            node = None
+            if node_ref is not None:
+                if generation is None:
+                    raise ToolError(
+                        "browser_generation_required",
+                        "generation is required when node_ref is used.",
+                        hint="Pass the generation returned by browser_snapshot/browser_query.",
+                    )
+                node = MANAGER.semantic_ref(session_id, node_ref, generation)
+            locator, evidence = await _resolve_semantic_locator(
+                page,
+                node=node,
+                role=role,
+                name=name,
+                label=label,
+                text=text,
+                test_id=test_id,
+                match_index=match_index,
+            )
+            output_dir = SETTINGS.browser_download_dir
+            output_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                async with page.expect_download(timeout=timeout_sec * 1_000) as download_info:
+                    await locator.click(timeout=timeout_sec * 1_000)
+                download = await download_info.value
+                safe_name = _sanitize_download_filename(str(download.suggested_filename))
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                output = output_dir / f"{stamp}_{safe_name}"
+                await download.save_as(str(output))
+                size = output.stat().st_size
+                if size > SETTINGS.browser_download_max_bytes:
+                    output.unlink(missing_ok=True)
+                    raise ToolError(
+                        "browser_download_too_large",
+                        f"Download size {size} exceeds the configured limit {SETTINGS.browser_download_max_bytes}.",
+                        hint="Increase MCP_BROWSER_DOWNLOAD_MAX_BYTES only when the larger file is expected.",
+                    )
+            except BaseException:
+                if output is not None:
+                    output.unlink(missing_ok=True)
+                raise
+
+            audit_action(
+                "browser_download",
+                target=_safe_url_target(page.url),
+                details={
+                    "session_id": session_id,
+                    "download_bytes": size,
+                    "suggested_name_chars": len(str(download.suggested_filename)),
+                    **evidence,
+                },
+            )
+            new_generation = MANAGER.invalidate_semantics(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "downloaded": True,
+                "path": str(output),
+                "file_name": output.name,
+                "suggested_filename": safe_name,
+                "bytes": size,
                 "generation": new_generation,
                 "evidence": evidence,
                 **_url_result(page.url),
