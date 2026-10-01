@@ -109,6 +109,10 @@ class Settings:
         return self.state_dir / "browser_downloads"
 
     @property
+    def document_lock_dir(self) -> Path:
+        return self.state_dir / "document_locks"
+
+    @property
     def workflow_db(self) -> Path:
         return self.state_dir / "workflows.sqlite3"
 
@@ -158,6 +162,7 @@ def ensure_runtime_dirs() -> None:
         SETTINGS.screenshot_dir,
         SETTINGS.search_snapshot_dir,
         SETTINGS.browser_download_dir,
+        SETTINGS.document_lock_dir,
         SETTINGS.memory_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)
