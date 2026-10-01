@@ -12,10 +12,11 @@ from pydantic import Field
 
 from core.audit import audit_action
 from core.config import SETTINGS, ensure_runtime_dirs, resolve_path
+from core.errors import ToolError
 from core.media import ImageDelivery, image_tool_result
 from core.tooling import OPEN_WORLD_READ, OPEN_WORLD_WRITE, compact_errors
 from tools.browser.manager import MANAGER
-from tools.browser.semantics import build_snapshot
+from tools.browser.semantics import build_snapshot, query_nodes
 
 SessionArg = Annotated[str, Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.-]+$")]
 SelectorArg = Annotated[str, Field(min_length=1, max_length=10_000)]
@@ -110,6 +111,63 @@ def register(mcp: MCPServer) -> None:
                 },
             )
             return result
+
+    @mcp.tool(annotations=OPEN_WORLD_READ, structured_output=True)
+    @compact_errors("browser_query")
+    async def browser_query(
+        session_id: SessionArg = "default",
+        role: Annotated[str | None, Field(max_length=100)] = None,
+        name: Annotated[str | None, Field(max_length=2_000)] = None,
+        label: Annotated[str | None, Field(max_length=2_000)] = None,
+        text: Annotated[str | None, Field(max_length=4_000)] = None,
+        test_id: Annotated[str | None, Field(max_length=500)] = None,
+        max_results: Annotated[int, Field(ge=1, le=500)] = 50,
+    ) -> dict[str, Any]:
+        """Find semantic elements without returning the entire page snapshot."""
+
+        if all(value is None for value in (role, name, label, text, test_id)):
+            raise ToolError(
+                "browser_query_invalid",
+                "At least one semantic query field is required.",
+                hint="Provide role, name, label, text, or test_id.",
+            )
+        async with MANAGER.session(session_id):
+            page = MANAGER.page(session_id)
+            generation = MANAGER.semantic_generation(session_id)
+            snapshot = await build_snapshot(
+                page,
+                generation=generation,
+                page_id="p1",
+                max_nodes=SETTINGS.browser_semantic_max_nodes,
+                max_text_chars=SETTINGS.browser_semantic_max_bytes,
+            )
+            MANAGER.remember_semantic_refs(session_id, generation, snapshot["nodes"])
+            result = query_nodes(
+                snapshot["nodes"],
+                role=role,
+                name=name,
+                label=label,
+                text=text,
+                test_id=test_id,
+                max_results=max_results,
+            )
+            audit_action(
+                "browser_query",
+                target=_safe_url_target(page.url),
+                details={
+                    "session_id": session_id,
+                    "generation": generation,
+                    "match_count": result["count"],
+                    "unique": result["unique"],
+                },
+            )
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "page_id": snapshot["page_id"],
+                "generation": generation,
+                **result,
+            }
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("browser_click")
