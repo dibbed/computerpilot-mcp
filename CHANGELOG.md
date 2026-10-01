@@ -6,6 +6,26 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-01
+
+### Added
+- Add a portable native-document domain with structured XLSX/XLSM inspection, bounded range/search/formula/table reads, and guarded workbook mutations without launching Excel.
+- Add DOCX structure/metadata inspection, bounded paragraph/table reads and search, conservative run-aware text replacement, paragraph/table-cell mutation, and simple document creation without launching Word.
+- Add PDF metadata/page inspection, bounded text extraction with artifact-backed delivery, and deterministic plain-text/Markdown PDF creation.
+- Add document artifact descriptors, per-target process/inter-process write locks, staged validation, optional SHA-256 preconditions, backups, and durable file-hash recovery checkpoints before atomic publication.
+
+### Changed
+- Preserve XLSM VBA projects only when staged serialization keeps the VBA bytes identical; reject macro-bearing XLSX files instead of risking silent macro loss.
+- Validate OOXML archive paths, duplicate members, encryption flags, CRC integrity, entry/expanded-size budgets, and excessive compression before document-library parsing.
+- Keep DOCX formatting mutations fail-closed when a replacement crosses runs with different formatting, and document unsupported DOCM/comments/tracked-changes/header-footer/arbitrary-XML operations explicitly.
+- Keep PDF extraction page/character bounded and reject encrypted text extraction; PDF creation intentionally supports a limited Markdown subset rather than arbitrary existing-PDF editing.
+- Extend standalone operation recovery with durable pre-publication file-hash checkpoints so an interrupted document replacement can be reconciled without blind replay.
+
+### Fixed
+- Serialize concurrent mutations to the same document while allowing independent document targets to proceed concurrently.
+- Checkpoint document file postconditions before atomic replacement so crash recovery can reconcile completed side effects without blind replay.
+- Harden the supervisor watchdog recovery test against interpreter-startup timing variance under full-suite load without relaxing production watchdog behavior.
+
 ## [0.5.0] - 2026-10-01
 
 ### Added

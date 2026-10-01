@@ -54,7 +54,20 @@ def requirements_fingerprint(path: Path) -> str:
 
 
 def _required_imports() -> tuple[str, ...]:
-    common = ("mcp", "pydantic", "psutil", "charset_normalizer", "PIL", "pytest", "ruff", "mypy")
+    common = (
+        "mcp",
+        "pydantic",
+        "psutil",
+        "charset_normalizer",
+        "PIL",
+        "openpyxl",
+        "docx",
+        "pypdf",
+        "reportlab",
+        "pytest",
+        "ruff",
+        "mypy",
+    )
     return (*common, "uiautomation") if os.name == "nt" else common
 
 

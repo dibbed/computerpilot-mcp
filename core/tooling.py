@@ -11,7 +11,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from core.lifecycle import RUNTIME_LIFECYCLE
-from core.recovery import OPERATION_RECOVERY
+from core.recovery import OPERATION_RECOVERY, operation_recovery_context
 from core.response import failure
 from core.timings import tool_timing
 from core.tool_activity import TOOL_ACTIVITY
@@ -64,6 +64,19 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "git_stage",
         "git_commit",
         "git_restore_file",
+        "excel_write_range",
+        "excel_clear_range",
+        "excel_add_sheet",
+        "excel_rename_sheet",
+        "excel_delete_sheet",
+        "excel_set_formula",
+        "excel_create_table",
+        "docx_replace_text",
+        "docx_insert_paragraph",
+        "docx_replace_table_cell",
+        "docx_create",
+        "pdf_create_from_text",
+        "pdf_create_from_markdown",
         "browser_click",
         "browser_fill",
         "browser_click_semantic",
@@ -129,7 +142,8 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                             with RUNTIME_LIFECYCLE.mutation(operation):
                                 handle = OPERATION_RECOVERY.begin(operation, target)
                                 try:
-                                    result = await fn(*args, **kwargs)
+                                    with operation_recovery_context(handle):
+                                        result = await fn(*args, **kwargs)
                                 except BaseException:
                                     try:
                                         OPERATION_RECOVERY.finish(handle, known_result="raised")
@@ -153,7 +167,8 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                         with RUNTIME_LIFECYCLE.mutation(operation):
                             handle = OPERATION_RECOVERY.begin(operation, target)
                             try:
-                                result = fn(*args, **kwargs)
+                                with operation_recovery_context(handle):
+                                    result = fn(*args, **kwargs)
                             except BaseException:
                                 try:
                                     OPERATION_RECOVERY.finish(handle, known_result="raised")

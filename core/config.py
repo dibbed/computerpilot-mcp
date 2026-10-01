@@ -32,7 +32,7 @@ class Settings:
     """Small immutable runtime configuration."""
 
     server_name: str = "ali_windows_agent_mcp"
-    version: str = "0.5.0"
+    version: str = "0.6.0"
     tool_profile: str = os.getenv("MCP_TOOL_PROFILE", "full")
     default_list_limit: int = _env_int("MCP_DEFAULT_LIST_LIMIT", 50, 1, 500)
     max_list_limit: int = _env_int("MCP_MAX_LIST_LIMIT", 500, 10, 5_000)
@@ -109,6 +109,10 @@ class Settings:
         return self.state_dir / "browser_downloads"
 
     @property
+    def document_lock_dir(self) -> Path:
+        return self.state_dir / "document_locks"
+
+    @property
     def workflow_db(self) -> Path:
         return self.state_dir / "workflows.sqlite3"
 
@@ -158,6 +162,7 @@ def ensure_runtime_dirs() -> None:
         SETTINGS.screenshot_dir,
         SETTINGS.search_snapshot_dir,
         SETTINGS.browser_download_dir,
+        SETTINGS.document_lock_dir,
         SETTINGS.memory_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)

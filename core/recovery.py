@@ -6,7 +6,9 @@ import json
 import os
 import threading
 import uuid
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +24,35 @@ _MAX_LINE_BYTES = 32_768
 _MAX_TARGET_CHARS = 1_000
 _JOURNAL_LOCK_WAIT_SEC = 10.0
 
-RecordType = Literal["begin", "result", "uncertain", "reconciliation", "acknowledged"]
+RecordType = Literal["begin", "checkpoint", "result", "uncertain", "reconciliation", "acknowledged"]
+
+
+def _bounded_result_postcondition(result: Any) -> dict[str, Any] | None:
+    """Keep only a safe, reconciler-compatible file hash postcondition."""
+
+    if not isinstance(result, dict):
+        return None
+    candidate = result.get("postcondition")
+    if not isinstance(candidate, dict) or candidate.get("kind") != "file_sha256":
+        return None
+    expected = candidate.get("expected")
+    if not isinstance(expected, dict):
+        return None
+    path = expected.get("path")
+    digest = expected.get("sha256")
+    if (
+        not isinstance(path, str)
+        or not path
+        or len(path) > _MAX_TARGET_CHARS
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in digest)
+    ):
+        return None
+    return {
+        "kind": "file_sha256",
+        "expected": {"path": path, "sha256": digest.casefold()},
+    }
 
 
 def _interprocess_journal_lock(path: Path) -> AbstractContextManager[None]:
@@ -42,6 +72,21 @@ class OperationHandle:
     operation_type: str
     target: str | None
     started_at: str
+
+
+_CURRENT_OPERATION_HANDLE: ContextVar[OperationHandle | None] = ContextVar(
+    "current_operation_recovery_handle",
+    default=None,
+)
+
+
+@contextmanager
+def operation_recovery_context(handle: OperationHandle | None) -> Iterator[None]:
+    token = _CURRENT_OPERATION_HANDLE.set(handle)
+    try:
+        yield
+    finally:
+        _CURRENT_OPERATION_HANDLE.reset(token)
 
 
 class OperationRecoveryJournal:
@@ -139,7 +184,7 @@ class OperationRecoveryJournal:
             operation_id = record.get("operation_id")
             record_type = record.get("type")
             if not isinstance(operation_id, str) or record_type not in {
-                "begin", "result", "uncertain", "reconciliation", "acknowledged",
+                "begin", "checkpoint", "result", "uncertain", "reconciliation", "acknowledged",
             }:
                 continue
             if record_type == "begin":
@@ -193,6 +238,9 @@ class OperationRecoveryJournal:
                         continue
                     terminal = item.get("acknowledged") or item.get("reconciliation")
                     retained.append(begin)
+                    checkpoint = item.get("checkpoint")
+                    if checkpoint is not None:
+                        retained.append(checkpoint)
                     uncertain = item.get("uncertain")
                     if uncertain is not None:
                         retained.append(uncertain)
@@ -245,6 +293,7 @@ class OperationRecoveryJournal:
     @staticmethod
     def _operation_view(operation_id: str, item: dict[str, Any]) -> dict[str, Any]:
         begin = item["begin"]
+        checkpoint = item.get("checkpoint")
         result = item.get("result")
         reconciliation = item.get("reconciliation")
         acknowledgment = item.get("acknowledged")
@@ -275,6 +324,10 @@ class OperationRecoveryJournal:
             "runtime_id": begin.get("runtime_id"),
             "evidence": evidence,
         }
+        if checkpoint is not None and isinstance(checkpoint.get("postcondition"), dict):
+            view["postcondition"] = checkpoint["postcondition"]
+        if result is not None and isinstance(result.get("postcondition"), dict):
+            view["postcondition"] = result["postcondition"]
         if reconciliation is not None and isinstance(reconciliation.get("postcondition"), dict):
             view["postcondition"] = reconciliation["postcondition"]
         return view
@@ -441,11 +494,55 @@ class OperationRecoveryJournal:
             })
             return handle
 
-    def finish(self, handle: OperationHandle | None, *, known_result: str) -> None:
+    def checkpoint_postcondition(
+        self,
+        handle: OperationHandle | None,
+        postcondition: dict[str, Any],
+    ) -> None:
+        if handle is None:
+            return
+        bounded = _bounded_result_postcondition({"postcondition": postcondition})
+        if bounded is None:
+            raise ToolError(
+                "invalid_recovery_postcondition",
+                "Recovery checkpoint requires a bounded file_sha256 postcondition.",
+            )
+        with self._lock:
+            current = self._state(self._load_locked()).get(handle.operation_id)
+            if current is None or current.get("begin") is None:
+                raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
+            if current.get("result") is not None:
+                raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
+            existing = current.get("checkpoint")
+            if existing is not None:
+                if existing.get("postcondition") == bounded:
+                    return
+                raise ToolError(
+                    "operation_checkpoint_conflict",
+                    "Operation already has a different recovery checkpoint.",
+                )
+            self._append_locked({
+                "schema_version": JOURNAL_SCHEMA_VERSION,
+                "type": "checkpoint",
+                "status": "in_progress",
+                "operation_id": handle.operation_id,
+                "runtime_id": handle.runtime_id,
+                "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "postcondition": bounded,
+            })
+            self._maybe_compact_locked()
+
+    def finish(
+        self,
+        handle: OperationHandle | None,
+        *,
+        known_result: str,
+        postcondition: dict[str, Any] | None = None,
+    ) -> None:
         if handle is None:
             return
         with self._lock:
-            self._append_locked({
+            record: dict[str, Any] = {
                 "schema_version": JOURNAL_SCHEMA_VERSION,
                 "type": "result",
                 "status": "completed",
@@ -453,7 +550,10 @@ class OperationRecoveryJournal:
                 "runtime_id": handle.runtime_id,
                 "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "known_result": known_result[:100],
-            })
+            }
+            if postcondition is not None:
+                record["postcondition"] = postcondition
+            self._append_locked(record)
             self._maybe_compact_locked()
 
     def finish_returned(self, handle: OperationHandle | None, result: Any) -> None:
@@ -461,7 +561,11 @@ class OperationRecoveryJournal:
             known_result = "ok" if result["ok"] else "returned_error"
         else:
             known_result = "returned"
-        self.finish(handle, known_result=known_result)
+        self.finish(
+            handle,
+            known_result=known_result,
+            postcondition=_bounded_result_postcondition(result),
+        )
 
     def summary(self, *, max_items: int = 5) -> dict[str, Any]:
         with self._lock:
@@ -503,3 +607,9 @@ class OperationRecoveryJournal:
 
 
 OPERATION_RECOVERY = OperationRecoveryJournal()
+
+
+def checkpoint_current_postcondition(postcondition: dict[str, Any]) -> None:
+    """Durably checkpoint the current mutation's file hash before its side effect."""
+
+    OPERATION_RECOVERY.checkpoint_postcondition(_CURRENT_OPERATION_HANDLE.get(), postcondition)

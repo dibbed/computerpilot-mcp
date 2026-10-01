@@ -14,6 +14,7 @@ flowchart TD
     R --> FS[Filesystem / project / language]
     R --> EX[Terminal / process / system]
     R --> DEV[Git / testing]
+    R --> DOC[Documents / artifacts]
     R --> AUTO[Browser / desktop]
     R --> DUR[Jobs / recovery / workflows / memory]
 
@@ -41,7 +42,7 @@ The public display title is **ComputerPilot MCP**. The protocol-level server ide
 
 The runtime does not pretend every host provides identical features.
 
-Portable domains include the shared filesystem/project/Git/testing/jobs/recovery/workflow core. Platform adapters decide whether Windows-only capabilities such as native desktop input, UI Automation, `run_cmd`, services, and installed-software backends are registered.
+Portable domains include the shared filesystem/project/Git/testing/documents/jobs/recovery/workflow core. Platform adapters decide whether Windows-only capabilities such as native desktop input, UI Automation, `run_cmd`, services, and installed-software backends are registered.
 
 Process ownership is intentionally implemented differently:
 
@@ -102,7 +103,7 @@ External side effects are not assumed to be replay-safe.
 
 Standalone mutations use the operation recovery journal. Durable workflows maintain operation checkpoints and reconciliation intent in the workflow store.
 
-If a runtime disappears after a side effect may have occurred but before the final outcome is known, the operation can remain `uncertain`.
+If a runtime disappears after a side effect may have occurred but before the final outcome is known, the operation can remain `uncertain`. Document publication checkpoints its validated final file hash before the atomic replacement, so that crash window retains a reconciler-compatible postcondition.
 
 Resolution paths are:
 
@@ -144,6 +145,18 @@ Editing primitives include:
 
 Hash/version preconditions are available on operations where stale external edits matter.
 
+## Native document adapters
+
+The `documents` domain uses file-format libraries directly instead of automating desktop applications.
+
+- Excel supports `.xlsx` and `.xlsm`, bounded workbook/range/search/formula/table reads, and guarded value/formula/sheet/table mutations.
+- DOCX supports metadata/structure inspection, bounded paragraph/table reads and search, plus conservative paragraph/text/table-cell mutations.
+- PDF supports metadata/page inspection, bounded text extraction, and deterministic creation from plain text or a limited Markdown subset.
+
+Binary document mutations share a publication primitive: per-target in-process and inter-process locking, optional source SHA-256 preconditions, same-directory staging, format-specific validation, recoverable backups, an fsynced recovery postcondition checkpoint before publication, atomic replacement, and final hash/size verification. The result includes an artifact descriptor with path, SHA-256, byte size, and media type.
+
+OOXML readers validate archive structure and bounded expansion before library parsing. Excel macro mutation is accepted only when the VBA project survives staged serialization byte-for-byte. DOCX intentionally refuses ambiguous formatting transformations and macro-enabled `.docm`; PDF creation does not claim arbitrary editing of existing PDFs.
+
 ## Project and language intelligence
 
 Python project analysis maintains bounded version-aware metadata rather than re-parsing every unchanged file for every query.
@@ -173,6 +186,7 @@ Generated state is intentionally local and separated by responsibility.
 | recovery journal | standalone mutation ambiguity/evidence |
 | project memory | bounded advisory project facts |
 | artifacts/backups/screenshots/search snapshots | bounded generated supporting data |
+| document lock directory | hashed cross-process coordination tokens for document mutation targets |
 | tunnel runtime cache | verified external Secure Tunnel runtime |
 
 Project memory is advisory data, not execution authority or a policy override.

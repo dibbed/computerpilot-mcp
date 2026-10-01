@@ -22,6 +22,7 @@ The portable core includes:
 - project analysis;
 - Git;
 - testing/diagnostics;
+- native XLSX/XLSM, DOCX, and PDF document tools;
 - durable jobs;
 - recovery;
 - workflows;

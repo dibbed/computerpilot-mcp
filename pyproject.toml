@@ -1,6 +1,6 @@
 [project]
 name = "computerpilot-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "Cross-platform MCP server for computer use, developer automation, durable jobs, recovery, and secure remote access."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,6 +22,10 @@ dependencies = [
     "psutil>=7.0,<8",
     "charset-normalizer>=3.4,<4",
     "Pillow>=11,<13",
+    "openpyxl>=3.1,<4",
+    "python-docx>=1.2,<2",
+    "pypdf>=4.2,<7",
+    "reportlab>=4.2,<5",
 ]
 
 [project.urls]

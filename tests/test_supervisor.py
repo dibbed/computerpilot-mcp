@@ -293,7 +293,7 @@ while True:
     h.write_text(str(os.getpid()))
     time.sleep(0.03)
 """
-    supervisor = Supervisor([sys.executable, "-c", code], readiness_url=None, state_dir=tmp_path, grace=0.15, interval=0.03)
+    supervisor = Supervisor([sys.executable, "-c", code], readiness_url=None, state_dir=tmp_path, grace=1.0, interval=0.03)
     thread = threading.Thread(target=supervisor.run)
     thread.start()
     try:

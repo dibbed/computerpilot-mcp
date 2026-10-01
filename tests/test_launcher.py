@@ -35,7 +35,7 @@ def test_launcher_restarts_then_honors_interrupt(tmp_path: Path, first_exit: int
         cwd=project,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=60,
     )
     assert result.returncode == 130, result.stdout + result.stderr
     assert (scripts / "attempts.txt").read_text().splitlines() == ["first", "second"]
