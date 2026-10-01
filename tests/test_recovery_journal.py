@@ -104,6 +104,26 @@ def test_known_result_is_never_reclassified_uncertain(tmp_path: Path) -> None:
     assert [record["type"] for record in _records(path)] == ["begin", "result"]
 
 
+def test_known_result_persists_bounded_file_postcondition(tmp_path: Path) -> None:
+    path = tmp_path / "operations.jsonl"
+    target = tmp_path / "document.xlsx"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "runtime-a")
+    handle = journal.begin("excel_write_range", f"path={target}")
+    assert handle is not None
+    postcondition = {
+        "kind": "file_sha256",
+        "expected": {"path": str(target), "sha256": "a" * 64},
+    }
+
+    journal.finish_returned(handle, {"ok": True, "postcondition": postcondition})
+
+    records = _records(path)
+    assert records[-1]["postcondition"] == postcondition
+    inspected = journal.inspect(handle.operation_id)
+    assert inspected["postcondition"] == postcondition
+
+
 def test_truncated_final_record_is_ignored_and_pending_begin_recovers(tmp_path: Path) -> None:
     path = tmp_path / "operations.jsonl"
     journal = OperationRecoveryJournal()

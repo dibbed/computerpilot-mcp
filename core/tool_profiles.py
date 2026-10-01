@@ -8,7 +8,7 @@ from core.errors import ToolError
 
 ALL_DOMAINS = (
     "filesystem", "terminal", "process", "system", "windows", "project", "language", "testing", "git",
-    "browser", "desktop", "memory", "jobs", "recovery", "workflows",
+    "browser", "desktop", "documents", "memory", "jobs", "recovery", "workflows",
 )
 
 PROFILE_DOMAINS: dict[str, tuple[str, ...]] = {
@@ -30,6 +30,7 @@ PROFILE_DOMAINS: dict[str, tuple[str, ...]] = {
     "git": ("filesystem", "project", "testing", "git", "recovery", "workflows"),
     "testing": ("terminal", "project", "language", "testing", "recovery", "workflows"),
     "desktop": ("process", "system", "windows", "desktop", "recovery", "workflows"),
+    "documents": ("filesystem", "documents", "recovery", "workflows"),
     "browser": ("terminal", "browser", "recovery", "workflows"),
     "operations": ("terminal", "process", "system", "windows", "jobs", "recovery", "workflows"),
     "full": ALL_DOMAINS,

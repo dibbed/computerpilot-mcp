@@ -21,6 +21,7 @@ from core.workflow_store import workflow_store
 from tools.browser import register as register_browser
 from tools.browser.manager import MANAGER as BROWSER_MANAGER
 from tools.desktop import register as register_desktop
+from tools.documents import register as register_documents
 from tools.filesystem import register as register_filesystem
 from tools.git import register as register_git
 from tools.jobs import register as register_jobs
@@ -47,6 +48,7 @@ REGISTRARS = {
     "git": register_git,
     "browser": register_browser,
     "desktop": register_desktop,
+    "documents": register_documents,
     "memory": register_memory,
     "jobs": register_jobs,
     "recovery": register_recovery,

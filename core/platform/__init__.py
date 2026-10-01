@@ -23,6 +23,7 @@ _PORTABLE_DOMAINS = frozenset({
     "testing",
     "git",
     "browser",
+    "documents",
     "memory",
     "jobs",
     "recovery",

@@ -25,6 +25,34 @@ _JOURNAL_LOCK_WAIT_SEC = 10.0
 RecordType = Literal["begin", "result", "uncertain", "reconciliation", "acknowledged"]
 
 
+def _bounded_result_postcondition(result: Any) -> dict[str, Any] | None:
+    """Keep only a safe, reconciler-compatible file hash postcondition."""
+
+    if not isinstance(result, dict):
+        return None
+    candidate = result.get("postcondition")
+    if not isinstance(candidate, dict) or candidate.get("kind") != "file_sha256":
+        return None
+    expected = candidate.get("expected")
+    if not isinstance(expected, dict):
+        return None
+    path = expected.get("path")
+    digest = expected.get("sha256")
+    if (
+        not isinstance(path, str)
+        or not path
+        or len(path) > _MAX_TARGET_CHARS
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in digest)
+    ):
+        return None
+    return {
+        "kind": "file_sha256",
+        "expected": {"path": path, "sha256": digest.casefold()},
+    }
+
+
 def _interprocess_journal_lock(path: Path) -> AbstractContextManager[None]:
     """Serialize journal append and compaction across runtime processes."""
 
@@ -275,6 +303,8 @@ class OperationRecoveryJournal:
             "runtime_id": begin.get("runtime_id"),
             "evidence": evidence,
         }
+        if result is not None and isinstance(result.get("postcondition"), dict):
+            view["postcondition"] = result["postcondition"]
         if reconciliation is not None and isinstance(reconciliation.get("postcondition"), dict):
             view["postcondition"] = reconciliation["postcondition"]
         return view
@@ -441,11 +471,17 @@ class OperationRecoveryJournal:
             })
             return handle
 
-    def finish(self, handle: OperationHandle | None, *, known_result: str) -> None:
+    def finish(
+        self,
+        handle: OperationHandle | None,
+        *,
+        known_result: str,
+        postcondition: dict[str, Any] | None = None,
+    ) -> None:
         if handle is None:
             return
         with self._lock:
-            self._append_locked({
+            record: dict[str, Any] = {
                 "schema_version": JOURNAL_SCHEMA_VERSION,
                 "type": "result",
                 "status": "completed",
@@ -453,7 +489,10 @@ class OperationRecoveryJournal:
                 "runtime_id": handle.runtime_id,
                 "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "known_result": known_result[:100],
-            })
+            }
+            if postcondition is not None:
+                record["postcondition"] = postcondition
+            self._append_locked(record)
             self._maybe_compact_locked()
 
     def finish_returned(self, handle: OperationHandle | None, result: Any) -> None:
@@ -461,7 +500,11 @@ class OperationRecoveryJournal:
             known_result = "ok" if result["ok"] else "returned_error"
         else:
             known_result = "returned"
-        self.finish(handle, known_result=known_result)
+        self.finish(
+            handle,
+            known_result=known_result,
+            postcondition=_bounded_result_postcondition(result),
+        )
 
     def summary(self, *, max_items: int = 5) -> dict[str, Any]:
         with self._lock:
