@@ -10,10 +10,12 @@ from pydantic import Field
 from core.audit import audit_action
 from core.config import resolve_path
 from core.tooling import MUTATING, READ_ONLY, PathArg, compact_errors
-from tools.documents import excel
+from tools.documents import docx, excel
 
 ExpectedSha256 = Annotated[str | None, Field(pattern=r"^[0-9a-fA-F]{64}$")]
 ExcelRows = Annotated[list[list[Any]], Field(min_length=1, max_length=10_000)]
+DocxParagraph = Annotated[str, Field(max_length=100_000)]
+DocxParagraphs = Annotated[list[DocxParagraph], Field(max_length=10_000)]
 
 
 def register(mcp: MCPServer) -> None:
@@ -278,4 +280,177 @@ def register(mcp: MCPServer) -> None:
             style_name=style_name,
             backup=backup,
             expected_sha256=expected_sha256,
+        )
+
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("docx_inspect")
+    def docx_inspect(path: PathArg) -> dict[str, Any]:
+        """Inspect DOCX structure and metadata without launching Word."""
+
+        target = resolve_path(path)
+        audit_action("docx_inspect", target=target)
+        return docx.inspect_document(target)
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("docx_read")
+    def docx_read(
+        path: PathArg,
+        offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0,
+        max_items: Annotated[int, Field(ge=1, le=5_000)] = 100,
+        max_chars: Annotated[int, Field(ge=1, le=2_000_000)] = 250_000,
+    ) -> dict[str, Any]:
+        """Read bounded DOCX paragraphs and table cells without launching Word."""
+
+        target = resolve_path(path)
+        audit_action("docx_read", target=target, details={"offset": offset, "max_items": max_items})
+        return docx.read_document(target, offset=offset, max_items=max_items, max_chars=max_chars)
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("docx_find")
+    def docx_find(
+        path: PathArg,
+        query: Annotated[str, Field(min_length=1, max_length=4_000)],
+        case_sensitive: bool = False,
+        max_results: Annotated[int, Field(ge=1, le=500)] = 100,
+        max_items_scanned: Annotated[int, Field(ge=1, le=1_000_000)] = 100_000,
+    ) -> dict[str, Any]:
+        """Find bounded text matches in DOCX paragraphs and table cells."""
+
+        target = resolve_path(path)
+        audit_action("docx_find", target=target, details={"query_chars": len(query)})
+        return docx.find_text(
+            target,
+            query=query,
+            case_sensitive=case_sensitive,
+            max_results=max_results,
+            max_items_scanned=max_items_scanned,
+        )
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("docx_replace_text")
+    def docx_replace_text(
+        path: PathArg,
+        old: Annotated[str, Field(min_length=1, max_length=100_000)],
+        new: Annotated[str, Field(max_length=100_000)],
+        replace_all: bool = True,
+        include_tables: bool = True,
+        backup: bool = True,
+        expected_sha256: ExpectedSha256 = None,
+    ) -> dict[str, Any]:
+        """Atomically replace supported DOCX text while preserving unambiguous run formatting."""
+
+        target = resolve_path(path)
+        audit_action(
+            "docx_replace_text",
+            target=target,
+            details={
+                "old_chars": len(old),
+                "new_chars": len(new),
+                "replace_all": replace_all,
+                "include_tables": include_tables,
+            },
+        )
+        return docx.replace_text(
+            target,
+            old=old,
+            new=new,
+            replace_all=replace_all,
+            include_tables=include_tables,
+            backup=backup,
+            expected_sha256=expected_sha256,
+        )
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("docx_insert_paragraph")
+    def docx_insert_paragraph(
+        path: PathArg,
+        text: Annotated[str, Field(max_length=100_000)],
+        after_index: Annotated[int | None, Field(ge=0, le=1_000_000)] = None,
+        style: Annotated[str | None, Field(max_length=255)] = None,
+        backup: bool = True,
+        expected_sha256: ExpectedSha256 = None,
+    ) -> dict[str, Any]:
+        """Atomically insert one DOCX paragraph at a deterministic top-level position."""
+
+        target = resolve_path(path)
+        audit_action(
+            "docx_insert_paragraph",
+            target=target,
+            details={"text_chars": len(text), "after_index": after_index, "style": style},
+        )
+        return docx.insert_paragraph(
+            target,
+            text=text,
+            after_index=after_index,
+            style=style,
+            backup=backup,
+            expected_sha256=expected_sha256,
+        )
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("docx_replace_table_cell")
+    def docx_replace_table_cell(
+        path: PathArg,
+        table_index: Annotated[int, Field(ge=0, le=100_000)],
+        row: Annotated[int, Field(ge=0, le=1_000_000)],
+        column: Annotated[int, Field(ge=0, le=100_000)],
+        text: Annotated[str, Field(max_length=100_000)],
+        backup: bool = True,
+        expected_sha256: ExpectedSha256 = None,
+    ) -> dict[str, Any]:
+        """Atomically replace one simple DOCX table cell while preserving supported run formatting."""
+
+        target = resolve_path(path)
+        audit_action(
+            "docx_replace_table_cell",
+            target=target,
+            details={
+                "table_index": table_index,
+                "row": row,
+                "column": column,
+                "text_chars": len(text),
+            },
+        )
+        return docx.replace_table_cell(
+            target,
+            table_index=table_index,
+            row=row,
+            column=column,
+            text=text,
+            backup=backup,
+            expected_sha256=expected_sha256,
+        )
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("docx_create")
+    def docx_create(
+        path: PathArg,
+        paragraphs: DocxParagraphs,
+        title: Annotated[str | None, Field(max_length=4_000)] = None,
+        overwrite: bool = False,
+        backup: bool = True,
+        expected_sha256: ExpectedSha256 = None,
+        create_parents: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically create or explicitly overwrite a simple DOCX document."""
+
+        target = resolve_path(path)
+        audit_action(
+            "docx_create",
+            target=target,
+            details={
+                "paragraph_count": len(paragraphs),
+                "title_chars": len(title or ""),
+                "overwrite": overwrite,
+            },
+        )
+        return docx.create_document(
+            target,
+            paragraphs=paragraphs,
+            title=title,
+            overwrite=overwrite,
+            backup=backup,
+            expected_sha256=expected_sha256,
+            create_parents=create_parents,
         )

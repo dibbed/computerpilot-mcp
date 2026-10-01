@@ -167,7 +167,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
     if os.name == "nt":
-        assert len(names) == 122
+        assert len(names) == 142
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     for tool in tools:
