@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -59,6 +61,40 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"com{index}" for index in range(1, 10)),
     *(f"lpt{index}" for index in range(1, 10)),
 }
+
+
+async def _semantic_snapshot(
+    page: Any,
+    *,
+    generation: int,
+    page_id: str,
+    max_nodes: int,
+    max_text_chars: int,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    result = await build_snapshot(
+        page,
+        generation=generation,
+        page_id=page_id,
+        max_nodes=max_nodes,
+        max_text_chars=max_text_chars,
+    )
+    MANAGER.record_semantic_snapshot(
+        duration_ms=(time.perf_counter() - started) * 1_000,
+        node_count=int(result["node_count"]),
+        truncated=bool(result["truncated"]),
+    )
+    return result
+
+
+async def _semantic_action(run: Callable[[], Awaitable[Any]]) -> Any:
+    try:
+        result = await run()
+    except Exception:
+        MANAGER.record_semantic_action(success=False)
+        raise
+    MANAGER.record_semantic_action(success=True)
+    return result
 
 
 def _sanitize_download_filename(value: str) -> str:
@@ -232,7 +268,7 @@ def register(mcp: MCPServer) -> None:
         async with MANAGER.session(session_id):
             page = MANAGER.page(session_id)
             generation = MANAGER.semantic_generation(session_id)
-            result = await build_snapshot(
+            result = await _semantic_snapshot(
                 page,
                 generation=generation,
                 page_id="p1",
@@ -274,7 +310,7 @@ def register(mcp: MCPServer) -> None:
         async with MANAGER.session(session_id):
             page = MANAGER.page(session_id)
             generation = MANAGER.semantic_generation(session_id)
-            snapshot = await build_snapshot(
+            snapshot = await _semantic_snapshot(
                 page,
                 generation=generation,
                 page_id="p1",
@@ -353,7 +389,9 @@ def register(mcp: MCPServer) -> None:
                 target=_safe_url_target(page.url),
                 details={"session_id": session_id, "button": button, **evidence},
             )
-            await locator.click(button=button, click_count=click_count, timeout=timeout_sec * 1_000)
+            await _semantic_action(
+                lambda: locator.click(button=button, click_count=click_count, timeout=timeout_sec * 1_000)
+            )
             new_generation = MANAGER.invalidate_semantics(session_id)
             return {
                 "ok": True,
@@ -407,7 +445,7 @@ def register(mcp: MCPServer) -> None:
                 details={"session_id": session_id, "value_chars": len(value), "mode": mode, **evidence},
             )
             supplied = "" if mode == "clear" else value
-            await locator.fill(supplied, timeout=timeout_sec * 1_000)
+            await _semantic_action(lambda: locator.fill(supplied, timeout=timeout_sec * 1_000))
             new_generation = MANAGER.invalidate_semantics(session_id)
             return {
                 "ok": True,
@@ -465,7 +503,7 @@ def register(mcp: MCPServer) -> None:
                 )
                 data = bound_records(list(records or []), max_items=max_items, max_text_chars=max_chars)
             elif mode == "form_fields":
-                snapshot = await build_snapshot(
+                snapshot = await _semantic_snapshot(
                     page,
                     generation=current_generation,
                     page_id="p1",
@@ -581,13 +619,17 @@ def register(mcp: MCPServer) -> None:
 
             if selection_mode == "native":
                 if option_value is not None:
-                    await locator.select_option(value=option_value, timeout=timeout_sec * 1_000)
+                    await _semantic_action(
+                        lambda: locator.select_option(value=option_value, timeout=timeout_sec * 1_000)
+                    )
                     option_chars = len(option_value)
                 else:
-                    await locator.select_option(label=option_label, timeout=timeout_sec * 1_000)
+                    await _semantic_action(
+                        lambda: locator.select_option(label=option_label, timeout=timeout_sec * 1_000)
+                    )
                     option_chars = len(option_label or "")
             else:
-                await locator.click(timeout=timeout_sec * 1_000)
+                await _semantic_action(lambda: locator.click(timeout=timeout_sec * 1_000))
                 option = page.get_by_role("option", name=option_label, exact=True)
                 count = int(await option.count())
                 if count != 1:
@@ -596,7 +638,7 @@ def register(mcp: MCPServer) -> None:
                         f"Listbox option matched {count} elements.",
                         hint="Use a unique visible option label.",
                     )
-                await option.nth(0).click(timeout=timeout_sec * 1_000)
+                await _semantic_action(lambda: option.nth(0).click(timeout=timeout_sec * 1_000))
                 option_chars = len(option_label or "")
 
             audit_action(
@@ -682,7 +724,7 @@ def register(mcp: MCPServer) -> None:
                     **evidence,
                 },
             )
-            await locator.set_input_files(str(source), timeout=timeout_sec * 1_000)
+            await _semantic_action(lambda: locator.set_input_files(str(source), timeout=timeout_sec * 1_000))
             new_generation = MANAGER.invalidate_semantics(session_id)
             return {
                 "ok": True,
@@ -738,7 +780,7 @@ def register(mcp: MCPServer) -> None:
             output_dir.mkdir(parents=True, exist_ok=True)
             try:
                 async with page.expect_download(timeout=timeout_sec * 1_000) as download_info:
-                    await locator.click(timeout=timeout_sec * 1_000)
+                    await _semantic_action(lambda: locator.click(timeout=timeout_sec * 1_000))
                 download = await download_info.value
                 safe_name = _sanitize_download_filename(str(download.suggested_filename))
                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -752,6 +794,7 @@ def register(mcp: MCPServer) -> None:
                         f"Download size {size} exceeds the configured limit {SETTINGS.browser_download_max_bytes}.",
                         hint="Increase MCP_BROWSER_DOWNLOAD_MAX_BYTES only when the larger file is expected.",
                     )
+                MANAGER.record_download_bytes(size)
             except BaseException:
                 if output is not None:
                     output.unlink(missing_ok=True)

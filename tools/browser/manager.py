@@ -68,6 +68,14 @@ class BrowserManager:
         self._session_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
         self._pending_sessions = 0
+        self._semantic_snapshots_total = 0
+        self._semantic_snapshot_ms_total = 0.0
+        self._semantic_snapshot_nodes_total = 0
+        self._semantic_snapshot_truncations = 0
+        self._semantic_action_success = 0
+        self._semantic_action_failure = 0
+        self._semantic_stale_ref_failures = 0
+        self._browser_download_bytes = 0
         self._session_idle_sec = float(SETTINGS.browser_idle_sec if session_idle_sec is None else session_idle_sec)
         self._pool_idle_sec = float(SETTINGS.browser_pool_idle_sec if pool_idle_sec is None else pool_idle_sec)
         self._max_sessions = SETTINGS.browser_max_sessions if max_sessions is None else max_sessions
@@ -471,6 +479,7 @@ class BrowserManager:
                 hint="Call browser_open_page first.",
             )
         if generation != session.generation:
+            self.record_stale_ref_failure()
             raise ToolError(
                 "browser_stale_ref",
                 f"Semantic node reference {node_ref!r} belongs to stale generation {generation}.",
@@ -611,8 +620,27 @@ class BrowserManager:
             await self._close_session_context(session, suppress_errors=session.stale)
             return {"ok": True, "session_id": session_id, "closed": True}
 
-    async def stats(self) -> dict[str, int]:
-        """Return bounded browser resource usage without starting Playwright."""
+    def record_semantic_snapshot(self, *, duration_ms: float, node_count: int, truncated: bool) -> None:
+        self._semantic_snapshots_total += 1
+        self._semantic_snapshot_ms_total += max(0.0, float(duration_ms))
+        self._semantic_snapshot_nodes_total += max(0, int(node_count))
+        if truncated:
+            self._semantic_snapshot_truncations += 1
+
+    def record_semantic_action(self, *, success: bool) -> None:
+        if success:
+            self._semantic_action_success += 1
+        else:
+            self._semantic_action_failure += 1
+
+    def record_stale_ref_failure(self) -> None:
+        self._semantic_stale_ref_failures += 1
+
+    def record_download_bytes(self, byte_count: int) -> None:
+        self._browser_download_bytes += max(0, int(byte_count))
+
+    async def stats(self) -> dict[str, int | float]:
+        """Return bounded browser resource usage and semantic counters without starting Playwright."""
 
         async with self._capacity_lock:
             async with self._pool_lock:
@@ -624,6 +652,14 @@ class BrowserManager:
                     "max_pools": self._max_pools,
                     "active_contexts": sum(pool.active_contexts for pool in self._pools.values()),
                     "pending_contexts": sum(pool.pending_contexts for pool in self._pools.values()),
+                    "semantic_snapshots_total": self._semantic_snapshots_total,
+                    "semantic_snapshot_ms_total": round(self._semantic_snapshot_ms_total, 3),
+                    "semantic_snapshot_nodes_total": self._semantic_snapshot_nodes_total,
+                    "semantic_snapshot_truncations": self._semantic_snapshot_truncations,
+                    "semantic_action_success": self._semantic_action_success,
+                    "semantic_action_failure": self._semantic_action_failure,
+                    "semantic_stale_ref_failures": self._semantic_stale_ref_failures,
+                    "browser_download_bytes": self._browser_download_bytes,
                 }
 
     async def cleanup_idle(self) -> dict[str, Any]:
