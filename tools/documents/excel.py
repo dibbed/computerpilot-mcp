@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable
 from datetime import date, datetime, time
@@ -43,13 +44,26 @@ def media_type(path: Path) -> str:
     return EXCEL_MEDIA_TYPES[path.suffix.casefold()]
 
 
-def has_vba_project(path: Path) -> bool:
+def vba_project_sha256(path: Path) -> str | None:
     try:
         with ZipFile(path, "r") as archive:
-            names = {name.casefold() for name in archive.namelist()}
-    except (BadZipFile, OSError) as exc:
+            matched = next(
+                (name for name in archive.namelist() if name.casefold() == "xl/vbaproject.bin"),
+                None,
+            )
+            if matched is None:
+                return None
+            digest = hashlib.sha256()
+            with archive.open(matched, "r") as stream:
+                for chunk in iter(lambda: stream.read(1_048_576), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+    except (BadZipFile, OSError, KeyError) as exc:
         raise ToolError("invalid_excel", f"Workbook archive is unreadable: {path}") from exc
-    return "xl/vbaproject.bin" in names
+
+
+def has_vba_project(path: Path) -> bool:
+    return vba_project_sha256(path) is not None
 
 
 def load_excel(path: str | Path, *, data_only: bool = False) -> tuple[Path, Any]:
@@ -363,14 +377,6 @@ _INVALID_SHEET_CHARS = re.compile(r"[\\/*?:\[\]]")
 _TABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 
 
-def _validate_mutation_format(target: Path) -> None:
-    if target.suffix.casefold() == ".xlsm":
-        raise ToolError(
-            "macro_preservation_unverified",
-            "XLSM mutation is disabled until VBA preservation is verified.",
-        )
-
-
 def _validate_sheet_name(workbook: Any, name: str, *, current: str | None = None) -> None:
     if not name or len(name) > 31 or _INVALID_SHEET_CHARS.search(name):
         raise ToolError(
@@ -439,7 +445,12 @@ def _mutate_workbook(
     expected_sha256: str | None,
 ) -> dict[str, Any]:
     target = excel_path(path)
-    _validate_mutation_format(target)
+    macro_before = vba_project_sha256(target)
+    if target.suffix.casefold() == ".xlsx" and macro_before is not None:
+        raise ToolError(
+            "macro_extension_mismatch",
+            "Workbook contains a VBA project but uses .xlsx; mutation is refused to prevent macro loss.",
+        )
     metadata: dict[str, Any] = {}
 
     def writer(staged: Path) -> None:
@@ -450,14 +461,29 @@ def _mutate_workbook(
         finally:
             workbook.close()
 
+    def validator(staged: Path) -> None:
+        _validate_saved_workbook(staged)
+        macro_after = vba_project_sha256(staged)
+        if macro_after != macro_before:
+            raise ToolError(
+                "macro_preservation_failed",
+                "VBA project bytes changed during staged workbook serialization; original file was not replaced.",
+            )
+
     result = publish_document(
         target,
         writer=writer,
-        validator=_validate_saved_workbook,
+        validator=validator,
         media_type=media_type(target),
         backup=backup,
         expected_sha256=expected_sha256,
     )
+    if target.suffix.casefold() == ".xlsm":
+        result.update(
+            macro_preserved=macro_before is not None,
+            macro_sha256=macro_before,
+            macro_policy="verified-preserved" if macro_before is not None else "no-vba-project",
+        )
     return {**result, **metadata}
 
 
