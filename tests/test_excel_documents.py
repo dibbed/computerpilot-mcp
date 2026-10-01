@@ -146,23 +146,13 @@ def test_excel_read_tools_are_registered() -> None:
 
 def test_excel_guarded_mutations_round_trip_and_preserve_original_on_rejection(tmp_path: Path) -> None:
     excel = importlib.import_module("tools.documents.excel")
-    write_range = getattr(excel, "write_range", None)
-    clear_range = getattr(excel, "clear_range", None)
-    add_sheet = getattr(excel, "add_sheet", None)
-    rename_sheet = getattr(excel, "rename_sheet", None)
-    delete_sheet = getattr(excel, "delete_sheet", None)
-    set_formula = getattr(excel, "set_formula", None)
-    create_table = getattr(excel, "create_table", None)
-    for operation in (
-        write_range,
-        clear_range,
-        add_sheet,
-        rename_sheet,
-        delete_sheet,
-        set_formula,
-        create_table,
-    ):
-        assert callable(operation)
+    write_range = excel.write_range
+    clear_range = excel.clear_range
+    add_sheet = excel.add_sheet
+    rename_sheet = excel.rename_sheet
+    delete_sheet = excel.delete_sheet
+    set_formula = excel.set_formula
+    create_table = excel.create_table
 
     path = tmp_path / "mutations.xlsx"
     _workbook(path)
@@ -303,3 +293,32 @@ def test_xlsm_mutation_preserves_vba_bytes_and_xlsx_macro_mismatch_fails_closed(
     assert error.value.code == "macro_extension_mismatch"
     assert mismatch.read_bytes() == original
 
+
+
+
+def test_excel_archive_guards_reject_unsafe_paths_and_resource_excess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    excel = importlib.import_module("tools.documents.excel")
+
+    unsafe = tmp_path / "unsafe.xlsx"
+    _workbook(unsafe)
+    with ZipFile(unsafe, "a") as archive:
+        archive.writestr("../escape.bin", b"x")
+    with pytest.raises(ToolError) as traversal:
+        excel.inspect_workbook(unsafe)
+    assert traversal.value.code == "unsafe_excel_archive"
+
+    bounded = tmp_path / "bounded.xlsx"
+    _workbook(bounded)
+    monkeypatch.setattr(excel, "_MAX_EXCEL_BYTES", 1)
+    with pytest.raises(ToolError) as too_large:
+        excel.inspect_workbook(bounded)
+    assert too_large.value.code == "excel_too_large"
+
+    monkeypatch.setattr(excel, "_MAX_EXCEL_BYTES", 1024 * 1024 * 1024)
+    monkeypatch.setattr(excel, "_MAX_ARCHIVE_UNCOMPRESSED_BYTES", 1)
+    with pytest.raises(ToolError) as expanded:
+        excel.inspect_workbook(bounded)
+    assert expanded.value.code == "unsafe_excel_archive"

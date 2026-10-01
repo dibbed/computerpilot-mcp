@@ -15,6 +15,7 @@ from core.backups import BACKUP_RETENTION
 from core.config import SETTINGS, ensure_runtime_dirs, resolve_path
 from core.errors import ToolError
 from core.file_lock import exclusive_file_lock
+from core.recovery import checkpoint_current_postcondition
 from core.resource_locks import RESOURCE_LOCKS, canonical_path
 from tools.filesystem import service as filesystem_service
 
@@ -121,6 +122,8 @@ def publish_document(
 
             staged_hash = file_sha256(staged)
             staged_size = staged.stat().st_size
+            postcondition = _postcondition(target, staged_hash)
+            checkpoint_current_postcondition(postcondition)
             if existed and staged_size == before_size and staged_hash == before_hash:
                 artifact = artifact_descriptor(target, media_type)
                 return {
@@ -134,7 +137,7 @@ def publish_document(
                     "sha256": before_hash,
                     "backup": None,
                     "artifact": artifact,
-                    "postcondition": _postcondition(target, staged_hash),
+                    "postcondition": postcondition,
                 }
 
             if existed and backup:
