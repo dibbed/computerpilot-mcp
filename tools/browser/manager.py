@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from core.config import SETTINGS
@@ -42,6 +42,8 @@ class Session:
     last_used: float = 0.0
     pool: BrowserPool | None = None
     stale: bool = False
+    generation: int = 0
+    semantic_refs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class BrowserManager:
@@ -310,6 +312,8 @@ class BrowserManager:
     async def _navigate(session: Session, url: str, *, timeout_ms: int, wait_until: str) -> dict[str, Any]:
         session.page.set_default_timeout(timeout_ms)
         response = await session.page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+        session.generation += 1
+        session.semantic_refs.clear()
         return {
             "ok": True,
             "url": session.page.url,
@@ -318,6 +322,7 @@ class BrowserManager:
             "status": response.status if response else None,
             "browser": session.browser_name,
             "headless": session.headless,
+            "generation": session.generation,
         }
 
     async def open(
@@ -406,6 +411,77 @@ class BrowserManager:
                 hint="Call browser_open_page to recreate the session.",
             )
         return session.page
+
+    def semantic_generation(self, session_id: str) -> int:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ToolError(
+                "browser_session_not_found",
+                f"Browser session {session_id!r} is not open.",
+                hint="Call browser_open_page first.",
+            )
+        if not self._session_usable(session):
+            raise ToolError(
+                "browser_session_stale",
+                f"Browser session {session_id!r} lost its browser process.",
+                hint="Call browser_open_page to recreate the session.",
+            )
+        return session.generation
+
+    def invalidate_semantics(self, session_id: str) -> int:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ToolError(
+                "browser_session_not_found",
+                f"Browser session {session_id!r} is not open.",
+                hint="Call browser_open_page first.",
+            )
+        session.generation += 1
+        session.semantic_refs.clear()
+        return session.generation
+
+    def remember_semantic_refs(self, session_id: str, generation: int, nodes: list[dict[str, Any]]) -> None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ToolError(
+                "browser_session_not_found",
+                f"Browser session {session_id!r} is not open.",
+                hint="Call browser_open_page first.",
+            )
+        if generation != session.generation:
+            raise ToolError(
+                "browser_stale_ref",
+                f"Semantic generation {generation} is stale for browser session {session_id!r}.",
+                hint="Take a new browser_snapshot before using node references.",
+            )
+        session.semantic_refs = {
+            str(node["ref"]): dict(node)
+            for node in nodes
+            if isinstance(node, dict) and isinstance(node.get("ref"), str)
+        }
+
+    def semantic_ref(self, session_id: str, node_ref: str, generation: int) -> dict[str, Any]:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ToolError(
+                "browser_session_not_found",
+                f"Browser session {session_id!r} is not open.",
+                hint="Call browser_open_page first.",
+            )
+        if generation != session.generation:
+            raise ToolError(
+                "browser_stale_ref",
+                f"Semantic node reference {node_ref!r} belongs to stale generation {generation}.",
+                hint="Take a new browser_snapshot and retry with its generation.",
+            )
+        node = session.semantic_refs.get(node_ref)
+        if node is None:
+            raise ToolError(
+                "browser_ref_not_found",
+                f"Semantic node reference {node_ref!r} is not known for generation {generation}.",
+                hint="Take a new browser_snapshot or browser_query and use a returned ref.",
+            )
+        return dict(node)
 
     async def close(self, session_id: str) -> dict[str, Any]:
         async with self.session(session_id):
