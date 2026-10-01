@@ -6,7 +6,7 @@ import hashlib
 import re
 from collections.abc import Callable
 from datetime import date, datetime, time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from zipfile import BadZipFile, ZipFile
 
@@ -25,6 +25,81 @@ EXCEL_MEDIA_TYPES = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
 }
+_MAX_EXCEL_BYTES = 256 * 1024 * 1024
+_MAX_ARCHIVE_ENTRIES = 20_000
+_MAX_ARCHIVE_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+_MAX_COMPRESSION_RATIO = 1_000
+_REQUIRED_MEMBERS = frozenset({"[content_types].xml", "xl/workbook.xml"})
+
+
+def _unsafe_archive_name(name: str) -> bool:
+    normalized = name.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    return (
+        normalized.startswith(("/", "\\"))
+        or (bool(path.parts) and ":" in path.parts[0])
+        or ".." in path.parts
+    )
+
+
+def validate_excel_archive(path: Path) -> None:
+    try:
+        with ZipFile(path, "r") as archive:
+            infos = archive.infolist()
+            if len(infos) > _MAX_ARCHIVE_ENTRIES:
+                raise ToolError(
+                    "unsafe_excel_archive",
+                    f"Workbook archive has {len(infos)} entries; limit is {_MAX_ARCHIVE_ENTRIES}.",
+                )
+            names: set[str] = set()
+            total_uncompressed = 0
+            for info in infos:
+                folded = info.filename.casefold()
+                if folded in names:
+                    raise ToolError(
+                        "unsafe_excel_archive",
+                        f"Workbook archive contains duplicate member {info.filename!r}.",
+                    )
+                names.add(folded)
+                if _unsafe_archive_name(info.filename):
+                    raise ToolError(
+                        "unsafe_excel_archive",
+                        f"Workbook archive contains unsafe member path {info.filename!r}.",
+                    )
+                if info.flag_bits & 0x1:
+                    raise ToolError(
+                        "unsupported_excel_encryption",
+                        "Encrypted workbook archive members are not supported.",
+                    )
+                total_uncompressed += int(info.file_size)
+                if total_uncompressed > _MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+                    raise ToolError(
+                        "unsafe_excel_archive",
+                        "Workbook archive expands beyond the supported uncompressed-size limit.",
+                    )
+                if info.file_size >= 1_048_576:
+                    ratio = info.file_size / max(info.compress_size, 1)
+                    if ratio > _MAX_COMPRESSION_RATIO:
+                        raise ToolError(
+                            "unsafe_excel_archive",
+                            "Workbook archive contains an excessive compression ratio.",
+                        )
+            missing = _REQUIRED_MEMBERS - names
+            if missing:
+                raise ToolError(
+                    "invalid_excel",
+                    f"Workbook archive is missing required members: {', '.join(sorted(missing))}.",
+                )
+            bad_member = archive.testzip()
+            if bad_member is not None:
+                raise ToolError(
+                    "invalid_excel",
+                    f"Workbook archive member failed CRC validation: {bad_member!r}.",
+                )
+    except ToolError:
+        raise
+    except (BadZipFile, OSError) as exc:
+        raise ToolError("invalid_excel", f"Workbook archive is unreadable: {path}") from exc
 
 
 def excel_path(path: str | Path) -> Path:
@@ -37,6 +112,12 @@ def excel_path(path: str | Path) -> Path:
         )
     if not target.is_file():
         raise FileNotFoundError(f"File not found: {target}")
+    size = target.stat().st_size
+    if size > _MAX_EXCEL_BYTES:
+        raise ToolError(
+            "excel_too_large",
+            f"Workbook is {size} bytes; limit is {_MAX_EXCEL_BYTES}.",
+        )
     return target
 
 
@@ -68,6 +149,7 @@ def has_vba_project(path: Path) -> bool:
 
 def load_excel(path: str | Path, *, data_only: bool = False) -> tuple[Path, Any]:
     target = excel_path(path)
+    validate_excel_archive(target)
     try:
         workbook = load_workbook(
             filename=target,
@@ -445,6 +527,7 @@ def _mutate_workbook(
     expected_sha256: str | None,
 ) -> dict[str, Any]:
     target = excel_path(path)
+    validate_excel_archive(target)
     macro_before = vba_project_sha256(target)
     if target.suffix.casefold() == ".xlsx" and macro_before is not None:
         raise ToolError(

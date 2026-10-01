@@ -11,7 +11,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from core.lifecycle import RUNTIME_LIFECYCLE
-from core.recovery import OPERATION_RECOVERY
+from core.recovery import OPERATION_RECOVERY, operation_recovery_context
 from core.response import failure
 from core.timings import tool_timing
 from core.tool_activity import TOOL_ACTIVITY
@@ -142,7 +142,8 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                             with RUNTIME_LIFECYCLE.mutation(operation):
                                 handle = OPERATION_RECOVERY.begin(operation, target)
                                 try:
-                                    result = await fn(*args, **kwargs)
+                                    with operation_recovery_context(handle):
+                                        result = await fn(*args, **kwargs)
                                 except BaseException:
                                     try:
                                         OPERATION_RECOVERY.finish(handle, known_result="raised")
@@ -166,7 +167,8 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                         with RUNTIME_LIFECYCLE.mutation(operation):
                             handle = OPERATION_RECOVERY.begin(operation, target)
                             try:
-                                result = fn(*args, **kwargs)
+                                with operation_recovery_context(handle):
+                                    result = fn(*args, **kwargs)
                             except BaseException:
                                 try:
                                     OPERATION_RECOVERY.finish(handle, known_result="raised")
