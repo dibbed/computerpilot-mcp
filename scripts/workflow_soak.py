@@ -133,8 +133,8 @@ asyncio.run(run())
         raise RuntimeError(f"MCP restart returned invalid tool count: {tool_count!r}")
     if payload.get("unique_tool_names") is not True:
         raise RuntimeError("MCP restart registered duplicate tool names")
-    if os.name == "nt" and tool_count != 112:
-        raise RuntimeError(f"MCP restart registered {tool_count} tools instead of 112 on Windows")
+    if os.name == "nt" and tool_count != 122:
+        raise RuntimeError(f"MCP restart registered {tool_count} tools instead of 122 on Windows")
     return payload
 
 

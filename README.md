@@ -59,7 +59,7 @@ For Secure Tunnel mode, browser setup, release archives, and platform-specific n
 | Code intelligence | project summaries, Python AST metadata, dependency graphs, consolidated code context, LSP definition/references/symbols/hover/call hierarchy/diagnostics |
 | Git & verification | status/diff/show/blame/merge-base, guarded branch/stage/commit/restore, affected-test selection, pytest, Ruff, mypy, change-aware verification |
 | Terminal & processes | native process execution, background processes, durable jobs, Windows CMD, PowerShell where available, POSIX shell on Linux/macOS |
-| Browser | Playwright sessions, navigation, click/fill, screenshots, isolated contexts, shared compatible browser processes |
+| Browser | Playwright sessions, bounded semantic snapshots/queries, generation-scoped refs, semantic click/fill/select/waits, tabs, extraction, controlled upload/download, screenshots, isolated contexts, shared compatible browser processes |
 | Windows desktop | native screenshots, mouse/keyboard input, semantic UI Automation with bounded locators |
 | Recovery & workflows | mutation journal, evidence-based reconciliation, durable workflow plans, optimistic versions, leases, restart recovery, bounded retries |
 | Operations | CPU/memory/disk/process/service/software inspection, health/resource budgets, local control panel, supervised restart/stop |
@@ -214,6 +214,20 @@ python -m scripts.doctor --mode local-http --browser
 
 Playwright sessions use isolated contexts. Compatible sessions can share a browser process, and idle sessions/pools are bounded by runtime budgets.
 
+The semantic browser layer prefers accessible meaning over raw selectors or coordinates:
+
+```text
+browser_open_page
+    ↓
+browser_snapshot / browser_query
+    ↓
+browser_click_semantic / browser_fill_semantic / browser_select
+    ↓
+browser_wait_for
+```
+
+Snapshot node refs are generation-scoped. Navigation, semantic mutations, or tab changes invalidate old refs, so stale targets fail closed instead of silently acting on a changed page. `browser_extract` returns bounded text, links, tables, form fields, or a selected subtree. Uploads require an explicit local file, and downloads are saved under controlled runtime storage with filename sanitization and a configured byte limit.
+
 ## Local State
 
 Generated machine-local state is kept out of Git.
@@ -225,6 +239,7 @@ Generated machine-local state is kept out of Git.
 | `.agent_state/artifacts/` | file-backed output |
 | `.agent_state/backups/` | recoverable edit backups |
 | `.agent_state/screenshots/` | browser/desktop screenshots |
+| `.agent_state/browser_downloads/` | controlled browser downloads |
 | `.agent_state/search_snapshots/` | bounded search continuation snapshots |
 | `.agent_state/tunnel-runtime/` | verified managed Secure Tunnel runtime |
 | `.agent_state/audit.jsonl` | metadata-oriented audit trail |

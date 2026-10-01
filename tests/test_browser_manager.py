@@ -275,3 +275,26 @@ def test_new_session_navigation_failure_closes_context_not_pool() -> None:
         assert not manager._session_locks
 
     asyncio.run(run())
+
+
+def test_browser_stats_include_semantic_observability_counters() -> None:
+    async def run() -> None:
+        manager = BrowserManager()
+        manager.record_semantic_snapshot(duration_ms=12.5, node_count=7, truncated=True)
+        manager.record_semantic_action(success=True)
+        manager.record_semantic_action(success=False)
+        manager.record_stale_ref_failure()
+        manager.record_download_bytes(321)
+
+        stats = await manager.stats()
+
+        assert stats["semantic_snapshots_total"] == 1
+        assert stats["semantic_snapshot_ms_total"] == 12.5
+        assert stats["semantic_snapshot_nodes_total"] == 7
+        assert stats["semantic_snapshot_truncations"] == 1
+        assert stats["semantic_action_success"] == 1
+        assert stats["semantic_action_failure"] == 1
+        assert stats["semantic_stale_ref_failures"] == 1
+        assert stats["browser_download_bytes"] == 321
+
+    asyncio.run(run())

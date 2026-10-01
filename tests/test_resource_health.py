@@ -101,3 +101,31 @@ def test_health_usage_does_not_follow_windows_junctions(
             assert resource_health._files_usage(inside) == (1, 3)
     finally:
         junction.rmdir()
+
+
+def test_resource_health_exposes_semantic_browser_counters() -> None:
+    metrics = resource_health.collect_resource_metrics(
+        {
+            "active_sessions": 0,
+            "pending_sessions": 0,
+            "active_pools": 0,
+            "active_contexts": 0,
+            "semantic_snapshots_total": 3,
+            "semantic_snapshot_ms_total": 25.5,
+            "semantic_snapshot_nodes_total": 42,
+            "semantic_snapshot_truncations": 1,
+            "semantic_action_success": 5,
+            "semantic_action_failure": 2,
+            "semantic_stale_ref_failures": 1,
+            "browser_download_bytes": 4096,
+        }
+    )
+
+    assert metrics["browser_semantic_snapshots_total"] == 3
+    assert metrics["browser_semantic_snapshot_ms_total"] == 25.5
+    assert metrics["browser_semantic_snapshot_nodes_total"] == 42
+    assert metrics["browser_semantic_snapshot_truncations"] == 1
+    assert metrics["browser_semantic_action_success"] == 5
+    assert metrics["browser_semantic_action_failure"] == 2
+    assert metrics["browser_stale_ref_failures"] == 1
+    assert metrics["browser_download_bytes"] == 4096

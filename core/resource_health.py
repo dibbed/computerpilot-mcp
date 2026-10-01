@@ -157,7 +157,7 @@ def _budget(value: int, maximum: int, *, unit: str) -> dict[str, Any]:
     return {"value": value, "max": maximum, "unit": unit, "usage_ratio": _ratio(value, maximum)}
 
 
-def collect_resource_metrics(browser: dict[str, int]) -> dict[str, Any]:
+def collect_resource_metrics(browser: dict[str, int | float]) -> dict[str, Any]:
     """Collect bounded runtime/storage usage without mutating or evicting resources."""
 
     process = psutil.Process(os.getpid())
@@ -180,11 +180,11 @@ def collect_resource_metrics(browser: dict[str, int]) -> dict[str, Any]:
         "search_snapshots": _budget(snapshot_stats["count"], SETTINGS.search_snapshot_max_count, unit="snapshots"),
         "search_snapshot_bytes": _budget(snapshot_stats["bytes"], SETTINGS.search_snapshot_max_bytes, unit="bytes"),
         "browser_sessions": _budget(
-            browser["active_sessions"] + browser["pending_sessions"],
+            int(browser["active_sessions"]) + int(browser["pending_sessions"]),
             SETTINGS.browser_max_sessions,
             unit="sessions",
         ),
-        "browser_pools": _budget(browser["active_pools"], SETTINGS.browser_max_pools, unit="pools"),
+        "browser_pools": _budget(int(browser["active_pools"]), SETTINGS.browser_max_pools, unit="pools"),
         "running_jobs": _budget(jobs["active_jobs"], SETTINGS.max_running_jobs, unit="jobs"),
         "artifacts": _budget(artifact_count, SETTINGS.artifact_max_count, unit="files"),
         "artifact_bytes": _budget(artifact_bytes, SETTINGS.artifact_max_bytes, unit="bytes"),
@@ -209,6 +209,14 @@ def collect_resource_metrics(browser: dict[str, int]) -> dict[str, Any]:
         "pending_browser_sessions": browser["pending_sessions"],
         "active_browser_pools": browser["active_pools"],
         "active_browser_contexts": browser["active_contexts"],
+        "browser_semantic_snapshots_total": int(browser.get("semantic_snapshots_total", 0)),
+        "browser_semantic_snapshot_ms_total": float(browser.get("semantic_snapshot_ms_total", 0.0)),
+        "browser_semantic_snapshot_nodes_total": int(browser.get("semantic_snapshot_nodes_total", 0)),
+        "browser_semantic_snapshot_truncations": int(browser.get("semantic_snapshot_truncations", 0)),
+        "browser_semantic_action_success": int(browser.get("semantic_action_success", 0)),
+        "browser_semantic_action_failure": int(browser.get("semantic_action_failure", 0)),
+        "browser_stale_ref_failures": int(browser.get("semantic_stale_ref_failures", 0)),
+        "browser_download_bytes": int(browser.get("browser_download_bytes", 0)),
         "active_background_processes": background["running"],
         "tracked_background_processes": background["tracked"],
         **jobs,

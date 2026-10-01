@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from core.config import SETTINGS
@@ -42,6 +42,10 @@ class Session:
     last_used: float = 0.0
     pool: BrowserPool | None = None
     stale: bool = False
+    generation: int = 0
+    semantic_refs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    page_refs: dict[str, Any] = field(default_factory=dict)
+    next_page_id: int = 1
 
 
 class BrowserManager:
@@ -64,6 +68,14 @@ class BrowserManager:
         self._session_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
         self._pending_sessions = 0
+        self._semantic_snapshots_total = 0
+        self._semantic_snapshot_ms_total = 0.0
+        self._semantic_snapshot_nodes_total = 0
+        self._semantic_snapshot_truncations = 0
+        self._semantic_action_success = 0
+        self._semantic_action_failure = 0
+        self._semantic_stale_ref_failures = 0
+        self._browser_download_bytes = 0
         self._session_idle_sec = float(SETTINGS.browser_idle_sec if session_idle_sec is None else session_idle_sec)
         self._pool_idle_sec = float(SETTINGS.browser_pool_idle_sec if pool_idle_sec is None else pool_idle_sec)
         self._max_sessions = SETTINGS.browser_max_sessions if max_sessions is None else max_sessions
@@ -310,6 +322,8 @@ class BrowserManager:
     async def _navigate(session: Session, url: str, *, timeout_ms: int, wait_until: str) -> dict[str, Any]:
         session.page.set_default_timeout(timeout_ms)
         response = await session.page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+        session.generation += 1
+        session.semantic_refs.clear()
         return {
             "ok": True,
             "url": session.page.url,
@@ -318,6 +332,7 @@ class BrowserManager:
             "status": response.status if response else None,
             "browser": session.browser_name,
             "headless": session.headless,
+            "generation": session.generation,
         }
 
     async def open(
@@ -407,6 +422,196 @@ class BrowserManager:
             )
         return session.page
 
+    def semantic_generation(self, session_id: str) -> int:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ToolError(
+                "browser_session_not_found",
+                f"Browser session {session_id!r} is not open.",
+                hint="Call browser_open_page first.",
+            )
+        if not self._session_usable(session):
+            raise ToolError(
+                "browser_session_stale",
+                f"Browser session {session_id!r} lost its browser process.",
+                hint="Call browser_open_page to recreate the session.",
+            )
+        return session.generation
+
+    def invalidate_semantics(self, session_id: str) -> int:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ToolError(
+                "browser_session_not_found",
+                f"Browser session {session_id!r} is not open.",
+                hint="Call browser_open_page first.",
+            )
+        session.generation += 1
+        session.semantic_refs.clear()
+        return session.generation
+
+    def remember_semantic_refs(self, session_id: str, generation: int, nodes: list[dict[str, Any]]) -> None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ToolError(
+                "browser_session_not_found",
+                f"Browser session {session_id!r} is not open.",
+                hint="Call browser_open_page first.",
+            )
+        if generation != session.generation:
+            raise ToolError(
+                "browser_stale_ref",
+                f"Semantic generation {generation} is stale for browser session {session_id!r}.",
+                hint="Take a new browser_snapshot before using node references.",
+            )
+        session.semantic_refs = {
+            str(node["ref"]): dict(node)
+            for node in nodes
+            if isinstance(node, dict) and isinstance(node.get("ref"), str)
+        }
+
+    def semantic_ref(self, session_id: str, node_ref: str, generation: int) -> dict[str, Any]:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ToolError(
+                "browser_session_not_found",
+                f"Browser session {session_id!r} is not open.",
+                hint="Call browser_open_page first.",
+            )
+        if generation != session.generation:
+            self.record_stale_ref_failure()
+            raise ToolError(
+                "browser_stale_ref",
+                f"Semantic node reference {node_ref!r} belongs to stale generation {generation}.",
+                hint="Take a new browser_snapshot and retry with its generation.",
+            )
+        node = session.semantic_refs.get(node_ref)
+        if node is None:
+            raise ToolError(
+                "browser_ref_not_found",
+                f"Semantic node reference {node_ref!r} is not known for generation {generation}.",
+                hint="Take a new browser_snapshot or browser_query and use a returned ref.",
+            )
+        return dict(node)
+
+    def _sync_session_pages(self, session: Session) -> list[tuple[str, Any]]:
+        raw_pages = getattr(session.context, "pages", None)
+        pages = list(raw_pages) if raw_pages is not None else [session.page]
+        pages = [page for page in pages if not self._page_closed(page)]
+
+        for page_id, known_page in list(session.page_refs.items()):
+            if not any(known_page is page for page in pages):
+                session.page_refs.pop(page_id, None)
+
+        for page in pages:
+            if any(known_page is page for known_page in session.page_refs.values()):
+                continue
+            page_id = f"p{session.next_page_id}"
+            session.next_page_id += 1
+            session.page_refs[page_id] = page
+
+        if pages and not any(session.page is page for page in pages):
+            session.page = pages[0]
+
+        return [
+            (page_id, page)
+            for page_id, page in session.page_refs.items()
+            if any(page is current for current in pages)
+        ]
+
+    async def tabs(self, session_id: str) -> list[dict[str, Any]]:
+        async with self.session(session_id):
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise ToolError(
+                    "browser_session_not_found",
+                    f"Browser session {session_id!r} is not open.",
+                    hint="Call browser_open_page first.",
+                )
+            items: list[dict[str, Any]] = []
+            for page_id, page in self._sync_session_pages(session):
+                items.append(
+                    {
+                        "page_id": page_id,
+                        "url": str(getattr(page, "url", "")),
+                        "title": str(await page.title()),
+                        "active": page is session.page,
+                    }
+                )
+            return items
+
+    async def activate_tab(self, session_id: str, page_id: str) -> dict[str, Any]:
+        async with self.session(session_id):
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise ToolError(
+                    "browser_session_not_found",
+                    f"Browser session {session_id!r} is not open.",
+                    hint="Call browser_open_page first.",
+                )
+            pages = dict(self._sync_session_pages(session))
+            page = pages.get(page_id)
+            if page is None:
+                raise ToolError(
+                    "browser_tab_not_found",
+                    f"Browser tab {page_id!r} is not available.",
+                    hint="List browser_tabs again and use a current page_id.",
+                )
+            bring_to_front = getattr(page, "bring_to_front", None)
+            if callable(bring_to_front):
+                await bring_to_front()
+            session.page = page
+            generation = self.invalidate_semantics(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "active_page_id": page_id,
+                "generation": generation,
+                "url": str(getattr(page, "url", "")),
+            }
+
+    async def close_tab(self, session_id: str, page_id: str) -> dict[str, Any]:
+        async with self.session(session_id):
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise ToolError(
+                    "browser_session_not_found",
+                    f"Browser session {session_id!r} is not open.",
+                    hint="Call browser_open_page first.",
+                )
+            pages = dict(self._sync_session_pages(session))
+            page = pages.get(page_id)
+            if page is None:
+                raise ToolError(
+                    "browser_tab_not_found",
+                    f"Browser tab {page_id!r} is not available.",
+                    hint="List browser_tabs again and use a current page_id.",
+                )
+            was_active = page is session.page
+            await page.close()
+            remaining = self._sync_session_pages(session)
+            active_page_id: str | None = None
+            if remaining:
+                if was_active or not any(session.page is current for _, current in remaining):
+                    active_page_id, session.page = remaining[0]
+                else:
+                    active_page_id = next(
+                        (candidate_id for candidate_id, current in remaining if current is session.page),
+                        None,
+                    )
+                session.stale = False
+            else:
+                session.stale = True
+            generation = self.invalidate_semantics(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "closed": True,
+                "page_id": page_id,
+                "active_page_id": active_page_id,
+                "generation": generation,
+            }
+
     async def close(self, session_id: str) -> dict[str, Any]:
         async with self.session(session_id):
             session = self._sessions.pop(session_id, None)
@@ -415,8 +620,27 @@ class BrowserManager:
             await self._close_session_context(session, suppress_errors=session.stale)
             return {"ok": True, "session_id": session_id, "closed": True}
 
-    async def stats(self) -> dict[str, int]:
-        """Return bounded browser resource usage without starting Playwright."""
+    def record_semantic_snapshot(self, *, duration_ms: float, node_count: int, truncated: bool) -> None:
+        self._semantic_snapshots_total += 1
+        self._semantic_snapshot_ms_total += max(0.0, float(duration_ms))
+        self._semantic_snapshot_nodes_total += max(0, int(node_count))
+        if truncated:
+            self._semantic_snapshot_truncations += 1
+
+    def record_semantic_action(self, *, success: bool) -> None:
+        if success:
+            self._semantic_action_success += 1
+        else:
+            self._semantic_action_failure += 1
+
+    def record_stale_ref_failure(self) -> None:
+        self._semantic_stale_ref_failures += 1
+
+    def record_download_bytes(self, byte_count: int) -> None:
+        self._browser_download_bytes += max(0, int(byte_count))
+
+    async def stats(self) -> dict[str, int | float]:
+        """Return bounded browser resource usage and semantic counters without starting Playwright."""
 
         async with self._capacity_lock:
             async with self._pool_lock:
@@ -428,6 +652,14 @@ class BrowserManager:
                     "max_pools": self._max_pools,
                     "active_contexts": sum(pool.active_contexts for pool in self._pools.values()),
                     "pending_contexts": sum(pool.pending_contexts for pool in self._pools.values()),
+                    "semantic_snapshots_total": self._semantic_snapshots_total,
+                    "semantic_snapshot_ms_total": round(self._semantic_snapshot_ms_total, 3),
+                    "semantic_snapshot_nodes_total": self._semantic_snapshot_nodes_total,
+                    "semantic_snapshot_truncations": self._semantic_snapshot_truncations,
+                    "semantic_action_success": self._semantic_action_success,
+                    "semantic_action_failure": self._semantic_action_failure,
+                    "semantic_stale_ref_failures": self._semantic_stale_ref_failures,
+                    "browser_download_bytes": self._browser_download_bytes,
                 }
 
     async def cleanup_idle(self) -> dict[str, Any]:
