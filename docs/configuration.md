@@ -47,6 +47,9 @@ Queued/running/orphaned jobs and unresolved workflow evidence are protected from
 | `MCP_BROWSER_POOL_IDLE_SEC` | empty pool lifetime | `120` |
 | `MCP_BROWSER_MAX_SESSIONS` | logical browser-session budget | `20` |
 | `MCP_BROWSER_MAX_POOLS` | shared browser-pool budget | `6` |
+| `MCP_BROWSER_SEMANTIC_MAX_NODES` | maximum nodes in one semantic browser snapshot | `500` |
+| `MCP_BROWSER_SEMANTIC_MAX_BYTES` | semantic snapshot/extraction text budget | `256 KiB` |
+| `MCP_BROWSER_DOWNLOAD_MAX_BYTES` | maximum accepted controlled browser download size | `512 MiB` |
 | `MCP_VISION_MAX_BYTES` | original image size before bounded preview | `8 MiB` |
 | `MCP_VISION_JPEG_QUALITY` | preview JPEG quality | `88` |
 

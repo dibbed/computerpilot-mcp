@@ -180,15 +180,23 @@ Built-in plans:
 
 ## Browser
 
-Optional Playwright tools provide:
+Optional Playwright tools provide both legacy selector actions and a structure-first semantic browser surface:
 
-- open/reuse session;
-- click;
-- fill;
-- screenshot;
+- `browser_open_page` for session navigation/reuse;
+- `browser_snapshot` for bounded semantic page structure with generation-scoped node refs;
+- `browser_query` for targeted role/name/label/text/test-id lookup without returning the full tree;
+- `browser_click_semantic`, `browser_fill_semantic`, and `browser_select` for semantic mutations;
+- `browser_wait_for` for bounded state, URL, text, generation, and download waits instead of fixed sleeps;
+- `browser_extract` for bounded text, links, tables, form fields, or a selected subtree;
+- `browser_tabs` for explicit list/activate/close behavior;
+- `browser_upload` for explicit local-file attachment;
+- `browser_download` for controlled, sanitized, byte-limited downloads;
+- selector-based click/fill and screenshots for compatibility and fallback;
 - close.
 
-Sessions use isolated browser contexts. Compatible sessions can share a browser process while remaining isolated at the context level.
+Semantic refs are valid only for the snapshot generation that produced them. Navigation, semantic mutations, and tab changes invalidate previous refs. Ambiguous semantic mutation targets fail closed unless the caller explicitly selects a match.
+
+Sessions use isolated browser contexts. Compatible sessions can share a browser process while remaining isolated at the context level. Semantic snapshot/action counters and download bytes are exposed through runtime health.
 
 ## Windows desktop
 
