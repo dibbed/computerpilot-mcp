@@ -75,6 +75,8 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "docx_insert_paragraph",
         "docx_replace_table_cell",
         "docx_create",
+        "pdf_create_from_text",
+        "pdf_create_from_markdown",
         "browser_click",
         "browser_fill",
         "browser_click_semantic",

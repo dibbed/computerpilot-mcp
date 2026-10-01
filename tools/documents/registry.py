@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
 from pydantic import Field
@@ -10,7 +10,7 @@ from pydantic import Field
 from core.audit import audit_action
 from core.config import resolve_path
 from core.tooling import MUTATING, READ_ONLY, PathArg, compact_errors
-from tools.documents import docx, excel
+from tools.documents import docx, excel, pdf
 
 ExpectedSha256 = Annotated[str | None, Field(pattern=r"^[0-9a-fA-F]{64}$")]
 ExcelRows = Annotated[list[list[Any]], Field(min_length=1, max_length=10_000)]
@@ -449,6 +449,143 @@ def register(mcp: MCPServer) -> None:
             target,
             paragraphs=paragraphs,
             title=title,
+            overwrite=overwrite,
+            backup=backup,
+            expected_sha256=expected_sha256,
+            create_parents=create_parents,
+        )
+
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("pdf_inspect")
+    def pdf_inspect(path: PathArg) -> dict[str, Any]:
+        """Inspect PDF page count, encryption state, metadata, and artifact identity."""
+
+        target = resolve_path(path)
+        audit_action("pdf_inspect", target=target)
+        return pdf.inspect_pdf(target)
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("pdf_metadata")
+    def pdf_metadata(path: PathArg) -> dict[str, Any]:
+        """Read bounded PDF document metadata without extracting page text."""
+
+        target = resolve_path(path)
+        audit_action("pdf_metadata", target=target)
+        return pdf.pdf_metadata(target)
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("pdf_page_text")
+    def pdf_page_text(
+        path: PathArg,
+        page_number: Annotated[int, Field(ge=1, le=10_000_000)],
+        max_chars: Annotated[int, Field(ge=1, le=2_000_000)] = 250_000,
+    ) -> dict[str, Any]:
+        """Extract bounded text from one 1-based PDF page."""
+
+        target = resolve_path(path)
+        audit_action("pdf_page_text", target=target, details={"page_number": page_number, "max_chars": max_chars})
+        return pdf.page_text(target, page_number=page_number, max_chars=max_chars)
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("pdf_extract_text")
+    def pdf_extract_text(
+        path: PathArg,
+        start_page: Annotated[int, Field(ge=1, le=10_000_000)] = 1,
+        end_page: Annotated[int | None, Field(ge=1, le=10_000_000)] = None,
+        max_pages: Annotated[int, Field(ge=1, le=10_000)] = 100,
+        max_chars: Annotated[int, Field(ge=1, le=2_000_000)] = 250_000,
+        delivery: Literal["inline", "file", "auto"] = "inline",
+    ) -> dict[str, Any]:
+        """Extract bounded PDF text with page, character, and delivery limits."""
+
+        target = resolve_path(path)
+        audit_action(
+            "pdf_extract_text",
+            target=target,
+            details={
+                "start_page": start_page,
+                "end_page": end_page,
+                "max_pages": max_pages,
+                "max_chars": max_chars,
+                "delivery": delivery,
+            },
+        )
+        return pdf.extract_text(
+            target,
+            start_page=start_page,
+            end_page=end_page,
+            max_pages=max_pages,
+            max_chars=max_chars,
+            delivery=delivery,
+        )
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("pdf_create_from_text")
+    def pdf_create_from_text(
+        path: PathArg,
+        text: Annotated[str, Field(max_length=2_000_000)],
+        title: Annotated[str | None, Field(max_length=4_000)] = None,
+        page_size: Literal["A4", "LETTER"] = "A4",
+        overwrite: bool = False,
+        backup: bool = True,
+        expected_sha256: ExpectedSha256 = None,
+        create_parents: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically create a deterministic text PDF with explicit overwrite semantics."""
+
+        target = resolve_path(path)
+        audit_action(
+            "pdf_create_from_text",
+            target=target,
+            details={
+                "text_chars": len(text),
+                "title_chars": len(title or ""),
+                "page_size": page_size,
+                "overwrite": overwrite,
+            },
+        )
+        return pdf.create_from_text(
+            target,
+            text=text,
+            title=title,
+            page_size=page_size,
+            overwrite=overwrite,
+            backup=backup,
+            expected_sha256=expected_sha256,
+            create_parents=create_parents,
+        )
+
+    @mcp.tool(annotations=MUTATING, structured_output=True)
+    @compact_errors("pdf_create_from_markdown")
+    def pdf_create_from_markdown(
+        path: PathArg,
+        markdown: Annotated[str, Field(max_length=2_000_000)],
+        title: Annotated[str | None, Field(max_length=4_000)] = None,
+        page_size: Literal["A4", "LETTER"] = "A4",
+        overwrite: bool = False,
+        backup: bool = True,
+        expected_sha256: ExpectedSha256 = None,
+        create_parents: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically create a deterministic PDF from a documented Markdown subset."""
+
+        target = resolve_path(path)
+        audit_action(
+            "pdf_create_from_markdown",
+            target=target,
+            details={
+                "markdown_chars": len(markdown),
+                "title_chars": len(title or ""),
+                "page_size": page_size,
+                "overwrite": overwrite,
+            },
+        )
+        return pdf.create_from_markdown(
+            target,
+            markdown=markdown,
+            title=title,
+            page_size=page_size,
             overwrite=overwrite,
             backup=backup,
             expected_sha256=expected_sha256,
