@@ -246,7 +246,7 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 
 <nav class="section-nav" aria-label="Section navigation">
 <div class="section-nav-list">
-<a href="#overview">Overview</a><a href="#runtime">Runtime</a><a href="#transport">Transport</a><a href="#resources">Resources</a><a href="#work">Work</a><a href="#recovery">Recovery</a><a href="#state-config">State &amp; Config</a><a href="#diagnostics">Diagnostics</a>
+<a href="#overview">Overview</a><a href="#runtime">Runtime</a><a href="#transport">Transport</a><a href="#resources">Resources</a><a href="#routing">Routing</a><a href="#work">Work</a><a href="#recovery">Recovery</a><a href="#state-config">State &amp; Config</a><a href="#diagnostics">Diagnostics</a>
 </div>
 </nav>
 
@@ -400,6 +400,25 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 <div id="doctorRows" class="doctor-list"></div>
 </section>
 </div>
+
+<div id="routing" class="section-anchor"><span>Execution Routing</span></div>
+<section class="panel">
+<div class="panel-head"><div><h2>Execution Routing</h2><div class="panel-note">Deterministic route selection diagnostics. Only bounded intent names and route metadata are shown.</div></div><span id="routingPill" class="pill">Pending</span></div>
+<div class="meta-grid">
+<div class="meta"><span>Policy</span><strong id="routingPolicy" class="mono">—</strong></div>
+<div class="meta"><span>Total Decisions</span><strong id="routingDecisions" class="mono">0</strong></div>
+<div class="meta"><span>Fallbacks</span><strong id="routingFallbacks" class="mono">0</strong></div>
+<div class="meta"><span>No Route</span><strong id="routingNoRoute" class="mono">0</strong></div>
+<div class="meta"><span>Rejected Candidates</span><strong id="routingRejected" class="mono">0</strong></div>
+<div class="meta"><span>Native Usage</span><strong id="routingNative" class="mono">0</strong></div>
+<div class="meta"><span>Semantic Usage</span><strong id="routingSemantic" class="mono">0</strong></div>
+<div class="meta"><span>Raw Usage</span><strong id="routingRaw" class="mono">0</strong></div>
+</div>
+<div class="section-title">Selected Route Distribution</div>
+<div id="routingDistribution" class="chips" style="margin-bottom:10px"></div>
+<div class="section-title">Recent Decisions</div>
+<div class="table-wrap"><table><thead><tr><th>Intent</th><th>Route</th><th>Fallback</th><th>Candidates</th><th>Rejected</th><th>Policy</th></tr></thead><tbody id="routingRecentRows"></tbody></table></div>
+</section>
 
 <section class="panel">
 <div class="panel-head"><div><h2>Runtime Processes</h2><div class="panel-note">Click a runtime-owned process for CPU, memory, thread, I/O and command metadata.</div></div><span id="processSummary" class="pill">0 processes</span></div>
@@ -686,7 +705,7 @@ function renderInsights(data){
   lastInsights=data;const id=data.identity||{},h=data.runtime_health||{},t=data.tunnel||{},sys=data.system||{},stor=data.storage||{},perf=data.performance||{},mem=data.memory||{};
   $('productName').textContent=id.product||'ComputerPilot MCP';$('productVersion').textContent=id.version||h.version||'—';$('gitBranch').textContent=id.git_branch||'—';$('gitCommit').textContent=id.git_commit||'—';$('pythonVersion').textContent=h.python||id.python||'—';$('platformKey').textContent=h.platform_key||'—';$('toolProfile').textContent=h.tool_profile||'—';$('toolCount').textContent=h.tool_count??'—';pill($('identityPill'),id.git_clean===true?'Working tree clean':id.git_clean===false?'Working tree changed':'Git unavailable',id.git_clean===true?'ok':id.git_clean===false?'warn':'');
   $('tunnelMode').textContent=t.mode||'—';$('tunnelVersion').textContent=t.version?'v'+String(t.version).replace(/^v/,''):'—';$('tunnelSource').textContent=t.source||'—';$('tunnelPlatform').textContent=t.platform||'—';$('tunnelLatest').textContent=t.latest_seen||'—';$('tunnelChecked').textContent=t.checked_at?epoch(t.checked_at):'—';$('tunnelUpdater').textContent=t.warning?'Fallback · '+t.warning:(t.enabled?'Verified managed runtime':'Not used in local-http mode');$('tunnelBinary').textContent=t.binary_path||'—';pill($('tunnelRuntimePill'),t.mode==='local-http'?'Local HTTP':t.available===false?'Unavailable':'Managed',t.available===false?'bad':t.warning?'warn':'ok');
-  renderRuntimeHealth(h);renderBrowserRuntime(h);renderResources(h);renderHost(sys);renderStorage(stor);renderPerformance(perf);renderCapabilities(h);renderMemory(mem);
+  renderRuntimeHealth(h);renderExecutionRouting(h);renderBrowserRuntime(h);renderResources(h);renderHost(sys);renderStorage(stor);renderPerformance(perf);renderCapabilities(h);renderMemory(mem);
 }
 function renderRuntimeHealth(h){
   const status=String(h.health_status||'pending'),recovery=h.operation_recovery||{},uncertain=Number(recovery.uncertain_count||0),pending=Number(recovery.pending_count||0);
@@ -701,6 +720,39 @@ function renderRuntimeHealth(h){
   $('degradedReasons').textContent=reasons.length?'Degraded reasons: '+reasons.join(', '):'No degradation reasons reported.';
   pill($('runtimeHealthPill'),status,status==='healthy'?'ok':status==='degraded'?'warn':status==='unhealthy'?'bad':'');
   renderWorkflowStats(h.workflow_health||h);
+}
+function renderExecutionRouting(h){
+  const r=h.execution_router||{},usage=r.usage||{},distribution=r.route_distribution||{},recent=Array.isArray(r.recent_decisions)?r.recent_decisions:[];
+  const available=Object.keys(r).length>0,enabled=r.enabled===true;
+  $('routingPolicy').textContent=r.policy_version||'—';
+  $('routingDecisions').textContent=fmtNum(r.decision_count||0);
+  const fallbackCount=Number(r.fallback_count||0),fallbackRate=Math.max(0,Number(r.fallback_rate||0))*100;
+  $('routingFallbacks').textContent=fmtNum(fallbackCount)+' · '+fallbackRate.toFixed(1)+'%';
+  $('routingNoRoute').textContent=fmtNum(r.no_route_count||0);
+  $('routingRejected').textContent=fmtNum(r.rejected_candidate_count||0);
+  $('routingNative').textContent=fmtNum(usage.native||0);
+  $('routingSemantic').textContent=fmtNum(usage.semantic||0);
+  $('routingRaw').textContent=fmtNum(usage.raw||0);
+
+  const routes=$('routingDistribution');routes.replaceChildren();
+  for(const [route,count] of Object.entries(distribution)){
+    const badge=document.createElement('span');badge.className='pill info';badge.textContent=route+': '+fmtNum(count);routes.append(badge)
+  }
+  if(!routes.children.length){const item=document.createElement('span');item.className='muted';item.textContent=available?'No routes selected yet.':'Routing snapshot pending.';routes.append(item)}
+
+  const body=$('routingRecentRows');body.replaceChildren();
+  for(const item of recent.slice(-50).reverse()){
+    const tr=document.createElement('tr');
+    cell(tr,item.intent||'—');
+    cell(tr,item.selected_route||'No route');
+    cell(tr,item.fallback_level===null||item.fallback_level===undefined?'—':item.fallback_level,'mono');
+    cell(tr,item.candidate_count??'—','mono');
+    cell(tr,item.rejected_candidate_count??'—','mono');
+    cell(tr,item.router_policy_version||r.policy_version||'—','mono');
+    body.append(tr)
+  }
+  if(!recent.length)emptyRow(body,6,available?'No routing decisions recorded yet.':'Execution router snapshot is not available yet.');
+  pill($('routingPill'),available?(enabled?'Enabled':'Disabled'):'Pending',available?(enabled?'ok':'warn'):'')
 }
 function renderBrowserRuntime(h){
   const sessions=Number(h.active_browser_sessions||0),pending=Number(h.pending_browser_sessions||0),pools=Number(h.active_browser_pools||0),contexts=Number(h.active_browser_contexts||0);
