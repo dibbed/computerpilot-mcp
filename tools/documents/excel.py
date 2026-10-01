@@ -162,6 +162,18 @@ def load_excel(path: str | Path, *, data_only: bool = False) -> tuple[Path, Any]
     return target, workbook
 
 
+def _close_excel(workbook: Any) -> None:
+    """Close openpyxl resources, including keep_vba's in-memory ZipFile."""
+
+    vba_archive = getattr(workbook, "vba_archive", None)
+    try:
+        workbook.close()
+    finally:
+        if vba_archive is not None:
+            vba_archive.close()
+            workbook.vba_archive = None
+
+
 def _sheet_summary(sheet: Any, index: int) -> dict[str, Any]:
     return {
         "index": index,
@@ -198,7 +210,7 @@ def inspect_workbook(path: str | Path, *, max_sheets: int = 100) -> dict[str, An
             "has_macros": has_vba_project(target),
         }
     finally:
-        workbook.close()
+        _close_excel(workbook)
 
 
 def list_sheets(
@@ -229,7 +241,7 @@ def list_sheets(
             ),
         }
     finally:
-        workbook.close()
+        _close_excel(workbook)
 
 
 def _worksheet(workbook: Any, sheet: str) -> Any:
@@ -318,7 +330,7 @@ def read_range(
             "max_chars": max_chars,
         }
     finally:
-        workbook.close()
+        _close_excel(workbook)
 
 
 def find_cells(
@@ -389,7 +401,7 @@ def find_cells(
             "truncated": truncated,
         }
     finally:
-        workbook.close()
+        _close_excel(workbook)
 
 
 def get_formula(path: str | Path, *, sheet: str, cell: str) -> dict[str, Any]:
@@ -412,7 +424,7 @@ def get_formula(path: str | Path, *, sheet: str, cell: str) -> dict[str, Any]:
             "formula": value if is_formula else None,
         }
     finally:
-        workbook.close()
+        _close_excel(workbook)
 
 
 def table_info(
@@ -451,7 +463,7 @@ def table_info(
             ),
         }
     finally:
-        workbook.close()
+        _close_excel(workbook)
 
 
 ExcelMutator = Callable[[Any], dict[str, Any]]
@@ -516,7 +528,7 @@ def _validate_cell_value(value: Any) -> None:
 
 def _validate_saved_workbook(staged: Path) -> None:
     _, workbook = load_excel(staged)
-    workbook.close()
+    _close_excel(workbook)
 
 
 def _mutate_workbook(
@@ -542,7 +554,7 @@ def _mutate_workbook(
             metadata.update(mutator(workbook))
             workbook.save(staged)
         finally:
-            workbook.close()
+            _close_excel(workbook)
 
     def validator(staged: Path) -> None:
         _validate_saved_workbook(staged)

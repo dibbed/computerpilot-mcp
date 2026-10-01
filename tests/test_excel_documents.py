@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import importlib
 import importlib.util
+import sys
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -294,6 +296,36 @@ def test_xlsm_mutation_preserves_vba_bytes_and_xlsx_macro_mismatch_fails_closed(
     assert mismatch.read_bytes() == original
 
 
+
+
+def test_xlsm_mutation_releases_vba_archive_without_unraisable_exception(tmp_path: Path) -> None:
+    excel = importlib.import_module("tools.documents.excel")
+    macro_path = tmp_path / "macro-cleanup.xlsm"
+    _workbook(macro_path)
+    with ZipFile(macro_path, "a") as archive:
+        archive.writestr("xl/vbaProject.bin", b"synthetic-vba-payload")
+
+    unraisable: list[BaseException] = []
+    previous = sys.unraisablehook
+
+    def capture(args: sys.UnraisableHookArgs) -> None:
+        if args.exc_value is not None:
+            unraisable.append(args.exc_value)
+
+    sys.unraisablehook = capture
+    try:
+        excel.write_range(
+            macro_path,
+            sheet="Summary",
+            cell_range="A3:A3",
+            values=[["MacroSafe"]],
+            backup=False,
+        )
+        gc.collect()
+    finally:
+        sys.unraisablehook = previous
+
+    assert unraisable == []
 
 
 def test_excel_archive_guards_reject_unsafe_paths_and_resource_excess(
