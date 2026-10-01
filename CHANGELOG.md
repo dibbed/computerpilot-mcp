@@ -6,6 +6,8 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-01
+
 ### Added
 - Add a structure-first semantic browser surface with bounded snapshots, targeted semantic queries, and generation-scoped node references that fail closed after navigation or mutation.
 - Add semantic click, fill, select, structured waits, explicit tab management, bounded page extraction, controlled file upload, and sanitized byte-limited browser downloads.
