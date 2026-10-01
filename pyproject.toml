@@ -1,6 +1,6 @@
 [project]
 name = "computerpilot-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "Cross-platform MCP server for computer use, developer automation, durable jobs, recovery, and secure remote access."
 readme = "README.md"
 requires-python = ">=3.10"
