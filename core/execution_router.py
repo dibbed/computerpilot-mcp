@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Any
 
-from core.execution_models import ExecutionIntent, RecoverabilityClass, RiskClass, RouteCandidate, RouteDecision
+from core.errors import ToolError
+from core.execution_models import ExecutionIntent, RecoverabilityClass, RiskClass, RouteCandidate, RouteClass, RouteDecision
 from core.platform import PlatformCapabilities
 from core.router_metrics import ROUTER_METRICS, RouterMetrics
 from core.tool_catalog import IntentRouteRule, intent_route_rules
@@ -32,14 +34,54 @@ class ExecutionRouter:
         registered_tools: set[str] | frozenset[str],
         capabilities: PlatformCapabilities,
         policy_version: str = ROUTER_POLICY_VERSION,
+        enabled: bool = True,
         metrics: RouterMetrics | None = None,
     ) -> None:
         self.registered_tools = frozenset(registered_tools)
         self.capabilities = capabilities
-        self.policy_version = policy_version
+        self.policy_version = policy_version.strip().casefold()
+        self.enabled = enabled
         self.metrics = metrics or ROUTER_METRICS
 
-    def _candidate(self, rule: IntentRouteRule) -> RouteCandidate:
+    def _validate_policy(self) -> None:
+        if not self.enabled:
+            raise ToolError(
+                "execution_router_disabled",
+                "The adaptive execution router is disabled by configuration.",
+            )
+        if self.policy_version != ROUTER_POLICY_VERSION:
+            raise ToolError(
+                "unsupported_router_policy",
+                f"Unsupported execution router policy {self.policy_version!r}.",
+                hint=f"Use {ROUTER_POLICY_VERSION!r}.",
+            )
+
+    @staticmethod
+    def _hard_rejection(intent: ExecutionIntent, candidate: RouteCandidate) -> tuple[str, str] | None:
+        route = candidate.route
+        if route is RouteClass.VISUAL_DESKTOP:
+            return "visual_route_unavailable", "visual desktop routing is reserved for v0.8.0"
+        if intent.semantic_stale and route in {
+            RouteClass.SEMANTIC_BROWSER,
+            RouteClass.SEMANTIC_WINDOWS_UIA,
+            RouteClass.RAW_DESKTOP,
+        }:
+            return "stale_semantic_reference", "stale semantic references cannot fall back to desktop coordinates"
+        if intent.destructive and intent.semantic_ambiguous and route in {
+            RouteClass.SEMANTIC_BROWSER,
+            RouteClass.SEMANTIC_WINDOWS_UIA,
+        }:
+            return "destructive_semantic_ambiguous", "ambiguous semantic destructive actions are not auto-selected"
+        if route is RouteClass.RAW_DESKTOP:
+            if intent.destructive:
+                return "destructive_raw_desktop_forbidden", "destructive actions cannot auto-select raw desktop input"
+            if not intent.allow_raw_desktop:
+                return "raw_desktop_not_allowed", "raw desktop routing requires explicit permission"
+        if intent.requires_macro_preservation and not candidate.preserves_macros:
+            return "macro_preservation_unsupported", "route cannot prove macro preservation"
+        return None
+
+    def _candidate(self, rule: IntentRouteRule, intent: ExecutionIntent) -> RouteCandidate:
         checks: list[str] = []
         supported = True
         rejection_code: str | None = None
@@ -61,7 +103,7 @@ class ExecutionRouter:
                 rejection_code = "capability_unavailable"
                 reason = f"required capability {capability_name!r} is unavailable"
 
-        return RouteCandidate(
+        candidate = RouteCandidate(
             route=rule.route,
             representative_tool=rule.representative_tool,
             determinism=rule.determinism,
@@ -77,6 +119,17 @@ class ExecutionRouter:
             rejection_code=rejection_code,
             preserves_macros=rule.preserves_macros,
         )
+        if candidate.supported:
+            hard_rejection = self._hard_rejection(intent, candidate)
+            if hard_rejection is not None:
+                rejection_code, reason = hard_rejection
+                candidate = replace(
+                    candidate,
+                    supported=False,
+                    rejection_code=rejection_code,
+                    reason=reason,
+                )
+        return candidate
 
     @staticmethod
     def _sort_key(candidate: RouteCandidate) -> tuple[int, int, int, int, int, int, str, str]:
@@ -92,7 +145,7 @@ class ExecutionRouter:
         )
 
     def _all_candidates(self, intent: ExecutionIntent) -> list[RouteCandidate]:
-        items = [self._candidate(rule) for rule in intent_route_rules(intent.name)]
+        items = [self._candidate(rule, intent) for rule in intent_route_rules(intent.name)]
         valid = sorted((item for item in items if item.supported), key=self._sort_key)
         rejected = sorted(
             (item for item in items if not item.supported),
@@ -106,6 +159,7 @@ class ExecutionRouter:
         *,
         max_candidates: int = 8,
     ) -> dict[str, Any]:
+        self._validate_policy()
         bounded_limit = min(max(int(max_candidates), 1), MAX_CANDIDATES)
         all_candidates = self._all_candidates(intent)
         returned = all_candidates[:bounded_limit]

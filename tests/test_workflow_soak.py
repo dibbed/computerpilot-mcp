@@ -29,7 +29,7 @@ def test_workflow_soak_smoke_covers_restarts_reconciliation_retention_and_leaks(
     assert restart["unique_tool_names"] is True
     assert isinstance(restart["tool_count"], int) and restart["tool_count"] > 0
     if os.name == "nt":
-        assert restart["tool_count"] == 148
+        assert restart["tool_count"] == 150
     assert result["leaked_leases"] == 0
     assert result["orphan_operations"] == 0
     assert result["orphan_events"] == 0

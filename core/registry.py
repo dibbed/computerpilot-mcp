@@ -9,12 +9,15 @@ from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict
 
 from core.config import SETTINGS, ensure_runtime_dirs
+from core.execution_models import ExecutionIntent
+from core.execution_router import ExecutionRouter
 from core.health_snapshot import collect_server_health
 from core.heartbeat import lifespan
 from core.platform import available_domains, detect_capabilities
 from core.recovery import OPERATION_RECOVERY
 from core.resource_health import collect_resource_metrics
 from core.timings import ToolRequestTimingMiddleware, install_sdk_timing_hooks
+from core.tool_catalog import tool_execution_metadata
 from core.tool_profiles import ALL_DOMAINS, PREFERRED_USE, PROFILE_DOMAINS, resolve_profile
 from core.tooling import READ_ONLY, compact_errors
 from core.workflow_store import workflow_store
@@ -128,12 +131,114 @@ def create_server() -> MCPServer:
             "ok": True,
             "query": query,
             "items": [
-                {"name": name, "description": description, "preferred_use": guidance}
+                {
+                    "name": name,
+                    "description": description,
+                    "preferred_use": guidance,
+                    **(
+                        {
+                            "execution": {
+                                "route": metadata.route.value,
+                                "determinism": metadata.determinism,
+                                "risk_class": metadata.risk.value,
+                                "recoverability": metadata.recoverability.value,
+                            }
+                        }
+                        if (metadata := tool_execution_metadata(name)) is not None
+                        else {}
+                    ),
+                }
                 for _, name, description, guidance in scored[:bounded_limit]
             ],
             "count": min(len(scored), bounded_limit),
             "total_matches": len(scored),
         }
+
+    async def _execution_router() -> ExecutionRouter:
+        registered = frozenset(tool.name for tool in await server.list_tools())
+        return ExecutionRouter(
+            registered_tools=registered,
+            capabilities=capabilities,
+            policy_version=SETTINGS.execution_router_policy,
+            enabled=SETTINGS.execution_router_enabled,
+        )
+
+    def _execution_intent(
+        intent: str,
+        *,
+        destructive: bool,
+        semantic_ambiguous: bool,
+        semantic_stale: bool,
+        requires_macro_preservation: bool,
+        allow_raw_desktop: bool,
+        preferred_tool: str | None,
+    ) -> ExecutionIntent:
+        return ExecutionIntent(
+            intent,
+            destructive=destructive,
+            semantic_ambiguous=semantic_ambiguous,
+            semantic_stale=semantic_stale,
+            requires_macro_preservation=requires_macro_preservation,
+            allow_raw_desktop=allow_raw_desktop,
+            preferred_tool=preferred_tool,
+        )
+
+    @server.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("execution_candidates")
+    async def execution_candidates(
+        intent: str,
+        max_candidates: int = 8,
+        destructive: bool = False,
+        semantic_ambiguous: bool = False,
+        semantic_stale: bool = False,
+        requires_macro_preservation: bool = False,
+        allow_raw_desktop: bool = False,
+        preferred_tool: str | None = None,
+    ) -> dict[str, Any]:
+        """List bounded execution-route candidates without performing the requested action."""
+
+        router = await _execution_router()
+        request = _execution_intent(
+            intent,
+            destructive=destructive,
+            semantic_ambiguous=semantic_ambiguous,
+            semantic_stale=semantic_stale,
+            requires_macro_preservation=requires_macro_preservation,
+            allow_raw_desktop=allow_raw_desktop,
+            preferred_tool=preferred_tool,
+        )
+        return router.candidates(request, max_candidates=max_candidates)
+
+    @server.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("execution_recommend")
+    async def execution_recommend(
+        intent: str,
+        max_candidates: int = 8,
+        explain: bool | None = None,
+        destructive: bool = False,
+        semantic_ambiguous: bool = False,
+        semantic_stale: bool = False,
+        requires_macro_preservation: bool = False,
+        allow_raw_desktop: bool = False,
+        preferred_tool: str | None = None,
+    ) -> dict[str, Any]:
+        """Recommend one explainable execution route without executing it."""
+
+        router = await _execution_router()
+        request = _execution_intent(
+            intent,
+            destructive=destructive,
+            semantic_ambiguous=semantic_ambiguous,
+            semantic_stale=semantic_stale,
+            requires_macro_preservation=requires_macro_preservation,
+            allow_raw_desktop=allow_raw_desktop,
+            preferred_tool=preferred_tool,
+        )
+        return router.recommend(
+            request,
+            explain=SETTINGS.execution_router_explain if explain is None else explain,
+            max_candidates=max_candidates,
+        )
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("server_health")

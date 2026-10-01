@@ -142,3 +142,113 @@ def test_router_metrics_are_bounded_and_classify_route_families() -> None:
     assert snapshot["usage"]["raw"] == 0
     assert len(snapshot["recent_decisions"]) == 2
     assert set(snapshot["route_distribution"]) == {"native.filesystem", "semantic.browser"}
+
+
+def test_raw_desktop_requires_permission_and_is_forbidden_for_destructive_intents() -> None:
+    router = _router({"mouse_click"})
+
+    denied = router.recommend(ExecutionIntent("desktop.raw.interact"))
+    assert denied["ok"] is False
+    assert denied["selected_route"] is None
+    assert denied["candidates"][0]["rejection_code"] == "raw_desktop_not_allowed"
+
+    destructive = router.recommend(
+        ExecutionIntent("desktop.raw.interact", destructive=True, allow_raw_desktop=True)
+    )
+    assert destructive["ok"] is False
+    assert destructive["candidates"][0]["rejection_code"] == "destructive_raw_desktop_forbidden"
+
+
+def test_destructive_ambiguous_semantic_target_fails_closed() -> None:
+    router = _router({"browser_click_semantic", "mouse_click"})
+    result = router.recommend(
+        ExecutionIntent(
+            "browser.interact",
+            destructive=True,
+            semantic_ambiguous=True,
+            allow_raw_desktop=True,
+        )
+    )
+
+    assert result["ok"] is False
+    by_route = {item["route"]: item for item in result["candidates"]}
+    assert by_route["semantic.browser"]["rejection_code"] == "destructive_semantic_ambiguous"
+    assert by_route["raw.desktop"]["rejection_code"] == "destructive_raw_desktop_forbidden"
+
+
+def test_stale_semantic_reference_never_falls_back_to_coordinates() -> None:
+    router = _router({"browser_click_semantic", "mouse_click"})
+    result = router.recommend(
+        ExecutionIntent("browser.interact", semantic_stale=True, allow_raw_desktop=True)
+    )
+
+    assert result["ok"] is False
+    by_route = {item["route"]: item for item in result["candidates"]}
+    assert by_route["semantic.browser"]["rejection_code"] == "stale_semantic_reference"
+    assert by_route["raw.desktop"]["rejection_code"] == "stale_semantic_reference"
+
+
+def test_macro_preservation_excludes_semantic_and_raw_document_fallbacks() -> None:
+    router = _router({"ui_set_value", "keyboard_type"})
+    result = router.recommend(
+        ExecutionIntent(
+            "document.excel.write",
+            requires_macro_preservation=True,
+            allow_raw_desktop=True,
+        )
+    )
+
+    assert result["ok"] is False
+    by_route = {item["route"]: item for item in result["candidates"]}
+    assert by_route["native.excel"]["rejection_code"] == "tool_unavailable"
+    assert by_route["semantic.windows_uia"]["rejection_code"] == "macro_preservation_unsupported"
+    assert by_route["raw.desktop"]["rejection_code"] == "macro_preservation_unsupported"
+
+
+def test_visual_desktop_is_not_a_v07_candidate() -> None:
+    router = _router(
+        {"read_file", "ui_invoke", "mouse_click", "browser_click_semantic"}
+    )
+    for intent_name in (
+        "filesystem.read",
+        "browser.interact",
+        "desktop.semantic.interact",
+        "desktop.raw.interact",
+    ):
+        result = router.candidates(
+            ExecutionIntent(intent_name, allow_raw_desktop=True),
+            max_candidates=25,
+        )
+        assert "visual.desktop" not in {item["route"] for item in result["items"]}
+
+
+def test_router_can_be_disabled_and_rejects_unknown_policy() -> None:
+    from core.errors import ToolError
+    from core.execution_router import ExecutionRouter
+    from core.router_metrics import RouterMetrics
+
+    disabled = ExecutionRouter(
+        registered_tools={"read_file"},
+        capabilities=_windows_caps(),
+        enabled=False,
+        metrics=RouterMetrics(max_recent=2),
+    )
+    try:
+        disabled.recommend(ExecutionIntent("filesystem.read"))
+    except ToolError as exc:
+        assert exc.code == "execution_router_disabled"
+    else:
+        raise AssertionError("disabled router must fail closed")
+
+    unsupported = ExecutionRouter(
+        registered_tools={"read_file"},
+        capabilities=_windows_caps(),
+        policy_version="mystery-v9",
+        metrics=RouterMetrics(max_recent=2),
+    )
+    try:
+        unsupported.recommend(ExecutionIntent("filesystem.read"))
+    except ToolError as exc:
+        assert exc.code == "unsupported_router_policy"
+    else:
+        raise AssertionError("unsupported policy must fail closed")
