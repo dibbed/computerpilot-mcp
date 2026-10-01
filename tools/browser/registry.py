@@ -17,9 +17,10 @@ from core.audit import audit_action
 from core.config import SETTINGS, ensure_runtime_dirs, resolve_path
 from core.errors import ToolError
 from core.media import ImageDelivery, image_tool_result
+from core.response import bounded_text
 from core.tooling import OPEN_WORLD_READ, OPEN_WORLD_WRITE, compact_errors
 from tools.browser.manager import MANAGER
-from tools.browser.semantics import build_snapshot, query_nodes
+from tools.browser.semantics import bound_records, build_snapshot, query_nodes
 
 SessionArg = Annotated[str, Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.-]+$")]
 SelectorArg = Annotated[str, Field(min_length=1, max_length=10_000)]
@@ -416,6 +417,113 @@ def register(mcp: MCPServer) -> None:
                 "value_chars": len(value),
                 "generation": new_generation,
                 "evidence": evidence,
+                **_url_result(page.url),
+            }
+
+    @mcp.tool(annotations=OPEN_WORLD_READ, structured_output=True)
+    @compact_errors("browser_extract")
+    async def browser_extract(
+        mode: Literal["text", "links", "form_fields", "table", "subtree"],
+        session_id: SessionArg = "default",
+        node_ref: Annotated[str | None, Field(max_length=100)] = None,
+        generation: Annotated[int | None, Field(ge=0)] = None,
+        role: Annotated[str | None, Field(max_length=100)] = None,
+        name: Annotated[str | None, Field(max_length=2_000)] = None,
+        label: Annotated[str | None, Field(max_length=2_000)] = None,
+        text: Annotated[str | None, Field(max_length=4_000)] = None,
+        test_id: Annotated[str | None, Field(max_length=500)] = None,
+        match_index: Annotated[int | None, Field(ge=0, le=10_000)] = None,
+        max_items: Annotated[int, Field(ge=1, le=5_000)] = 500,
+        max_chars: Annotated[int, Field(ge=1, le=4 * 1_024 * 1_024)] = SETTINGS.browser_semantic_max_bytes,
+    ) -> dict[str, Any]:
+        """Extract bounded structured content from the active semantic browser page."""
+
+        async with MANAGER.session(session_id):
+            page = MANAGER.page(session_id)
+            current_generation = MANAGER.semantic_generation(session_id)
+
+            if mode == "text":
+                raw_text = str(await page.locator("body").inner_text())
+                data: dict[str, Any] = bounded_text(raw_text, max_chars, mode="head")
+            elif mode == "links":
+                records = await page.evaluate(
+                    """() => Array.from(document.querySelectorAll('a[href]')).map((a) => ({
+                        text: (a.innerText || a.textContent || '').trim(),
+                        href: a.href
+                    }))"""
+                )
+                data = bound_records(list(records or []), max_items=max_items, max_text_chars=max_chars)
+            elif mode == "table":
+                records = await page.evaluate(
+                    """() => Array.from(document.querySelectorAll('table')).flatMap((table, tableIndex) =>
+                        Array.from(table.rows).map((row, rowIndex) => ({
+                            table_index: tableIndex,
+                            row_index: rowIndex,
+                            cells: Array.from(row.cells).map((cell) => (cell.innerText || cell.textContent || '').trim())
+                        }))
+                    )"""
+                )
+                data = bound_records(list(records or []), max_items=max_items, max_text_chars=max_chars)
+            elif mode == "form_fields":
+                snapshot = await build_snapshot(
+                    page,
+                    generation=current_generation,
+                    page_id="p1",
+                    max_nodes=SETTINGS.browser_semantic_max_nodes,
+                    max_text_chars=max_chars,
+                )
+                records = [
+                    node
+                    for node in snapshot["nodes"]
+                    if node.get("tag") in {"input", "textarea", "select"}
+                    or node.get("role") in {"textbox", "checkbox", "radio", "combobox", "spinbutton", "slider"}
+                ]
+                data = bound_records(records, max_items=max_items, max_text_chars=max_chars)
+            else:
+                node = None
+                if node_ref is not None:
+                    if generation is None:
+                        raise ToolError(
+                            "browser_generation_required",
+                            "generation is required when node_ref is used.",
+                            hint="Pass the generation returned by browser_snapshot/browser_query.",
+                        )
+                    node = MANAGER.semantic_ref(session_id, node_ref, generation)
+                locator, _ = await _resolve_semantic_locator(
+                    page,
+                    node=node,
+                    role=role,
+                    name=name,
+                    label=label,
+                    text=text,
+                    test_id=test_id,
+                    match_index=match_index,
+                )
+                record = await locator.evaluate(
+                    """(el) => ({
+                        tag: el.tagName.toLowerCase(),
+                        role: el.getAttribute('role'),
+                        name: el.getAttribute('aria-label'),
+                        text: (el.innerText || el.textContent || '').trim()
+                    })"""
+                )
+                data = bound_records([record], max_items=1, max_text_chars=max_chars)
+
+            audit_action(
+                "browser_extract",
+                target=_safe_url_target(page.url),
+                details={
+                    "session_id": session_id,
+                    "mode": mode,
+                    "truncated": bool(data.get("truncated", False)),
+                },
+            )
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "mode": mode,
+                "generation": current_generation,
+                "data": data,
                 **_url_result(page.url),
             }
 

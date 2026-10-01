@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from typing import Any
-
 
 _SEMANTIC_SNAPSHOT_JS = r"""
 () => {
@@ -102,7 +102,9 @@ _SEMANTIC_SNAPSHOT_JS = r"""
         disabled: Boolean(el.disabled) || el.getAttribute("aria-disabled") === "true",
         selected: el.getAttribute("aria-selected") === "true" || Boolean(el.selected),
         expanded: el.hasAttribute("aria-expanded") ? el.getAttribute("aria-expanded") === "true" : null,
-        checked: el.hasAttribute("aria-checked") ? el.getAttribute("aria-checked") === "true" : (("checked" in el) ? Boolean(el.checked) : null),
+        checked: el.hasAttribute("aria-checked")
+          ? el.getAttribute("aria-checked") === "true"
+          : (("checked" in el) ? Boolean(el.checked) : null),
         value: input ? String(el.value || "") : null
       };
     });
@@ -209,6 +211,64 @@ async def build_snapshot(
         "node_count": len(nodes),
         "source_node_count": len(raw),
         "text_chars": total_text_chars,
+        "truncated": truncated,
+    }
+
+
+def _trim_json_value(value: Any, max_chars: int) -> Any:
+    if max_chars <= 0:
+        return "" if isinstance(value, str) else value
+    if isinstance(value, str):
+        return value[:max_chars]
+    if isinstance(value, list):
+        return [_trim_json_value(item, max_chars) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _trim_json_value(item, max_chars) for key, item in value.items()}
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:max_chars]
+
+
+def bound_records(
+    records: list[Any],
+    *,
+    max_items: int,
+    max_text_chars: int,
+) -> dict[str, Any]:
+    """Bound structured extraction records by count and serialized text size."""
+
+    limit_items = max(1, max_items)
+    limit_chars = max(1, max_text_chars)
+    items: list[Any] = []
+    used_chars = 0
+    truncated = False
+
+    for record in records:
+        if len(items) >= limit_items:
+            truncated = True
+            break
+        normalized = _trim_json_value(record, limit_chars)
+        encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), default=str)
+        if items and used_chars + len(encoded) > limit_chars:
+            truncated = True
+            break
+        if not items and len(encoded) > limit_chars:
+            normalized = _trim_json_value(record, max(1, limit_chars // 2))
+            encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), default=str)
+            if len(encoded) > limit_chars:
+                normalized = {"value": encoded[: max(1, limit_chars - 20)]}
+                encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+            truncated = True
+        items.append(normalized)
+        used_chars += len(encoded)
+
+    if len(records) > len(items):
+        truncated = True
+    return {
+        "items": items,
+        "count": len(items),
+        "total_count": len(records),
+        "text_chars": used_chars,
         "truncated": truncated,
     }
 
