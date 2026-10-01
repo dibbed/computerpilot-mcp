@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,20 @@ import pytest
 from core.config import SETTINGS
 from tools.browser import registry
 from tools.browser.manager import BrowserManager, PoolKey, Session
-from tests.test_browser_semantic_registry import Capture
+
+ToolFunction = Callable[..., Any]
+
+
+class Capture:
+    def __init__(self) -> None:
+        self.functions: dict[str, ToolFunction] = {}
+
+    def tool(self, **kwargs: Any) -> Callable[[ToolFunction], ToolFunction]:
+        def decorate(fn: ToolFunction) -> ToolFunction:
+            self.functions[fn.__name__] = fn
+            return fn
+
+        return decorate
 
 
 def test_browser_upload_requires_real_file_and_uses_semantic_file_input(

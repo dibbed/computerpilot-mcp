@@ -88,7 +88,18 @@ def test_semantic_click_uses_generation_ref_and_invalidates_snapshot(monkeypatch
         manager.remember_semantic_refs(
             "s",
             5,
-            [{"ref": "n1", "role": "button", "name": "Save", "label": None, "text": "Save", "test_id": None, "tag": "button", "ordinal": 0}],
+            [
+                {
+                    "ref": "n1",
+                    "role": "button",
+                    "name": "Save",
+                    "label": None,
+                    "text": "Save",
+                    "test_id": None,
+                    "tag": "button",
+                    "ordinal": 0,
+                }
+            ],
         )
         monkeypatch.setattr(registry, "MANAGER", manager)
         monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)

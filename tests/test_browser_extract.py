@@ -1,13 +1,27 @@
 import asyncio
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.test_browser_semantic_registry import Capture
 from tools.browser import registry
 from tools.browser.manager import BrowserManager, PoolKey, Session
+
+ToolFunction = Callable[..., Any]
+
+
+class Capture:
+    def __init__(self) -> None:
+        self.functions: dict[str, ToolFunction] = {}
+
+    def tool(self, **kwargs: Any) -> Callable[[ToolFunction], ToolFunction]:
+        def decorate(fn: ToolFunction) -> ToolFunction:
+            self.functions[fn.__name__] = fn
+            return fn
+
+        return decorate
 
 
 def test_browser_extract_text_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
