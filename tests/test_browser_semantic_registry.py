@@ -202,3 +202,61 @@ def test_browser_wait_for_generation_change_observes_invalidation(monkeypatch: p
         assert result["generation"] == 5
 
     asyncio.run(run())
+
+
+def test_browser_select_uses_semantic_target_and_invalidates_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        locator = SimpleNamespace(count=AsyncMock(return_value=1), select_option=AsyncMock())
+        locator.nth = lambda _: locator
+        page = SimpleNamespace(url="https://example.test/", get_by_role=lambda role, **kwargs: locator)
+        manager = BrowserManager()
+        manager._sessions["s"] = Session(PoolKey("chromium", True), SimpleNamespace(), page, "chromium", True, generation=3)
+        monkeypatch.setattr(registry, "MANAGER", manager)
+        monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+        capture = Capture()
+        registry.register(cast(Any, capture))
+
+        result = await capture.functions["browser_select"](
+            session_id="s",
+            role="combobox",
+            name="Country",
+            option_value="de",
+        )
+
+        locator.select_option.assert_awaited_once_with(value="de", timeout=30_000.0)
+        assert result["ok"] is True
+        assert result["generation"] == 4
+
+    asyncio.run(run())
+
+
+def test_browser_tabs_public_surface_lists_and_activates_stable_page_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        page1 = SimpleNamespace(
+            url="https://one.test/",
+            title=AsyncMock(return_value="One"),
+            is_closed=lambda: False,
+            bring_to_front=AsyncMock(),
+        )
+        page2 = SimpleNamespace(
+            url="https://two.test/",
+            title=AsyncMock(return_value="Two"),
+            is_closed=lambda: False,
+            bring_to_front=AsyncMock(),
+        )
+        context = SimpleNamespace(pages=[page1, page2])
+        manager = BrowserManager()
+        manager._sessions["s"] = Session(PoolKey("chromium", True), context, page1, "chromium", True, generation=1)
+        monkeypatch.setattr(registry, "MANAGER", manager)
+        monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+        capture = Capture()
+        registry.register(cast(Any, capture))
+
+        listed = await capture.functions["browser_tabs"](operation="list", session_id="s")
+        assert [item["page_id"] for item in listed["tabs"]] == ["p1", "p2"]
+
+        activated = await capture.functions["browser_tabs"](operation="activate", session_id="s", page_id="p2")
+        assert activated["active_page_id"] == "p2"
+        assert activated["generation"] == 2
+
+    asyncio.run(run())

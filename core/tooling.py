@@ -68,6 +68,8 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "browser_fill",
         "browser_click_semantic",
         "browser_fill_semantic",
+        "browser_select",
+        "browser_tabs",
         "browser_screenshot",
         "browser_close",
         "desktop_screenshot",

@@ -44,6 +44,8 @@ class Session:
     stale: bool = False
     generation: int = 0
     semantic_refs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    page_refs: dict[str, Any] = field(default_factory=dict)
+    next_page_id: int = 1
 
 
 class BrowserManager:
@@ -482,6 +484,124 @@ class BrowserManager:
                 hint="Take a new browser_snapshot or browser_query and use a returned ref.",
             )
         return dict(node)
+
+    def _sync_session_pages(self, session: Session) -> list[tuple[str, Any]]:
+        raw_pages = getattr(session.context, "pages", None)
+        pages = list(raw_pages) if raw_pages is not None else [session.page]
+        pages = [page for page in pages if not self._page_closed(page)]
+
+        for page_id, known_page in list(session.page_refs.items()):
+            if not any(known_page is page for page in pages):
+                session.page_refs.pop(page_id, None)
+
+        for page in pages:
+            if any(known_page is page for known_page in session.page_refs.values()):
+                continue
+            page_id = f"p{session.next_page_id}"
+            session.next_page_id += 1
+            session.page_refs[page_id] = page
+
+        if pages and not any(session.page is page for page in pages):
+            session.page = pages[0]
+
+        return [
+            (page_id, page)
+            for page_id, page in session.page_refs.items()
+            if any(page is current for current in pages)
+        ]
+
+    async def tabs(self, session_id: str) -> list[dict[str, Any]]:
+        async with self.session(session_id):
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise ToolError(
+                    "browser_session_not_found",
+                    f"Browser session {session_id!r} is not open.",
+                    hint="Call browser_open_page first.",
+                )
+            items: list[dict[str, Any]] = []
+            for page_id, page in self._sync_session_pages(session):
+                items.append(
+                    {
+                        "page_id": page_id,
+                        "url": str(getattr(page, "url", "")),
+                        "title": str(await page.title()),
+                        "active": page is session.page,
+                    }
+                )
+            return items
+
+    async def activate_tab(self, session_id: str, page_id: str) -> dict[str, Any]:
+        async with self.session(session_id):
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise ToolError(
+                    "browser_session_not_found",
+                    f"Browser session {session_id!r} is not open.",
+                    hint="Call browser_open_page first.",
+                )
+            pages = dict(self._sync_session_pages(session))
+            page = pages.get(page_id)
+            if page is None:
+                raise ToolError(
+                    "browser_tab_not_found",
+                    f"Browser tab {page_id!r} is not available.",
+                    hint="List browser_tabs again and use a current page_id.",
+                )
+            bring_to_front = getattr(page, "bring_to_front", None)
+            if callable(bring_to_front):
+                await bring_to_front()
+            session.page = page
+            generation = self.invalidate_semantics(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "active_page_id": page_id,
+                "generation": generation,
+                "url": str(getattr(page, "url", "")),
+            }
+
+    async def close_tab(self, session_id: str, page_id: str) -> dict[str, Any]:
+        async with self.session(session_id):
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise ToolError(
+                    "browser_session_not_found",
+                    f"Browser session {session_id!r} is not open.",
+                    hint="Call browser_open_page first.",
+                )
+            pages = dict(self._sync_session_pages(session))
+            page = pages.get(page_id)
+            if page is None:
+                raise ToolError(
+                    "browser_tab_not_found",
+                    f"Browser tab {page_id!r} is not available.",
+                    hint="List browser_tabs again and use a current page_id.",
+                )
+            was_active = page is session.page
+            await page.close()
+            remaining = self._sync_session_pages(session)
+            active_page_id: str | None = None
+            if remaining:
+                if was_active or not any(session.page is current for _, current in remaining):
+                    active_page_id, session.page = remaining[0]
+                else:
+                    active_page_id = next(
+                        (candidate_id for candidate_id, current in remaining if current is session.page),
+                        None,
+                    )
+                session.stale = False
+            else:
+                session.stale = True
+            generation = self.invalidate_semantics(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "closed": True,
+                "page_id": page_id,
+                "active_page_id": active_page_id,
+                "generation": generation,
+            }
 
     async def close(self, session_id: str) -> dict[str, Any]:
         async with self.session(session_id):

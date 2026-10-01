@@ -393,6 +393,124 @@ def register(mcp: MCPServer) -> None:
                 **_url_result(page.url),
             }
 
+    @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
+    @compact_errors("browser_select")
+    async def browser_select(
+        session_id: SessionArg = "default",
+        node_ref: Annotated[str | None, Field(max_length=100)] = None,
+        generation: Annotated[int | None, Field(ge=0)] = None,
+        role: Annotated[str | None, Field(max_length=100)] = None,
+        name: Annotated[str | None, Field(max_length=2_000)] = None,
+        label: Annotated[str | None, Field(max_length=2_000)] = None,
+        test_id: Annotated[str | None, Field(max_length=500)] = None,
+        match_index: Annotated[int | None, Field(ge=0, le=10_000)] = None,
+        option_value: Annotated[str | None, Field(max_length=10_000)] = None,
+        option_label: Annotated[str | None, Field(max_length=10_000)] = None,
+        selection_mode: Literal["native", "listbox"] = "native",
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+    ) -> dict[str, Any]:
+        """Select an option through a deterministic semantic control."""
+
+        if (option_value is None) == (option_label is None):
+            raise ToolError(
+                "browser_select_invalid",
+                "Exactly one of option_value or option_label is required.",
+                hint="Use option_value for native selects or option_label for a visible semantic option.",
+            )
+        if selection_mode == "listbox" and option_label is None:
+            raise ToolError(
+                "browser_select_invalid",
+                "listbox mode requires option_label.",
+                hint="Provide the visible option label for a semantic listbox.",
+            )
+
+        async with MANAGER.session(session_id):
+            page = MANAGER.page(session_id)
+            node = None
+            if node_ref is not None:
+                if generation is None:
+                    raise ToolError(
+                        "browser_generation_required",
+                        "generation is required when node_ref is used.",
+                        hint="Pass the generation returned by browser_snapshot/browser_query.",
+                    )
+                node = MANAGER.semantic_ref(session_id, node_ref, generation)
+            locator, evidence = await _resolve_semantic_locator(
+                page,
+                node=node,
+                role=role,
+                name=name,
+                label=label,
+                test_id=test_id,
+                match_index=match_index,
+            )
+
+            if selection_mode == "native":
+                if option_value is not None:
+                    await locator.select_option(value=option_value, timeout=timeout_sec * 1_000)
+                    option_chars = len(option_value)
+                else:
+                    await locator.select_option(label=option_label, timeout=timeout_sec * 1_000)
+                    option_chars = len(option_label or "")
+            else:
+                await locator.click(timeout=timeout_sec * 1_000)
+                option = page.get_by_role("option", name=option_label, exact=True)
+                count = int(await option.count())
+                if count != 1:
+                    raise ToolError(
+                        "browser_ambiguous_target",
+                        f"Listbox option matched {count} elements.",
+                        hint="Use a unique visible option label.",
+                    )
+                await option.nth(0).click(timeout=timeout_sec * 1_000)
+                option_chars = len(option_label or "")
+
+            audit_action(
+                "browser_select",
+                target=_safe_url_target(page.url),
+                details={
+                    "session_id": session_id,
+                    "selection_mode": selection_mode,
+                    "option_chars": option_chars,
+                    **evidence,
+                },
+            )
+            new_generation = MANAGER.invalidate_semantics(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "selected": True,
+                "selection_mode": selection_mode,
+                "generation": new_generation,
+                "evidence": evidence,
+                **_url_result(page.url),
+            }
+
+    @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
+    @compact_errors("browser_tabs")
+    async def browser_tabs(
+        operation: Literal["list", "activate", "close"] = "list",
+        session_id: SessionArg = "default",
+        page_id: Annotated[str | None, Field(max_length=100)] = None,
+    ) -> dict[str, Any]:
+        """List, activate, or close deterministic page IDs within one browser session."""
+
+        if operation == "list":
+            tabs = await MANAGER.tabs(session_id)
+            return {"ok": True, "session_id": session_id, "tabs": tabs, "count": len(tabs)}
+        if page_id is None:
+            raise ToolError(
+                "browser_tab_id_required",
+                f"page_id is required for browser_tabs operation {operation!r}.",
+                hint="Call browser_tabs(operation='list') first.",
+            )
+        if operation == "activate":
+            result = await MANAGER.activate_tab(session_id, page_id)
+        else:
+            result = await MANAGER.close_tab(session_id, page_id)
+        audit_action("browser_tabs", target=session_id, details={"operation": operation, "page_id": page_id})
+        return result
+
     @mcp.tool(annotations=OPEN_WORLD_READ, structured_output=True)
     @compact_errors("browser_wait_for")
     async def browser_wait_for(
