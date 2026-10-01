@@ -123,6 +123,7 @@ class ActionDescriptor:
     secret_fields: frozenset[str] = frozenset()
     cancel_mode: Literal["immediate", "cooperative", "deferred"] = "deferred"
     availability: Literal["available", "disabled", "adapter_required", "platform_unavailable"] = "available"
+    execution_route: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,13 +369,29 @@ ACTION_HANDLERS: dict[str, ActionHandler] = {
 
 ACTION_DESCRIPTORS: dict[str, ActionDescriptor] = {
     "apply_patch": ActionDescriptor(
-        "apply_patch", ApplyPatchInput, _apply_patch, True, "never", frozenset({"patch_effect_intent"})
+        "apply_patch", ApplyPatchInput, _apply_patch, True, "never", frozenset({"patch_effect_intent"}),
+        execution_route="native.filesystem",
     ),
-    "affected_tests": ActionDescriptor("affected_tests", AffectedTestsInput, _affected_tests, False, "never", frozenset()),
-    "verify_changes": ActionDescriptor("verify_changes", VerifyChangesInput, _verify_changes, False, "never", frozenset()),
-    "git_status": ActionDescriptor("git_status", GitStatusInput, _git_status, False, "transient", frozenset()),
-    "git_stage": ActionDescriptor("git_stage", GitStageInput, _git_stage, True, "never", frozenset({"git_stage_intent"})),
-    "git_commit": ActionDescriptor("git_commit", GitCommitInput, _git_commit, True, "never", frozenset({"git_commit_intent"})),
+    "affected_tests": ActionDescriptor(
+        "affected_tests", AffectedTestsInput, _affected_tests, False, "never", frozenset(),
+        execution_route="native.code",
+    ),
+    "verify_changes": ActionDescriptor(
+        "verify_changes", VerifyChangesInput, _verify_changes, False, "never", frozenset(),
+        execution_route="native.code",
+    ),
+    "git_status": ActionDescriptor(
+        "git_status", GitStatusInput, _git_status, False, "transient", frozenset(),
+        execution_route="native.git",
+    ),
+    "git_stage": ActionDescriptor(
+        "git_stage", GitStageInput, _git_stage, True, "never", frozenset({"git_stage_intent"}),
+        execution_route="native.git",
+    ),
+    "git_commit": ActionDescriptor(
+        "git_commit", GitCommitInput, _git_commit, True, "never", frozenset({"git_commit_intent"}),
+        execution_route="native.git",
+    ),
     "run_durable_job": ActionDescriptor(
         "run_durable_job",
         DurableJobInput,
@@ -384,16 +401,22 @@ ACTION_DESCRIPTORS: dict[str, ActionDescriptor] = {
         frozenset({"job_request_key_intent"}),
         frozenset(),
         "cooperative",
+        execution_route="native.process",
     ),
-    "check_file": ActionDescriptor("check_file", CheckFileInput, _check_file, False, "never", frozenset()),
+    "check_file": ActionDescriptor(
+        "check_file", CheckFileInput, _check_file, False, "never", frozenset(),
+        execution_route="native.filesystem",
+    ),
     "check_http": ActionDescriptor("check_http", CheckHttpInput, _check_http, False, "transient", frozenset()),
     "desktop_semantic_action": ActionDescriptor(
         "desktop_semantic_action", SemanticActionInput, _adapter_required, True, "never",
         frozenset({"ui_element_state"}), availability="adapter_required",
+        execution_route="semantic.windows_uia",
     ),
     "browser_action": ActionDescriptor(
         "browser_action", BrowserActionInput, _adapter_required, True, "never",
         frozenset({"browser_state"}), availability="adapter_required",
+        execution_route="semantic.browser",
     ),
 }
 

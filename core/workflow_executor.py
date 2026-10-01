@@ -5,9 +5,11 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from core.errors import ToolError
+from core.execution_models import ExecutionIntent
 from core.reconcilers import evaluate_postcondition
 from core.recovery_models import Postcondition
 from core.workflow_actions import (
@@ -77,8 +79,60 @@ class _LeaseHeartbeat:
 
 
 class WorkflowExecutor:
-    def __init__(self, store: WorkflowStore) -> None:
+    def __init__(
+        self,
+        store: WorkflowStore,
+        *,
+        route_planner: Callable[[ExecutionIntent], dict[str, Any]] | None = None,
+    ) -> None:
         self.store = store
+        self.route_planner = route_planner
+
+    def _plan_route(
+        self,
+        step: StepDefinition,
+        operation_id: str,
+        lease_token: str,
+    ) -> None:
+        if step.execution_intent is None:
+            return
+        if self.route_planner is None:
+            raise ToolError(
+                "workflow_route_planner_missing",
+                "This workflow step declares an execution intent but no route planner is available.",
+            )
+        intent = ExecutionIntent(**step.execution_intent)
+        decision = self.route_planner(intent)
+        selected_route = decision.get("selected_route")
+        policy_version = decision.get("router_policy_version")
+        if decision.get("ok") is not True or not isinstance(selected_route, str) or not selected_route:
+            raise ToolError(
+                "workflow_route_unavailable",
+                f"No valid execution route is available for intent {intent.name!r}.",
+            )
+        if not isinstance(policy_version, str) or not policy_version:
+            raise ToolError(
+                "workflow_route_policy_missing",
+                "Route planner did not return a policy version.",
+            )
+        self.store.record_route_decision(
+            operation_id,
+            lease_token=lease_token,
+            selected_route=selected_route,
+            router_policy_version=policy_version,
+            decision=decision,
+        )
+        expected_route = get_action_descriptor(step.action).execution_route
+        if expected_route is None:
+            raise ToolError(
+                "workflow_action_route_unmapped",
+                f"Workflow action {step.action!r} has no fixed execution route.",
+            )
+        if selected_route != expected_route:
+            raise ToolError(
+                "workflow_route_mismatch",
+                f"Selected route {selected_route!r} does not match fixed workflow action route {expected_route!r}.",
+            )
 
     @staticmethod
     def _postcondition(step: StepDefinition, result: dict[str, Any]) -> dict[str, Any]:
@@ -236,6 +290,11 @@ class WorkflowExecutor:
                         )
                     attempts += 1
                     try:
+                        self._plan_route(
+                            step,
+                            operation["operation_id"],
+                            lease.lease_token,
+                        )
                         canonical_postcondition, intent_evidence = prepare_action_intent(
                             step.action, step.arguments, step.postcondition,
                         )
@@ -265,6 +324,7 @@ class WorkflowExecutor:
                         step.timeout_sec,
                         step.max_retries,
                         canonical_postcondition,
+                        step.execution_intent,
                     )
                     self.store.checkpoint_operation(
                         operation["operation_id"],
