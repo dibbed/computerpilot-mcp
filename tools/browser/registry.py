@@ -47,6 +47,94 @@ def _selector_audit(selector: str) -> dict[str, Any]:
     }
 
 
+async def _resolve_semantic_locator(
+    page: Any,
+    *,
+    node: dict[str, Any] | None = None,
+    role: str | None = None,
+    name: str | None = None,
+    label: str | None = None,
+    text: str | None = None,
+    test_id: str | None = None,
+    match_index: int | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    target = dict(node or {})
+    role = str(target.get("role") or role or "") or None
+    name = str(target.get("name") or name or "") or None
+    label = str(target.get("label") or label or "") or None
+    text = str(target.get("text") or text or "") or None
+    test_id = str(target.get("test_id") or test_id or "") or None
+
+    if test_id is not None:
+        locator = page.get_by_test_id(test_id)
+        kind = "test_id"
+        target_value = test_id
+    elif role is not None and name is not None:
+        locator = page.get_by_role(role, name=name, exact=True)
+        kind = "role_name"
+        target_value = f"{role}:{name}"
+    elif label is not None:
+        locator = page.get_by_label(label, exact=True)
+        kind = "label"
+        target_value = label
+    elif text is not None:
+        locator = page.get_by_text(text, exact=True)
+        kind = "text"
+        target_value = text
+    elif role is not None:
+        locator = page.get_by_role(role)
+        kind = "role"
+        target_value = role
+    else:
+        raise ToolError(
+            "browser_semantic_target_invalid",
+            "No usable semantic target was provided.",
+            hint="Use node_ref+generation, role+name, label, text, or test_id.",
+        )
+
+    count = int(await locator.count())
+    if count < 1:
+        code = "browser_stale_ref" if node is not None else "browser_target_not_found"
+        raise ToolError(
+            code,
+            "No element currently matches the semantic target.",
+            hint="Take a new browser_snapshot/browser_query and retry.",
+        )
+
+    if node is not None:
+        index = int(target.get("ordinal", 0))
+        if index >= count:
+            raise ToolError(
+                "browser_stale_ref",
+                "The semantic target no longer resolves to the snapshotted occurrence.",
+                hint="Take a new browser_snapshot and retry.",
+            )
+    elif match_index is None:
+        if count != 1:
+            raise ToolError(
+                "browser_ambiguous_target",
+                f"Semantic target matched {count} elements.",
+                hint="Narrow the semantic target, use browser_query, or provide match_index.",
+            )
+        index = 0
+    else:
+        index = match_index
+        if index >= count:
+            raise ToolError(
+                "browser_target_not_found",
+                f"match_index {index} is outside the {count} matching elements.",
+                hint="Use browser_query to inspect the available matches.",
+            )
+
+    return locator.nth(index), {
+        "target_kind": kind,
+        "match_count": count,
+        "match_index": index,
+        "target_chars": len(target_value),
+        "target_sha256": hashlib.sha256(target_value.encode("utf-8", errors="replace")).hexdigest(),
+    }
+
+
 def register(mcp: MCPServer) -> None:
     @mcp.tool(annotations=OPEN_WORLD_READ, structured_output=True)
     @compact_errors("browser_open_page")
@@ -170,6 +258,117 @@ def register(mcp: MCPServer) -> None:
             }
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
+    @compact_errors("browser_click_semantic")
+    async def browser_click_semantic(
+        session_id: SessionArg = "default",
+        node_ref: Annotated[str | None, Field(max_length=100)] = None,
+        generation: Annotated[int | None, Field(ge=0)] = None,
+        role: Annotated[str | None, Field(max_length=100)] = None,
+        name: Annotated[str | None, Field(max_length=2_000)] = None,
+        label: Annotated[str | None, Field(max_length=2_000)] = None,
+        text: Annotated[str | None, Field(max_length=4_000)] = None,
+        test_id: Annotated[str | None, Field(max_length=500)] = None,
+        match_index: Annotated[int | None, Field(ge=0, le=10_000)] = None,
+        button: Literal["left", "right", "middle"] = "left",
+        click_count: Annotated[int, Field(ge=1, le=5)] = 1,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+    ) -> dict[str, Any]:
+        """Click a semantic browser target and invalidate snapshot-scoped refs."""
+
+        async with MANAGER.session(session_id):
+            page = MANAGER.page(session_id)
+            node = None
+            if node_ref is not None:
+                if generation is None:
+                    raise ToolError(
+                        "browser_generation_required",
+                        "generation is required when node_ref is used.",
+                        hint="Pass the generation returned by browser_snapshot/browser_query.",
+                    )
+                node = MANAGER.semantic_ref(session_id, node_ref, generation)
+            locator, evidence = await _resolve_semantic_locator(
+                page,
+                node=node,
+                role=role,
+                name=name,
+                label=label,
+                text=text,
+                test_id=test_id,
+                match_index=match_index,
+            )
+            audit_action(
+                "browser_click_semantic",
+                target=_safe_url_target(page.url),
+                details={"session_id": session_id, "button": button, **evidence},
+            )
+            await locator.click(button=button, click_count=click_count, timeout=timeout_sec * 1_000)
+            new_generation = MANAGER.invalidate_semantics(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "clicked": True,
+                "generation": new_generation,
+                "evidence": evidence,
+                **_url_result(page.url),
+            }
+
+    @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
+    @compact_errors("browser_fill_semantic")
+    async def browser_fill_semantic(
+        value: Annotated[str, Field(max_length=100_000)],
+        session_id: SessionArg = "default",
+        node_ref: Annotated[str | None, Field(max_length=100)] = None,
+        generation: Annotated[int | None, Field(ge=0)] = None,
+        role: Annotated[str | None, Field(max_length=100)] = None,
+        name: Annotated[str | None, Field(max_length=2_000)] = None,
+        label: Annotated[str | None, Field(max_length=2_000)] = None,
+        test_id: Annotated[str | None, Field(max_length=500)] = None,
+        match_index: Annotated[int | None, Field(ge=0, le=10_000)] = None,
+        mode: Literal["replace", "clear"] = "replace",
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+    ) -> dict[str, Any]:
+        """Fill a semantic editable target without exposing the supplied value."""
+
+        async with MANAGER.session(session_id):
+            page = MANAGER.page(session_id)
+            node = None
+            if node_ref is not None:
+                if generation is None:
+                    raise ToolError(
+                        "browser_generation_required",
+                        "generation is required when node_ref is used.",
+                        hint="Pass the generation returned by browser_snapshot/browser_query.",
+                    )
+                node = MANAGER.semantic_ref(session_id, node_ref, generation)
+            locator, evidence = await _resolve_semantic_locator(
+                page,
+                node=node,
+                role=role,
+                name=name,
+                label=label,
+                test_id=test_id,
+                match_index=match_index,
+            )
+            audit_action(
+                "browser_fill_semantic",
+                target=_safe_url_target(page.url),
+                details={"session_id": session_id, "value_chars": len(value), "mode": mode, **evidence},
+            )
+            supplied = "" if mode == "clear" else value
+            await locator.fill(supplied, timeout=timeout_sec * 1_000)
+            new_generation = MANAGER.invalidate_semantics(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "filled": True,
+                "mode": mode,
+                "value_chars": len(value),
+                "generation": new_generation,
+                "evidence": evidence,
+                **_url_result(page.url),
+            }
+
+    @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("browser_click")
     async def browser_click(
         selector: SelectorArg,
@@ -187,7 +386,15 @@ def register(mcp: MCPServer) -> None:
                 details={"session_id": session_id, "button": button, **_selector_audit(selector)},
             )
             await page.locator(selector).first.click(button=button, click_count=click_count, timeout=timeout_sec * 1_000)
-            return {"ok": True, "session_id": session_id, "clicked": True, "selector_chars": len(selector), **_url_result(page.url)}
+            generation = MANAGER.invalidate_semantics(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "clicked": True,
+                "selector_chars": len(selector),
+                "generation": generation,
+                **_url_result(page.url),
+            }
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("browser_fill")
@@ -206,12 +413,14 @@ def register(mcp: MCPServer) -> None:
                 details={"session_id": session_id, "text_chars": len(text), **_selector_audit(selector)},
             )
             await page.locator(selector).first.fill(text, timeout=timeout_sec * 1_000)
+            generation = MANAGER.invalidate_semantics(session_id)
             return {
                 "ok": True,
                 "session_id": session_id,
                 "filled": True,
                 "selector_chars": len(selector),
                 "text_chars": len(text),
+                "generation": generation,
                 **_url_result(page.url),
             }
 

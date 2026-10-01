@@ -66,6 +66,8 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "git_restore_file",
         "browser_click",
         "browser_fill",
+        "browser_click_semantic",
+        "browser_fill_semantic",
         "browser_screenshot",
         "browser_close",
         "desktop_screenshot",

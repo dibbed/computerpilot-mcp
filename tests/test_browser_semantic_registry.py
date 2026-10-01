@@ -76,3 +76,74 @@ def test_browser_query_returns_only_matching_nodes_and_uniqueness(monkeypatch: p
         assert manager.semantic_ref("s", result["matches"][0]["ref"], 4)["name"] == "Cancel"
 
     asyncio.run(run())
+
+
+def test_semantic_click_uses_generation_ref_and_invalidates_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        locator = SimpleNamespace(count=AsyncMock(return_value=1), click=AsyncMock())
+        locator.nth = lambda _: locator
+        page = SimpleNamespace(url="https://example.test/", get_by_role=lambda role, **kwargs: locator)
+        manager = BrowserManager()
+        manager._sessions["s"] = Session(PoolKey("chromium", True), SimpleNamespace(), page, "chromium", True, generation=5)
+        manager.remember_semantic_refs(
+            "s",
+            5,
+            [{"ref": "n1", "role": "button", "name": "Save", "label": None, "text": "Save", "test_id": None, "tag": "button", "ordinal": 0}],
+        )
+        monkeypatch.setattr(registry, "MANAGER", manager)
+        monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+        capture = Capture()
+        registry.register(cast(Any, capture))
+
+        result = await capture.functions["browser_click_semantic"](session_id="s", node_ref="n1", generation=5)
+
+        assert result["ok"] is True
+        locator.click.assert_awaited_once()
+        assert result["generation"] == 6
+        assert manager.semantic_generation("s") == 6
+
+    asyncio.run(run())
+
+
+def test_semantic_click_refuses_ambiguous_direct_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        locator = SimpleNamespace(count=AsyncMock(return_value=2), click=AsyncMock())
+        locator.nth = lambda _: locator
+        page = SimpleNamespace(url="https://example.test/", get_by_role=lambda role, **kwargs: locator)
+        manager = BrowserManager()
+        manager._sessions["s"] = Session(PoolKey("chromium", True), SimpleNamespace(), page, "chromium", True, generation=2)
+        monkeypatch.setattr(registry, "MANAGER", manager)
+        monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+        capture = Capture()
+        registry.register(cast(Any, capture))
+
+        result = await capture.functions["browser_click_semantic"](session_id="s", role="button", name="Save")
+
+        assert result["ok"] is False
+        assert result["error"] == "browser_ambiguous_target"
+        locator.click.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_semantic_fill_uses_label_and_redacts_value_from_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        locator = SimpleNamespace(count=AsyncMock(return_value=1), fill=AsyncMock())
+        locator.nth = lambda _: locator
+        page = SimpleNamespace(url="https://example.test/", get_by_label=lambda label, **kwargs: locator)
+        manager = BrowserManager()
+        manager._sessions["s"] = Session(PoolKey("chromium", True), SimpleNamespace(), page, "chromium", True, generation=9)
+        monkeypatch.setattr(registry, "MANAGER", manager)
+        monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+        capture = Capture()
+        registry.register(cast(Any, capture))
+
+        result = await capture.functions["browser_fill_semantic"]("secret@example.test", session_id="s", label="Email")
+
+        locator.fill.assert_awaited_once_with("secret@example.test", timeout=30_000.0)
+        assert result["ok"] is True
+        assert result["value_chars"] == len("secret@example.test")
+        assert "secret@example.test" not in str(result)
+        assert result["generation"] == 10
+
+    asyncio.run(run())
