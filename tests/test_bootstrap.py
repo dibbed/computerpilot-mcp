@@ -20,6 +20,11 @@ def test_requirements_fingerprint_includes_nested_files(tmp_path: Path) -> None:
     assert before != after
 
 
+def test_document_runtime_imports_are_required() -> None:
+    imports = set(bootstrap._required_imports())
+    assert {"openpyxl", "docx", "pypdf", "reportlab"} <= imports
+
+
 def test_supervisor_command_is_platform_neutral() -> None:
     assert bootstrap._supervisor_command("local-http", "default") == [
         sys.executable,

@@ -53,6 +53,10 @@ Notable dependencies include:
 - `psutil`
 - `charset-normalizer`
 - `Pillow`
+- `openpyxl` for XLSX/XLSM document handling
+- `python-docx` for DOCX document handling
+- `pypdf` for PDF inspection and text extraction
+- `reportlab` for deterministic PDF creation
 - `uiautomation` on Windows
 - `pytest`, `ruff`, and `mypy` for validation
 - `playwright` for optional browser automation
