@@ -41,6 +41,81 @@ def test_restart_backoff() -> None:
     assert [restart_delay(i) for i in range(1, 7)] == [5, 10, 30, 60, 60, 60]
 
 
+def test_console_interrupt_requests_graceful_then_forced_shutdown(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    try:
+        assert supervisor.request_console_shutdown() is False
+        assert supervisor.stop.is_set()
+        assert not supervisor.force_stop.is_set()
+        assert "Press Ctrl+C again to force exit" in capsys.readouterr().out
+
+        assert supervisor.request_console_shutdown() is True
+        assert supervisor.stop.is_set()
+        assert supervisor.force_stop.is_set()
+        assert "Force stopping ComputerPilot" in capsys.readouterr().out
+    finally:
+        close_logger(supervisor)
+
+
+def test_console_interrupt_is_safe_while_supervisor_lock_is_held(tmp_path: Path) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    finished = threading.Event()
+
+    def request_shutdown() -> None:
+        with supervisor.lock:
+            supervisor.request_console_shutdown()
+        finished.set()
+
+    thread = threading.Thread(target=request_shutdown, daemon=True)
+    try:
+        thread.start()
+        assert finished.wait(1.0)
+        assert supervisor.stop.is_set()
+    finally:
+        close_logger(supervisor)
+
+
+def test_forced_console_interrupt_aborts_runtime_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path, drain_timeout=5)
+
+    class FakeProcess:
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr(supervisor, "_write_lifecycle_control", lambda *args: None)
+    monkeypatch.setattr(
+        supervisor,
+        "_read_lifecycle_status",
+        lambda path: {
+            "schema_version": 1,
+            "request_id": "different-request",
+            "state": "RUNNING",
+            "active_mutations": 1,
+        },
+    )
+    supervisor.force_stop.set()
+    started = time.monotonic()
+    try:
+        result = supervisor.drain_runtime(
+            FakeProcess(),  # type: ignore[arg-type]
+            reason="user_stop",
+            control_path=tmp_path / "control.json",
+            status_path=tmp_path / "status.json",
+        )
+        assert result["forced"] is True
+        assert result["drained"] is False
+        assert result["timed_out"] is False
+        assert time.monotonic() - started < 0.5
+    finally:
+        close_logger(supervisor)
+
+
 def test_supervisor_snapshot_exposes_timing_events_and_errors(tmp_path: Path) -> None:
     supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
     try:

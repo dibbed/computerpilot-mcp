@@ -6,6 +6,9 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+### Fixed
+- Make Windows console shutdown graceful on the first Ctrl+C and promptly forceable on the second without re-entering the launcher restart loop or deadlocking the supervisor signal path.
+
 ## [0.7.0] - 2026-10-07
 
 ### Added

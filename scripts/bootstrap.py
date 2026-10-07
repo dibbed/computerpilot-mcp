@@ -193,11 +193,11 @@ def validate() -> tuple[str, str]:
     return mode, profile
 
 
-def _supervisor_command(mode: str, profile: str) -> list[str]:
-    command = [sys.executable, "-m", "scripts.supervisor", "--mode", mode]
+def _supervisor_args(mode: str, profile: str) -> list[str]:
+    args = ["--mode", mode]
     if mode == "tunnel":
-        command.extend(["--profile", profile])
-    return command
+        args.extend(["--profile", profile])
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -217,7 +217,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print("[5/5] Starting MCP supervisor...")
     try:
-        return subprocess.call(_supervisor_command(mode, profile), cwd=ROOT)
+        from scripts.supervisor import main as supervisor_main
+
+        return supervisor_main(_supervisor_args(mode, profile))
     except KeyboardInterrupt:
         return 130
 

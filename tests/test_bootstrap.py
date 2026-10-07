@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -25,15 +24,19 @@ def test_document_runtime_imports_are_required() -> None:
     assert {"openpyxl", "docx", "pypdf", "reportlab"} <= imports
 
 
-def test_supervisor_command_is_platform_neutral() -> None:
-    assert bootstrap._supervisor_command("local-http", "default") == [
-        sys.executable,
-        "-m",
-        "scripts.supervisor",
+def test_supervisor_args_are_platform_neutral() -> None:
+    assert bootstrap._supervisor_args("local-http", "default") == [
         "--mode",
         "local-http",
     ]
-    assert bootstrap._supervisor_command("tunnel", "work")[-2:] == ["--profile", "work"]
+    assert bootstrap._supervisor_args("tunnel", "work")[-2:] == ["--profile", "work"]
+
+
+def test_windows_launcher_suppresses_batch_interrupt_confirmation() -> None:
+    launcher = (bootstrap.ROOT / "START_MCP.bat").read_text(encoding="utf-8")
+    assert "setlocal EnableDelayedExpansion" in launcher
+    assert '"%~dp0.venv\\Scripts\\python.exe" -m scripts.bootstrap --start' in launcher
+    assert '& set "MCP_EXIT_CODE=!ERRORLEVEL!" & call;' in launcher
 
 
 def test_mode_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
