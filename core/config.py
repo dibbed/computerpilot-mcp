@@ -32,7 +32,7 @@ class Settings:
     """Small immutable runtime configuration."""
 
     server_name: str = "ali_windows_agent_mcp"
-    version: str = "0.6.0"
+    version: str = "0.7.0"
     tool_profile: str = os.getenv("MCP_TOOL_PROFILE", "full")
     execution_router_enabled: bool = _env_bool("MCP_EXECUTION_ROUTER_ENABLED", True)
     execution_router_policy: str = os.getenv("MCP_EXECUTION_ROUTER_POLICY", "deterministic-v1").strip().casefold() or "deterministic-v1"
