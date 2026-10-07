@@ -38,6 +38,27 @@ It:
 
 The public display title is **ComputerPilot MCP**. The protocol-level server identifier remains `ali_windows_agent_mcp` for compatibility with existing client/tunnel configuration.
 
+## Adaptive execution router
+
+`core/tool_catalog.py` is the shared execution metadata source for discovery enrichment, route planning, and workflow route checks. The live MCP registry remains the authority for availability: a catalog entry never makes an unregistered tool selectable.
+
+`core/execution_router.py` is a pure decision layer:
+
+```text
+structured execution intent
+    -> registered candidate generation
+    -> platform/capability filtering
+    -> hard safety constraints
+    -> deterministic-v1 ranking
+    -> explainable route decision
+```
+
+The router does not launch applications, take screenshots, execute commands, mutate files, or perform external probes while choosing a route. Candidate availability comes only from the registered tool names supplied by the current MCP server and the supplied platform capability snapshot.
+
+The initial policy ranks valid candidates lexicographically by stronger determinism, recoverability, lower side-effect risk, capability confidence, lower cost/latency tiers, and stable route/tool tie-breakers. Hard constraints run first and cannot be overridden by ranking. In particular, stale semantic references do not fall back to coordinates, destructive ambiguous semantic actions fail closed, raw desktop requires explicit permission and is forbidden for destructive fallback, and document fidelity constraints such as macro preservation eliminate routes that cannot prove them.
+
+Public APIs are read-only `execution_candidates` and `execution_recommend`. v0.7 deliberately has no universal `execution_run` dispatcher. `visual.desktop` is reserved but unavailable until the visual-grounding phase.
+
 ## Platform capability model
 
 The runtime does not pretend every host provides identical features.
@@ -75,7 +96,7 @@ Its data model is split so frequent refreshes stay lightweight while detailed vi
 - transport diagnosis/history plus confirmed poll-stall recovery state;
 - Recent Jobs with bounded incremental/downloadable output and guarded cancellation;
 - Recent Operations with searchable/filterable audit metadata and full-target inspection;
-- workflow, recovery, tool-activity, process, Doctor, and diagnostics views.
+- workflow, recovery, execution-routing, tool-activity, process, Doctor, and diagnostics views.
 
 Generation-scoped runtime-health and tool-activity snapshots let the Supervisor observe the live MCP process without constructing a second MCP server. Audit/transport records are metadata-only and are bounded by retention/rotation settings.
 
@@ -124,7 +145,12 @@ Workflows persist:
 - leases;
 - events;
 - cancellation;
-- reconciliation evidence.
+- reconciliation evidence;
+- optional structured execution intent;
+- selected execution route and router policy version;
+- compact route decision metadata and bounded fallback history.
+
+For routed steps, the route decision is persisted before the operation enters the side-effect path and must match the fixed allowlisted workflow action route. A safe retry may record a capability-driven route change before a new side effect, but an uncertain operation is never rerouted or replayed until reconciliation conclusively resolves the existing effect.
 
 Built-in plans include `implement_and_verify`, `safe_git_commit`, and `prepare_release`.
 

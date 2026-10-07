@@ -26,6 +26,7 @@ The portable core includes:
 - durable jobs;
 - recovery;
 - workflows;
+- deterministic adaptive execution routing over the tools actually registered on that host/profile;
 - project memory;
 - process/system inspection with platform adapters;
 - browser automation when Playwright is installed;
@@ -54,7 +55,7 @@ Linux/macOS use:
 - Linux service/software adapters such as systemd/SysV/package-manager discovery where available;
 - macOS launchd/application/system metadata adapters.
 
-Native Windows desktop/UIA tools are not emulated on POSIX hosts. Browser automation is the portable UI path.
+Native Windows desktop/UIA tools are not emulated on POSIX hosts. Browser automation is the portable UI path. The execution router therefore excludes `semantic.windows_uia` and `raw.desktop` candidates on hosts where their required capabilities/tools are unavailable instead of pretending the fallback exists.
 
 ## Package targets vs native runtime validation
 

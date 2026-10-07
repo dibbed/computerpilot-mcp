@@ -172,6 +172,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
         assert len(names) == 150
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
+    assert "execution_run" not in names
     for tool in tools:
         assert tool.input_schema["type"] == "object"
         assert tool.input_schema["additionalProperties"] is False
