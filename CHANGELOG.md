@@ -6,6 +6,8 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-07
+
 ### Added
 - Add the v0.7 Adaptive Execution Router with a shared execution metadata catalog, structured intent model, bounded `execution_candidates`, and read-only `execution_recommend` diagnostics.
 - Add deterministic `deterministic-v1` route ranking across native filesystem/code/Git/process/system/document routes, semantic browser/UIA routes, and explicitly permitted raw desktop fallback.
