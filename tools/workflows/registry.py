@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from dataclasses import asdict
@@ -13,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from core.audit import audit_action
 from core.config import SETTINGS
 from core.errors import ToolError
+from core.execution_router import ExecutionRouter
+from core.platform import detect_capabilities
 from core.tooling import MUTATING, READ_ONLY, compact_errors
 from core.workflow_actions import get_action_descriptor, validate_workflow_definition
 from core.workflow_models import OperationState
@@ -20,6 +23,17 @@ from core.workflow_reconciliation import acknowledge_operation, reconcile_operat
 from core.workflow_store import redact_inputs
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, workflow_store
 from tools.workflows.builtins import builtin_workflow
+
+
+class ExecutionIntentInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=200)
+    destructive: bool = False
+    semantic_ambiguous: bool = False
+    semantic_stale: bool = False
+    requires_macro_preservation: bool = False
+    allow_raw_desktop: bool = False
+    preferred_tool: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class StepInput(BaseModel):
@@ -30,6 +44,7 @@ class StepInput(BaseModel):
     timeout_sec: float = Field(default=300, gt=0, le=3_600)
     max_retries: int = Field(default=0, ge=0, le=10)
     postcondition: dict[str, Any] | None = None
+    execution_intent: ExecutionIntentInput | None = None
 
 
 class WorkflowInput(BaseModel):
@@ -120,7 +135,7 @@ def register(mcp: MCPServer) -> None:
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("workflow_execute")
-    def workflow_execute(
+    async def workflow_execute(
         workflow_id: Annotated[str, Field(min_length=1, max_length=128)],
         expected_version: Annotated[int, Field(ge=1)],
         dry_run: bool = False,
@@ -143,7 +158,22 @@ def register(mcp: MCPServer) -> None:
                 "required_postconditions": summary["required_postconditions"],
                 "estimated_max_runtime_sec": summary["estimated_max_runtime_sec"],
             }
-        result = WorkflowExecutor(store).execute(
+        registered_tools = frozenset(tool.name for tool in await mcp.list_tools())
+        router = ExecutionRouter(
+            registered_tools=registered_tools,
+            capabilities=detect_capabilities(),
+            policy_version=SETTINGS.execution_router_policy,
+            enabled=SETTINGS.execution_router_enabled,
+        )
+        def route_planner(intent: Any) -> dict[str, Any]:
+            return router.recommend(
+                intent,
+                explain=SETTINGS.execution_router_explain,
+            )
+
+        executor = WorkflowExecutor(store, route_planner=route_planner)
+        result = await asyncio.to_thread(
+            executor.execute,
             workflow_id,
             owner_id=_mcp_owner_id(),
             dry_run=False,

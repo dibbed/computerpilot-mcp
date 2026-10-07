@@ -6,6 +6,22 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+### Added
+- Add the v0.7 Adaptive Execution Router with a shared execution metadata catalog, structured intent model, bounded `execution_candidates`, and read-only `execution_recommend` diagnostics.
+- Add deterministic `deterministic-v1` route ranking across native filesystem/code/Git/process/system/document routes, semantic browser/UIA routes, and explicitly permitted raw desktop fallback.
+- Add hard route safety constraints for profile/platform capability loss, destructive ambiguity, stale semantic refs, raw-desktop permission/destructive fallback, macro-preservation fidelity, and reserved visual routing.
+- Add durable workflow execution-intent, selected-route, policy-version, decision, and bounded fallback-history persistence in workflow schema v6; routed workflow actions persist and validate their route before side effects.
+- Add bounded routing metrics to `server_health` and an English-only Execution Routing section in the loopback Control Panel.
+
+### Changed
+- Enrich `recommend_tools` with execution metadata from the same shared catalog used by the router while retaining its existing keyword scoring/order.
+- Route workflow execution through the actual registered MCP tool catalog and current platform capabilities; workflows without `execution_intent` retain their existing behavior.
+- Keep uncertain workflow effects reconciliation-only: the router never blindly reroutes or replays an uncertain side effect.
+- Increase the Windows full-profile catalog from 148 to 150 tools by adding the two read-only router diagnostics.
+
+### Fixed
+- Close OpenPyXL/VBA archive handles explicitly so macro-enabled workbook validation does not leak a ZipFile finalizer warning under full-suite execution.
+
 ## [0.6.0] - 2026-10-01
 
 ### Added

@@ -63,6 +63,7 @@ For Secure Tunnel mode, browser setup, release archives, and platform-specific n
 | Browser | Playwright sessions, bounded semantic snapshots/queries, generation-scoped refs, semantic click/fill/select/waits, tabs, extraction, controlled upload/download, screenshots, isolated contexts, shared compatible browser processes |
 | Windows desktop | native screenshots, mouse/keyboard input, semantic UI Automation with bounded locators |
 | Recovery & workflows | mutation journal, evidence-based reconciliation, durable workflow plans, optimistic versions, leases, restart recovery, bounded retries |
+| Adaptive execution routing | deterministic route candidates/recommendations across native, semantic, and explicitly allowed raw-desktop paths; hard safety constraints and explainable policy metadata |
 | Operations | CPU/memory/disk/process/service/software inspection, health/resource budgets, local control panel, supervised restart/stop |
 | Project memory | bounded versioned records with provenance and optimistic revisions |
 | Secure Tunnel | verified managed runtime download/update, pinning, checksums, version validation, managed offline cache |
@@ -176,13 +177,45 @@ The default `full` profile preserves the complete catalog. Smaller profiles redu
 
 `minimal`, `coding`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, `full`.
 
-`discover_tool_domains` reports the current profile and platform capabilities. `recommend_tools` ranks tools that are actually registered in the active profile.
+`discover_tool_domains` reports the current profile and platform capabilities. `recommend_tools` ranks tools that are actually registered in the active profile and enriches recognized tools with shared execution-route metadata. The read-only `execution_candidates` and `execution_recommend` diagnostics use that same registered catalog; metadata alone cannot make an unavailable tool routable.
 
 Set a profile with:
 
 ```text
 MCP_TOOL_PROFILE=coding
 ```
+
+## Adaptive Execution Routing
+
+The v0.7 routing layer is a **decision layer**, not a universal dispatcher. It receives a structured intent, generates candidates only from tools registered in the active MCP profile, filters platform/capability and safety constraints, and applies the versioned deterministic policy `deterministic-v1`.
+
+Initial route classes are:
+
+- native: filesystem, code/LSP, Git, process, system, Excel, DOCX, and PDF;
+- semantic: browser and Windows UI Automation;
+- `raw.desktop`, only when the request explicitly permits raw desktop fallback and the action is not destructive;
+- `visual.desktop`, reserved for a later visual-grounding phase and unavailable in v0.7.
+
+The public diagnostics are read-only:
+
+```text
+execution_candidates
+execution_recommend
+```
+
+There is intentionally no `execution_run` or hidden arbitrary-action dispatcher. Hard constraints run before ranking: unsupported platform/profile routes are excluded, stale semantic references never degrade to coordinates, destructive ambiguous semantic targets fail closed, destructive raw-desktop fallback is forbidden, and fidelity requirements such as Excel macro preservation cannot be overridden by ranking.
+
+A workflow step may optionally persist a bounded `execution_intent`. Its selected route, router policy version, compact decision metadata, and bounded fallback history are stored before the side effect begins. If an operation becomes uncertain, the existing evidence/reconciliation path remains authoritative; the router does not blindly reroute and replay it.
+
+Router configuration:
+
+```text
+MCP_EXECUTION_ROUTER_ENABLED=1
+MCP_EXECUTION_ROUTER_POLICY=deterministic-v1
+MCP_EXECUTION_ROUTER_EXPLAIN=1
+```
+
+Runtime health and the loopback Control Panel expose bounded route distribution, fallback/no-route counts, native/semantic/raw usage, latency, and recent decisions without storing raw prompts, document contents, screenshots, credentials, or secrets.
 
 ## Secure Tunnel Mode
 

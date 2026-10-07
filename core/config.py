@@ -34,6 +34,9 @@ class Settings:
     server_name: str = "ali_windows_agent_mcp"
     version: str = "0.6.0"
     tool_profile: str = os.getenv("MCP_TOOL_PROFILE", "full")
+    execution_router_enabled: bool = _env_bool("MCP_EXECUTION_ROUTER_ENABLED", True)
+    execution_router_policy: str = os.getenv("MCP_EXECUTION_ROUTER_POLICY", "deterministic-v1").strip().casefold() or "deterministic-v1"
+    execution_router_explain: bool = _env_bool("MCP_EXECUTION_ROUTER_EXPLAIN", True)
     default_list_limit: int = _env_int("MCP_DEFAULT_LIST_LIMIT", 50, 1, 500)
     max_list_limit: int = _env_int("MCP_MAX_LIST_LIMIT", 500, 10, 5_000)
     max_file_write_chars: int = _env_int("MCP_MAX_FILE_WRITE_CHARS", 2_000_000, 1_024, 20_000_000)

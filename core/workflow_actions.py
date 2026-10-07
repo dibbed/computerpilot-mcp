@@ -16,8 +16,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from core.config import resolve_path
 from core.errors import ToolError
+from core.execution_models import ExecutionIntent
 from core.job_scheduler import ensure_job_scheduler
 from core.jobs import JobStore
+from core.tool_catalog import intent_route_rules
 from core.workflow_models import WorkflowDefinition
 from tools.filesystem.patches import apply_patch_transaction
 from tools.testing.impact import select_affected_tests
@@ -121,6 +123,7 @@ class ActionDescriptor:
     secret_fields: frozenset[str] = frozenset()
     cancel_mode: Literal["immediate", "cooperative", "deferred"] = "deferred"
     availability: Literal["available", "disabled", "adapter_required", "platform_unavailable"] = "available"
+    execution_route: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,13 +369,29 @@ ACTION_HANDLERS: dict[str, ActionHandler] = {
 
 ACTION_DESCRIPTORS: dict[str, ActionDescriptor] = {
     "apply_patch": ActionDescriptor(
-        "apply_patch", ApplyPatchInput, _apply_patch, True, "never", frozenset({"patch_effect_intent"})
+        "apply_patch", ApplyPatchInput, _apply_patch, True, "never", frozenset({"patch_effect_intent"}),
+        execution_route="native.filesystem",
     ),
-    "affected_tests": ActionDescriptor("affected_tests", AffectedTestsInput, _affected_tests, False, "never", frozenset()),
-    "verify_changes": ActionDescriptor("verify_changes", VerifyChangesInput, _verify_changes, False, "never", frozenset()),
-    "git_status": ActionDescriptor("git_status", GitStatusInput, _git_status, False, "transient", frozenset()),
-    "git_stage": ActionDescriptor("git_stage", GitStageInput, _git_stage, True, "never", frozenset({"git_stage_intent"})),
-    "git_commit": ActionDescriptor("git_commit", GitCommitInput, _git_commit, True, "never", frozenset({"git_commit_intent"})),
+    "affected_tests": ActionDescriptor(
+        "affected_tests", AffectedTestsInput, _affected_tests, False, "never", frozenset(),
+        execution_route="native.code",
+    ),
+    "verify_changes": ActionDescriptor(
+        "verify_changes", VerifyChangesInput, _verify_changes, False, "never", frozenset(),
+        execution_route="native.code",
+    ),
+    "git_status": ActionDescriptor(
+        "git_status", GitStatusInput, _git_status, False, "transient", frozenset(),
+        execution_route="native.git",
+    ),
+    "git_stage": ActionDescriptor(
+        "git_stage", GitStageInput, _git_stage, True, "never", frozenset({"git_stage_intent"}),
+        execution_route="native.git",
+    ),
+    "git_commit": ActionDescriptor(
+        "git_commit", GitCommitInput, _git_commit, True, "never", frozenset({"git_commit_intent"}),
+        execution_route="native.git",
+    ),
     "run_durable_job": ActionDescriptor(
         "run_durable_job",
         DurableJobInput,
@@ -382,16 +401,22 @@ ACTION_DESCRIPTORS: dict[str, ActionDescriptor] = {
         frozenset({"job_request_key_intent"}),
         frozenset(),
         "cooperative",
+        execution_route="native.process",
     ),
-    "check_file": ActionDescriptor("check_file", CheckFileInput, _check_file, False, "never", frozenset()),
+    "check_file": ActionDescriptor(
+        "check_file", CheckFileInput, _check_file, False, "never", frozenset(),
+        execution_route="native.filesystem",
+    ),
     "check_http": ActionDescriptor("check_http", CheckHttpInput, _check_http, False, "transient", frozenset()),
     "desktop_semantic_action": ActionDescriptor(
         "desktop_semantic_action", SemanticActionInput, _adapter_required, True, "never",
         frozenset({"ui_element_state"}), availability="adapter_required",
+        execution_route="semantic.windows_uia",
     ),
     "browser_action": ActionDescriptor(
         "browser_action", BrowserActionInput, _adapter_required, True, "never",
         frozenset({"browser_state"}), availability="adapter_required",
+        execution_route="semantic.browser",
     ),
 }
 
@@ -443,6 +468,15 @@ def validate_operation(
 def validate_workflow_definition(definition: WorkflowDefinition) -> None:
     for step in definition.steps:
         validate_operation(step.action, step.arguments, step.postcondition)
+        if step.execution_intent is not None:
+            try:
+                intent = ExecutionIntent(**step.execution_intent)
+            except (TypeError, ValueError) as exc:
+                raise ToolError(
+                    "invalid_execution_intent",
+                    f"Invalid execution intent for step {step.name!r}: {exc}",
+                ) from exc
+            intent_route_rules(intent.name)
 
 
 def prepare_action_intent(

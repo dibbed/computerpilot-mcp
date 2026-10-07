@@ -61,6 +61,7 @@ cloudflared-*.tar.gz
 # Local development workflows and temporary documentation
 docs/superpowers/
 docs/roadmap/
+.worktrees/
 
 # Local SQLite databases and write-ahead logs
 # Also ignore rollback-journal variants created by non-WAL SQLite connections.

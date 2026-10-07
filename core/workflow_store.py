@@ -25,7 +25,9 @@ from core.workflow_models import (
     validate_workflow_transition,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+_ROUTE_HISTORY_MAX = 20
+_ROUTE_JSON_MAX_CHARS = 16_000
 _SECRET_MARKERS = (
     "password",
     "secret",
@@ -186,6 +188,10 @@ class WorkflowStore:
                         version = 4
                     if version < 5:
                         self._migrate_v5(connection)
+                        version = 5
+                    if version < 6:
+                        self._migrate_v6(connection)
+                        version = 6
             if version > SCHEMA_VERSION:
                 raise ToolError(
                     "workflow_schema_too_new",
@@ -331,6 +337,23 @@ class WorkflowStore:
         )
 
     @staticmethod
+    def _migrate_v6(connection: sqlite3.Connection) -> None:
+        """Persist execution-router intent, decision, policy, and fallback history."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflow_operations ADD COLUMN execution_intent_json TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN selected_route TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN router_policy_version TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN route_decision_json TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN fallback_history_json TEXT;
+            PRAGMA user_version = 6;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
     def _definition_json(definition: WorkflowDefinition) -> str:
         return _canonical(public_workflow_projection(asdict(definition)))
 
@@ -357,6 +380,8 @@ class WorkflowStore:
             "max_retries": int(step.get("max_retries", 0)),
             "postcondition": step.get("postcondition"),
         }
+        if step.get("execution_intent") is not None:
+            payload["execution_intent"] = step["execution_intent"]
         return payload, _digest(payload), arguments_fingerprint
 
     @classmethod
@@ -417,8 +442,9 @@ class WorkflowStore:
                     operation_id, workflow_id, step_index, operation_index, action,
                     definition_hash, idempotency_key, state, attempts, version,
                     arguments_fingerprint, postcondition_json, result_json, evidence_json,
-                    recovery_operation_id, started_at, updated_at, finished_at, error
-                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, NULL, ?, ?, ?, ?)
+                    recovery_operation_id, started_at, updated_at, finished_at, error,
+                    execution_intent_json
+                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?)
                 """,
                 (
                     operation_id,
@@ -436,6 +462,11 @@ class WorkflowStore:
                     workflow["updated_at"],
                     step_row["finished_at"],
                     step_row["error"],
+                    (
+                        _canonical(payload["execution_intent"])
+                        if payload.get("execution_intent") is not None
+                        else None
+                    ),
                 ),
             )
             connection.execute(
@@ -646,9 +677,14 @@ class WorkflowStore:
             for key in (
                 "postcondition_json", "result_json", "evidence_json",
                 "intent_evidence_json", "external_ref_json", "reconciliation_evidence_json",
+                "execution_intent_json", "route_decision_json", "fallback_history_json",
             ):
                 raw = item.pop(key)
-                item[key.removesuffix("_json")] = json.loads(raw) if raw else None
+                public_key = key.removesuffix("_json")
+                if key == "fallback_history_json":
+                    item[public_key] = json.loads(raw) if raw else []
+                else:
+                    item[public_key] = json.loads(raw) if raw else None
             items.append(item)
         return {
             "items": items,
@@ -675,10 +711,148 @@ class WorkflowStore:
         for key in (
             "postcondition_json", "result_json", "evidence_json",
             "intent_evidence_json", "external_ref_json", "reconciliation_evidence_json",
+            "execution_intent_json", "route_decision_json", "fallback_history_json",
         ):
             raw = item.pop(key)
-            item[key.removesuffix("_json")] = json.loads(raw) if raw else None
+            public_key = key.removesuffix("_json")
+            if key == "fallback_history_json":
+                item[public_key] = json.loads(raw) if raw else []
+            else:
+                item[public_key] = json.loads(raw) if raw else None
         return item
+
+    def record_route_decision(
+        self,
+        operation_id: str,
+        *,
+        lease_token: str,
+        selected_route: str,
+        router_policy_version: str,
+        decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a bounded route decision before an operation side effect begins."""
+
+        selected_route = selected_route.strip()
+        router_policy_version = router_policy_version.strip()
+        if not selected_route or len(selected_route) > 200:
+            raise ToolError("invalid_selected_route", "selected_route must contain between 1 and 200 characters.")
+        if not router_policy_version or len(router_policy_version) > 100:
+            raise ToolError(
+                "invalid_router_policy_version",
+                "router_policy_version must contain between 1 and 100 characters.",
+            )
+        redacted_decision = redact_inputs(decision)
+        decision_json = _canonical(redacted_decision)
+        if len(decision_json) > _ROUTE_JSON_MAX_CHARS:
+            raise ToolError(
+                "route_decision_too_large",
+                f"Route decision exceeds the {_ROUTE_JSON_MAX_CHARS}-character persistence limit.",
+            )
+
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT workflow_id, step_index, state, execution_intent_json,
+                       selected_route, router_policy_version, route_decision_json,
+                       fallback_history_json
+                FROM workflow_operations WHERE operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            if row["execution_intent_json"] is None:
+                raise ToolError(
+                    "workflow_execution_intent_missing",
+                    "Route metadata can only be recorded for a step with an execution intent.",
+                )
+            if str(row["state"]) not in {
+                OperationState.CREATED.value,
+                OperationState.FAILED.value,
+                OperationState.WAITING.value,
+            }:
+                raise ToolError(
+                    "workflow_route_locked",
+                    "Route selection is locked after execution begins or the operation becomes terminal/uncertain.",
+                )
+
+            workflow_id = str(row["workflow_id"])
+            lease = connection.execute(
+                "SELECT lease_token, expires_at FROM workflow_leases WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+            if lease is None or str(lease["lease_token"]) != lease_token:
+                raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+            if str(lease["expires_at"]) <= now:
+                raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
+
+            try:
+                history = list(json.loads(str(row["fallback_history_json"]))) if row["fallback_history_json"] else []
+            except (TypeError, ValueError):
+                history = []
+            previous_route = str(row["selected_route"]) if row["selected_route"] else None
+            if previous_route is not None and previous_route != selected_route:
+                previous_decision = (
+                    json.loads(str(row["route_decision_json"]))
+                    if row["route_decision_json"]
+                    else {}
+                )
+                history.append(
+                    {
+                        "selected_route": previous_route,
+                        "router_policy_version": (
+                            str(row["router_policy_version"])
+                            if row["router_policy_version"]
+                            else None
+                        ),
+                        "representative_tool": previous_decision.get("representative_tool"),
+                        "fallback_level": previous_decision.get("fallback_level"),
+                    }
+                )
+                history = history[-_ROUTE_HISTORY_MAX:]
+
+            connection.execute(
+                """
+                UPDATE workflow_operations
+                SET selected_route = ?, router_policy_version = ?, route_decision_json = ?,
+                    fallback_history_json = ?, updated_at = ?, version = version + 1
+                WHERE operation_id = ?
+                """,
+                (
+                    selected_route,
+                    router_policy_version,
+                    decision_json,
+                    _canonical(history),
+                    now,
+                    operation_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events(
+                    workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workflow_id,
+                    int(row["step_index"]),
+                    operation_id,
+                    "route_changed" if previous_route and previous_route != selected_route else "route_selected",
+                    str(row["state"]),
+                    _canonical(
+                        {
+                            "selected_route": selected_route,
+                            "router_policy_version": router_policy_version,
+                            "fallback_count": len(history),
+                        }
+                    ),
+                    now,
+                ),
+            )
+            connection.commit()
+        return self.get_operation(operation_id)
 
     def update_operation_context(
         self,

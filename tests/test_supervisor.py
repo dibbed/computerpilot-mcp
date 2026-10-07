@@ -370,6 +370,16 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         assert '<div class="grid two">' not in html[diagnostics_index:transport_index]
         assert "Runtime Health" in html
         assert "Tool Activity" in html
+        assert "Execution Routing" in html
+        assert 'id="routingPill"' in html
+        assert 'id="routingPolicy"' in html
+        assert 'id="routingDecisions"' in html
+        assert 'id="routingFallbacks"' in html
+        assert 'id="routingRejected"' in html
+        assert 'id="routingDistribution"' in html
+        assert 'id="routingRecentRows"' in html
+        assert "renderExecutionRouting" in html
+        assert "execution_router" in html
         assert "Browser Runtime" in html
         assert "Slowest Tools" in html
         assert "System Doctor" in html

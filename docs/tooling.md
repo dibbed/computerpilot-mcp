@@ -22,7 +22,32 @@ Set:
 MCP_TOOL_PROFILE=<profile>
 ```
 
-`discover_tool_domains` reports the requested/active domains and platform capabilities. `recommend_tools` searches only the tools actually registered in the active profile.
+`discover_tool_domains` reports the requested/active domains and platform capabilities. `recommend_tools` searches only the tools actually registered in the active profile and attaches shared execution metadata when known.
+
+## Adaptive execution routing
+
+Use the routing diagnostics when an agent or workflow needs to decide *how* an intent should be executed without executing it yet:
+
+- `execution_candidates`: returns a bounded set of valid and rejected candidate routes with capability checks and machine-readable rejection reasons;
+- `execution_recommend`: returns one deterministic, explainable recommendation plus bounded candidate details when explanation is enabled.
+
+Supported initial structured intents are:
+
+`filesystem.read`, `filesystem.write`, `code.rename`, `git.read`, `git.write`, `process.run`, `system.inspect`, `document.excel.read`, `document.excel.write`, `document.docx.read`, `document.docx.write`, `document.pdf.read`, `document.pdf.create`, `browser.interact`, `desktop.semantic.interact`, and `desktop.raw.interact`.
+
+The initial route classes are `native.filesystem`, `native.code`, `native.git`, `native.process`, `native.system`, `native.excel`, `native.docx`, `native.pdf`, `semantic.browser`, `semantic.windows_uia`, reserved `visual.desktop`, and `raw.desktop`.
+
+`deterministic-v1` is rule/metadata based; it does not use an opaque model score. Exact structured routes are preferred over semantic UI routes and raw coordinates when all are valid. Unsupported profile/platform routes are removed before ranking.
+
+Hard safety rules include:
+
+- raw desktop must be explicitly permitted and cannot be auto-selected for destructive work;
+- stale semantic references cannot fall back to coordinates;
+- destructive ambiguous semantic targets fail closed;
+- macro-preservation requirements exclude routes that cannot prove fidelity;
+- `visual.desktop` is unavailable in v0.7.
+
+There is intentionally no `execution_run` tool in v0.7. The selected route still resolves to existing typed tools and their existing validation, lifecycle, audit, recovery, and permission behavior.
 
 ## Filesystem and editing
 
@@ -169,7 +194,7 @@ workflow_execute
 workflow_status / workflow_operations
 ```
 
-If an operation becomes uncertain, reconcile it before resuming.
+If an operation becomes uncertain, reconcile it before resuming. A step may also declare a bounded `execution_intent`; the workflow store persists the selected route/policy/decision before execution and preserves bounded fallback history. Uncertain operations are not rerouted or replayed by the router.
 
 Built-in plans:
 
@@ -254,12 +279,12 @@ Use it to inspect:
 - resource/storage budgets and performance summaries;
 - Recent Jobs, including status, command/cwd metadata, bounded stdout/stderr, and guarded cancellation;
 - Recent Operations, including search, outcome filters, paging, target inspection, and safe audit metadata;
-- transport history, workflow/recovery state, tool activity, Doctor checks, and redacted diagnostics export.
+- transport history, workflow/recovery state, execution-routing distribution/recent decisions, tool activity, Doctor checks, and redacted diagnostics export.
 
 Detailed panel endpoints are control-token guarded. The panel is intended for loopback use, not direct untrusted-network exposure.
 
 ## Health and discovery
 
-`server_health` reports runtime/platform capability state plus resource/job/browser/workflow/recovery summaries.
+`server_health` reports runtime/platform capability state plus resource/job/browser/workflow/recovery summaries and a bounded in-memory `execution_router` snapshot with policy, route distribution, fallback/no-route/rejection counts, native/semantic/raw usage, latency, and recent decisions.
 
 Use health metadata for diagnostics, not as a substitute for validating the external effect you care about.

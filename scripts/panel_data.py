@@ -475,6 +475,9 @@ def config_snapshot() -> dict[str, Any]:
 
     keys = (
         "tool_profile",
+        "execution_router_enabled",
+        "execution_router_policy",
+        "execution_router_explain",
         "ast_cache_max_files",
         "ast_cache_max_bytes",
         "search_snapshot_ttl_sec",

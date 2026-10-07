@@ -269,3 +269,44 @@ def test_wal_is_configured_at_startup_and_not_repeated_on_each_read(
     assert wal_setups == 1
     with original_connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_v5_database_migrates_route_columns_without_losing_legacy_data(tmp_path: Path) -> None:
+    path = tmp_path / "v5.db"
+    _seed_v024_database(path)
+    with sqlite3.connect(path) as connection:
+        WorkflowStore._migrate_v1(connection)
+        WorkflowStore._migrate_v2(connection)
+        WorkflowStore._migrate_v3(connection)
+        WorkflowStore._migrate_v4(connection)
+        WorkflowStore._migrate_v5(connection)
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+
+    store = WorkflowStore(path)
+    migrated = store.get("legacy-workflow")
+    operations = store.list_operations("legacy-workflow")
+
+    assert SCHEMA_VERSION == 6
+    assert migrated["state"] == "completed"
+    assert migrated["version"] == 7
+    assert operations["total_count"] == 1
+    operation = operations["items"][0]
+    assert operation["execution_intent"] is None
+    assert operation["selected_route"] is None
+    assert operation["router_policy_version"] is None
+    assert operation["route_decision"] is None
+    assert operation["fallback_history"] == []
+
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_operations)").fetchall()
+        }
+        assert {
+            "execution_intent_json",
+            "selected_route",
+            "router_policy_version",
+            "route_decision_json",
+            "fallback_history_json",
+        } <= columns
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

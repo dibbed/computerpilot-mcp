@@ -8,6 +8,7 @@ import pytest
 from mcp import Client
 
 from core import registry
+from core.config import Settings
 from core.errors import ToolError
 from core.tool_profiles import PROFILE_DOMAINS, resolve_profile
 
@@ -25,7 +26,7 @@ def test_full_is_default_and_preserves_complete_catalog() -> None:
     assert resolve_profile(None).name == "full"
     names = _names("full")
     if os.name == "nt":
-        assert len(names) == 148
+        assert len(names) == 150
     else:
         assert "run_shell" in names
         assert "run_cmd" not in names
@@ -54,7 +55,7 @@ def test_minimal_profile_does_not_register_workflow_tools() -> None:
 def test_every_named_profile_is_nonempty_and_keeps_discovery() -> None:
     for profile in PROFILE_DOMAINS:
         names = _names(profile)
-        assert {"discover_tool_domains", "recommend_tools", "server_health"} <= names
+        assert {"discover_tool_domains", "recommend_tools", "execution_candidates", "execution_recommend", "server_health"} <= names
 
 
 def test_invalid_profile_fails_startup_with_guidance() -> None:
@@ -78,3 +79,78 @@ def test_discovery_reports_active_profile_and_recommends_registered_tools() -> N
         asyncio.run(scenario())
     finally:
         registry.SETTINGS = original
+
+
+def test_router_settings_have_safe_defaults() -> None:
+    assert registry.SETTINGS.execution_router_enabled is True
+    assert registry.SETTINGS.execution_router_policy == "deterministic-v1"
+    assert registry.SETTINGS.execution_router_explain is True
+
+
+def test_router_diagnostics_use_registered_profile_and_enrich_recommendations() -> None:
+    original = registry.SETTINGS
+    registry.SETTINGS = replace(original, tool_profile="documents")
+
+    async def scenario() -> None:
+        async with Client(registry.create_server()) as client:
+            recommendation = await client.call_tool(
+                "execution_recommend",
+                {"intent": "document.excel.write", "allow_raw_desktop": True},
+            )
+            assert recommendation.structured_content
+            assert recommendation.structured_content["selected_route"] == "native.excel"
+            assert recommendation.structured_content["representative_tool"] == "excel_write_range"
+
+            candidates = await client.call_tool(
+                "execution_candidates",
+                {"intent": "document.excel.write", "max_candidates": 25, "allow_raw_desktop": True},
+            )
+            assert candidates.structured_content
+            by_route = {item["route"]: item for item in candidates.structured_content["items"]}
+            assert by_route["native.excel"]["supported"] is True
+            assert by_route["semantic.windows_uia"]["supported"] is False
+            assert by_route["semantic.windows_uia"]["rejection_code"] == "tool_unavailable"
+
+            recommendations = await client.call_tool("recommend_tools", {"query": "transactional patch"})
+            assert recommendations.structured_content
+            patch = next(
+                item for item in recommendations.structured_content["items"]
+                if item["name"] == "apply_patch"
+            )
+            assert patch["execution"]["route"] == "native.filesystem"
+            assert patch["execution"]["determinism"] == 5
+            assert patch["execution"]["recoverability"] == "strong"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.SETTINGS = original
+
+
+def test_disabled_and_unknown_policy_router_fail_as_structured_tool_errors() -> None:
+    async def call_with(settings: Settings) -> tuple[dict[str, object], dict[str, object]]:
+        original = registry.SETTINGS
+        registry.SETTINGS = settings
+        try:
+            async with Client(registry.create_server()) as client:
+                recommended = await client.call_tool("execution_recommend", {"intent": "filesystem.read"})
+                candidates = await client.call_tool("execution_candidates", {"intent": "filesystem.read"})
+                assert isinstance(recommended.structured_content, dict)
+                assert isinstance(candidates.structured_content, dict)
+                return recommended.structured_content, candidates.structured_content
+        finally:
+            registry.SETTINGS = original
+
+    disabled = replace(registry.SETTINGS, execution_router_enabled=False)
+    recommended, candidates = asyncio.run(call_with(disabled))
+    assert recommended["ok"] is False
+    assert recommended["error"] == "execution_router_disabled"
+    assert candidates["ok"] is False
+    assert candidates["error"] == "execution_router_disabled"
+
+    unsupported = replace(registry.SETTINGS, execution_router_policy="mystery-v9")
+    recommended, candidates = asyncio.run(call_with(unsupported))
+    assert recommended["ok"] is False
+    assert recommended["error"] == "unsupported_router_policy"
+    assert candidates["ok"] is False
+    assert candidates["error"] == "unsupported_router_policy"

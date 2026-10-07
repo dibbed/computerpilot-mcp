@@ -56,6 +56,7 @@ class StepDefinition:
     timeout_sec: float = 300
     max_retries: int = 0
     postcondition: dict[str, Any] | None = None
+    execution_intent: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

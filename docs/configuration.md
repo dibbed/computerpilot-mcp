@@ -10,10 +10,13 @@ This page highlights the settings most users are likely to change.
 | --- | --- | --- |
 | `MCP_START_MODE` | `tunnel` or `local-http` | `tunnel` |
 | `MCP_TOOL_PROFILE` | active catalog profile | `full` |
+| `MCP_EXECUTION_ROUTER_ENABLED` | enable read-only adaptive route diagnostics and routed workflow planning | enabled |
+| `MCP_EXECUTION_ROUTER_POLICY` | versioned deterministic routing policy | `deterministic-v1` |
+| `MCP_EXECUTION_ROUTER_EXPLAIN` | include bounded candidate explanations in recommendations | enabled |
 | `CONTROL_PLANE_API_KEY` | tunnel control-plane credential | unset |
 | `MCP_TUNNEL_PROFILE` | explicit tunnel profile | auto-detected / `default` |
 
-Named tool profiles are `minimal`, `coding`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, and `full`. The `documents` profile keeps filesystem, native document, recovery, and workflow domains together.
+Named tool profiles are `minimal`, `coding`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, and `full`. The `documents` profile keeps filesystem, native document, recovery, and workflow domains together. Router candidate generation always uses the tools actually registered in the selected profile; catalog metadata does not bypass profile or platform filtering. Unsupported router policy names fail closed only when router APIs/routed steps are invoked and do not prevent the MCP server from starting.
 
 ## Managed tunnel runtime
 
