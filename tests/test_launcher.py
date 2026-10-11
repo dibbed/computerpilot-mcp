@@ -17,16 +17,22 @@ def test_launcher_restarts_then_honors_interrupt(tmp_path: Path, first_exit: int
     scripts = project / "scripts"
     scripts.mkdir(parents=True)
     shutil.copyfile(Path(__file__).resolve().parents[1] / "START_MCP.bat", project / "START_MCP.bat")
-    (scripts / "bootstrap.ps1").write_text(
-        "param([switch]$Start)\n"
-        "if (-not $Start) { exit 99 }\n"
-        "$marker = Join-Path $PSScriptRoot 'attempts.txt'\n"
-        "if (Test-Path -LiteralPath $marker) {\n"
-        "    Add-Content -LiteralPath $marker -Value 'second'\n"
-        "    exit 130\n"
-        "}\n"
-        "Set-Content -LiteralPath $marker -Value 'first'\n"
-        f"exit {first_exit}\n",
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", str(project / ".venv")],
+        check=True,
+        capture_output=True,
+        timeout=40,
+    )
+    (scripts / "__init__.py").write_text("", encoding="utf-8")
+    (scripts / "bootstrap.py").write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "if '--start' not in sys.argv: raise SystemExit(99)\n"
+        "marker = Path('scripts/attempts.txt')\n"
+        "if marker.exists():\n"
+        "    with marker.open('a', encoding='utf-8') as stream: stream.write('second\\n')\n"
+        "    raise SystemExit(130)\n"
+        f"marker.write_text('first\\n', encoding='utf-8'); raise SystemExit({first_exit})\n",
         encoding="utf-8",
     )
     started = time.monotonic()

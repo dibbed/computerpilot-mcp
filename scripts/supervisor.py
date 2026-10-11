@@ -10,6 +10,7 @@ import logging.handlers
 import os
 import secrets
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -134,8 +135,12 @@ class Supervisor:
         if self.drain_timeout <= 0 or self.watchdog_drain_timeout <= 0:
             raise ValueError("Supervisor drain timeouts must be positive.")
         self.stop = threading.Event()
+        self.force_stop = threading.Event()
         self.restart = threading.Event()
-        self.lock = threading.Lock()
+        # SIGINT is handled on the main thread and can interrupt code that already
+        # holds this lock, so console shutdown must be re-entrant.
+        self.lock = threading.RLock()
+        self._console_interrupt_count = 0
         started_at = time.time()
         self.state: dict[str, Any] = {
             "state": "starting",
@@ -330,6 +335,21 @@ class Supervisor:
                 values.setdefault("last_state_change_at", time.time())
             self.state.update(values)
 
+    def request_console_shutdown(self) -> bool:
+        """First Ctrl+C drains cleanly; a second one forces prompt cleanup."""
+        with self.lock:
+            self._console_interrupt_count += 1
+            forced = self._console_interrupt_count >= 2
+        self.stop.set()
+        if forced:
+            self.force_stop.set()
+            print("\nForce stopping ComputerPilot...", flush=True)
+            self.event("Forced console shutdown requested")
+            return True
+        print("\nStopping ComputerPilot... Press Ctrl+C again to force exit.", flush=True)
+        self.event("Graceful console shutdown requested")
+        return False
+
     @staticmethod
     def _read_bounded_json(path: Path | None, max_bytes: int) -> dict[str, Any] | None:
         if path is None:
@@ -484,7 +504,11 @@ class Supervisor:
         saw_status = False
         start_grace = min(LIFECYCLE_START_GRACE_SEC, timeout)
 
-        while time.monotonic() < deadline_monotonic and process.poll() is None:
+        while (
+            time.monotonic() < deadline_monotonic
+            and process.poll() is None
+            and not self.force_stop.is_set()
+        ):
             status = self._read_lifecycle_status(status_path)
             if status is not None:
                 saw_status = True
@@ -513,7 +537,11 @@ class Supervisor:
         if drained and process.poll() is None:
             self._write_lifecycle_control(control_path, "stop", request_id, deadline_epoch)
             stop_deadline = min(deadline_monotonic, time.monotonic() + LIFECYCLE_STOP_ACK_SEC)
-            while time.monotonic() < stop_deadline and process.poll() is None:
+            while (
+                time.monotonic() < stop_deadline
+                and process.poll() is None
+                and not self.force_stop.is_set()
+            ):
                 status = self._read_lifecycle_status(status_path)
                 if status is not None and status.get("request_id") == request_id:
                     runtime_state = str(status.get("state"))
@@ -530,7 +558,13 @@ class Supervisor:
             "reason": reason,
             "acknowledged": acknowledged,
             "drained": drained,
-            "timed_out": saw_status and not drained and time.monotonic() >= deadline_monotonic,
+            "timed_out": (
+                saw_status
+                and not drained
+                and not self.force_stop.is_set()
+                and time.monotonic() >= deadline_monotonic
+            ),
+            "forced": self.force_stop.is_set(),
             "runtime_lifecycle": runtime_state,
             "active_mutations": active_mutations,
             "elapsed_ms": elapsed_ms,
@@ -655,15 +689,16 @@ class Supervisor:
         except (ProcessLookupError, OSError) as exc:
             self.event(f"Runtime root fallback kill failed pid={process.pid}: {type(exc).__name__}: {exc}")
 
+        cleanup_wait = 0.5 if self.force_stop.is_set() else 5.0
         if tracked:
             try:
-                psutil.wait_procs(tracked, timeout=5)
+                psutil.wait_procs(tracked, timeout=cleanup_wait)
             except (psutil.Error, OSError) as exc:
                 self.event(f"Process cleanup wait degraded: {type(exc).__name__}: {exc}")
         self.owned.clear()
 
         try:
-            process.wait(timeout=5)
+            process.wait(timeout=cleanup_wait)
         except subprocess.TimeoutExpired:
             self.event("Runtime process did not exit after cleanup.")
         except OSError as exc:
@@ -1331,12 +1366,12 @@ def _default_profile() -> str:
     return detect_profile()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["tunnel", "local-http"], default="tunnel")
     parser.add_argument("--profile", default=_default_profile())
     parser.add_argument("--panel-port", type=int, default=8766)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.mode == "tunnel":
         try:
             tunnel_runtime = current_runtime(PROJECT_ROOT)
@@ -1358,9 +1393,15 @@ def main() -> int:
     thread = threading.Thread(target=panel.serve_forever, daemon=True)
     thread.start()
     print(f"MCP panel: http://127.0.0.1:{panel.server_port} (keep this window open)", flush=True)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal_installed = threading.current_thread() is threading.main_thread()
+    if signal_installed:
+        signal.signal(signal.SIGINT, lambda _signum, _frame: supervisor.request_console_shutdown())
     try:
         return supervisor.run()
     finally:
+        if signal_installed:
+            signal.signal(signal.SIGINT, previous_sigint)
         panel.shutdown()
         panel.server_close()
 
