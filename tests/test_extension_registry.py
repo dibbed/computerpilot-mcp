@@ -11,6 +11,9 @@ import pytest
 from core.extensions.models import (
     LIMITS,
     ExtensionToolDescriptor,
+    MutationClass,
+    ProviderToolHints,
+    TrustClass,
 )
 from core.extensions.registry import (
     ArgumentValidationResult,
@@ -23,6 +26,8 @@ from core.extensions.registry import (
     SchemaValidationResult,
     StaleGenerationError,
     TombstoneQuotaExceededError,
+    evaluate_capability_trust_mutation,
+    evaluate_tool_trust_mutation,
     validate_schema_subset,
     validate_tool_arguments,
 )
@@ -544,4 +549,147 @@ def test_candidate_publishing_withheld_invalid_schema_tools() -> None:
     snapshot2 = registry.retire_extension_catalog("ext_a")
     assert snapshot2.total_tools == 0
     assert len(snapshot2.withheld_tools) == 0
+
+
+def test_evaluate_tool_trust_mutation_matrix() -> None:
+    # 1. BUILT_IN claim always denied
+    for mut in MutationClass:
+        for allow in (True, False):
+            for closed in (True, False):
+                ok, err = evaluate_tool_trust_mutation(
+                    "built_in", mut, allow, is_mutation_gate_closed=closed
+                )
+                assert ok is False
+                assert err == "built_in_claim_denied"
+
+    # 2. UNTRUSTED always forbidden
+    for mut in MutationClass:
+        for allow in (True, False):
+            for closed in (True, False):
+                ok, err = evaluate_tool_trust_mutation(
+                    TrustClass.UNTRUSTED, mut, allow, is_mutation_gate_closed=closed
+                )
+                assert ok is False
+                assert err == "untrusted_extension_call_forbidden"
+
+    # 3. allow_call=False always disallowed under RESTRICTED and TRUSTED
+    for trust in (TrustClass.RESTRICTED, TrustClass.TRUSTED):
+        for mut in MutationClass:
+            for closed in (True, False):
+                ok, err = evaluate_tool_trust_mutation(trust, mut, False, is_mutation_gate_closed=closed)
+                assert ok is False
+                assert err == "operator_policy_disallowed"
+
+    # 4. UNKNOWN mutation class always forbidden when allow_call=True
+    for trust in (TrustClass.RESTRICTED, TrustClass.TRUSTED):
+        for closed in (True, False):
+            ok, err = evaluate_tool_trust_mutation(
+                trust, MutationClass.UNKNOWN, True, is_mutation_gate_closed=closed
+            )
+            assert ok is False
+            assert err == "unknown_mutation_class_forbidden"
+
+    # 5. RESTRICTED trust class only permits READ_ONLY
+    # READ_ONLY is allowed
+    ok, err = evaluate_tool_trust_mutation(TrustClass.RESTRICTED, MutationClass.READ_ONLY, True, is_mutation_gate_closed=True)
+    assert ok is True and err is None
+    ok, err = evaluate_tool_trust_mutation(TrustClass.RESTRICTED, MutationClass.READ_ONLY, True, is_mutation_gate_closed=False)
+    assert ok is True and err is None
+
+    # All non-read_only mutations are forbidden under RESTRICTED
+    for mut in (
+        MutationClass.LOCAL_MUTATION,
+        MutationClass.REMOTE_MUTATION,
+        MutationClass.DESTRUCTIVE_LOCAL_MUTATION,
+        MutationClass.DESTRUCTIVE_REMOTE_MUTATION,
+    ):
+        for closed in (True, False):
+            ok, err = evaluate_tool_trust_mutation(TrustClass.RESTRICTED, mut, True, is_mutation_gate_closed=closed)
+            assert ok is False
+            assert err == "restricted_trust_mutation_forbidden"
+
+    # 6. TRUSTED trust class
+    # READ_ONLY is allowed
+    ok, err = evaluate_tool_trust_mutation(TrustClass.TRUSTED, MutationClass.READ_ONLY, True, is_mutation_gate_closed=True)
+    assert ok is True and err is None
+
+    # Mutations when mutation gate is closed (pre-M10 default)
+    for mut in (
+        MutationClass.LOCAL_MUTATION,
+        MutationClass.REMOTE_MUTATION,
+        MutationClass.DESTRUCTIVE_LOCAL_MUTATION,
+        MutationClass.DESTRUCTIVE_REMOTE_MUTATION,
+    ):
+        ok, err = evaluate_tool_trust_mutation(TrustClass.TRUSTED, mut, True, is_mutation_gate_closed=True)
+        assert ok is False
+        assert err == "mutation_gate_closed_pre_m10"
+
+        # When mutation gate is open (post-M10 simulation)
+        ok, err = evaluate_tool_trust_mutation(TrustClass.TRUSTED, mut, True, is_mutation_gate_closed=False)
+        assert ok is True and err is None
+
+
+def test_provider_hints_never_grant_authority_threat_model_r07() -> None:
+    # A provider supplies deceptive hints claiming to be read-only, idempotent, and non-destructive
+    deceptive_hints = ProviderToolHints(
+        read_only=True,
+        idempotent=True,
+        destructive=False,
+        raw_hints={"readOnlyHint": True, "claim": "harmless"},
+    )
+
+    # 1. Deceptive hints cannot bypass allow_call=False
+    ok, err = evaluate_tool_trust_mutation(
+        TrustClass.RESTRICTED,
+        MutationClass.READ_ONLY,
+        False,
+        provider_hints=deceptive_hints,
+    )
+    assert ok is False
+    assert err == "operator_policy_disallowed"
+
+    # 2. Deceptive hints cannot bypass RESTRICTED mutation prohibition
+    ok, err = evaluate_tool_trust_mutation(
+        TrustClass.RESTRICTED,
+        MutationClass.LOCAL_MUTATION,
+        True,
+        provider_hints=deceptive_hints,
+    )
+    assert ok is False
+    assert err == "restricted_trust_mutation_forbidden"
+
+    # 3. Deceptive hints cannot bypass UNTRUSTED extension prohibition
+    ok, err = evaluate_tool_trust_mutation(
+        TrustClass.UNTRUSTED,
+        MutationClass.READ_ONLY,
+        True,
+        provider_hints=deceptive_hints,
+    )
+    assert ok is False
+    assert err == "untrusted_extension_call_forbidden"
+
+    # 4. Deceptive hints cannot make UNKNOWN mutation class permitted
+    ok, err = evaluate_tool_trust_mutation(
+        TrustClass.TRUSTED,
+        MutationClass.UNKNOWN,
+        True,
+        provider_hints=deceptive_hints,
+    )
+    assert ok is False
+    assert err == "unknown_mutation_class_forbidden"
+
+    # 5. evaluate_capability_trust_mutation with ExtensionCapabilityMetadata
+    tool = _make_tool(
+        "ext_a",
+        "query",
+        generation=1,
+    )
+    # Metadata inherits operator policy
+    meta = tool.to_capability_metadata(TrustClass.RESTRICTED)
+    assert meta.classification_source == "operator_policy"
+    # By default in _make_tool, policy has allow_call=False and mutation_class=UNKNOWN
+    ok, err = evaluate_capability_trust_mutation(meta)
+    assert ok is False
+    assert err == "operator_policy_disallowed"
+
 

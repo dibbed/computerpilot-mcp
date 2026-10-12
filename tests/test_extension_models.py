@@ -144,3 +144,44 @@ def test_discovery_name_index_rejects_cross_page_duplicates_and_preserves_logica
         public_tool_names("fixture", (f"t{i}" for i in range(129)))
     assert public_tool_name("old", "Read") != public_tool_name("new", "Read")
     assert public_tool_names("old", ["Read"]) == ("external.old.Read",)
+
+
+def test_provider_hints_and_capability_metadata_authority() -> None:
+    from core.extensions.models import (
+        ExtensionCapabilityMetadata,
+        ExtensionToolDescriptor,
+        ProviderToolHints,
+    )
+
+    # Provider tool hints defaults
+    hints = ProviderToolHints(read_only=True, idempotent=True, destructive=False)
+    assert hints.read_only is True
+    assert hints.idempotent is True
+    assert hints.destructive is False
+    assert hints.raw_hints == {}
+
+    pol = ToolPolicy(remote_name="op", domain="testing", allow_call=True, mutation_class=MutationClass.READ_ONLY)
+    desc = ExtensionToolDescriptor.create(
+        extension_id="ext",
+        provider="prov",
+        remote_name="op",
+        description="test",
+        input_schema={"type": "object"},
+        policy=pol,
+        provider_hints=hints,
+    )
+
+    # External capability claiming built_in trust must be rejected
+    with pytest.raises(ValueError, match="built_in claim denied"):
+        desc.to_capability_metadata("built_in")
+
+    # Valid restricted/trusted metadata projection
+    meta = desc.to_capability_metadata(TrustClass.RESTRICTED)
+    assert isinstance(meta, ExtensionCapabilityMetadata)
+    assert meta.public_name == "external.ext.op"
+    assert meta.trust_class is TrustClass.RESTRICTED
+    assert meta.allow_call is True
+    assert meta.mutation_class is MutationClass.READ_ONLY
+    assert meta.provider_hints.read_only is True
+    assert meta.classification_source == "operator_policy"
+

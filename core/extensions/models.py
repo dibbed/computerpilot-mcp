@@ -259,6 +259,40 @@ class ExtensionIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderToolHints:
+    """Non-authoritative provider diagnostic hints retained without permission grant."""
+
+    read_only: bool | None = None
+    idempotent: bool | None = None
+    destructive: bool | None = None
+    raw_hints: Mapping[str, Any] = MappingProxyType({})
+
+
+@dataclass(frozen=True, slots=True)
+class ExtensionCapabilityMetadata:
+    """Immutable authoritative capability metadata combining operator policy and diagnostic hints."""
+
+    public_name: str
+    extension_id: str
+    domain: str
+    mutation_class: MutationClass
+    risk_class: RiskClass
+    recoverability: RecoverabilityClass
+    trust_class: TrustClass
+    allow_call: bool
+    determinism: int
+    capability_confidence: int
+    cost_tier: int
+    latency_tier: int
+    profiles: tuple[str, ...]
+    intents: tuple[str, ...]
+    required_env_refs: tuple[str, ...]
+    source_type: Literal["external_mcp"] = "external_mcp"
+    provider_hints: ProviderToolHints = ProviderToolHints()
+    classification_source: str = "operator_policy"
+
+
+@dataclass(frozen=True, slots=True)
 class ExtensionToolDescriptor:
     public_name: str
     remote_name: str
@@ -269,6 +303,7 @@ class ExtensionToolDescriptor:
     policy: ToolPolicy
     catalog_generation: int
     schema_fingerprint: str
+    provider_hints: ProviderToolHints = ProviderToolHints()
 
     @property
     def input_schema(self) -> dict[str, Any]:
@@ -289,6 +324,31 @@ class ExtensionToolDescriptor:
             + len(self.public_name.encode("utf-8"))
         )
 
+    def to_capability_metadata(self, trust_class: TrustClass | str) -> ExtensionCapabilityMetadata:
+        if str(trust_class) == "built_in":
+            raise ValueError("built_in claim denied for external capabilities")
+        resolved_trust = trust_class if isinstance(trust_class, TrustClass) else TrustClass(trust_class)
+        return ExtensionCapabilityMetadata(
+            public_name=self.public_name,
+            extension_id=self.identity.extension_id,
+            domain=self.policy.domain,
+            mutation_class=self.policy.mutation_class,
+            risk_class=self.policy.risk_class,
+            recoverability=self.policy.recoverability,
+            trust_class=resolved_trust,
+            allow_call=self.policy.allow_call,
+            determinism=self.policy.determinism,
+            capability_confidence=self.policy.capability_confidence,
+            cost_tier=self.policy.cost_tier,
+            latency_tier=self.policy.latency_tier,
+            profiles=self.policy.profiles,
+            intents=self.policy.intents,
+            required_env_refs=self.policy.required_env_refs,
+            source_type=self.identity.source_type,
+            provider_hints=self.provider_hints,
+            classification_source="operator_policy",
+        )
+
     @classmethod
     def create(
         cls,
@@ -301,6 +361,7 @@ class ExtensionToolDescriptor:
         output_schema: Mapping[str, Any] | None = None,
         policy: ToolPolicy | None = None,
         catalog_generation: int = 1,
+        provider_hints: ProviderToolHints | None = None,
     ) -> ExtensionToolDescriptor:
         pub_name = public_tool_name(extension_id, remote_name)
         in_bytes = json.dumps(
@@ -323,6 +384,7 @@ class ExtensionToolDescriptor:
         )
         fingerprint = schema_fingerprint(input_schema, output_schema)
         pol = policy or ToolPolicy(remote_name=remote_name, domain="testing")
+        hints = provider_hints or ProviderToolHints()
         return cls(
             public_name=pub_name,
             remote_name=remote_name,
@@ -333,6 +395,7 @@ class ExtensionToolDescriptor:
             policy=pol,
             catalog_generation=catalog_generation,
             schema_fingerprint=fingerprint,
+            provider_hints=hints,
         )
 
 

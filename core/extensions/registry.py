@@ -11,8 +11,12 @@ from typing import Any
 
 from core.extensions.models import (
     LIMITS,
+    ExtensionCapabilityMetadata,
     ExtensionCatalogSnapshot,
     ExtensionToolDescriptor,
+    MutationClass,
+    ProviderToolHints,
+    TrustClass,
     public_tool_name,
     schema_fingerprint,
 )
@@ -766,3 +770,58 @@ class ExtensionRegistry:
             self._active_snapshot = ExtensionCatalogSnapshot.empty()
             self._runtime_fingerprints.clear()
             self._max_published_generations.clear()
+
+
+def evaluate_tool_trust_mutation(
+    trust_class: TrustClass | str,
+    mutation_class: MutationClass | str,
+    allow_call: bool,
+    *,
+    is_mutation_gate_closed: bool = True,
+    provider_hints: ProviderToolHints | None = None,
+) -> tuple[bool, str | None]:
+    """Authoritatively evaluate tool call eligibility against Trust x Mutation x AllowCall matrix.
+
+    Provider hints are non-authoritative diagnostic annotations and cannot grant permissions,
+    override operator policy, or elevate trust/mutation status.
+    """
+    trust_val = trust_class.value if isinstance(trust_class, TrustClass) else str(trust_class)
+    mut_val = mutation_class.value if isinstance(mutation_class, MutationClass) else str(mutation_class)
+
+    if trust_val == "built_in":
+        return False, "built_in_claim_denied"
+
+    if trust_val == TrustClass.UNTRUSTED.value:
+        return False, "untrusted_extension_call_forbidden"
+
+    if not allow_call:
+        return False, "operator_policy_disallowed"
+
+    if mut_val == MutationClass.UNKNOWN.value:
+        return False, "unknown_mutation_class_forbidden"
+
+    if trust_val == TrustClass.RESTRICTED.value:
+        if mut_val != MutationClass.READ_ONLY.value:
+            return False, "restricted_trust_mutation_forbidden"
+
+    if mut_val != MutationClass.READ_ONLY.value:
+        if is_mutation_gate_closed:
+            return False, "mutation_gate_closed_pre_m10"
+
+    return True, None
+
+
+def evaluate_capability_trust_mutation(
+    metadata: ExtensionCapabilityMetadata,
+    *,
+    is_mutation_gate_closed: bool = True,
+) -> tuple[bool, str | None]:
+    """Authoritatively evaluate capability metadata against Trust x Mutation x AllowCall matrix."""
+    return evaluate_tool_trust_mutation(
+        metadata.trust_class,
+        metadata.mutation_class,
+        metadata.allow_call,
+        is_mutation_gate_closed=is_mutation_gate_closed,
+        provider_hints=metadata.provider_hints,
+    )
+
