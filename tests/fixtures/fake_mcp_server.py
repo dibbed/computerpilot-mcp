@@ -179,7 +179,7 @@ def spawn_tree_member(workspace: Path, mode: str) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve()), "--workspace", str(workspace), "--mode", mode],
         cwd=workspace, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0,
     )
 
 

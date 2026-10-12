@@ -271,7 +271,7 @@ def test_fixture_root_exit_retains_owned_child_and_grandchild_cleanup(tmp_path: 
     owned = spawn_owned_process(
         [sys.executable, str(FIXTURE.resolve()), "--workspace", str(tmp_path), "--mode", "root_exit_child"],
         cwd=tmp_path, env=_fixture_env(tmp_path), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0,
     )
     try:
         assert owned.ownership_backend in {"windows_job", "posix_process_group"}
