@@ -203,8 +203,9 @@ class BoundedStderrDrain:
     Redacts synthetic canaries and potential tokens to prevent credential leakage.
     """
 
-    def __init__(self, max_bytes: int = MAX_STDERR_BYTES) -> None:
+    def __init__(self, max_bytes: int = MAX_STDERR_BYTES, *, credential_bearing: bool = False) -> None:
         self.max_bytes = max_bytes
+        self.credential_bearing = credential_bearing
         self._buffer = bytearray()
         self._total_bytes_seen = 0
 
@@ -224,6 +225,9 @@ class BoundedStderrDrain:
 
     def get_tail(self) -> str:
         """Return the retained stderr tail, strictly decoded and sanitized."""
+        if self.credential_bearing and self._buffer:
+            # Withhold credential-bearing stderr, including unfinished/chopped secret fragments.
+            return "[REDACTED_PROVIDER_STDERR]"
         raw_text = self._buffer.decode("utf-8", errors="replace")
         sanitized = self.sanitize_text(raw_text)
         sanitized_bytes = sanitized.encode("utf-8")

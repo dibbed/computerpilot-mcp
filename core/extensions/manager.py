@@ -29,7 +29,8 @@ from core.extensions.models import (
 )
 from core.extensions.output import normalize_result, validate_arguments
 from core.extensions.registry import CatalogLimitExceededError, ExtensionLease, ExtensionRegistry
-from core.extensions.transport import bounded_stdio_transport
+from core.extensions.security import CredentialRedactor, suppress_sdk_payload_logs
+from core.extensions.transport import BoundedStderrDrain, bounded_stdio_transport
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +223,7 @@ class ExtensionOwner:
         self._active_session_id: str | None = None
         self._is_running = False
         self.call_semaphore = anyio.Semaphore(LIMITS.calls_per_extension)
+        self._credential_values: tuple[str, ...] = ()
 
     @property
     def state(self) -> ExtensionState:
@@ -313,6 +315,13 @@ class ExtensionOwner:
         if self.definition.trust_class not in {TrustClass.RESTRICTED, TrustClass.TRUSTED}:
             raise ToolError("trust_denied", "The extension trust policy prohibits execution.")
 
+    def credential_redactor(self) -> CredentialRedactor:
+        values = self._credential_values
+        if self.definition.environment.references:
+            env = build_extension_environment(self.definition)
+            values += tuple(env[name] for name in self.definition.environment.references)
+        return CredentialRedactor(values)
+
     async def call_tool(
         self,
         remote_name: str,
@@ -329,19 +338,23 @@ class ExtensionOwner:
                 message=f"Extension '{self.extension_id}' has no active session",
             )
         try:
-            with anyio.fail_after(timeout_sec):
+            with suppress_sdk_payload_logs(), anyio.fail_after(timeout_sec):
                 args_dict = dict(arguments) if arguments is not None else {}
                 return await session.send_request(
                     types.CallToolRequest(params=types.CallToolRequestParams(name=remote_name, arguments=args_dict)),
                     types.CallToolResult, request_read_timeout_seconds=timeout_sec,
                 )
-        except ValidationError as exc:
-            raise ToolError("malformed_result", "The provider returned an invalid tool result.") from exc
+        except ValidationError:
+            raise ToolError("malformed_result", "The provider returned an invalid tool result.") from None
         except TimeoutError as exc:
             raise ToolError(
                 code="call_timeout",
                 message=f"Tool call '{remote_name}' on extension '{self.extension_id}' timed out after {timeout_sec}s",
             ) from exc
+        except ToolError:
+            raise
+        except Exception:
+            raise ToolError("provider_error", "The external provider call failed.") from None
 
     async def run_owner_loop(
         self,
@@ -368,11 +381,11 @@ class ExtensionOwner:
                                     await runner_fn(self)
                                     if self.state == ExtensionState.HEALTHY:
                                         self.restart_budget.record_success()
-                                except Exception as exc:
-                                    logger.exception("Error in extension runner: %s", exc)
+                                except Exception:
+                                    logger.warning("Extension runner failed.")
                                     if self.state_machine.can_transition(ExtensionState.FAILED):
                                         self.state_machine.transition(
-                                            ExtensionState.FAILED, reason=str(exc)
+                                            ExtensionState.FAILED, reason="startup_failed"
                                         )
 
                     elif sig == OwnerSignal.STOP:
@@ -423,11 +436,11 @@ class ExtensionOwner:
                                     await runner_fn(self)
                                     if self.state == ExtensionState.HEALTHY:
                                         self.restart_budget.record_success()
-                                except Exception as exc:
-                                    logger.exception("Error during extension restart: %s", exc)
+                                except Exception:
+                                    logger.warning("Extension restart failed.")
                                     if self.state_machine.can_transition(ExtensionState.FAILED):
                                         self.state_machine.transition(
-                                            ExtensionState.FAILED, reason=str(exc)
+                                            ExtensionState.FAILED, reason="startup_failed"
                                         )
         finally:
             self._is_running = False
@@ -438,7 +451,6 @@ async def connect_and_discover_tools(
     owner: ExtensionOwner,
     registry: ExtensionRegistry | None = None,
     parent_env: Mapping[str, str] | None = None,
-    extra_env: Mapping[str, str] | None = None,
     startup_timeout: float = LIMITS.startup_sec,
     handshake_timeout: float = LIMITS.handshake_sec,
     discovery_timeout: float = LIMITS.discovery_sec,
@@ -452,17 +464,17 @@ async def connect_and_discover_tools(
     cwd = Path(definition.working_directory).resolve()
     base_env = build_extension_environment(definition, parent=parent_env)
     env = {**base_env, "MCP_EXTENSIONS_ENABLED": "0"}
-    if extra_env:
-        env.update(extra_env)
+    owner._credential_values = tuple(base_env[name] for name in definition.environment.references)
 
     session_id = f"{owner.extension_id}-gen{owner.generation}-{time.monotonic()}"
 
-    with anyio.fail_after(startup_timeout):
+    with suppress_sdk_payload_logs(), anyio.fail_after(startup_timeout):
         async with bounded_stdio_transport(
             cmd,
             cwd=cwd,
             env=env,
             shutdown_timeout=5.0,
+            stderr_drain=BoundedStderrDrain(credential_bearing=bool(owner._credential_values)),
         ) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 owner.register_session(session, session_id)
@@ -717,8 +729,8 @@ class ExtensionLifecycleManager:
         for hook in self._unresolved_mutation_hooks:
             try:
                 hook("runtime_shutdown")
-            except Exception as exc:
-                logger.warning("Unresolved mutation hook raised: %s", exc)
+            except Exception:
+                logger.warning("Unresolved mutation hook failed.")
 
         # 3. Trigger shutdown event to release waiting background discovery tasks
         self._shutdown_event.set()
@@ -894,4 +906,4 @@ class ExtensionLifecycleManager:
                 args,
                 timeout_sec=timeout_sec,
             )
-            return normalize_result(descriptor, result)
+            return normalize_result(descriptor, result, owner.credential_redactor())

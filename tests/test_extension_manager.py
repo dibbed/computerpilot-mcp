@@ -356,14 +356,14 @@ def test_all_states_healthy_and_routable_strictness() -> None:
             assert sm.is_routable is False, f"State {s} should not be routable"
 
 
-def test_owner_actor_runner_failure_transitions_to_failed() -> None:
+def test_owner_actor_runner_failure_transitions_to_failed(caplog: pytest.LogCaptureFixture) -> None:
     """Verify that an exception in the runner task transitions the owner to FAILED with error recorded."""
     definition = _dummy_definition("ext-failed")
     owner = ExtensionOwner(definition)
     stop_event = anyio.Event()
 
     async def failing_runner(own: ExtensionOwner) -> None:
-        raise RuntimeError("Subprocess connection failed")
+        raise RuntimeError("synthetic-private-startup-credential")
 
     async def scenario() -> None:
         async with anyio.create_task_group() as tg:
@@ -372,13 +372,15 @@ def test_owner_actor_runner_failure_transitions_to_failed() -> None:
             owner.signal(OwnerSignal.START)
             await anyio.sleep(0.05)
             assert owner.state == ExtensionState.FAILED
-            assert owner.state_machine.last_error == "Subprocess connection failed"
+            assert owner.state_machine.last_error == "startup_failed"
+            assert "synthetic-private-startup-credential" not in str(owner.state_machine.history)
             assert not owner.is_routable
 
             owner.signal(OwnerSignal.STOP)
             await stop_event.wait()
 
     anyio.run(scenario)
+    assert "synthetic-private-startup-credential" not in caplog.text
 
 
 def test_slow_ab_concurrency_and_isolated_failure() -> None:
@@ -477,6 +479,7 @@ def test_disabled_extensions_are_never_started() -> None:
 
 def test_real_fixture_mcp_discovery_integration(tmp_path: Path) -> None:
     """Verify real fake_mcp_server subprocess handshake, discovery, and catalog registration."""
+    import os
     import sys
 
     from core.extensions.manager import connect_and_discover_tools
@@ -503,27 +506,17 @@ def test_real_fixture_mcp_discovery_integration(tmp_path: Path) -> None:
         })
     )
 
-    for p in ("home", "config", "state", "temp"):
-        (tmp_path / p).mkdir(parents=True, exist_ok=True)
-
-    extra_env = {
-        "HOME": str(tmp_path / "home"),
-        "USERPROFILE": str(tmp_path / "home"),
-        "APPDATA": str(tmp_path / "config"),
-        "LOCALAPPDATA": str(tmp_path / "state"),
-        "TEMP": str(tmp_path / "temp"),
-        "TMP": str(tmp_path / "temp"),
-    }
-
     manager = ExtensionLifecycleManager()
     owner = manager.register_extension(definition)
     owner.state_machine.transition(ExtensionState.STARTING)
+    parent_env = {name: os.environ[name] for name in ("SystemRoot", "WINDIR", "COMSPEC") if name in os.environ}
+    parent_env.update({"TEMP": str(tmp_path), "TMP": str(tmp_path), "TMPDIR": str(tmp_path)})
 
     async def scenario() -> None:
         descriptors = await connect_and_discover_tools(
             owner,
             manager.registry,
-            extra_env=extra_env,
+            parent_env=parent_env,
             startup_timeout=5.0,
             handshake_timeout=3.0,
             discovery_timeout=3.0,

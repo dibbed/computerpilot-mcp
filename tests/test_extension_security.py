@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,8 +17,10 @@ from core.errors import ToolError
 from core.extensions.config import build_extension_environment
 from core.extensions.manager import ExtensionLifecycleManager
 from core.extensions.models import ExtensionDefinition, ExtensionState, ExtensionToolDescriptor, MutationClass, ToolPolicy
+from core.extensions.output import normalize_result
 from core.extensions.registry import ExtensionLease, validate_schema_subset, validate_tool_arguments
-from core.extensions.transport import bounded_stdio_transport
+from core.extensions.security import CredentialRedactor
+from core.extensions.transport import BoundedStderrDrain, bounded_stdio_transport
 from core.platform import normalize_system
 
 
@@ -121,29 +125,53 @@ def test_calls_use_public_request_and_return_core_envelope() -> None:
     anyio.run(scenario)
 
 
-def test_real_owned_fixture_returns_exact_arguments_in_core_envelope(tmp_path: Path) -> None:
+@pytest.mark.parametrize("credential_echo", [False, True])
+def test_real_owned_fixture_returns_exact_arguments_in_core_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, credential_echo: bool,
+) -> None:
     manager, lease, _ = admitted_call({"type": "object"}, types.CallToolResult(content=[]))
     owner = manager.get_owner("security-fixture")
     assert owner is not None
     fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.py"
     definition = owner.definition.model_copy(update={"command": sys.executable, "working_directory": str(tmp_path)})
+    canary = "real-wire-private-credential-47b9-راز"
+    if credential_echo:
+        from core.extensions.models import ExtensionEnvironment
+
+        monkeypatch.setenv("SECURITY_OPERATOR_TOKEN", canary)
+        definition = definition.model_copy(update={"environment": ExtensionEnvironment.model_validate_json(json.dumps({
+            "references": {"FIXTURE_CANARY": {"kind": "env", "name": "SECURITY_OPERATOR_TOKEN"}},
+        }))})
+    owner.definition = definition
     env = build_extension_environment(definition)
     env["MCP_EXTENSIONS_ENABLED"] = "0"
+    drain = BoundedStderrDrain(credential_bearing=credential_echo)
 
     async def scenario() -> None:
         async with bounded_stdio_transport(
-            [sys.executable, str(fixture.resolve()), "--workspace", str(tmp_path)], cwd=tmp_path, env=env,
+            [sys.executable, str(fixture.resolve()), "--workspace", str(tmp_path),
+             "--mode", "stderr_flood" if credential_echo else "readonly"],
+            cwd=tmp_path, env=env, stderr_drain=drain,
         ) as (read, write), ClientSession(read, write) as session:
             await session.initialize()
             owner.register_session(session, "real-security-session")
-            result = await manager.execute_guarded_call(lease, {"value": "safe", "file.name": "exact.property"})
+            value = canary if credential_echo else "safe"
+            result = await manager.execute_guarded_call(lease, {"value": value, "file.name": "exact.property"})
             assert result["ok"] is True
-            assert result["structured_content"] == {"value": "safe", "arguments": {"value": "safe", "file.name": "exact.property"}}
+            expected = "[REDACTED]" if credential_echo else value
+            assert result["structured_content"] == {"value": expected, "arguments": {"value": expected, "file.name": "exact.property"}}
+            if credential_echo:
+                with anyio.fail_after(3):
+                    while drain.total_bytes_seen == 0:
+                        await anyio.sleep(0)
+                assert canary not in json.dumps(result, ensure_ascii=False)
+                assert drain.get_tail() == "[REDACTED_PROVIDER_STDERR]"
             owner.close_active_session()
 
     anyio.run(scenario)
     assert (tmp_path / "call_received").exists()
     assert not (tmp_path / "effects.jsonl").exists()
+    assert canary not in caplog.text
 
 
 @pytest.mark.parametrize("result", [
@@ -163,3 +191,91 @@ def test_nonterminal_or_invalid_provider_output_is_rejected(result: types.CallTo
         assert denied.value.code == "malformed_result"
 
     anyio.run(scenario)
+
+
+def test_credential_literal_is_removed_from_nested_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    canary = "private-credential-47b9-راز"
+    monkeypatch.setenv("SECURITY_OPERATOR_TOKEN", canary)
+    raw = types.CallToolResult(
+        content=[types.TextContent(type="text", text="echo: " + canary)],
+        structured_content={"safe_key": {"nested": [canary]}},
+    )
+    manager, lease, _ = admitted_call({"type": "object"}, raw)
+    owner = manager.get_owner("security-fixture")
+    assert owner is not None
+    from core.extensions.models import ExtensionEnvironment
+
+    owner.definition = owner.definition.model_copy(update={
+        "environment": ExtensionEnvironment.model_validate_json(json.dumps({
+            "references": {"SERVICE_API_TOKEN": {"kind": "env", "name": "SECURITY_OPERATOR_TOKEN"}},
+        })),
+    })
+
+    async def scenario() -> None:
+        result = await manager.execute_guarded_call(lease)
+        assert canary not in json.dumps(result, ensure_ascii=False)
+        assert result["ok"] is True
+
+    anyio.run(scenario)
+
+
+def test_provider_exception_never_crosses_native_error_boundary(caplog: pytest.LogCaptureFixture) -> None:
+    manager, lease, session = admitted_call({"type": "object"}, types.CallToolResult(content=[]))
+    canary = "exception-private-credential-0931"
+    session.send_request.side_effect = RuntimeError(canary)
+
+    async def scenario() -> None:
+        with pytest.raises(ToolError) as failed:
+            await manager.execute_guarded_call(lease)
+        assert canary not in str(failed.value)
+        assert failed.value.code == "provider_error"
+
+    anyio.run(scenario)
+    assert canary not in caplog.text
+
+
+def test_sdk_provider_logging_is_suppressed_only_in_external_calls(caplog: pytest.LogCaptureFixture) -> None:
+    manager, lease, session = admitted_call({"type": "object"}, types.CallToolResult(content=[]))
+    canary = "sdk-private-credential-817b"
+
+    async def provider_response(*args: Any, **kwargs: Any) -> types.CallToolResult:
+        logging.getLogger("client").warning("SDK response %s", canary)
+        return types.CallToolResult(content=[])
+
+    session.send_request.side_effect = provider_response
+    with caplog.at_level(logging.WARNING, logger="client"):
+        anyio.run(manager.execute_guarded_call, lease)
+        logging.getLogger("client").warning("native SDK message remains visible")
+    assert canary not in caplog.text
+    assert "native SDK message remains visible" in caplog.text
+
+
+def test_credential_bearing_stderr_never_reveals_chunk_or_retention_fragments() -> None:
+    drain = BoundedStderrDrain(max_bytes=32, credential_bearing=True)
+    chunks = [b"private-first-", "راز".encode(), b"-credential-tail" * 4]
+    for chunk in chunks:
+        drain.feed_chunk(chunk)
+        assert drain.get_tail() == "[REDACTED_PROVIDER_STDERR]"
+    assert drain.total_bytes_seen == sum(len(chunk) for chunk in chunks)
+
+
+def test_binary_credential_echo_is_withheld_instead_of_returning_corrupt_base64() -> None:
+    canary = "private-binary-credential-0147"
+    raw = types.CallToolResult(content=[types.ImageContent(
+        type="image", mime_type="image/png", data=base64.b64encode(canary.encode()).decode(),
+    )])
+    manager, lease, _ = admitted_call({"type": "object"}, raw)
+    descriptor = manager.registry.get_tool(lease.public_name)
+    assert descriptor is not None
+    with pytest.raises(ToolError, match="withheld"):
+        normalize_result(descriptor, raw, CredentialRedactor([canary]))
+
+
+def test_redaction_covers_encoded_literals_without_expanding_tiny_values() -> None:
+    from urllib.parse import quote
+
+    canary = "private-راز-credential"
+    redactor = CredentialRedactor([canary])
+    for encoded in (canary, json.dumps(canary)[1:-1], quote(canary, safe="")):
+        assert redactor.text(encoded) == "[REDACTED]"
+    assert len(CredentialRedactor(["x"]).text("x" * 1000)) <= 1000

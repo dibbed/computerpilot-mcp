@@ -13,6 +13,7 @@ from mcp import types
 from core.errors import ToolError
 from core.extensions.models import LIMITS, ExtensionToolDescriptor, StrictDefinition
 from core.extensions.registry import validate_tool_value
+from core.extensions.security import CredentialRedactor
 
 
 class ResultLimits(StrictDefinition):
@@ -91,10 +92,13 @@ def validate_arguments(descriptor: ExtensionToolDescriptor, arguments: Mapping[s
     return args
 
 
-def normalize_result(descriptor: ExtensionToolDescriptor, result: types.CallToolResult) -> dict[str, Any]:
+def normalize_result(
+    descriptor: ExtensionToolDescriptor, result: types.CallToolResult, redactor: CredentialRedactor | None = None,
+) -> dict[str, Any]:
     if not isinstance(result, types.CallToolResult) or result.result_type != "complete":
         raise ToolError("malformed_result", "External calls require one terminal tool result.")
     original = bounded_json(result.model_dump(mode="json", by_alias=True), LIMITS.frame_bytes, error_code="output_too_large")
+    redactor = redactor or CredentialRedactor()
     if result.is_error:
         content: list[dict[str, Any]] = []
         structured = None
@@ -108,9 +112,11 @@ def normalize_result(descriptor: ExtensionToolDescriptor, result: types.CallTool
                 content.append({"type": "text", "text": block.text})
             elif isinstance(block, types.ImageContent | types.AudioContent):
                 try:
-                    base64.b64decode(block.data, validate=True)
+                    decoded = base64.b64decode(block.data, validate=True)
                 except (ValueError, UnicodeError) as exc:
                     raise ToolError("malformed_result", "External binary content is invalid.") from exc
+                if redactor.sensitive_binary(block.data, decoded):
+                    raise ToolError("malformed_result", "Credential-bearing binary output is withheld.")
                 content.append({"type": block.type, "data": block.data, "mimeType": block.mime_type})
             elif isinstance(block, types.ResourceLink):
                 content.append({"type": "resource_link", "name": block.name, "uri": str(block.uri)})
@@ -120,13 +126,17 @@ def normalize_result(descriptor: ExtensionToolDescriptor, result: types.CallTool
                     content.append({"type": "resource", "uri": str(resource.uri), "text": resource.text})
                 else:
                     try:
-                        base64.b64decode(resource.blob, validate=True)
+                        decoded = base64.b64decode(resource.blob, validate=True)
                     except (ValueError, UnicodeError) as exc:
                         raise ToolError("malformed_result", "External resource content is invalid.") from exc
+                    if redactor.sensitive_binary(resource.blob, decoded):
+                        raise ToolError("malformed_result", "Credential-bearing resource output is withheld.")
                     content.append({"type": "resource", "uri": str(resource.uri), "blob": resource.blob})
             else:
                 raise ToolError("malformed_result", "External content type is unsupported.")
-    returned = bounded_json({"content": content, "structured_content": structured}, LIMITS.inline_bytes, error_code="output_too_large")
+    sanitized = redactor.json({"content": content, "structured_content": structured})
+    content, structured = sanitized["content"], sanitized["structured_content"]
+    returned = bounded_json(sanitized, LIMITS.inline_bytes, error_code="output_too_large")
     return ExtensionResult(
         ok=not result.is_error, extension_id=descriptor.extension_id, provider=descriptor.identity.provider,
         tool=descriptor.public_name, catalog_generation=descriptor.catalog_generation,
