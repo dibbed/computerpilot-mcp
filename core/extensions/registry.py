@@ -13,6 +13,8 @@ from core.extensions.models import (
     LIMITS,
     ExtensionCapabilityMetadata,
     ExtensionCatalogSnapshot,
+    ExtensionDefinition,
+    ExtensionState,
     ExtensionToolDescriptor,
     MutationClass,
     ProviderToolHints,
@@ -20,6 +22,7 @@ from core.extensions.models import (
     public_tool_name,
     schema_fingerprint,
 )
+from core.platform import normalize_system
 
 ALLOWED_SCHEMA_KEYWORDS: frozenset[str] = frozenset({
     "$schema",
@@ -101,6 +104,15 @@ class ArgumentValidationResult:
     valid: bool
     error_code: str | None = None
     message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolEligibilityResult:
+    """Result of pure deterministic tool eligibility evaluation across ordered gates."""
+
+    eligible: bool
+    rejection_code: str | None = None
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -771,6 +783,62 @@ class ExtensionRegistry:
             self._runtime_fingerprints.clear()
             self._max_published_generations.clear()
 
+    def evaluate_eligibility(
+        self,
+        tool: ExtensionToolDescriptor | str,
+        *,
+        definition: ExtensionDefinition | None = None,
+        runtime_state: ExtensionState | str = ExtensionState.HEALTHY,
+        active_profile: str | None = None,
+        platform: str | None = None,
+        resolved_env_refs: Collection[str] | None = None,
+        is_mutation_gate_closed: bool = True,
+        is_recovery_available: bool = False,
+        trust_class: TrustClass | str | None = None,
+    ) -> ToolEligibilityResult:
+        """Evaluate tool eligibility against active snapshot and caller context."""
+        with self._lock:
+            snap = self._active_snapshot
+        return evaluate_tool_eligibility(
+            tool,
+            snapshot=snap,
+            definition=definition,
+            runtime_state=runtime_state,
+            active_profile=active_profile,
+            platform=platform,
+            resolved_env_refs=resolved_env_refs,
+            is_mutation_gate_closed=is_mutation_gate_closed,
+            is_recovery_available=is_recovery_available,
+            trust_class=trust_class,
+        )
+
+    def eligible_tools(
+        self,
+        *,
+        definitions: Mapping[str, ExtensionDefinition] | None = None,
+        runtime_states: Mapping[str, ExtensionState | str] | None = None,
+        active_profile: str | None = None,
+        platform: str | None = None,
+        resolved_env_refs: Collection[str] | None = None,
+        is_mutation_gate_closed: bool = True,
+        is_recovery_available: bool = False,
+        default_trust_class: TrustClass | str | None = None,
+    ) -> tuple[ExtensionToolDescriptor, ...]:
+        """Return tuple of all currently eligible tools in active snapshot."""
+        with self._lock:
+            snap = self._active_snapshot
+        return filter_eligible_tools(
+            snap,
+            definitions=definitions,
+            runtime_states=runtime_states,
+            active_profile=active_profile,
+            platform=platform,
+            resolved_env_refs=resolved_env_refs,
+            is_mutation_gate_closed=is_mutation_gate_closed,
+            is_recovery_available=is_recovery_available,
+            default_trust_class=default_trust_class,
+        )
+
 
 def evaluate_tool_trust_mutation(
     trust_class: TrustClass | str,
@@ -824,4 +892,148 @@ def evaluate_capability_trust_mutation(
         is_mutation_gate_closed=is_mutation_gate_closed,
         provider_hints=metadata.provider_hints,
     )
+
+
+def evaluate_tool_eligibility(
+    tool: ExtensionToolDescriptor | str,
+    *,
+    snapshot: ExtensionCatalogSnapshot | None = None,
+    definition: ExtensionDefinition | None = None,
+    runtime_state: ExtensionState | str = ExtensionState.HEALTHY,
+    active_profile: str | None = None,
+    platform: str | None = None,
+    resolved_env_refs: Collection[str] | None = None,
+    is_mutation_gate_closed: bool = True,
+    is_recovery_available: bool = False,
+    trust_class: TrustClass | str | None = None,
+) -> ToolEligibilityResult:
+    """Authoritatively and deterministically evaluate tool eligibility across ordered gates.
+
+    Order of gates:
+    1. Snapshot / Tool presence & schema validation
+    2. Configuration & Launch approval
+    3. Runtime state / Live health
+    4. Platform match
+    5. Active profile match
+    6. Authentication / Required environment references
+    7. Tool policy & Trust
+    8. Mutation & Recovery (fail closed pre-M10)
+
+    No protocol I/O is performed.
+    """
+    # Gate 1: Snapshot / Tool presence & schema
+    desc: ExtensionToolDescriptor
+    if isinstance(tool, str):
+        if snapshot is None:
+            return ToolEligibilityResult(False, "missing_snapshot", "Cannot evaluate tool name without active catalog snapshot")
+        withheld_reason = snapshot.get_withheld_reason(tool)
+        if withheld_reason is not None:
+            return ToolEligibilityResult(False, "schema_withheld", f"Tool schema was withheld: {withheld_reason}")
+        resolved_desc = snapshot.get_tool(tool)
+        if resolved_desc is None:
+            return ToolEligibilityResult(False, "tool_not_found", f"Tool '{tool}' is not in active catalog snapshot")
+        desc = resolved_desc
+    else:
+        desc = tool
+        if snapshot is not None:
+            if desc.public_name in snapshot.withheld_tools:
+                reason_msg = f"Tool schema was withheld: {snapshot.withheld_tools[desc.public_name]}"
+                return ToolEligibilityResult(False, "schema_withheld", reason_msg)
+            ext_gen = snapshot.extension_generations.get(desc.identity.extension_id)
+            if ext_gen is None or desc.catalog_generation != ext_gen:
+                return ToolEligibilityResult(False, "stale_generation", "Tool catalog generation does not match active snapshot generation")
+            if not snapshot.has_tool(desc.public_name):
+                return ToolEligibilityResult(False, "tool_not_found", f"Tool '{desc.public_name}' is not in active catalog snapshot")
+
+    # Gate 2: Configuration & Launch approval (if definition provided)
+    if definition is not None:
+        if not definition.launch_approved:
+            msg = f"Extension '{definition.extension_id}' has not been approved for launch"
+            return ToolEligibilityResult(False, "launch_not_approved", msg)
+        if not definition.enabled:
+            return ToolEligibilityResult(False, "extension_disabled", f"Extension '{definition.extension_id}' is disabled in configuration")
+
+    # Gate 3: Runtime State / Live Health
+    state_val = runtime_state.value if isinstance(runtime_state, ExtensionState) else str(runtime_state)
+    if state_val != ExtensionState.HEALTHY.value:
+        return ToolEligibilityResult(False, "runtime_not_healthy", f"Extension runtime state is '{state_val}', not healthy")
+
+    # Gate 4: Platform match
+    if platform is not None and definition is not None:
+        norm_plat = normalize_system(platform)
+        if norm_plat not in definition.platforms:
+            msg = f"Platform '{norm_plat}' is not supported by extension platforms {definition.platforms}"
+            return ToolEligibilityResult(False, "platform_mismatch", msg)
+
+    # Gate 5: Active profile match
+    if active_profile is not None and active_profile != "all":
+        if active_profile not in desc.policy.profiles:
+            msg = f"Tool '{desc.public_name}' is not permitted under active profile '{active_profile}'"
+            return ToolEligibilityResult(False, "profile_mismatch", msg)
+
+    # Gate 6: Authentication / Required Environment References
+    if desc.policy.required_env_refs:
+        available_refs = frozenset(resolved_env_refs) if resolved_env_refs is not None else frozenset()
+        missing = [r for r in desc.policy.required_env_refs if r not in available_refs]
+        if missing:
+            msg = f"Required environment references missing: {', '.join(sorted(missing))}"
+            return ToolEligibilityResult(False, "missing_auth_refs", msg)
+
+    # Gate 7: Tool policy & Trust
+    eff_trust = definition.trust_class if definition is not None else (trust_class or TrustClass.UNTRUSTED)
+    ok, err = evaluate_tool_trust_mutation(
+        eff_trust,
+        desc.policy.mutation_class,
+        desc.policy.allow_call,
+        is_mutation_gate_closed=is_mutation_gate_closed,
+        provider_hints=desc.provider_hints,
+    )
+    if not ok:
+        return ToolEligibilityResult(False, err, f"Trust/mutation policy rejection: {err}")
+
+    # Gate 8: Mutation & Recovery (if mutation gate is open in post-M10 simulation)
+    mut_val = desc.policy.mutation_class.value if isinstance(desc.policy.mutation_class, MutationClass) else str(desc.policy.mutation_class)
+    if mut_val != MutationClass.READ_ONLY.value:
+        if not is_mutation_gate_closed and not is_recovery_available:
+            return ToolEligibilityResult(False, "recovery_unavailable", "Recovery mechanism is not available for mutating tool")
+
+    return ToolEligibilityResult(True, None, None)
+
+
+def filter_eligible_tools(
+    snapshot: ExtensionCatalogSnapshot,
+    *,
+    definitions: Mapping[str, ExtensionDefinition] | None = None,
+    runtime_states: Mapping[str, ExtensionState | str] | None = None,
+    active_profile: str | None = None,
+    platform: str | None = None,
+    resolved_env_refs: Collection[str] | None = None,
+    is_mutation_gate_closed: bool = True,
+    is_recovery_available: bool = False,
+    default_trust_class: TrustClass | str | None = None,
+) -> tuple[ExtensionToolDescriptor, ...]:
+    """Filter snapshot tools to only those eligible under given context, preserving deterministic ordering."""
+    defs = definitions or {}
+    states = runtime_states or {}
+    eligible: list[ExtensionToolDescriptor] = []
+    for desc in snapshot.tools.values():
+        ext_id = desc.identity.extension_id
+        defn = defs.get(ext_id)
+        r_state = states.get(ext_id, ExtensionState.HEALTHY)
+        res = evaluate_tool_eligibility(
+            desc,
+            snapshot=snapshot,
+            definition=defn,
+            runtime_state=r_state,
+            active_profile=active_profile,
+            platform=platform,
+            resolved_env_refs=resolved_env_refs,
+            is_mutation_gate_closed=is_mutation_gate_closed,
+            is_recovery_available=is_recovery_available,
+            trust_class=default_trust_class,
+        )
+        if res.eligible:
+            eligible.append(desc)
+    return tuple(eligible)
+
 

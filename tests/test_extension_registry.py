@@ -10,9 +10,12 @@ import pytest
 
 from core.extensions.models import (
     LIMITS,
+    ExtensionDefinition,
+    ExtensionState,
     ExtensionToolDescriptor,
     MutationClass,
     ProviderToolHints,
+    ToolPolicy,
     TrustClass,
 )
 from core.extensions.registry import (
@@ -26,8 +29,11 @@ from core.extensions.registry import (
     SchemaValidationResult,
     StaleGenerationError,
     TombstoneQuotaExceededError,
+    ToolEligibilityResult,
     evaluate_capability_trust_mutation,
+    evaluate_tool_eligibility,
     evaluate_tool_trust_mutation,
+    filter_eligible_tools,
     validate_schema_subset,
     validate_tool_arguments,
 )
@@ -40,6 +46,7 @@ def _make_tool(
     schema: Mapping[str, Any] | None = None,
     output_schema: Mapping[str, Any] | None = None,
     description: str = "A test tool",
+    policy: ToolPolicy | None = None,
 ) -> ExtensionToolDescriptor:
     input_s = schema if schema is not None else {"type": "object", "properties": {"param": {"type": "string"}}}
     return ExtensionToolDescriptor.create(
@@ -50,6 +57,7 @@ def _make_tool(
         input_schema=input_s,
         output_schema=output_schema,
         catalog_generation=generation,
+        policy=policy,
     )
 
 
@@ -691,5 +699,289 @@ def test_provider_hints_never_grant_authority_threat_model_r07() -> None:
     ok, err = evaluate_capability_trust_mutation(meta)
     assert ok is False
     assert err == "operator_policy_disallowed"
+
+
+def _make_def(
+    extension_id: str = "ext_a",
+    enabled: bool = True,
+    launch_approved: bool = True,
+    trust_class: TrustClass = TrustClass.RESTRICTED,
+    platforms: tuple[str, ...] = ("windows", "linux"),
+) -> ExtensionDefinition:
+    import json
+    raw = {
+        "extension_id": extension_id,
+        "display_name": "Test Extension",
+        "provider": f"prov-{extension_id}",
+        "transport": "stdio",
+        "command": "python.exe",
+        "working_directory": "C:/tmp",
+        "enabled": enabled,
+        "launch_approved": launch_approved,
+        "trust_class": trust_class.value,
+        "platforms": list(platforms),
+        "tools": {
+            "query": {
+                "remote_name": "query",
+                "domain": "testing",
+                "allow_call": True,
+                "mutation_class": "read_only",
+            }
+        },
+    }
+    return ExtensionDefinition.model_validate_json(json.dumps(raw))
+
+
+def test_evaluate_tool_eligibility_ordered_gates() -> None:
+    pol = ToolPolicy(
+        remote_name="query",
+        domain="testing",
+        allow_call=True,
+        mutation_class=MutationClass.READ_ONLY,
+        profiles=("testing",),
+        required_env_refs=("API_KEY",),
+    )
+    tool = _make_tool("ext_a", "query", generation=1, policy=pol)
+
+    registry = ExtensionRegistry()
+    snapshot = registry.publish_extension_catalog("ext_a", 1, [tool])
+
+    # Gate 1: Snapshot / Presence / Withheld / Stale
+    # Missing snapshot when evaluated by string
+    res_miss_snap = evaluate_tool_eligibility("external.ext_a.query")
+    assert isinstance(res_miss_snap, ToolEligibilityResult)
+    assert res_miss_snap.eligible is False
+    assert res_miss_snap.rejection_code == "missing_snapshot"
+
+    # Tool not found in snapshot
+    res_not_found = evaluate_tool_eligibility("external.ext_a.absent", snapshot=snapshot)
+    assert res_not_found.eligible is False
+    assert res_not_found.rejection_code == "tool_not_found"
+
+    # Withheld schema
+    reg_withheld = ExtensionRegistry()
+    t_invalid = _make_tool(
+        "ext_a",
+        "invalid",
+        generation=1,
+        schema={"type": "object", "properties": {"q": {"type": "string", "pattern": "^a"}}},
+    )
+    snap_withheld = reg_withheld.publish_extension_catalog("ext_a", 1, [t_invalid])
+    res_withheld = evaluate_tool_eligibility("external.ext_a.invalid", snapshot=snap_withheld)
+    assert res_withheld.eligible is False
+    assert res_withheld.rejection_code == "schema_withheld"
+
+    # Stale generation
+    tool_gen1 = _make_tool("ext_a", "query", generation=1, policy=pol)
+    tool_gen2 = _make_tool("ext_a", "query", generation=2, policy=pol)
+    reg_stale = ExtensionRegistry()
+    snap_stale = reg_stale.publish_extension_catalog("ext_a", 2, [tool_gen2])
+    res_stale = evaluate_tool_eligibility(tool_gen1, snapshot=snap_stale)
+    assert res_stale.eligible is False
+    assert res_stale.rejection_code == "stale_generation"
+
+    # Gate 2: Configuration & Launch approval
+    # Launch not approved
+    res_no_launch = evaluate_tool_eligibility(
+        tool, snapshot=snapshot, definition=_make_def(launch_approved=False)
+    )
+    assert res_no_launch.eligible is False
+    assert res_no_launch.rejection_code == "launch_not_approved"
+
+    # Disabled
+    res_disabled = evaluate_tool_eligibility(
+        tool, snapshot=snapshot, definition=_make_def(enabled=False)
+    )
+    assert res_disabled.eligible is False
+    assert res_disabled.rejection_code == "extension_disabled"
+
+    # Gate 3: Runtime State / Live Health
+    res_degraded = evaluate_tool_eligibility(
+        tool, snapshot=snapshot, definition=_make_def(), runtime_state=ExtensionState.DEGRADED
+    )
+    assert res_degraded.eligible is False
+    assert res_degraded.rejection_code == "runtime_not_healthy"
+
+    # Healthy denied scenario: state is HEALTHY, but operator policy has allow_call=False
+    pol_disallow = ToolPolicy(
+        remote_name="query", domain="testing", allow_call=False, mutation_class=MutationClass.READ_ONLY
+    )
+    tool_disallow = _make_tool("ext_a", "query", generation=1, policy=pol_disallow)
+    res_healthy_denied = evaluate_tool_eligibility(
+        tool_disallow, snapshot=snapshot, definition=_make_def(), runtime_state=ExtensionState.HEALTHY
+    )
+    assert res_healthy_denied.eligible is False
+    assert res_healthy_denied.rejection_code == "operator_policy_disallowed"
+
+    # Gate 4: Platform match
+    res_plat_mismatch = evaluate_tool_eligibility(
+        tool, snapshot=snapshot, definition=_make_def(platforms=("windows",)), platform="macos"
+    )
+    assert res_plat_mismatch.eligible is False
+    assert res_plat_mismatch.rejection_code == "platform_mismatch"
+
+    # Gate 5: Active profile match
+    res_prof_mismatch = evaluate_tool_eligibility(
+        tool,
+        snapshot=snapshot,
+        definition=_make_def(),
+        active_profile="desktop",
+        platform="windows",
+        resolved_env_refs=("API_KEY",),
+    )
+    assert res_prof_mismatch.eligible is False
+    assert res_prof_mismatch.rejection_code == "profile_mismatch"
+
+    # Gate 6: Authentication / Required environment references
+    res_auth_missing = evaluate_tool_eligibility(
+        tool,
+        snapshot=snapshot,
+        definition=_make_def(),
+        active_profile="testing",
+        platform="windows",
+        resolved_env_refs=(),
+    )
+    assert res_auth_missing.eligible is False
+    assert res_auth_missing.rejection_code == "missing_auth_refs"
+
+    # Gate 7: Tool policy & Trust
+    res_untrusted = evaluate_tool_eligibility(
+        tool,
+        snapshot=snapshot,
+        definition=_make_def(trust_class=TrustClass.UNTRUSTED),
+        active_profile="testing",
+        platform="windows",
+        resolved_env_refs=("API_KEY",),
+    )
+    assert res_untrusted.eligible is False
+    assert res_untrusted.rejection_code == "untrusted_extension_call_forbidden"
+
+    # Restricted mutation forbidden
+    pol_mut = ToolPolicy(
+        remote_name="query", domain="testing", allow_call=True, mutation_class=MutationClass.LOCAL_MUTATION
+    )
+    tool_mut = _make_tool("ext_a", "query", generation=1, policy=pol_mut)
+    res_rest_mut = evaluate_tool_eligibility(
+        tool_mut,
+        snapshot=snapshot,
+        definition=_make_def(trust_class=TrustClass.RESTRICTED),
+        platform="windows",
+    )
+    assert res_rest_mut.eligible is False
+    assert res_rest_mut.rejection_code == "restricted_trust_mutation_forbidden"
+
+    # Gate 8: Mutation & Recovery
+    # Mutation gate closed pre-M10 (even under TRUSTED)
+    res_mut_closed = evaluate_tool_eligibility(
+        tool_mut,
+        snapshot=snapshot,
+        definition=_make_def(trust_class=TrustClass.TRUSTED),
+        is_mutation_gate_closed=True,
+        platform="windows",
+    )
+    assert res_mut_closed.eligible is False
+    assert res_mut_closed.rejection_code == "mutation_gate_closed_pre_m10"
+
+    # Recovery unavailable when gate is open
+    res_rec_unavail = evaluate_tool_eligibility(
+        tool_mut,
+        snapshot=snapshot,
+        definition=_make_def(trust_class=TrustClass.TRUSTED),
+        is_mutation_gate_closed=False,
+        is_recovery_available=False,
+        platform="windows",
+    )
+    assert res_rec_unavail.eligible is False
+    assert res_rec_unavail.rejection_code == "recovery_unavailable"
+
+    # When recovery available and mutation gate open -> eligible!
+    res_rec_avail = evaluate_tool_eligibility(
+        tool_mut,
+        snapshot=snapshot,
+        definition=_make_def(trust_class=TrustClass.TRUSTED),
+        is_mutation_gate_closed=False,
+        is_recovery_available=True,
+        platform="windows",
+    )
+    assert res_rec_avail.eligible is True
+    assert res_rec_avail.rejection_code is None
+
+    # Fully eligible read-only tool under RESTRICTED
+    res_eligible = evaluate_tool_eligibility(
+        tool,
+        snapshot=snapshot,
+        definition=_make_def(),
+        active_profile="testing",
+        platform="windows",
+        resolved_env_refs=("API_KEY",),
+    )
+    assert res_eligible.eligible is True
+    assert res_eligible.rejection_code is None
+    assert res_eligible.reason is None
+
+
+def test_filter_eligible_tools_and_registry_service() -> None:
+    pol_valid = ToolPolicy(
+        remote_name="tool_ok", domain="testing", allow_call=True, mutation_class=MutationClass.READ_ONLY
+    )
+    pol_disallowed = ToolPolicy(
+        remote_name="tool_deny", domain="testing", allow_call=False, mutation_class=MutationClass.READ_ONLY
+    )
+    t1 = _make_tool("ext_a", "tool_ok", generation=1, policy=pol_valid)
+    t2 = _make_tool("ext_a", "tool_deny", generation=1, policy=pol_disallowed)
+    t3 = _make_tool("ext_b", "tool_plat", generation=1, policy=pol_valid)
+
+    registry = ExtensionRegistry()
+    registry.publish_extension_catalog("ext_a", 1, [t1, t2])
+    registry.publish_extension_catalog("ext_b", 1, [t3])
+
+    defs = {
+        "ext_a": _make_def("ext_a", platforms=("windows", "linux")),
+        "ext_b": _make_def("ext_b", platforms=("macos",)),
+    }
+
+    # Evaluate via filter_eligible_tools on Windows
+    eligible = filter_eligible_tools(
+        registry.active_snapshot,
+        definitions=defs,
+        platform="windows",
+    )
+    # Only t1 is eligible on Windows (t2 has allow_call=False, t3 is macos only)
+    assert len(eligible) == 1
+    assert eligible[0].public_name == "external.ext_a.tool_ok"
+
+    # Evaluate via registry.eligible_tools method
+    eligible_reg = registry.eligible_tools(definitions=defs, platform="windows")
+    assert eligible_reg == eligible
+
+    # Evaluate via registry.evaluate_eligibility method
+    res1 = registry.evaluate_eligibility("external.ext_a.tool_ok", definition=defs["ext_a"], platform="windows")
+    assert res1.eligible is True
+
+    res2 = registry.evaluate_eligibility("external.ext_a.tool_deny", definition=defs["ext_a"], platform="windows")
+    assert res2.eligible is False
+    assert res2.rejection_code == "operator_policy_disallowed"
+
+    res_missing = registry.evaluate_eligibility("external.ext_a.nonexistent")
+    assert res_missing.eligible is False
+    assert res_missing.rejection_code == "tool_not_found"
+
+
+def test_pure_eligibility_strictly_no_protocol_io(monkeypatch: pytest.MonkeyPatch) -> None:
+    import urllib.request
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Protocol/network I/O called during pure eligibility evaluation!")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+
+    pol = ToolPolicy(remote_name="q", domain="testing", allow_call=True, mutation_class=MutationClass.READ_ONLY)
+    tool = _make_tool("ext_a", "q", generation=1, policy=pol)
+    registry = ExtensionRegistry()
+    snap = registry.publish_extension_catalog("ext_a", 1, [tool])
+
+    res = evaluate_tool_eligibility(tool, snapshot=snap, definition=_make_def(), platform="windows")
+    assert res.eligible is True
+
 
 
