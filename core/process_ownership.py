@@ -18,6 +18,7 @@ from typing import IO, Any, Protocol
 import psutil
 
 from core import windows_job
+from core.windows_job import NativeOwnershipRequiredError
 
 
 class OwnedProcess(Protocol):
@@ -264,6 +265,7 @@ def spawn_owned_process(
     stdout: int | IO[Any] | None,
     stderr: int | IO[Any] | None,
     creationflags: int,
+    require_native: bool = False,
 ) -> OwnedProcess:
     """Spawn under the strongest process-tree ownership available on this host."""
 
@@ -276,9 +278,14 @@ def spawn_owned_process(
             stdout=stdout,
             stderr=stderr,
             creationflags=creationflags,
+            require_native=require_native,
         )
 
     if not posix_process_groups_enabled():
+        if require_native:
+            raise NativeOwnershipRequiredError(
+                "POSIX process groups are disabled but native process-tree ownership is required."
+            )
         return _regular_popen(
             command,
             cwd=cwd,
@@ -290,14 +297,21 @@ def spawn_owned_process(
             backend="psutil",
         )
 
-    process = subprocess.Popen(
-        list(command),
-        cwd=str(cwd),
-        env=env,
-        stdin=stdin,
-        stdout=stdout,
-        stderr=stderr,
-        creationflags=creationflags,
-        start_new_session=True,
-    )
+    try:
+        process = subprocess.Popen(
+            list(command),
+            cwd=str(cwd),
+            env=env,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            creationflags=creationflags,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        if require_native:
+            raise NativeOwnershipRequiredError(
+                f"Failed to spawn POSIX process in a new session: {exc}"
+            ) from exc
+        raise
     return PosixOwnedProcess(process, process.pid)
