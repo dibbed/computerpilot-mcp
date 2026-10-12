@@ -297,6 +297,56 @@ def test_acyclic_reference_fanout_has_a_finite_expansion_budget() -> None:
     assert not validate_schema_subset(schema).valid
 
 
+@pytest.mark.parametrize("namespace,shadow", [("$defs", "definitions"), ("definitions", "$defs")])
+def test_reference_budget_resolves_the_exact_definition_namespace(namespace: str, shadow: str) -> None:
+    definitions: dict[str, Any] = {"L0": {"type": "integer"}}
+    for level in range(1, 8):
+        definitions[f"L{level}"] = {"allOf": [{"$ref": f"#/{namespace}/L{level - 1}"} for _ in range(5)]}
+    schema = {
+        "type": "object", namespace: definitions,
+        shadow: {name: {"type": "integer"} for name in definitions},
+        "properties": {"x": {"$ref": f"#/{namespace}/L7"}},
+    }
+    assert not validate_schema_subset(schema).valid
+
+
+@pytest.mark.parametrize("reference", ["#/$defs/wrapper/default", "#/$defs/wrapper%2Fdefault"])
+def test_nested_reference_cannot_enter_unvalidated_schema_metadata(reference: str) -> None:
+    schema = {"$defs": {
+        "wrapper": {"default": {"type": "string", "pattern": "(a+)+$"}},
+        "default": {"type": "integer"},
+    }, "$ref": reference}
+    assert not validate_schema_subset(schema).valid
+
+
+def test_reference_cycle_cannot_be_hidden_by_a_second_namespace() -> None:
+    schema = {"$defs": {"node": {"$ref": "#/$defs/node"}}, "definitions": {"node": {"type": "integer"}}}
+    assert not validate_schema_subset(schema).valid
+
+
+@pytest.mark.parametrize("name,reference", [
+    ("file.name/tilde~key", "file.name~1tilde~0key"), ("space key", "space%20key"),
+])
+def test_direct_local_reference_decoding_matches_the_offline_validator(name: str, reference: str) -> None:
+    schema = {
+        "type": "object", "$defs": {name: {"type": "integer"}},
+        "properties": {"value": {"$ref": f"#/$defs/{reference}"}},
+    }
+    assert validate_schema_subset(schema).valid
+    assert validate_tool_arguments(schema, {"value": 12}).valid
+    assert not validate_tool_arguments(schema, {"value": "wrong type"}).valid
+
+
+def test_same_definition_name_in_two_namespaces_preserves_both_constraints() -> None:
+    schema = {
+        "type": "object", "$defs": {"value": {"type": "integer"}},
+        "definitions": {"value": {"type": "string"}},
+        "properties": {"number": {"$ref": "#/$defs/value"}, "text": {"$ref": "#/definitions/value"}},
+    }
+    assert validate_tool_arguments(schema, {"number": 12, "text": "valid"}).valid
+    assert not validate_tool_arguments(schema, {"number": "invalid", "text": 12}).valid
+
+
 def test_reference_chain_depth_is_bounded_before_validator_recursion() -> None:
     definitions: dict[str, Any] = {"L0": {"type": "integer"}}
     for level in range(1, 40):

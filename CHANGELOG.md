@@ -7,7 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Added
-- 2026-10-12: Add the contributor execution contract, native/extension authoring and testing standards, and the tracked extensibility execution ledger.
+- 2026-10-12: Add the contributor execution contract, native/extension authoring and testing standards, and the local extensibility execution ledger.
 - 2026-10-12: Add strict immutable extension definitions, exact namespaces, a bounded opt-in offline configuration reader and private minimal env-only credential references; provider activation remains gated.
 - 2026-10-12: Add isolated local MCP fixtures for protocol, catalog, cancellation, lost-response and owned process-tree tests; keep extensions disabled in both CI matrices.
 - 2026-10-12: Validate complete accepted provider schemas without network retrieval and return a Core-owned external result envelope through public SDK requests.
@@ -20,6 +20,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Require operator launch approval and permitted trust before extension start/restart, direct connection and call admission, including revalidation after queue waits.
 - 2026-10-12: Remove unvalidated extension environment overrides and sanitize credential echoes, provider exceptions, SDK payload logs and credential-bearing stderr before public output or diagnostics.
 - 2026-10-12: Bound expanded schema-reference work, reject tuple-form schema bypasses, and cover numeric/escaped binary credential echoes and SDK dispatcher payload logs.
+- 2026-10-12: Resolve local schema references by exact namespace and decoded JSON Pointer identity; reject nested targets that could enter unchecked metadata or evade complexity bounds.
 
 ## [0.7.1] - 2026-10-11
 

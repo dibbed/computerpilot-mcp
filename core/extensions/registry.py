@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, cast
+from urllib.parse import unquote
 
 from jsonschema.validators import validator_for
 from referencing import Registry
@@ -151,14 +152,7 @@ def validate_schema_subset(schema: Any) -> SchemaValidationResult:
                 message=f"Unsupported or unrecognized $schema dialect: '{dialect}'",
             )
 
-    # Collect local definitions for ref resolution and cycle detection
-    local_defs: dict[str, Any] = {}
-    if "$defs" in schema and isinstance(schema["$defs"], Mapping):
-        local_defs.update(schema["$defs"])
-    if "definitions" in schema and isinstance(schema["definitions"], Mapping):
-        local_defs.update(schema["definitions"])
-
-    ref_targets: list[str] = []
+    ref_targets: dict[str, tuple[str, str]] = {}
     node_count = 0
 
     def walk(node: Any, depth: int) -> SchemaValidationResult | None:
@@ -236,7 +230,18 @@ def validate_schema_subset(schema: Any) -> SchemaValidationResult:
                         error_code="unsupported_remote_ref",
                         message=f"Only local #/$defs/ or #/definitions/ references are permitted: '{val}'",
                     )
-                ref_targets.append(val)
+                try:
+                    parts = unquote(val[1:], errors="strict").split("/")
+                except UnicodeError:
+                    parts = []
+                # Only direct root definitions are schemas already inspected by walk.
+                if len(parts) != 3 or parts[1] not in ("$defs", "definitions") or "~" in parts[2].replace("~0", "").replace("~1", ""):
+                    return SchemaValidationResult(False, "unsupported_local_ref", "Only direct root-definition pointers are supported.")
+                namespace, target = parts[1], parts[2].replace("~1", "/").replace("~0", "~")
+                definitions = schema.get(namespace)
+                if not isinstance(definitions, Mapping) or target not in definitions:
+                    return SchemaValidationResult(False, f"unresolvable_local_ref:{val}", "The exact local definition does not exist.")
+                ref_targets[val] = (namespace, target)
 
             elif key in ("properties", "$defs", "definitions"):
                 if isinstance(val, Mapping):
@@ -259,20 +264,10 @@ def validate_schema_subset(schema: Any) -> SchemaValidationResult:
     if root_res is not None:
         return root_res
 
-    # Validate local refs exist
-    for ref_str in ref_targets:
-        target_name = ref_str.split("/")[-1]
-        if target_name not in local_defs:
-            return SchemaValidationResult(
-                valid=False,
-                error_code=f"unresolvable_local_ref:{ref_str}",
-                message=f"Local schema definition '{target_name}' referenced by '{ref_str}' does not exist",
-            )
-
     # Count expanded references, including repeated DAG edges, before validator execution.
     expanded_nodes = 0
 
-    def expanded_work(node: Any, depth: int, active: frozenset[str] = frozenset()) -> SchemaValidationResult | None:
+    def expanded_work(node: Any, depth: int, active: frozenset[tuple[str, str]] = frozenset()) -> SchemaValidationResult | None:
         nonlocal expanded_nodes
         expanded_nodes += 1
         if expanded_nodes > LIMITS.schema_nodes:
@@ -283,10 +278,10 @@ def validate_schema_subset(schema: Any) -> SchemaValidationResult:
             return None
         for key, value in node.items():
             if key == "$ref" and isinstance(value, str):
-                target = value.split("/")[-1]
+                target = ref_targets[value]
                 if target in active:
                     return SchemaValidationResult(False, "cyclic_reference_detected", "Cyclic schema references are unsupported.")
-                result = expanded_work(local_defs[target], depth + 1, active | {target})
+                result = expanded_work(schema[target[0]][target[1]], depth + 1, active | {target})
                 if result is not None:
                     return result
             elif key in ("properties", "$defs", "definitions") and isinstance(value, Mapping):
