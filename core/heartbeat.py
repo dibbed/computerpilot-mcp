@@ -80,10 +80,38 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
         if RUNTIME_LIFECYCLE.snapshot()["managed"] else None
     )
     maintenance_task = asyncio.create_task(maintain_state())
+    extension_manager: Any = getattr(server, "extension_manager", None)
+    if extension_manager is None and SETTINGS.extensions_enabled:
+        from core.extensions.config import load_extension_config
+        from core.extensions.manager import ExtensionLifecycleManager
+
+        config_res = load_extension_config(settings=SETTINGS)
+        if config_res.config.extensions:
+            extension_manager = ExtensionLifecycleManager()
+            for ext_def in config_res.config.extensions:
+                extension_manager.register_extension(ext_def)
+            if hasattr(server, "__dict__"):
+                server.extension_manager = extension_manager
+
+    extension_task = (
+        asyncio.create_task(extension_manager.start_all_async())
+        if extension_manager is not None
+        else None
+    )
+
     try:
         yield {}
     finally:
         RUNTIME_LIFECYCLE.mark_stopping()
+        if extension_manager is not None:
+            try:
+                await extension_manager.drain_and_stop(timeout_sec=5.0)
+            except Exception:
+                pass
+        if extension_task:
+            extension_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await extension_task
         if lifecycle_task:
             lifecycle_task.cancel()
         maintenance_task.cancel()

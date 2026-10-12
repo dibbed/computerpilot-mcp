@@ -232,6 +232,10 @@ class ExtensionOwner:
     def generation(self) -> int:
         return self.state_machine.generation
 
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+
     def signal(self, sig: OwnerSignal) -> bool:
         """Send a control signal to the owner actor. Duplicate starts are coalesced."""
         # Coalesce duplicate start signals if already starting, healthy, or degraded
@@ -475,6 +479,8 @@ class ExtensionLifecycleManager:
         self._parallel_startup = parallel_startup
         self._startup_semaphore = anyio.Semaphore(parallel_startup)
         self._owners: dict[str, ExtensionOwner] = {}
+        self._unresolved_mutation_hooks: list[Callable[[str], None]] = []
+        self._shutdown_event: anyio.Event = anyio.Event()
 
     @property
     def registry(self) -> ExtensionRegistry:
@@ -634,3 +640,57 @@ class ExtensionLifecycleManager:
                     keep_alive_event,
                     runner,
                 )
+
+    def register_unresolved_mutation_hook(self, hook: Callable[[str], None]) -> None:
+        """Register a hook invoked during drain to mark in-flight mutations unresolved."""
+        self._unresolved_mutation_hooks.append(hook)
+
+    def close_all_admission(self) -> None:
+        """Close admission across all extensions by retiring catalogs from registry."""
+        for ext_id in list(self._owners.keys()):
+            self._registry.retire_extension_catalog(ext_id)
+
+    async def drain_and_stop(self, timeout_sec: float = LIMITS.shutdown_sec) -> None:
+        """Drain and stop all extensions within bounded timeout and reap resources."""
+        # 1. Close admission first across all extensions
+        self.close_all_admission()
+
+        # 2. Invoke mark mutation unresolved hooks before teardown
+        for hook in self._unresolved_mutation_hooks:
+            try:
+                hook("runtime_shutdown")
+            except Exception as exc:
+                logger.warning("Unresolved mutation hook raised: %s", exc)
+
+        # 3. Trigger shutdown event to release waiting background discovery tasks
+        self._shutdown_event.set()
+
+        # 4. Signal stop and close sessions bounded by timeout
+        with anyio.move_on_after(timeout_sec):
+            for owner in list(self._owners.values()):
+                owner.signal(OwnerSignal.STOP)
+
+            while any(owner.is_running for owner in self._owners.values()):
+                await anyio.sleep(0.01)
+
+            for owner in list(self._owners.values()):
+                owner.close_active_session()
+                if owner.state_machine.can_transition(ExtensionState.STOPPING):
+                    owner.state_machine.transition(ExtensionState.STOPPING, reason="drain_and_stop")
+                target = (
+                    ExtensionState.DISABLED
+                    if not owner.is_enabled
+                    else ExtensionState.CONFIGURED
+                )
+                if owner.state_machine.can_transition(target):
+                    owner.state_machine.transition(target, reason="drain_and_stop")
+
+    async def start_all_async(
+        self,
+        keep_alive_event: anyio.Event | None = None,
+        custom_runners: dict[str, Callable[[ExtensionOwner], Any]] | None = None,
+    ) -> None:
+        """Run all enabled extensions in background task group."""
+        event = keep_alive_event or self._shutdown_event
+        async with anyio.create_task_group() as tg:
+            await self.start_all_background(tg, keep_alive_event=event, custom_runners=custom_runners)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -715,3 +716,185 @@ def test_fresh_session_and_generation_on_reconnect() -> None:
     session_mock_2 = MagicMock()
     owner.register_session(session_mock_2, "session-2")
     assert owner.generation == 2
+
+
+def test_drain_and_stop_closes_admission_fires_hooks_and_transitions_owners() -> None:
+    """Verify drain_and_stop closes admission first, fires unresolved hooks, and transitions states."""
+    manager = ExtensionLifecycleManager()
+    definition = _dummy_definition("ext-drain-test", enabled=True)
+    owner = manager.register_extension(definition)
+    owner.state_machine.transition(ExtensionState.STARTING)
+
+    tool = ExtensionToolDescriptor.create(
+        extension_id="ext-drain-test",
+        provider="fixture",
+        remote_name="dummy_tool",
+        description="Dummy tool description",
+        input_schema={"type": "object"},
+        catalog_generation=owner.generation,
+    )
+    manager.registry.publish_extension_catalog("ext-drain-test", owner.generation, (tool,))
+    owner.state_machine.transition(ExtensionState.HEALTHY)
+
+    # Register session mock
+    session_mock = MagicMock()
+    owner.register_session(session_mock, "session-drain-1")
+
+    # Track hook invocations
+    hook_calls: list[str] = []
+    manager.register_unresolved_mutation_hook(lambda reason: hook_calls.append(reason))
+
+    # Verify initial healthy routable state
+    assert manager.is_routable("ext-drain-test")
+    assert len(manager.list_tools()) == 1
+    assert owner._active_session is not None
+
+    async def scenario() -> None:
+        await manager.drain_and_stop(timeout_sec=0.5)
+
+        # 1. Admission closed
+        assert not manager.is_routable("ext-drain-test")
+        assert len(manager.list_tools()) == 0
+        assert not manager.registry.has_tool("external.ext-drain-test.dummy_tool")
+
+        # 2. Hook was called
+        assert hook_calls == ["runtime_shutdown"]
+
+        # 3. Transitions to CONFIGURED (enabled)
+        assert owner.state == ExtensionState.CONFIGURED
+        assert owner._active_session is None
+
+    anyio.run(scenario)
+
+
+def test_drain_and_stop_stops_running_background_extensions() -> None:
+    """Verify drain_and_stop unblocks and cleanly stops background owner loops."""
+    manager = ExtensionLifecycleManager()
+    definition = _dummy_definition("ext-bg-drain", enabled=True)
+    owner = manager.register_extension(definition)
+
+    ready_event = anyio.Event()
+
+    async def runner(own: ExtensionOwner) -> None:
+        own.state_machine.transition(ExtensionState.HEALTHY)
+        ready_event.set()
+        await manager._shutdown_event.wait()
+
+    async def scenario() -> None:
+        async def run_bg() -> None:
+            await manager.start_all_async(custom_runners={"ext-bg-drain": runner})
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_bg)
+            await ready_event.wait()
+            assert owner.state == ExtensionState.HEALTHY
+            assert owner.is_running
+
+            # Now drain and stop
+            await manager.drain_and_stop(timeout_sec=1.0)
+            assert not owner.is_running
+            assert owner.state == ExtensionState.CONFIGURED
+
+    anyio.run(scenario)
+
+
+def test_lifespan_integration_with_extensions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Verify heartbeat lifespan stop order coordinates RUNTIME_LIFECYCLE, extension drain, and task cancel."""
+    from dataclasses import replace
+
+    from core import heartbeat
+    from core.lifecycle import RuntimeLifecycle
+
+    stop_events_order: list[str] = []
+
+    # Mock lifecycle to record mark_stopping
+    mock_lifecycle = RuntimeLifecycle()
+    original_mark = mock_lifecycle.mark_stopping
+
+    def tracked_mark_stopping() -> None:
+        stop_events_order.append("mark_stopping")
+        original_mark()
+
+    monkeypatch.setattr(mock_lifecycle, "mark_stopping", tracked_mark_stopping)
+    monkeypatch.setattr(heartbeat, "RUNTIME_LIFECYCLE", mock_lifecycle)
+
+    # Settings mock with extensions enabled
+    monkeypatch.setattr(
+        heartbeat, "SETTINGS", replace(heartbeat.SETTINGS, state_dir=tmp_path, extensions_enabled=True)
+    )
+    for name in (
+        "schedule_artifact_retention",
+        "schedule_job_history_retention",
+        "schedule_workflow_history_retention",
+        "flush_audit",
+    ):
+        monkeypatch.setattr(heartbeat, name, lambda **kwargs: None)
+    monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
+    monkeypatch.setattr(heartbeat, "flush_audit", lambda: stop_events_order.append("flush_audit"))
+
+    # Mock extension manager
+    class FakeExtensionManager:
+        def __init__(self) -> None:
+            self.started = False
+            self.drained = False
+
+        async def start_all_async(self) -> None:
+            self.started = True
+            try:
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                pass
+
+        async def drain_and_stop(self, timeout_sec: float = 5.0) -> None:
+            stop_events_order.append("drain_and_stop")
+            self.drained = True
+
+    class FakeServer:
+        def __init__(self) -> None:
+            self.extension_manager = FakeExtensionManager()
+
+    server = FakeServer()
+
+    async def scenario() -> None:
+        async with heartbeat.lifespan(server):
+            await asyncio.sleep(0.05)
+            assert server.extension_manager.started
+
+    asyncio.run(scenario())
+
+    # Stop order must be: mark_stopping -> drain_and_stop -> flush_audit
+    assert stop_events_order == ["mark_stopping", "drain_and_stop", "flush_audit"]
+    assert server.extension_manager.drained
+
+
+def test_lifespan_native_zero_extension_compatibility(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Verify lifespan without extensions enabled has zero impact and leaves server untouched."""
+    from dataclasses import replace
+
+    from core import heartbeat
+
+    monkeypatch.setattr(
+        heartbeat, "SETTINGS", replace(heartbeat.SETTINGS, state_dir=tmp_path, extensions_enabled=False)
+    )
+    for name in (
+        "schedule_artifact_retention",
+        "schedule_job_history_retention",
+        "schedule_workflow_history_retention",
+        "flush_audit",
+    ):
+        monkeypatch.setattr(heartbeat, name, lambda **kwargs: None)
+    monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
+
+    class PlainServer:
+        pass
+
+    server = PlainServer()
+
+    async def scenario() -> None:
+        async with heartbeat.lifespan(server):
+            await asyncio.sleep(0.05)
+            assert getattr(server, "extension_manager", None) is None
+
+    asyncio.run(scenario())
+    assert getattr(server, "extension_manager", None) is None
+
