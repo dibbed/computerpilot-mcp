@@ -13,14 +13,18 @@ from core.extensions.models import (
     ExtensionToolDescriptor,
 )
 from core.extensions.registry import (
+    ArgumentValidationResult,
     CatalogLimitExceededError,
     DuplicateToolIdentityError,
     ExtensionLease,
     ExtensionRegistry,
     ExtensionRegistryError,
     SchemaChangedRestartRequiredError,
+    SchemaValidationResult,
     StaleGenerationError,
     TombstoneQuotaExceededError,
+    validate_schema_subset,
+    validate_tool_arguments,
 )
 
 
@@ -299,3 +303,245 @@ def test_lease_creation_and_validation() -> None:
     assert registry.is_lease_valid(new_lease) is True
     registry.retire_extension_catalog("ext_a")
     assert registry.is_lease_valid(new_lease) is False
+
+
+def test_schema_subset_allowed_and_rejected_keywords() -> None:
+    # Valid schema with typical allowed keywords
+    valid_schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "title": "Search",
+        "description": "Search items",
+        "properties": {
+            "query": {"type": "string", "minLength": 1, "maxLength": 100},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+            "status": {"type": "string", "enum": ["active", "archived"]},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    assert validate_schema_subset(valid_schema) == SchemaValidationResult(valid=True)
+
+    # Boolean schema is valid
+    assert validate_schema_subset(True) == SchemaValidationResult(valid=True)
+
+    # Unrecognized $schema dialect
+    bad_dialect = {"$schema": "https://json-schema.org/draft/2099/schema", "type": "object"}
+    res_dialect = validate_schema_subset(bad_dialect)
+    assert res_dialect.valid is False
+    assert res_dialect.error_code == "unsupported_schema_dialect"
+
+    # Unknown keyword rejected
+    bad_keyword = {"type": "object", "customKeyword": 123}
+    res_kw = validate_schema_subset(bad_keyword)
+    assert res_kw.valid is False
+    assert res_kw.error_code == "unsupported_keyword:customKeyword"
+
+    # ReDoS regex keywords rejected
+    bad_pattern = {"type": "object", "properties": {"code": {"type": "string", "pattern": "^[a-z]+$"}}}
+    res_pattern = validate_schema_subset(bad_pattern)
+    assert res_pattern.valid is False
+    assert res_pattern.error_code == "unsupported_regex_keyword:pattern"
+
+    bad_prop_pattern = {"type": "object", "patternProperties": {"^s_": {"type": "string"}}}
+    res_prop_pattern = validate_schema_subset(bad_prop_pattern)
+    assert res_prop_pattern.valid is False
+    assert res_prop_pattern.error_code == "unsupported_regex_keyword:patternProperties"
+
+    # Unsupported schema keywords ($id, $dynamicRef, etc.) rejected
+    bad_id = {"$id": "https://example.com/schema.json", "type": "object"}
+    res_id = validate_schema_subset(bad_id)
+    assert res_id.valid is False
+    assert res_id.error_code == "unsupported_schema_keyword:$id"
+
+
+def test_schema_subset_remote_ref_rejected() -> None:
+    # HTTP remote ref rejected
+    remote_http = {"type": "object", "properties": {"user": {"$ref": "https://example.com/user.json"}}}
+    res_http = validate_schema_subset(remote_http)
+    assert res_http.valid is False
+    assert res_http.error_code == "unsupported_remote_ref"
+
+    # File remote ref rejected
+    remote_file = {"type": "object", "properties": {"user": {"$ref": "file:///etc/passwd"}}}
+    res_file = validate_schema_subset(remote_file)
+    assert res_file.valid is False
+    assert res_file.error_code == "unsupported_remote_ref"
+
+    # Non-standard anchor ref rejected
+    anchor_ref = {"type": "object", "properties": {"user": {"$ref": "#myAnchor"}}}
+    res_anchor = validate_schema_subset(anchor_ref)
+    assert res_anchor.valid is False
+    assert res_anchor.error_code == "unsupported_remote_ref"
+
+
+def test_schema_subset_local_defs_and_cyclic_detection() -> None:
+    # Valid acyclic local ref
+    valid_local = {
+        "type": "object",
+        "$defs": {
+            "Address": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+        "properties": {
+            "billing": {"$ref": "#/$defs/Address"},
+        },
+    }
+    assert validate_schema_subset(valid_local) == SchemaValidationResult(valid=True)
+
+    # Unresolvable local ref
+    unresolvable = {
+        "type": "object",
+        "$defs": {
+            "Existing": {"type": "string"},
+        },
+        "properties": {
+            "billing": {"$ref": "#/$defs/Missing"},
+        },
+    }
+    res_missing = validate_schema_subset(unresolvable)
+    assert res_missing.valid is False
+    assert res_missing.error_code == "unresolvable_local_ref:#/$defs/Missing"
+
+    # Cyclic local ref (A -> B -> A)
+    cyclic = {
+        "type": "object",
+        "$defs": {
+            "NodeA": {
+                "type": "object",
+                "properties": {"next": {"$ref": "#/$defs/NodeB"}},
+            },
+            "NodeB": {
+                "type": "object",
+                "properties": {"back": {"$ref": "#/$defs/NodeA"}},
+            },
+        },
+        "properties": {
+            "head": {"$ref": "#/$defs/NodeA"},
+        },
+    }
+    res_cyclic = validate_schema_subset(cyclic)
+    assert res_cyclic.valid is False
+    assert res_cyclic.error_code == "cyclic_reference_detected"
+
+
+def test_schema_subset_depth_and_composition_limits() -> None:
+    # Composition width > 16 rejected
+    wide_all_of = {
+        "type": "object",
+        "allOf": [{"type": "object"} for _ in range(LIMITS.composition_width + 1)],
+    }
+    res_wide = validate_schema_subset(wide_all_of)
+    assert res_wide.valid is False
+    assert res_wide.error_code == "schema_composition_width_exceeded"
+
+    # Depth > 32 rejected
+    deep_schema: dict[str, Any] = {"type": "string"}
+    for _ in range(LIMITS.json_depth + 2):
+        deep_schema = {"type": "object", "properties": {"nested": deep_schema}}
+
+    res_deep = validate_schema_subset(deep_schema)
+    assert res_deep.valid is False
+    assert res_deep.error_code == "schema_depth_exceeded"
+
+
+def test_validate_tool_arguments_preserves_file_name_and_types() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "file.name": {"type": "string", "minLength": 1},
+            "retry_count": {"type": "integer", "minimum": 0, "maximum": 5},
+            "enabled": {"type": "boolean"},
+            "mode": {"type": "string", "enum": ["read", "write"]},
+        },
+        "required": ["file.name", "retry_count"],
+        "additionalProperties": False,
+    }
+
+    # Valid arguments matching exact 'file.name' property
+    good_args = {"file.name": "report.pdf", "retry_count": 3, "enabled": True, "mode": "read"}
+    assert validate_tool_arguments(schema, good_args) == ArgumentValidationResult(valid=True)
+
+    # Missing required argument
+    missing_args = {"retry_count": 3}
+    res_missing = validate_tool_arguments(schema, missing_args)
+    assert res_missing.valid is False
+    assert res_missing.error_code == "missing_required_argument:file.name"
+
+    # Type mismatch
+    type_err = {"file.name": 12345, "retry_count": 3}
+    res_type = validate_tool_arguments(schema, type_err)
+    assert res_type.valid is False
+    assert res_type.error_code == "type_mismatch:file.name"
+
+    # Enum violation
+    enum_err = {"file.name": "test.txt", "retry_count": 1, "mode": "destroy"}
+    res_enum = validate_tool_arguments(schema, enum_err)
+    assert res_enum.valid is False
+    assert res_enum.error_code == "enum_violation:mode"
+
+    # Additional property rejected when additionalProperties is False
+    unexpected = {"file.name": "test.txt", "retry_count": 1, "unexpected_key": "val"}
+    res_unexpected = validate_tool_arguments(schema, unexpected)
+    assert res_unexpected.valid is False
+    assert res_unexpected.error_code == "unexpected_argument:unexpected_key"
+
+
+def test_validate_tool_arguments_strictly_no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    import urllib.request
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Network I/O called during schema or argument validation!")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+    }
+    res = validate_tool_arguments(schema, {"name": "testing"})
+    assert res.valid is True
+
+
+def test_candidate_publishing_withheld_invalid_schema_tools() -> None:
+    registry = ExtensionRegistry()
+
+    # Tool 1 has a valid safe schema
+    t1_valid = _make_tool(
+        "ext_a",
+        "valid_tool",
+        generation=1,
+        schema={"type": "object", "properties": {"q": {"type": "string"}}},
+    )
+
+    # Tool 2 has an invalid schema with a forbidden regex pattern
+    t2_invalid = _make_tool(
+        "ext_a",
+        "invalid_tool",
+        generation=1,
+        schema={"type": "object", "properties": {"q": {"type": "string", "pattern": "^[a-z]+$"}}},
+    )
+
+    # Publishing succeeds for valid tools; invalid tool is WITHHELD with explicit code
+    snapshot = registry.publish_extension_catalog("ext_a", 1, [t1_valid, t2_invalid])
+
+    # Valid tool is active and callable
+    assert snapshot.total_tools == 1
+    assert snapshot.has_tool("external.ext_a.valid_tool") is True
+    assert registry.get_tool("external.ext_a.valid_tool") is not None
+
+    # Invalid tool is NOT callable in snapshot.tools
+    assert snapshot.has_tool("external.ext_a.invalid_tool") is False
+    assert registry.get_tool("external.ext_a.invalid_tool") is None
+
+    # Invalid tool is tracked in withheld_tools with explicit reason
+    assert "external.ext_a.invalid_tool" in snapshot.withheld_tools
+    assert snapshot.withheld_tools["external.ext_a.invalid_tool"] == "unsupported_regex_keyword:pattern"
+    assert registry.get_withheld_reason("external.ext_a.invalid_tool") == "unsupported_regex_keyword:pattern"
+
+    # Retiring ext_a cleans up both active and withheld tools
+    snapshot2 = registry.retire_extension_catalog("ext_a")
+    assert snapshot2.total_tools == 0
+    assert len(snapshot2.withheld_tools) == 0
+

@@ -344,6 +344,7 @@ class ExtensionCatalogSnapshot:
     total_tools: int
     total_bytes: int
     observed_at: str
+    withheld_tools: Mapping[str, str] = MappingProxyType({})
 
     @classmethod
     def empty(cls) -> ExtensionCatalogSnapshot:
@@ -354,6 +355,7 @@ class ExtensionCatalogSnapshot:
             total_tools=0,
             total_bytes=0,
             observed_at="",
+            withheld_tools=MappingProxyType({}),
         )
 
     def get_tool(self, public_name: str) -> ExtensionToolDescriptor | None:
@@ -361,6 +363,9 @@ class ExtensionCatalogSnapshot:
 
     def has_tool(self, public_name: str) -> bool:
         return public_name in self.tools
+
+    def get_withheld_reason(self, public_name: str) -> str | None:
+        return self.withheld_tools.get(public_name)
 
     @property
     def tool_names(self) -> tuple[str, ...]:
