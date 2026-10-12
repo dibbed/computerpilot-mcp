@@ -25,7 +25,6 @@ from core.extensions.registry import (
     ExtensionLease,
     ExtensionRegistry,
     ExtensionRegistryError,
-    SchemaChangedRestartRequiredError,
     SchemaValidationResult,
     StaleGenerationError,
     TombstoneQuotaExceededError,
@@ -232,16 +231,17 @@ def test_reconnect_same_schema_allowed_different_schema_rejected() -> None:
     registry.retire_extension_catalog("ext_a")
     assert registry.get_tool("external.ext_a.query") is None
 
-    # Reconnect with changed schema -> REJECTED with SchemaChangedRestartRequiredError
+    # Reconnect with changed schema -> withheld until Core restart.
     t_changed = _make_tool("ext_a", "query", generation=2, schema=schema_v2)
-    with pytest.raises(SchemaChangedRestartRequiredError, match=r"schema changed.*restart required"):
-        registry.publish_extension_catalog("ext_a", 2, [t_changed])
+    changed = registry.publish_extension_catalog("ext_a", 2, [t_changed])
+    assert changed.get_tool(t_changed.public_name) is None
+    assert changed.withheld_tools[t_changed.public_name] == "schema_changed_restart_required"
 
     # Reconnect with SAME schema -> ALLOWED
-    t_same = _make_tool("ext_a", "query", generation=2, schema=schema_v1)
-    snapshot = registry.publish_extension_catalog("ext_a", 2, [t_same])
+    t_same = _make_tool("ext_a", "query", generation=3, schema=schema_v1)
+    snapshot = registry.publish_extension_catalog("ext_a", 3, [t_same])
     assert snapshot.get_tool("external.ext_a.query") is not None
-    assert snapshot.get_tool("external.ext_a.query").catalog_generation == 2  # type: ignore[union-attr]
+    assert snapshot.get_tool("external.ext_a.query").catalog_generation == 3  # type: ignore[union-attr]
 
 
 def test_tombstone_quota_exhaustion(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -316,6 +316,17 @@ def test_lease_creation_and_validation() -> None:
     assert registry.is_lease_valid(new_lease) is True
     registry.retire_extension_catalog("ext_a")
     assert registry.is_lease_valid(new_lease) is False
+
+
+def test_core_public_envelope_overhead_is_bounded_before_catalog_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.extensions import registry as reg_mod
+
+    tool = _make_tool("ext_a", "query")
+    monkeypatch.setattr(reg_mod, "LIMITS", dataclasses.replace(reg_mod.LIMITS, catalog_bytes=tool.byte_size + 100))
+    registry = ExtensionRegistry()
+    with pytest.raises(CatalogLimitExceededError, match="Public catalog"):
+        registry.publish_extension_catalog("ext_a", 1, (tool,))
+    assert registry.active_snapshot.total_tools == 0
 
 
 def test_schema_subset_allowed_and_rejected_keywords() -> None:

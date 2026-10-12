@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -153,7 +154,7 @@ class ExtensionLifecycleStateMachine:
         self.generation: int = 0
         self.restart_count: int = 0
         self.last_error: str | None = None
-        self.history: list[tuple[ExtensionState, str | None]] = [(initial_state, "initial")]
+        self.history: deque[tuple[ExtensionState, str | None]] = deque([(initial_state, "initial")], maxlen=LIMITS.recent_errors)
 
     @property
     def state(self) -> ExtensionState:
@@ -464,81 +465,97 @@ async def connect_and_discover_tools(
     max_tools: int = LIMITS.tools_per_extension,
     keep_alive_event: anyio.Event | None = None,
 ) -> tuple[ExtensionToolDescriptor, ...]:
-    """Connect to subprocess via bounded stdio, perform paginated discovery, and register."""
+    """Own one session, with bounded startup/discovery and coalesced live refresh."""
     owner.require_launch_authorization()
     definition = owner.definition
-    cmd = [definition.command, *definition.arguments]
     cwd = Path(definition.working_directory).resolve()
     base_env = build_extension_environment(definition, parent=parent_env)
-    env = {**base_env, "MCP_EXTENSIONS_ENABLED": "0"}
     owner._credential_values = tuple(base_env[name] for name in definition.environment.references)
-
+    refresh_requested = anyio.Event()
+    startup_deadline = time.monotonic() + min(startup_timeout, LIMITS.startup_sec)
     session_id = f"{owner.extension_id}-gen{owner.generation}-{time.monotonic()}"
 
-    with suppress_sdk_payload_logs(), anyio.fail_after(startup_timeout):
+    async def notification(message: Any) -> None:
+        if isinstance(message, types.ToolListChangedNotification):
+            if owner.state_machine.can_transition(ExtensionState.DEGRADED):
+                owner.state_machine.transition(ExtensionState.DEGRADED, reason="catalog_refresh_pending")
+            refresh_requested.set()
+
+    with suppress_sdk_payload_logs():
         async with bounded_stdio_transport(
-            cmd,
-            cwd=cwd,
-            env=env,
-            shutdown_timeout=5.0,
+            [definition.command, *definition.arguments], cwd=cwd,
+            env={**base_env, "MCP_EXTENSIONS_ENABLED": "0"}, shutdown_timeout=definition.timeouts.shutdown_sec,
             stderr_drain=BoundedStderrDrain(credential_bearing=bool(owner._credential_values)),
-        ) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                owner.register_session(session, session_id)
+        ) as (read_stream, write_stream), ClientSession(read_stream, write_stream, message_handler=notification) as session:
+            owner.register_session(session, session_id)
+            descriptors: tuple[ExtensionToolDescriptor, ...] = ()
 
-                with anyio.fail_after(handshake_timeout):
-                    await session.initialize()
-
-                with anyio.fail_after(discovery_timeout):
-                    discovered_tools: list[types.Tool] = []
+            async def discover() -> tuple[ExtensionToolDescriptor, ...]:
+                generation = registry.next_catalog_generation(owner.extension_id, owner.generation) if registry else owner.generation
+                with anyio.fail_after(min(discovery_timeout, definition.timeouts.discovery_sec)):
+                    discovered: list[types.Tool] = []
                     cursor: str | None = None
+                    seen_cursors: set[str] = set()
+                    pages = 0
+                    size = 0
                     while True:
-                        req_params = (
-                            types.PaginatedRequestParams(cursor=cursor)
-                            if cursor is not None
-                            else None
-                        )
-                        res = await session.list_tools(params=req_params)
-                        discovered_tools.extend(res.tools)
-                        if len(discovered_tools) > max_tools:
-                            raise CatalogLimitExceededError(
-                                f"Discovered tool count {len(discovered_tools)} exceeded limit {max_tools}"
-                            )
-                        if not res.next_cursor:
+                        pages += 1
+                        if pages > LIMITS.tools_per_extension:
+                            raise CatalogLimitExceededError("Discovery page limit exceeded")
+                        params = types.PaginatedRequestParams(cursor=cursor) if cursor is not None else None
+                        result = await session.list_tools(params=params)
+                        size += len(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+                        if size > LIMITS.catalog_bytes or len(discovered) + len(result.tools) > min(max_tools, LIMITS.tools_per_extension):
+                            raise CatalogLimitExceededError("Discovery aggregate tool/byte limit exceeded")
+                        discovered.extend(result.tools)
+                        if not result.next_cursor:
                             break
-                        cursor = res.next_cursor
+                        if result.next_cursor in seen_cursors:
+                            raise CatalogLimitExceededError("Discovery cursor cycle detected")
+                        seen_cursors.add(result.next_cursor)
+                        cursor = result.next_cursor
+                    candidate = tuple(ExtensionToolDescriptor.create(
+                        extension_id=owner.extension_id, provider=definition.provider, remote_name=tool.name,
+                        description=tool.description or "", input_schema=tool.input_schema, output_schema=tool.output_schema,
+                        policy=definition.tools.get(tool.name), catalog_generation=generation,
+                    ) for tool in discovered)
+                    if registry is not None:
+                        registry.publish_extension_catalog(owner.extension_id, generation, candidate)
+                    if owner.state_machine.can_transition(ExtensionState.HEALTHY):
+                        owner.state_machine.transition(ExtensionState.HEALTHY)
+                    return candidate
 
-                descriptors_list: list[ExtensionToolDescriptor] = []
-                for t in discovered_tools:
-                    raw_schema = getattr(t, "input_schema", getattr(t, "inputSchema", {}))
-                    tool_schema = raw_schema if isinstance(raw_schema, dict) else {}
-                    descriptors_list.append(
-                        ExtensionToolDescriptor.create(
-                            extension_id=owner.extension_id,
-                            provider=definition.provider,
-                            remote_name=t.name,
-                            description=t.description or "",
-                            input_schema=tool_schema,
-                            output_schema=t.output_schema,
-                            policy=definition.tools.get(t.name),
-                            catalog_generation=owner.generation,
-                        )
-                    )
-                descriptors = tuple(descriptors_list)
+            async def refresh() -> None:
+                nonlocal refresh_requested, descriptors
+                while True:
+                    await refresh_requested.wait()
+                    await anyio.sleep(0.1)
+                    refresh_requested = anyio.Event()
+                    try:
+                        descriptors = await discover()
+                    except Exception:
+                        if registry is not None:
+                            registry.retire_extension_catalog(owner.extension_id)
+                        if owner.state_machine.can_transition(ExtensionState.UNREACHABLE):
+                            owner.state_machine.transition(ExtensionState.UNREACHABLE, reason="catalog_refresh_failed")
+                        raise ToolError("catalog_refresh_failed", "The external catalog refresh failed.") from None
 
-                if registry is not None:
-                    registry.publish_extension_catalog(
-                        owner.extension_id,
-                        owner.generation,
-                        descriptors,
-                    )
-
-                owner.state_machine.transition(ExtensionState.HEALTHY)
-
+            try:
+                # The startup scope ends before the live session's keep-alive wait.
+                with anyio.fail_after(max(0.0, startup_deadline - time.monotonic())):
+                    with anyio.fail_after(min(handshake_timeout, definition.timeouts.handshake_sec)):
+                        await session.initialize()
+                    descriptors = await discover()
                 if keep_alive_event is not None:
-                    await keep_alive_event.wait()
-
+                    async with anyio.create_task_group() as tasks:
+                        tasks.start_soon(refresh)
+                        await keep_alive_event.wait()
+                        tasks.cancel_scope.cancel()
                 return descriptors
+            finally:
+                owner.close_active_session()
+                if registry is not None and keep_alive_event is not None:
+                    registry.retire_extension_catalog(owner.extension_id)
 
 
 class ExtensionLifecycleManager:
@@ -671,6 +688,8 @@ class ExtensionLifecycleManager:
         snapshot = self.get_catalog_snapshot()
         descriptor = snapshot.get_tool(name)
         if descriptor is None:
+            if snapshot.get_withheld_reason(name) is not None:
+                return ToolEligibilityResult(False, "schema_withheld", "The external schema is withheld.")
             return ToolEligibilityResult(False, "tool_not_found", "The external tool is unavailable.")
         owner = self.get_owner(descriptor.extension_id)
         if owner is None or not owner.is_enabled:

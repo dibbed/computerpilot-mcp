@@ -66,6 +66,8 @@ def tools(mode: str = "readonly", epoch: int = 0) -> list[types.Tool]:
         catalog[0].annotations = types.ToolAnnotations(read_only_hint=True, idempotent_hint=True)
     elif mode == "catalog_change" and epoch == 1:
         read.input_schema["properties"]["value"] = {"type": "integer"}
+    elif mode == "catalog_change" and epoch == 3:
+        read.name = "renamed_read_value"
     elif mode == "remove" or (mode == "catalog_change" and epoch >= 2):
         catalog.remove(read)
     elif mode == "unknown":
@@ -114,7 +116,11 @@ async def raw_result(workspace: Path, mode: str, request_id: Any, data: dict[str
 
 
 async def run(workspace: Path, page_size: int, mode: str) -> None:
+    catalog_session: Any = None
+
     async def list_tools(context: Any, params: types.PaginatedRequestParams | None) -> types.ListToolsResult:
+        nonlocal catalog_session
+        catalog_session = context.session
         cursor = int(params.cursor) if params and params.cursor else 0
         epoch_file = workspace / "catalog_epoch"
         epoch = int(epoch_file.read_text(encoding="utf-8")) if epoch_file.exists() else 0
@@ -127,7 +133,7 @@ async def run(workspace: Path, page_size: int, mode: str) -> None:
         marker(workspace, "call_received")
         arguments = params.arguments or {}
         data: dict[str, Any]
-        if params.name == "read_value" and set(arguments) <= {"value", "file.name"}:
+        if params.name in {"read_value", "renamed_read_value"} and set(arguments) <= {"value", "file.name"}:
             data = {"value": arguments.get("value", "fixture"), "arguments": arguments}
         elif params.name == "increment_value" and set(arguments) == {"amount"} and type(arguments["amount"]) is int:
             if not 1 <= arguments["amount"] <= 10:
@@ -168,8 +174,22 @@ async def run(workspace: Path, page_size: int, mode: str) -> None:
     server: Server[Any] = Server(
         "computerpilot-local-fixture", version="1", on_list_tools=list_tools, on_call_tool=call_tool,
     )
+    async def watch_catalog() -> None:
+        epoch = 0
+        while True:
+            await anyio.sleep(0.05)
+            epoch_file = workspace / "catalog_epoch"
+            current = int(epoch_file.read_text(encoding="utf-8")) if epoch_file.exists() else 0
+            if current != epoch and catalog_session is not None:
+                epoch = current
+                await catalog_session.send_tool_list_changed()
+
     async with stdio_server() as (read, write):
-        await server.run(read, write, server.create_initialization_options())
+        async with anyio.create_task_group() as tasks:
+            if mode == "catalog_change":
+                tasks.start_soon(watch_catalog)
+            await server.run(read, write, server.create_initialization_options())
+            tasks.cancel_scope.cancel()
 
 
 def spawn_tree_member(workspace: Path, mode: str) -> subprocess.Popen[bytes]:

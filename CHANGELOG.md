@@ -14,6 +14,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Bound complete external result envelopes, return explicit overflow previews, and allow sanitized retained JSON artifacts only through an explicit operator tool policy.
 - 2026-10-12: Add a public MCPServer list/call bridge for approved read-only external tools, preserving exact provider input schemas and native tool dispatch.
 - 2026-10-12: Report separate native/external/total discovery counts and attribute only eligible live external recommendations across all nine existing profiles.
+- 2026-10-12: Coalesce provider catalog refresh and public modern/legacy change notifications, preserving runtime schema fingerprints and monotonic catalog generations.
 
 ### Changed
 - 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.
@@ -24,6 +25,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Bound expanded schema-reference work, reject tuple-form schema bypasses, and cover numeric/escaped binary credential echoes and SDK dispatcher payload logs.
 - 2026-10-12: Resolve local schema references by exact namespace and decoded JSON Pointer identity; reject nested targets that could enter unchecked metadata or evade complexity bounds.
 - 2026-10-12: Recheck external profile, platform and credential authority after admission waits, withhold credential-bearing public schemas, and enforce one total queue/execution deadline.
+- 2026-10-12: End startup timeouts before healthy keep-alive waits; bound discovery pages/cursors/aggregate bytes, public catalog envelope overhead, notification handles and state history.
 
 ## [0.7.1] - 2026-10-11
 

@@ -42,6 +42,25 @@ class ExtensionResult(StrictDefinition):
     error: str | None = None
     message: str | None = None
 
+_RESULT_SCHEMA_JSON = json.dumps(ExtensionResult.model_json_schema())
+
+
+def public_tool_descriptor(descriptor: ExtensionToolDescriptor, redactor: CredentialRedactor | None = None) -> types.Tool:
+    description = (redactor or CredentialRedactor()).text(descriptor.description)
+    return types.Tool(
+        name=descriptor.public_name,
+        description=(
+            f"External MCP ({descriptor.identity.provider}); untrusted provider description: {description}"
+        )[:LIMITS.description_chars],
+        input_schema=descriptor.input_schema, output_schema=json.loads(_RESULT_SCHEMA_JSON),
+        annotations=types.ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True),
+        _meta={
+            "source_type": "external_mcp", "extension_id": descriptor.extension_id,
+            "provider": descriptor.identity.provider, "catalog_generation": descriptor.catalog_generation,
+            "domain": descriptor.policy.domain,
+        },
+    )
+
 
 def bounded_json(value: Any, max_bytes: int, *, error_code: str) -> bytes:
     """Reject excessive/non-JSON values before allocating their serialized payload."""
