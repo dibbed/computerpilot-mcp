@@ -120,6 +120,8 @@ async def run(workspace: Path, page_size: int, mode: str) -> None:
 
     async def list_tools(context: Any, params: types.PaginatedRequestParams | None) -> types.ListToolsResult:
         nonlocal catalog_session
+        if mode == "startup_delayed":
+            await anyio.sleep(0.5)
         catalog_session = context.session
         cursor = int(params.cursor) if params and params.cursor else 0
         epoch_file = workspace / "catalog_epoch"
@@ -243,7 +245,7 @@ def main() -> None:
         "readonly", "mutation_success", "malformed", "oversize", "no_newline", "nesting", "split_utf8",
         "duplicate", "cursor_loop", "schema_remote_ref", "schema_regex", "recursive_schema",
         "catalog_change", "remove", "unknown", "dangerous_annotation", "notification_flood", "stderr_flood",
-        "delayed", "call_timeout", "startup_timeout", "handshake_failed", "blocked_stdin", "crash", "root_exit_child",
+        "delayed", "call_timeout", "startup_timeout", "startup_delayed", "handshake_failed", "blocked_stdin", "crash", "root_exit_child",
         "uncertain_mutation", "ignore_cancel", "clean_shutdown", "tree_child", "tree_grandchild",
     ], default="readonly")
     args = parser.parse_args()

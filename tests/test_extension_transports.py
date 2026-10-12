@@ -118,8 +118,11 @@ def test_actual_http_entrypoint_exposes_modern_external_tools(tmp_path: Path) ->
                     assert {tool.name for tool in tools} == native_names
             anyio.run(scenario)
         finally:
-            owned.terminate_tree(force=True)
-            owned.process.wait(timeout=5)
-            owned.close_ownership()
+            try:
+                owned.process.terminate()
+                owned.process.wait(timeout=10)
+            finally:
+                owned.terminate_tree(force=True)
+                owned.close_ownership()
     process = json.loads((tmp_path / "root_process").read_text(encoding="utf-8"))
     assert not psutil.pid_exists(process["pid"])

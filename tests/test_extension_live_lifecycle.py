@@ -73,6 +73,34 @@ def test_completed_shutdown_never_starts_a_queued_provider(tmp_path: Path) -> No
     anyio.run(scenario)
 
 
+def test_operator_startup_deadline_stops_a_real_delayed_provider(tmp_path: Path) -> None:
+    manager = configured_manager(tmp_path, "startup_delayed", starting=False)
+    owner = manager.get_owner("refresh-fixture")
+    assert owner is not None
+    owner.definition = owner.definition.model_copy(update={
+        "timeouts": owner.definition.timeouts.model_copy(update={"startup_sec": 0.1}),
+    })
+
+    async def scenario() -> None:
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(manager.start_all_async)
+            try:
+                with anyio.fail_after(5):
+                    while owner.state in {ExtensionState.CONFIGURED, ExtensionState.STARTING}:
+                        await anyio.sleep(0.01)
+                assert owner.state == ExtensionState.FAILED
+                assert not manager.list_tools()
+                assert owner._active_session is None
+                marker = tmp_path / "root_process"
+                if marker.exists():
+                    assert not psutil.pid_exists(json.loads(marker.read_text(encoding="utf-8"))["pid"])
+            finally:
+                await manager.drain_and_stop(timeout_sec=3)
+                tasks.cancel_scope.cancel()
+
+    anyio.run(scenario)
+
+
 def test_real_transport_loss_reconnects_once_without_replaying_the_call(tmp_path: Path) -> None:
     manager = configured_manager(tmp_path, "crash", starting=False)
     owner = manager.get_owner("refresh-fixture")

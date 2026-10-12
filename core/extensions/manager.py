@@ -342,6 +342,7 @@ class ExtensionOwner:
     ) -> types.CallToolResult:
         """Call a remote tool on the active session bounded by timeout."""
         self.require_launch_authorization()
+        timeout_sec = min(timeout_sec, self.definition.timeouts.call_sec, LIMITS.call_sec)
         session = self._active_session
         if session is None:
             raise ToolError(
@@ -491,7 +492,7 @@ async def connect_and_discover_tools(
     base_env = build_extension_environment(definition, parent=parent_env)
     owner._credential_values = tuple(base_env[name] for name in definition.environment.references)
     refresh_requested = anyio.Event()
-    startup_deadline = time.monotonic() + min(startup_timeout, LIMITS.startup_sec)
+    startup_deadline = time.monotonic() + min(startup_timeout, definition.timeouts.startup_sec, LIMITS.startup_sec)
     session_id = f"{owner.extension_id}-gen{owner.generation}-{time.monotonic()}"
 
     async def notification(message: Any) -> None:
@@ -1000,6 +1001,9 @@ class ExtensionLifecycleManager:
         active_profile: str = "full",
     ) -> dict[str, Any]:
         """Admit and execute a tool call under guarded boundaries."""
+        initial = self._registry.get_tool(lease.public_name) if isinstance(lease, ExtensionLease) else None
+        initial_owner = self.get_owner(initial.extension_id) if initial is not None else None
+        timeout_sec = min(timeout_sec, LIMITS.call_sec, initial_owner.definition.timeouts.call_sec if initial_owner else LIMITS.call_sec)
         dispatched = False
         try:
             with anyio.fail_after(timeout_sec):

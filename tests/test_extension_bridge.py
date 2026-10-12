@@ -206,3 +206,29 @@ def test_call_deadline_includes_queue_and_provider_time() -> None:
                 await manager.execute_guarded_call(lease, timeout_sec=0.20)
 
     anyio.run(scenario)
+
+
+def test_direct_call_cannot_raise_the_operator_deadline() -> None:
+    from core.errors import ToolError
+
+    _, manager, session = bridge()
+    descriptor = manager.list_tools()[0]
+    owner = manager.get_owner(descriptor.extension_id)
+    assert owner is not None
+    owner.definition = owner.definition.model_copy(update={
+        "timeouts": owner.definition.timeouts.model_copy(update={"call_sec": 0.01}),
+    })
+    lease = manager.registry.create_lease(descriptor.public_name)
+    assert lease is not None
+
+    async def provider(*args: Any, **kwargs: Any) -> types.CallToolResult:
+        await anyio.sleep(0.05)
+        return types.CallToolResult(content=[], structured_content={"value": "too late"})
+    session.send_request.side_effect = provider
+
+    async def scenario() -> None:
+        with pytest.raises(ToolError, match="timed out"):
+            await manager.execute_guarded_call(lease, timeout_sec=0.2)
+        session.send_request.assert_awaited_once()
+
+    anyio.run(scenario)
