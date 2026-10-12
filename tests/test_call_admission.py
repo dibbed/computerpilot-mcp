@@ -54,6 +54,7 @@ def _create_descriptor(
         domain="system",
         mutation_class=mutation_class,
         allow_call=allow_call,
+        profiles=("full",),
     )
     return ExtensionToolDescriptor.create(
         extension_id=extension_id,

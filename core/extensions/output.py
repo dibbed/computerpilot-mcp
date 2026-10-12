@@ -42,6 +42,25 @@ class ExtensionResult(StrictDefinition):
     error: str | None = None
     message: str | None = None
 
+_RESULT_SCHEMA_JSON = json.dumps(ExtensionResult.model_json_schema())
+
+
+def public_tool_descriptor(descriptor: ExtensionToolDescriptor, redactor: CredentialRedactor | None = None) -> types.Tool:
+    description = (redactor or CredentialRedactor()).text(descriptor.description)
+    return types.Tool(
+        name=descriptor.public_name,
+        description=(
+            f"External MCP ({descriptor.identity.provider}); untrusted provider description: {description}"
+        )[:LIMITS.description_chars],
+        input_schema=descriptor.input_schema, output_schema=json.loads(_RESULT_SCHEMA_JSON),
+        annotations=types.ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True),
+        _meta={
+            "source_type": "external_mcp", "extension_id": descriptor.extension_id,
+            "provider": descriptor.identity.provider, "catalog_generation": descriptor.catalog_generation,
+            "domain": descriptor.policy.domain,
+        },
+    )
+
 
 def bounded_json(value: Any, max_bytes: int, *, error_code: str) -> bytes:
     """Reject excessive/non-JSON values before allocating their serialized payload."""
@@ -169,15 +188,19 @@ def normalize_result(
         message="The external provider reported a tool error." if result.is_error else None,
     ).model_dump(mode="json")
     try:
-        for _ in range(3):
-            encoded = bounded_json(envelope, LIMITS.inline_bytes, error_code="output_too_large")
-            if envelope["limits"]["returned_bytes"] == len(encoded):
-                break
-            envelope["limits"]["returned_bytes"] = len(encoded)
-        return envelope
+        return finalize_envelope(envelope)
     except ToolError:
         if artifact is not None:
             from pathlib import Path
 
             Path(artifact["path"]).unlink(missing_ok=True)
         raise
+
+
+def finalize_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    for _ in range(3):
+        encoded = bounded_json(envelope, LIMITS.inline_bytes, error_code="output_too_large")
+        if envelope["limits"]["returned_bytes"] == len(encoded):
+            break
+        envelope["limits"]["returned_bytes"] = len(encoded)
+    return envelope

@@ -12,15 +12,22 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Add isolated local MCP fixtures for protocol, catalog, cancellation, lost-response and owned process-tree tests; keep extensions disabled in both CI matrices.
 - 2026-10-12: Validate complete accepted provider schemas without network retrieval and return a Core-owned external result envelope through public SDK requests.
 - 2026-10-12: Bound complete external result envelopes, return explicit overflow previews, and allow sanitized retained JSON artifacts only through an explicit operator tool policy.
+- 2026-10-12: Add a public MCPServer list/call bridge for approved read-only external tools, preserving exact provider input schemas and native tool dispatch.
+- 2026-10-12: Report separate native/external/total discovery counts and attribute only eligible live external recommendations across all nine existing profiles.
+- 2026-10-12: Coalesce provider catalog refresh and public modern/legacy change notifications, preserving runtime schema fingerprints and monotonic catalog generations.
 
 ### Changed
 - 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.
 
 ### Fixed
+- 2026-10-13: Honor positive finite startup/handshake/discovery/call deadlines and operator/Core ceilings in direct extension calls as well as public calls, including admission queue time.
+- 2026-10-13: Interrupt live extension owners on STOP/RESTART, release startup slots after discovery, revalidate queued launches and reconnect lost transports under the finite budget without replaying calls; verify real stdio/modern HTTP entrypoints and native-only legacy stateless HTTP.
 - 2026-10-12: Require operator launch approval and permitted trust before extension start/restart, direct connection and call admission, including revalidation after queue waits.
 - 2026-10-12: Remove unvalidated extension environment overrides and sanitize credential echoes, provider exceptions, SDK payload logs and credential-bearing stderr before public output or diagnostics.
 - 2026-10-12: Bound expanded schema-reference work, reject tuple-form schema bypasses, and cover numeric/escaped binary credential echoes and SDK dispatcher payload logs.
 - 2026-10-12: Resolve local schema references by exact namespace and decoded JSON Pointer identity; reject nested targets that could enter unchecked metadata or evade complexity bounds.
+- 2026-10-12: Recheck external profile, platform and credential authority after admission waits, withhold credential-bearing public schemas, and enforce one total queue/execution deadline.
+- 2026-10-12: End startup timeouts before healthy keep-alive waits; bound discovery pages/cursors/aggregate bytes, public catalog envelope overhead, notification handles and state history.
 
 ## [0.7.1] - 2026-10-11
 

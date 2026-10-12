@@ -66,6 +66,8 @@ def tools(mode: str = "readonly", epoch: int = 0) -> list[types.Tool]:
         catalog[0].annotations = types.ToolAnnotations(read_only_hint=True, idempotent_hint=True)
     elif mode == "catalog_change" and epoch == 1:
         read.input_schema["properties"]["value"] = {"type": "integer"}
+    elif mode == "catalog_change" and epoch == 3:
+        read.name = "renamed_read_value"
     elif mode == "remove" or (mode == "catalog_change" and epoch >= 2):
         catalog.remove(read)
     elif mode == "unknown":
@@ -114,7 +116,13 @@ async def raw_result(workspace: Path, mode: str, request_id: Any, data: dict[str
 
 
 async def run(workspace: Path, page_size: int, mode: str) -> None:
+    catalog_session: Any = None
+
     async def list_tools(context: Any, params: types.PaginatedRequestParams | None) -> types.ListToolsResult:
+        nonlocal catalog_session
+        if mode == "startup_delayed":
+            await anyio.sleep(0.5)
+        catalog_session = context.session
         cursor = int(params.cursor) if params and params.cursor else 0
         epoch_file = workspace / "catalog_epoch"
         epoch = int(epoch_file.read_text(encoding="utf-8")) if epoch_file.exists() else 0
@@ -126,8 +134,10 @@ async def run(workspace: Path, page_size: int, mode: str) -> None:
     async def call_tool(context: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
         marker(workspace, "call_received")
         arguments = params.arguments or {}
+        with (workspace / "calls.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"tool": params.name, "arguments": arguments}) + "\n")
         data: dict[str, Any]
-        if params.name == "read_value" and set(arguments) <= {"value", "file.name"}:
+        if params.name in {"read_value", "renamed_read_value"} and set(arguments) <= {"value", "file.name"}:
             data = {"value": arguments.get("value", "fixture"), "arguments": arguments}
         elif params.name == "increment_value" and set(arguments) == {"amount"} and type(arguments["amount"]) is int:
             if not 1 <= arguments["amount"] <= 10:
@@ -168,8 +178,22 @@ async def run(workspace: Path, page_size: int, mode: str) -> None:
     server: Server[Any] = Server(
         "computerpilot-local-fixture", version="1", on_list_tools=list_tools, on_call_tool=call_tool,
     )
+    async def watch_catalog() -> None:
+        epoch = 0
+        while True:
+            await anyio.sleep(0.05)
+            epoch_file = workspace / "catalog_epoch"
+            current = int(epoch_file.read_text(encoding="utf-8")) if epoch_file.exists() else 0
+            if current != epoch and catalog_session is not None:
+                epoch = current
+                await catalog_session.send_tool_list_changed()
+
     async with stdio_server() as (read, write):
-        await server.run(read, write, server.create_initialization_options())
+        async with anyio.create_task_group() as tasks:
+            if mode == "catalog_change":
+                tasks.start_soon(watch_catalog)
+            await server.run(read, write, server.create_initialization_options())
+            tasks.cancel_scope.cancel()
 
 
 def spawn_tree_member(workspace: Path, mode: str) -> subprocess.Popen[bytes]:
@@ -221,13 +245,14 @@ def main() -> None:
         "readonly", "mutation_success", "malformed", "oversize", "no_newline", "nesting", "split_utf8",
         "duplicate", "cursor_loop", "schema_remote_ref", "schema_regex", "recursive_schema",
         "catalog_change", "remove", "unknown", "dangerous_annotation", "notification_flood", "stderr_flood",
-        "delayed", "call_timeout", "startup_timeout", "handshake_failed", "blocked_stdin", "crash", "root_exit_child",
+        "delayed", "call_timeout", "startup_timeout", "startup_delayed", "handshake_failed", "blocked_stdin", "crash", "root_exit_child",
         "uncertain_mutation", "ignore_cancel", "clean_shutdown", "tree_child", "tree_grandchild",
     ], default="readonly")
     args = parser.parse_args()
     workspace = args.workspace.resolve()
     if workspace != Path.cwd().resolve() or args.workspace.is_symlink() or not 1 <= args.page_size <= 128:
         parser.error("fixture requires its disposable cwd and bounded page size")
+    marker(workspace, "root_process", json.dumps({"pid": os.getpid(), "created": psutil.Process().create_time()}))
     marker(workspace, "environment_isolated", json.dumps({
         "extensions_disabled": os.getenv("MCP_EXTENSIONS_ENABLED") == "0",
         "parent_canary_absent": "FIXTURE_PARENT_SECRET" not in os.environ,

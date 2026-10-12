@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -28,11 +31,24 @@ from core.extensions.models import (
     TrustClass,
 )
 from core.extensions.output import normalize_result, validate_arguments
-from core.extensions.registry import CatalogLimitExceededError, ExtensionLease, ExtensionRegistry
+from core.extensions.registry import (
+    CatalogLimitExceededError,
+    ExtensionLease,
+    ExtensionRegistry,
+    ToolEligibilityResult,
+    evaluate_tool_eligibility,
+)
 from core.extensions.security import CredentialRedactor, suppress_sdk_payload_logs
 from core.extensions.transport import BoundedStderrDrain, bounded_stdio_transport
+from core.platform import normalize_system
 
 logger = logging.getLogger(__name__)
+
+
+def _bounded_timeout(requested: float, configured: float, ceiling: float) -> float:
+    if not math.isfinite(requested) or requested <= 0:
+        raise ToolError("invalid_timeout", "The extension deadline must be positive and finite.")
+    return min(requested, configured, ceiling)
 
 
 class IllegalStateTransitionError(ValueError):
@@ -145,7 +161,7 @@ class ExtensionLifecycleStateMachine:
         self.generation: int = 0
         self.restart_count: int = 0
         self.last_error: str | None = None
-        self.history: list[tuple[ExtensionState, str | None]] = [(initial_state, "initial")]
+        self.history: deque[tuple[ExtensionState, str | None]] = deque([(initial_state, "initial")], maxlen=LIMITS.recent_errors)
 
     @property
     def state(self) -> ExtensionState:
@@ -224,6 +240,7 @@ class ExtensionOwner:
         self._is_running = False
         self.call_semaphore = anyio.Semaphore(LIMITS.calls_per_extension)
         self._credential_values: tuple[str, ...] = ()
+        self._runner_scope: anyio.CancelScope | None = None
 
     @property
     def state(self) -> ExtensionState:
@@ -262,8 +279,10 @@ class ExtensionOwner:
 
         try:
             self._send_channel.send_nowait(sig)
+            if sig in {OwnerSignal.STOP, OwnerSignal.RESTART} and self._runner_scope is not None:
+                self._runner_scope.cancel()
             return True
-        except (anyio.WouldBlock, anyio.ClosedResourceError):
+        except (anyio.WouldBlock, anyio.ClosedResourceError, anyio.BrokenResourceError):
             logger.warning("Could not send signal %s to '%s'", sig, self.extension_id)
             return False
 
@@ -318,8 +337,7 @@ class ExtensionOwner:
     def credential_redactor(self) -> CredentialRedactor:
         values = self._credential_values
         if self.definition.environment.references:
-            env = build_extension_environment(self.definition)
-            values += tuple(env[name] for name in self.definition.environment.references)
+            values += tuple(os.environ.get(ref.name, "") for ref in self.definition.environment.references.values())
         return CredentialRedactor(values)
 
     async def _call_tool(
@@ -331,6 +349,7 @@ class ExtensionOwner:
     ) -> types.CallToolResult:
         """Call a remote tool on the active session bounded by timeout."""
         self.require_launch_authorization()
+        timeout_sec = _bounded_timeout(timeout_sec, self.definition.timeouts.call_sec, LIMITS.call_sec)
         session = self._active_session
         if session is None:
             raise ToolError(
@@ -378,7 +397,7 @@ class ExtensionOwner:
                             self.state_machine.transition(ExtensionState.STARTING)
                             if runner_fn is not None:
                                 try:
-                                    await runner_fn(self)
+                                    await self._run_service(runner_fn)
                                     if self.state == ExtensionState.HEALTHY:
                                         self.restart_budget.record_success()
                                 except Exception:
@@ -417,7 +436,14 @@ class ExtensionOwner:
 
                         backoff = self.restart_budget.record_attempt()
                         if backoff > 0:
-                            await sleep_fn(backoff)
+                            with anyio.CancelScope() as scope:
+                                self._runner_scope = scope
+                                try:
+                                    await sleep_fn(backoff)
+                                finally:
+                                    self._runner_scope = None
+                            if scope.cancel_called:
+                                continue
 
                         if self.state_machine.can_transition(ExtensionState.STOPPING):
                             self.state_machine.transition(ExtensionState.STOPPING)
@@ -433,7 +459,7 @@ class ExtensionOwner:
                             )
                             if runner_fn is not None:
                                 try:
-                                    await runner_fn(self)
+                                    await self._run_service(runner_fn)
                                     if self.state == ExtensionState.HEALTHY:
                                         self.restart_budget.record_success()
                                 except Exception:
@@ -446,6 +472,14 @@ class ExtensionOwner:
             self._is_running = False
             self.close_active_session()
 
+    async def _run_service(self, runner: Callable[[ExtensionOwner], Any]) -> None:
+        with anyio.CancelScope() as scope:
+            self._runner_scope = scope
+            try:
+                await runner(self)
+            finally:
+                self._runner_scope = None
+
 
 async def connect_and_discover_tools(
     owner: ExtensionOwner,
@@ -456,82 +490,126 @@ async def connect_and_discover_tools(
     discovery_timeout: float = LIMITS.discovery_sec,
     max_tools: int = LIMITS.tools_per_extension,
     keep_alive_event: anyio.Event | None = None,
+    startup_gate: anyio.Semaphore | None = None,
 ) -> tuple[ExtensionToolDescriptor, ...]:
-    """Connect to subprocess via bounded stdio, perform paginated discovery, and register."""
+    """Own one session, with bounded startup/discovery and coalesced live refresh."""
     owner.require_launch_authorization()
     definition = owner.definition
-    cmd = [definition.command, *definition.arguments]
+    startup_timeout = _bounded_timeout(startup_timeout, definition.timeouts.startup_sec, LIMITS.startup_sec)
+    handshake_timeout = _bounded_timeout(handshake_timeout, definition.timeouts.handshake_sec, LIMITS.handshake_sec)
+    discovery_timeout = _bounded_timeout(discovery_timeout, definition.timeouts.discovery_sec, LIMITS.discovery_sec)
     cwd = Path(definition.working_directory).resolve()
     base_env = build_extension_environment(definition, parent=parent_env)
-    env = {**base_env, "MCP_EXTENSIONS_ENABLED": "0"}
     owner._credential_values = tuple(base_env[name] for name in definition.environment.references)
-
+    refresh_requested = anyio.Event()
+    startup_deadline = time.monotonic() + startup_timeout
     session_id = f"{owner.extension_id}-gen{owner.generation}-{time.monotonic()}"
 
-    with suppress_sdk_payload_logs(), anyio.fail_after(startup_timeout):
-        async with bounded_stdio_transport(
-            cmd,
-            cwd=cwd,
-            env=env,
-            shutdown_timeout=5.0,
-            stderr_drain=BoundedStderrDrain(credential_bearing=bool(owner._credential_values)),
-        ) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
+    async def notification(message: Any) -> None:
+        if isinstance(message, types.ToolListChangedNotification):
+            if owner.state_machine.can_transition(ExtensionState.DEGRADED):
+                owner.state_machine.transition(ExtensionState.DEGRADED, reason="catalog_refresh_pending")
+            refresh_requested.set()
+
+    gate_held = False
+    if startup_gate is not None:
+        with anyio.fail_after(max(0.0, startup_deadline - time.monotonic())):
+            await startup_gate.acquire()
+        gate_held = True
+    try:
+        owner.require_launch_authorization()
+        with suppress_sdk_payload_logs():
+            async with bounded_stdio_transport(
+                [definition.command, *definition.arguments], cwd=cwd,
+                env={**base_env, "MCP_EXTENSIONS_ENABLED": "0"}, shutdown_timeout=definition.timeouts.shutdown_sec,
+                stderr_drain=BoundedStderrDrain(credential_bearing=bool(owner._credential_values)),
+            ) as (read_stream, write_stream), ClientSession(read_stream, write_stream, message_handler=notification) as session:
                 owner.register_session(session, session_id)
+                descriptors: tuple[ExtensionToolDescriptor, ...] = ()
 
-                with anyio.fail_after(handshake_timeout):
-                    await session.initialize()
+                async def discover() -> tuple[ExtensionToolDescriptor, ...]:
+                    generation = registry.next_catalog_generation(owner.extension_id, owner.generation) if registry else owner.generation
+                    with anyio.fail_after(discovery_timeout):
+                        discovered: list[types.Tool] = []
+                        cursor: str | None = None
+                        seen_cursors: set[str] = set()
+                        pages = 0
+                        size = 0
+                        while True:
+                            pages += 1
+                            if pages > LIMITS.tools_per_extension:
+                                raise CatalogLimitExceededError("Discovery page limit exceeded")
+                            params = types.PaginatedRequestParams(cursor=cursor) if cursor is not None else None
+                            result = await session.list_tools(params=params)
+                            size += len(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+                            if (
+                                size > LIMITS.catalog_bytes
+                                or len(discovered) + len(result.tools) > min(max_tools, LIMITS.tools_per_extension)
+                            ):
+                                raise CatalogLimitExceededError("Discovery aggregate tool/byte limit exceeded")
+                            discovered.extend(result.tools)
+                            if not result.next_cursor:
+                                break
+                            if result.next_cursor in seen_cursors:
+                                raise CatalogLimitExceededError("Discovery cursor cycle detected")
+                            seen_cursors.add(result.next_cursor)
+                            cursor = result.next_cursor
+                        candidate = tuple(ExtensionToolDescriptor.create(
+                            extension_id=owner.extension_id, provider=definition.provider, remote_name=tool.name,
+                            description=tool.description or "", input_schema=tool.input_schema, output_schema=tool.output_schema,
+                            policy=definition.tools.get(tool.name), catalog_generation=generation,
+                        ) for tool in discovered)
+                        if registry is not None:
+                            registry.publish_extension_catalog(owner.extension_id, generation, candidate)
+                        if owner.state_machine.can_transition(ExtensionState.HEALTHY):
+                            owner.state_machine.transition(ExtensionState.HEALTHY)
+                        return candidate
 
-                with anyio.fail_after(discovery_timeout):
-                    discovered_tools: list[types.Tool] = []
-                    cursor: str | None = None
+                async def refresh() -> None:
+                    nonlocal refresh_requested, descriptors
                     while True:
-                        req_params = (
-                            types.PaginatedRequestParams(cursor=cursor)
-                            if cursor is not None
-                            else None
-                        )
-                        res = await session.list_tools(params=req_params)
-                        discovered_tools.extend(res.tools)
-                        if len(discovered_tools) > max_tools:
-                            raise CatalogLimitExceededError(
-                                f"Discovered tool count {len(discovered_tools)} exceeded limit {max_tools}"
-                            )
-                        if not res.next_cursor:
-                            break
-                        cursor = res.next_cursor
+                        await refresh_requested.wait()
+                        await anyio.sleep(0.1)
+                        refresh_requested = anyio.Event()
+                        try:
+                            descriptors = await discover()
+                        except Exception:
+                            if registry is not None:
+                                registry.retire_extension_catalog(owner.extension_id)
+                            if owner.state_machine.can_transition(ExtensionState.UNREACHABLE):
+                                owner.state_machine.transition(ExtensionState.UNREACHABLE, reason="catalog_refresh_failed")
+                            raise ToolError("catalog_refresh_failed", "The external catalog refresh failed.") from None
 
-                descriptors_list: list[ExtensionToolDescriptor] = []
-                for t in discovered_tools:
-                    raw_schema = getattr(t, "input_schema", getattr(t, "inputSchema", {}))
-                    tool_schema = raw_schema if isinstance(raw_schema, dict) else {}
-                    descriptors_list.append(
-                        ExtensionToolDescriptor.create(
-                            extension_id=owner.extension_id,
-                            provider=definition.provider,
-                            remote_name=t.name,
-                            description=t.description or "",
-                            input_schema=tool_schema,
-                            output_schema=t.output_schema,
-                            policy=definition.tools.get(t.name),
-                            catalog_generation=owner.generation,
-                        )
-                    )
-                descriptors = tuple(descriptors_list)
+                async def watch_transport() -> None:
+                    while read_stream.statistics().open_send_streams:
+                        await anyio.sleep(0.05)
+                    owner.handle_transport_loss(registry=registry)
+                    if owner._runner_scope is None or not owner._runner_scope.cancel_called:
+                        raise ToolError("transport_lost", "The external provider connection closed.")
 
-                if registry is not None:
-                    registry.publish_extension_catalog(
-                        owner.extension_id,
-                        owner.generation,
-                        descriptors,
-                    )
-
-                owner.state_machine.transition(ExtensionState.HEALTHY)
-
-                if keep_alive_event is not None:
-                    await keep_alive_event.wait()
-
-                return descriptors
+                try:
+                    # The startup scope ends before the live session's keep-alive wait.
+                    with anyio.fail_after(max(0.0, startup_deadline - time.monotonic())):
+                        with anyio.fail_after(handshake_timeout):
+                            await session.initialize()
+                        descriptors = await discover()
+                    if gate_held and startup_gate is not None:
+                        startup_gate.release()
+                        gate_held = False
+                    if keep_alive_event is not None:
+                        async with anyio.create_task_group() as tasks:
+                            tasks.start_soon(refresh)
+                            tasks.start_soon(watch_transport)
+                            await keep_alive_event.wait()
+                            tasks.cancel_scope.cancel()
+                    return descriptors
+                finally:
+                    owner.close_active_session()
+                    if registry is not None and keep_alive_event is not None:
+                        registry.retire_extension_catalog(owner.extension_id)
+    finally:
+        if gate_held and startup_gate is not None:
+            startup_gate.release()
 
 
 class ExtensionLifecycleManager:
@@ -659,6 +737,36 @@ class ExtensionLifecycleManager:
         """Return cached discovered tools from registry memory without spawning any processes."""
         return tuple(self._registry.active_snapshot.tools.values())
 
+    def tool_eligibility(self, name: str, active_profile: str = "full") -> ToolEligibilityResult:
+        """Read current operator/runtime authority without spawning, RPC or filesystem IO."""
+        snapshot = self.get_catalog_snapshot()
+        descriptor = snapshot.get_tool(name)
+        if descriptor is None:
+            if snapshot.get_withheld_reason(name) is not None:
+                return ToolEligibilityResult(False, "schema_withheld", "The external schema is withheld.")
+            return ToolEligibilityResult(False, "tool_not_found", "The external tool is unavailable.")
+        owner = self.get_owner(descriptor.extension_id)
+        if owner is None or not owner.is_enabled:
+            return ToolEligibilityResult(False, "extension_disabled", "The external tool is disabled.")
+        refs = tuple(key for key, ref in owner.definition.environment.references.items() if os.environ.get(ref.name))
+        eligibility = evaluate_tool_eligibility(
+            descriptor, snapshot=snapshot, definition=owner.definition, runtime_state=owner.state,
+            active_profile=active_profile, platform=normalize_system(), resolved_env_refs=refs,
+        )
+        if not eligibility.eligible:
+            return eligibility
+        if owner._active_session is None:
+            return ToolEligibilityResult(False, "session_not_active", "The external session is unavailable.")
+        try:
+            redactor = owner.credential_redactor()
+            schema = descriptor.input_schema
+            identity = (descriptor.public_name, descriptor.extension_id, descriptor.identity.provider)
+            if redactor.json(schema) != schema or any(redactor.text(value) != value for value in identity):
+                return ToolEligibilityResult(False, "credential_metadata_withheld", "Credential-bearing schema is withheld.")
+        except ToolError:
+            return ToolEligibilityResult(False, "credential_metadata_withheld", "Credential-bearing schema is withheld.")
+        return eligibility
+
     def get_catalog_snapshot(self) -> ExtensionCatalogSnapshot:
         """Return authoritative in-memory catalog snapshot."""
         return self._registry.active_snapshot
@@ -671,7 +779,7 @@ class ExtensionLifecycleManager:
     ) -> None:
         """Start a single extension under bounded concurrency semaphore."""
         owner = self.get_owner(extension_id)
-        if not owner:
+        if not owner or self._shutdown_event.is_set():
             return
         # Do not start disabled or unapproved extensions
         if owner.state == ExtensionState.DISABLED or not owner.is_enabled:
@@ -680,18 +788,18 @@ class ExtensionLifecycleManager:
 
         async def runner(own: ExtensionOwner) -> None:
             if custom_runner is not None:
-                await custom_runner(own)
+                async with self._startup_semaphore:
+                    await custom_runner(own)
             else:
                 await connect_and_discover_tools(
                     own,
                     self._registry,
                     keep_alive_event=keep_alive_event,
+                    startup_gate=self._startup_semaphore,
                 )
 
-        async with self._startup_semaphore:
-            # Signal start and run owner loop
-            owner.signal(OwnerSignal.START)
-            await owner.run_owner_loop(runner_fn=runner)
+        owner.signal(OwnerSignal.START)
+        await owner.run_owner_loop(runner_fn=runner)
 
     async def start_all_background(
         self,
@@ -772,6 +880,7 @@ class ExtensionLifecycleManager:
         *,
         timeout_sec: float = LIMITS.call_sec,
         request_callback: bool = False,
+        active_profile: str = "full",
     ) -> AsyncIterator[tuple[ExtensionOwner, ExtensionToolDescriptor]]:
         """Guard call admission across all paths enforcing semaphores, lease validity, and security policies.
 
@@ -842,7 +951,12 @@ class ExtensionLifecycleManager:
                 message=f"Mutating tool '{lease.public_name}' is withheld until M10 activation",
             )
 
+        eligibility = self.tool_eligibility(lease.public_name, active_profile)
+        if not eligibility.eligible:
+            raise ToolError(eligibility.rejection_code or "policy_denied", "The external tool is not eligible.")
+
         # 7. Acquire global semaphore bounded by timeout
+        timeout_sec = _bounded_timeout(timeout_sec, owner.definition.timeouts.call_sec, LIMITS.call_sec)
         try:
             with anyio.fail_after(timeout_sec):
                 await self._global_call_semaphore.acquire()
@@ -876,6 +990,9 @@ class ExtensionLifecycleManager:
                         code="stale_generation",
                         message="Tool lease became invalid while waiting in admission queue",
                     )
+                eligibility = self.tool_eligibility(lease.public_name, active_profile)
+                if not eligibility.eligible:
+                    raise ToolError(eligibility.rejection_code or "policy_denied", "The external tool is no longer eligible.")
 
                 yield owner, descriptor
             finally:
@@ -892,18 +1009,25 @@ class ExtensionLifecycleManager:
         *,
         timeout_sec: float = LIMITS.call_sec,
         request_callback: bool = False,
+        active_profile: str = "full",
     ) -> dict[str, Any]:
         """Admit and execute a tool call under guarded boundaries."""
-        descriptor = self._registry.get_tool(lease.public_name) if isinstance(lease, ExtensionLease) else None
-        args = validate_arguments(descriptor, arguments) if descriptor is not None else arguments
-        async with self.guard_call_admission(
-            lease,
-            timeout_sec=timeout_sec,
-            request_callback=request_callback,
-        ) as (owner, descriptor):
-            result = await owner._call_tool(
-                descriptor.remote_name,
-                args,
-                timeout_sec=timeout_sec,
-            )
-            return normalize_result(descriptor, result, owner.credential_redactor())
+        initial = self._registry.get_tool(lease.public_name) if isinstance(lease, ExtensionLease) else None
+        initial_owner = self.get_owner(initial.extension_id) if initial is not None else None
+        timeout_sec = _bounded_timeout(
+            timeout_sec, initial_owner.definition.timeouts.call_sec if initial_owner else LIMITS.call_sec, LIMITS.call_sec,
+        )
+        dispatched = False
+        try:
+            with anyio.fail_after(timeout_sec):
+                descriptor = self._registry.get_tool(lease.public_name) if isinstance(lease, ExtensionLease) else None
+                args = validate_arguments(descriptor, arguments) if descriptor is not None else arguments
+                async with self.guard_call_admission(
+                    lease, timeout_sec=timeout_sec, request_callback=request_callback, active_profile=active_profile,
+                ) as (owner, descriptor):
+                    dispatched = True
+                    result = await owner._call_tool(descriptor.remote_name, args, timeout_sec=timeout_sec)
+                    return normalize_result(descriptor, result, owner.credential_redactor())
+        except TimeoutError:
+            code = "call_timeout" if dispatched else "admission_limit_exceeded"
+            raise ToolError(code, "The external call timed out within its total admission/execution deadline.") from None

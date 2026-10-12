@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -83,10 +84,6 @@ class DuplicateToolIdentityError(ExtensionRegistryError):
 
 class StaleGenerationError(ExtensionRegistryError):
     """Raised when candidate catalog generation is not strictly monotonic."""
-
-
-class SchemaChangedRestartRequiredError(ExtensionRegistryError):
-    """Raised when a tool's schema changes under an existing public name during the same Core runtime."""
 
 
 class TombstoneQuotaExceededError(ExtensionRegistryError):
@@ -370,6 +367,10 @@ class ExtensionRegistry:
     def get_tool(self, public_name: str) -> ExtensionToolDescriptor | None:
         return self._active_snapshot.get_tool(public_name)
 
+    def next_catalog_generation(self, extension_id: str, minimum: int = 1) -> int:
+        with self._lock:
+            return max(minimum, self._max_published_generations.get(extension_id, 0) + 1)
+
     def has_tool(self, public_name: str) -> bool:
         return self._active_snapshot.has_tool(public_name)
 
@@ -514,9 +515,8 @@ class ExtensionRegistry:
             # Check schema drift against runtime tombstone
             recorded_fp = self._runtime_fingerprints.get(desc.public_name)
             if recorded_fp is not None and recorded_fp != desc.schema_fingerprint:
-                raise SchemaChangedRestartRequiredError(
-                    f"schema changed for tool '{desc.public_name}'; Core restart required"
-                )
+                withheld_dict[desc.public_name] = "schema_changed_restart_required"
+                continue
 
             accepted_list.append(desc)
 
@@ -540,6 +540,17 @@ class ExtensionRegistry:
             raise CatalogLimitExceededError(
                 f"total catalog bytes {projected_bytes} exceeds global limit {LIMITS.catalog_bytes}"
             )
+
+        from core.extensions.output import public_tool_descriptor
+
+        # Reserve the full original description too: redaction can expose a longer suffix in the clipped preview.
+        wire_bytes = 16 + sum(
+            len(public_tool_descriptor(d).model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+            + len(json.dumps(d.description, ensure_ascii=False).encode("utf-8"))
+            for d in (*other_tools, *accepted_list)
+        )
+        if wire_bytes > LIMITS.catalog_bytes:
+            raise CatalogLimitExceededError("Public catalog serialized byte limit exceeded")
 
         sorted_accepted = tuple(sorted(accepted_list, key=lambda d: d.public_name))
         return sorted_accepted, withheld_dict

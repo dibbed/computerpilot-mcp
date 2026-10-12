@@ -11,6 +11,7 @@ from pydantic import ConfigDict
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.execution_models import ExecutionIntent
 from core.execution_router import ExecutionRouter
+from core.extensions.bridge import ExtensionMCPServer
 from core.health_snapshot import collect_server_health
 from core.heartbeat import lifespan
 from core.platform import available_domains, detect_capabilities
@@ -67,7 +68,8 @@ def create_server() -> MCPServer:
     profile = resolve_profile(SETTINGS.tool_profile)
     capabilities = detect_capabilities()
     active_domains = available_domains(profile.domains, capabilities)
-    server = MCPServer(
+    server = ExtensionMCPServer(
+        tool_profile=profile.name,
         name=SETTINGS.server_name,
         title="ComputerPilot MCP",
         description="Cross-platform computer-use and developer-automation MCP backend with structured output.",
@@ -90,9 +92,11 @@ def create_server() -> MCPServer:
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("discover_tool_domains")
-    def discover_tool_domains() -> dict[str, Any]:
+    async def discover_tool_domains() -> dict[str, Any]:
         """List deterministic tool profiles/domains and the domains active in this server."""
 
+        native = await MCPServer.list_tools(server)
+        external = server.external_tools()
         return {
             "ok": True,
             "active_profile": profile.name,
@@ -103,6 +107,7 @@ def create_server() -> MCPServer:
             "platform": capabilities.platform_key,
             "capabilities": capabilities.as_dict(),
             "profiles": {name: list(domains) for name, domains in PROFILE_DOMAINS.items()},
+            "tool_counts": {"native": len(native), "external": len(external), "total": len(native) + len(external)},
         }
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
@@ -118,14 +123,19 @@ def create_server() -> MCPServer:
             raise ValueError("query must not be empty")
         bounded_limit = min(max(limit, 1), 25)
         terms = set(normalized.replace("_", " ").split())
-        scored: list[tuple[int, str, str, str | None]] = []
+        scored: list[tuple[int, str, str, str | None, dict[str, Any]]] = []
         for tool in await server.list_tools():
             haystack = f"{tool.name} {tool.description or ''} {PREFERRED_USE.get(tool.name, '')}".casefold()
             score = sum(3 if term in tool.name.casefold() else 1 for term in terms if term in haystack)
             if normalized in haystack:
                 score += 4
             if score:
-                scored.append((score, tool.name, tool.description or "", PREFERRED_USE.get(tool.name)))
+                meta = tool.meta or {}
+                attribution = {
+                    key: meta[key] for key in ("source_type", "extension_id", "provider", "domain", "catalog_generation")
+                    if key in meta
+                } if meta.get("source_type") == "external_mcp" else {}
+                scored.append((score, tool.name, tool.description or "", PREFERRED_USE.get(tool.name), attribution))
         scored.sort(key=lambda item: (-item[0], item[1]))
         return {
             "ok": True,
@@ -135,6 +145,7 @@ def create_server() -> MCPServer:
                     "name": name,
                     "description": description,
                     "preferred_use": guidance,
+                    **attribution,
                     **(
                         {
                             "execution": {
@@ -148,7 +159,7 @@ def create_server() -> MCPServer:
                         else {}
                     ),
                 }
-                for _, name, description, guidance in scored[:bounded_limit]
+                for _, name, description, guidance, attribution in scored[:bounded_limit]
             ],
             "count": min(len(scored), bounded_limit),
             "total_matches": len(scored),
