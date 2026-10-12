@@ -19,7 +19,7 @@ from core.extensions.registry import CatalogLimitExceededError
 from core.platform import normalize_system
 
 
-def configured_manager(tmp_path: Path, mode: str) -> ExtensionLifecycleManager:
+def configured_manager(tmp_path: Path, mode: str, *, starting: bool = True) -> ExtensionLifecycleManager:
     fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.py"
     definition = ExtensionDefinition.model_validate_json(json.dumps({
         "extension_id": "refresh-fixture", "display_name": "Refresh fixture", "provider": "fixture",
@@ -32,7 +32,8 @@ def configured_manager(tmp_path: Path, mode: str) -> ExtensionLifecycleManager:
     }))
     manager = ExtensionLifecycleManager()
     owner = manager.register_extension(definition)
-    owner.state_machine.transition(ExtensionState.STARTING)
+    if starting:
+        owner.state_machine.transition(ExtensionState.STARTING)
     return manager
 
 

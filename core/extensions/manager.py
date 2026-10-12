@@ -233,6 +233,7 @@ class ExtensionOwner:
         self._is_running = False
         self.call_semaphore = anyio.Semaphore(LIMITS.calls_per_extension)
         self._credential_values: tuple[str, ...] = ()
+        self._runner_scope: anyio.CancelScope | None = None
 
     @property
     def state(self) -> ExtensionState:
@@ -271,8 +272,10 @@ class ExtensionOwner:
 
         try:
             self._send_channel.send_nowait(sig)
+            if sig in {OwnerSignal.STOP, OwnerSignal.RESTART} and self._runner_scope is not None:
+                self._runner_scope.cancel()
             return True
-        except (anyio.WouldBlock, anyio.ClosedResourceError):
+        except (anyio.WouldBlock, anyio.ClosedResourceError, anyio.BrokenResourceError):
             logger.warning("Could not send signal %s to '%s'", sig, self.extension_id)
             return False
 
@@ -386,7 +389,7 @@ class ExtensionOwner:
                             self.state_machine.transition(ExtensionState.STARTING)
                             if runner_fn is not None:
                                 try:
-                                    await runner_fn(self)
+                                    await self._run_service(runner_fn)
                                     if self.state == ExtensionState.HEALTHY:
                                         self.restart_budget.record_success()
                                 except Exception:
@@ -425,7 +428,14 @@ class ExtensionOwner:
 
                         backoff = self.restart_budget.record_attempt()
                         if backoff > 0:
-                            await sleep_fn(backoff)
+                            with anyio.CancelScope() as scope:
+                                self._runner_scope = scope
+                                try:
+                                    await sleep_fn(backoff)
+                                finally:
+                                    self._runner_scope = None
+                            if scope.cancel_called:
+                                continue
 
                         if self.state_machine.can_transition(ExtensionState.STOPPING):
                             self.state_machine.transition(ExtensionState.STOPPING)
@@ -441,7 +451,7 @@ class ExtensionOwner:
                             )
                             if runner_fn is not None:
                                 try:
-                                    await runner_fn(self)
+                                    await self._run_service(runner_fn)
                                     if self.state == ExtensionState.HEALTHY:
                                         self.restart_budget.record_success()
                                 except Exception:
@@ -454,6 +464,14 @@ class ExtensionOwner:
             self._is_running = False
             self.close_active_session()
 
+    async def _run_service(self, runner: Callable[[ExtensionOwner], Any]) -> None:
+        with anyio.CancelScope() as scope:
+            self._runner_scope = scope
+            try:
+                await runner(self)
+            finally:
+                self._runner_scope = None
+
 
 async def connect_and_discover_tools(
     owner: ExtensionOwner,
@@ -464,6 +482,7 @@ async def connect_and_discover_tools(
     discovery_timeout: float = LIMITS.discovery_sec,
     max_tools: int = LIMITS.tools_per_extension,
     keep_alive_event: anyio.Event | None = None,
+    startup_gate: anyio.Semaphore | None = None,
 ) -> tuple[ExtensionToolDescriptor, ...]:
     """Own one session, with bounded startup/discovery and coalesced live refresh."""
     owner.require_launch_authorization()
@@ -481,81 +500,105 @@ async def connect_and_discover_tools(
                 owner.state_machine.transition(ExtensionState.DEGRADED, reason="catalog_refresh_pending")
             refresh_requested.set()
 
-    with suppress_sdk_payload_logs():
-        async with bounded_stdio_transport(
-            [definition.command, *definition.arguments], cwd=cwd,
-            env={**base_env, "MCP_EXTENSIONS_ENABLED": "0"}, shutdown_timeout=definition.timeouts.shutdown_sec,
-            stderr_drain=BoundedStderrDrain(credential_bearing=bool(owner._credential_values)),
-        ) as (read_stream, write_stream), ClientSession(read_stream, write_stream, message_handler=notification) as session:
-            owner.register_session(session, session_id)
-            descriptors: tuple[ExtensionToolDescriptor, ...] = ()
+    gate_held = False
+    if startup_gate is not None:
+        with anyio.fail_after(max(0.0, startup_deadline - time.monotonic())):
+            await startup_gate.acquire()
+        gate_held = True
+    try:
+        owner.require_launch_authorization()
+        with suppress_sdk_payload_logs():
+            async with bounded_stdio_transport(
+                [definition.command, *definition.arguments], cwd=cwd,
+                env={**base_env, "MCP_EXTENSIONS_ENABLED": "0"}, shutdown_timeout=definition.timeouts.shutdown_sec,
+                stderr_drain=BoundedStderrDrain(credential_bearing=bool(owner._credential_values)),
+            ) as (read_stream, write_stream), ClientSession(read_stream, write_stream, message_handler=notification) as session:
+                owner.register_session(session, session_id)
+                descriptors: tuple[ExtensionToolDescriptor, ...] = ()
 
-            async def discover() -> tuple[ExtensionToolDescriptor, ...]:
-                generation = registry.next_catalog_generation(owner.extension_id, owner.generation) if registry else owner.generation
-                with anyio.fail_after(min(discovery_timeout, definition.timeouts.discovery_sec)):
-                    discovered: list[types.Tool] = []
-                    cursor: str | None = None
-                    seen_cursors: set[str] = set()
-                    pages = 0
-                    size = 0
-                    while True:
-                        pages += 1
-                        if pages > LIMITS.tools_per_extension:
-                            raise CatalogLimitExceededError("Discovery page limit exceeded")
-                        params = types.PaginatedRequestParams(cursor=cursor) if cursor is not None else None
-                        result = await session.list_tools(params=params)
-                        size += len(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
-                        if size > LIMITS.catalog_bytes or len(discovered) + len(result.tools) > min(max_tools, LIMITS.tools_per_extension):
-                            raise CatalogLimitExceededError("Discovery aggregate tool/byte limit exceeded")
-                        discovered.extend(result.tools)
-                        if not result.next_cursor:
-                            break
-                        if result.next_cursor in seen_cursors:
-                            raise CatalogLimitExceededError("Discovery cursor cycle detected")
-                        seen_cursors.add(result.next_cursor)
-                        cursor = result.next_cursor
-                    candidate = tuple(ExtensionToolDescriptor.create(
-                        extension_id=owner.extension_id, provider=definition.provider, remote_name=tool.name,
-                        description=tool.description or "", input_schema=tool.input_schema, output_schema=tool.output_schema,
-                        policy=definition.tools.get(tool.name), catalog_generation=generation,
-                    ) for tool in discovered)
-                    if registry is not None:
-                        registry.publish_extension_catalog(owner.extension_id, generation, candidate)
-                    if owner.state_machine.can_transition(ExtensionState.HEALTHY):
-                        owner.state_machine.transition(ExtensionState.HEALTHY)
-                    return candidate
-
-            async def refresh() -> None:
-                nonlocal refresh_requested, descriptors
-                while True:
-                    await refresh_requested.wait()
-                    await anyio.sleep(0.1)
-                    refresh_requested = anyio.Event()
-                    try:
-                        descriptors = await discover()
-                    except Exception:
+                async def discover() -> tuple[ExtensionToolDescriptor, ...]:
+                    generation = registry.next_catalog_generation(owner.extension_id, owner.generation) if registry else owner.generation
+                    with anyio.fail_after(min(discovery_timeout, definition.timeouts.discovery_sec)):
+                        discovered: list[types.Tool] = []
+                        cursor: str | None = None
+                        seen_cursors: set[str] = set()
+                        pages = 0
+                        size = 0
+                        while True:
+                            pages += 1
+                            if pages > LIMITS.tools_per_extension:
+                                raise CatalogLimitExceededError("Discovery page limit exceeded")
+                            params = types.PaginatedRequestParams(cursor=cursor) if cursor is not None else None
+                            result = await session.list_tools(params=params)
+                            size += len(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+                            if (
+                                size > LIMITS.catalog_bytes
+                                or len(discovered) + len(result.tools) > min(max_tools, LIMITS.tools_per_extension)
+                            ):
+                                raise CatalogLimitExceededError("Discovery aggregate tool/byte limit exceeded")
+                            discovered.extend(result.tools)
+                            if not result.next_cursor:
+                                break
+                            if result.next_cursor in seen_cursors:
+                                raise CatalogLimitExceededError("Discovery cursor cycle detected")
+                            seen_cursors.add(result.next_cursor)
+                            cursor = result.next_cursor
+                        candidate = tuple(ExtensionToolDescriptor.create(
+                            extension_id=owner.extension_id, provider=definition.provider, remote_name=tool.name,
+                            description=tool.description or "", input_schema=tool.input_schema, output_schema=tool.output_schema,
+                            policy=definition.tools.get(tool.name), catalog_generation=generation,
+                        ) for tool in discovered)
                         if registry is not None:
-                            registry.retire_extension_catalog(owner.extension_id)
-                        if owner.state_machine.can_transition(ExtensionState.UNREACHABLE):
-                            owner.state_machine.transition(ExtensionState.UNREACHABLE, reason="catalog_refresh_failed")
-                        raise ToolError("catalog_refresh_failed", "The external catalog refresh failed.") from None
+                            registry.publish_extension_catalog(owner.extension_id, generation, candidate)
+                        if owner.state_machine.can_transition(ExtensionState.HEALTHY):
+                            owner.state_machine.transition(ExtensionState.HEALTHY)
+                        return candidate
 
-            try:
-                # The startup scope ends before the live session's keep-alive wait.
-                with anyio.fail_after(max(0.0, startup_deadline - time.monotonic())):
-                    with anyio.fail_after(min(handshake_timeout, definition.timeouts.handshake_sec)):
-                        await session.initialize()
-                    descriptors = await discover()
-                if keep_alive_event is not None:
-                    async with anyio.create_task_group() as tasks:
-                        tasks.start_soon(refresh)
-                        await keep_alive_event.wait()
-                        tasks.cancel_scope.cancel()
-                return descriptors
-            finally:
-                owner.close_active_session()
-                if registry is not None and keep_alive_event is not None:
-                    registry.retire_extension_catalog(owner.extension_id)
+                async def refresh() -> None:
+                    nonlocal refresh_requested, descriptors
+                    while True:
+                        await refresh_requested.wait()
+                        await anyio.sleep(0.1)
+                        refresh_requested = anyio.Event()
+                        try:
+                            descriptors = await discover()
+                        except Exception:
+                            if registry is not None:
+                                registry.retire_extension_catalog(owner.extension_id)
+                            if owner.state_machine.can_transition(ExtensionState.UNREACHABLE):
+                                owner.state_machine.transition(ExtensionState.UNREACHABLE, reason="catalog_refresh_failed")
+                            raise ToolError("catalog_refresh_failed", "The external catalog refresh failed.") from None
+
+                async def watch_transport() -> None:
+                    while read_stream.statistics().open_send_streams:
+                        await anyio.sleep(0.05)
+                    owner.handle_transport_loss(registry=registry)
+                    if owner._runner_scope is None or not owner._runner_scope.cancel_called:
+                        raise ToolError("transport_lost", "The external provider connection closed.")
+
+                try:
+                    # The startup scope ends before the live session's keep-alive wait.
+                    with anyio.fail_after(max(0.0, startup_deadline - time.monotonic())):
+                        with anyio.fail_after(min(handshake_timeout, definition.timeouts.handshake_sec)):
+                            await session.initialize()
+                        descriptors = await discover()
+                    if gate_held and startup_gate is not None:
+                        startup_gate.release()
+                        gate_held = False
+                    if keep_alive_event is not None:
+                        async with anyio.create_task_group() as tasks:
+                            tasks.start_soon(refresh)
+                            tasks.start_soon(watch_transport)
+                            await keep_alive_event.wait()
+                            tasks.cancel_scope.cancel()
+                    return descriptors
+                finally:
+                    owner.close_active_session()
+                    if registry is not None and keep_alive_event is not None:
+                        registry.retire_extension_catalog(owner.extension_id)
+    finally:
+        if gate_held and startup_gate is not None:
+            startup_gate.release()
 
 
 class ExtensionLifecycleManager:
@@ -725,7 +768,7 @@ class ExtensionLifecycleManager:
     ) -> None:
         """Start a single extension under bounded concurrency semaphore."""
         owner = self.get_owner(extension_id)
-        if not owner:
+        if not owner or self._shutdown_event.is_set():
             return
         # Do not start disabled or unapproved extensions
         if owner.state == ExtensionState.DISABLED or not owner.is_enabled:
@@ -734,18 +777,18 @@ class ExtensionLifecycleManager:
 
         async def runner(own: ExtensionOwner) -> None:
             if custom_runner is not None:
-                await custom_runner(own)
+                async with self._startup_semaphore:
+                    await custom_runner(own)
             else:
                 await connect_and_discover_tools(
                     own,
                     self._registry,
                     keep_alive_event=keep_alive_event,
+                    startup_gate=self._startup_semaphore,
                 )
 
-        async with self._startup_semaphore:
-            # Signal start and run owner loop
-            owner.signal(OwnerSignal.START)
-            await owner.run_owner_loop(runner_fn=runner)
+        owner.signal(OwnerSignal.START)
+        await owner.run_owner_loop(runner_fn=runner)
 
     async def start_all_background(
         self,
