@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Mapping
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import anyio
+import mcp.types as types
 from mcp.client.session import ClientSession
 
-from core.extensions.models import ExtensionDefinition, ExtensionState
+from core.extensions.config import build_extension_environment
+from core.extensions.models import (
+    LIMITS,
+    ExtensionCatalogSnapshot,
+    ExtensionDefinition,
+    ExtensionState,
+    ExtensionToolDescriptor,
+)
+from core.extensions.registry import CatalogLimitExceededError, ExtensionRegistry
+from core.extensions.transport import bounded_stdio_transport
 
 logger = logging.getLogger(__name__)
 
@@ -251,11 +263,107 @@ class ExtensionOwner:
             self.close_active_session()
 
 
+async def connect_and_discover_tools(
+    owner: ExtensionOwner,
+    registry: ExtensionRegistry | None = None,
+    parent_env: Mapping[str, str] | None = None,
+    extra_env: Mapping[str, str] | None = None,
+    startup_timeout: float = LIMITS.startup_sec,
+    handshake_timeout: float = LIMITS.handshake_sec,
+    discovery_timeout: float = LIMITS.discovery_sec,
+    max_tools: int = LIMITS.tools_per_extension,
+    keep_alive_event: anyio.Event | None = None,
+) -> tuple[ExtensionToolDescriptor, ...]:
+    """Connect to subprocess via bounded stdio, perform paginated discovery, and register."""
+    definition = owner.definition
+    cmd = [definition.command, *definition.arguments]
+    cwd = Path(definition.working_directory).resolve()
+    base_env = build_extension_environment(definition, parent=parent_env)
+    env = {**base_env, "MCP_EXTENSIONS_ENABLED": "0"}
+    if extra_env:
+        env.update(extra_env)
+
+    session_id = f"{owner.extension_id}-gen{owner.generation}-{time.monotonic()}"
+
+    with anyio.fail_after(startup_timeout):
+        async with bounded_stdio_transport(
+            cmd,
+            cwd=cwd,
+            env=env,
+            shutdown_timeout=5.0,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                owner.register_session(session, session_id)
+
+                with anyio.fail_after(handshake_timeout):
+                    await session.initialize()
+
+                with anyio.fail_after(discovery_timeout):
+                    discovered_tools: list[types.Tool] = []
+                    cursor: str | None = None
+                    while True:
+                        req_params = (
+                            types.PaginatedRequestParams(cursor=cursor)
+                            if cursor is not None
+                            else None
+                        )
+                        res = await session.list_tools(params=req_params)
+                        discovered_tools.extend(res.tools)
+                        if len(discovered_tools) > max_tools:
+                            raise CatalogLimitExceededError(
+                                f"Discovered tool count {len(discovered_tools)} exceeded limit {max_tools}"
+                            )
+                        if not res.next_cursor:
+                            break
+                        cursor = res.next_cursor
+
+                descriptors_list: list[ExtensionToolDescriptor] = []
+                for t in discovered_tools:
+                    raw_schema = getattr(t, "input_schema", getattr(t, "inputSchema", {}))
+                    tool_schema = raw_schema if isinstance(raw_schema, dict) else {}
+                    descriptors_list.append(
+                        ExtensionToolDescriptor.create(
+                            extension_id=owner.extension_id,
+                            provider=definition.provider,
+                            remote_name=t.name,
+                            description=t.description or "",
+                            input_schema=tool_schema,
+                            catalog_generation=owner.generation,
+                        )
+                    )
+                descriptors = tuple(descriptors_list)
+
+                if registry is not None:
+                    registry.publish_extension_catalog(
+                        owner.extension_id,
+                        owner.generation,
+                        descriptors,
+                    )
+
+                owner.state_machine.transition(ExtensionState.HEALTHY)
+
+                if keep_alive_event is not None:
+                    await keep_alive_event.wait()
+
+                return descriptors
+
+
 class ExtensionLifecycleManager:
     """Manages lifecycles, states, and owner channels across all configured extensions."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        registry: ExtensionRegistry | None = None,
+        parallel_startup: int = LIMITS.parallel_startup,
+    ) -> None:
+        self._registry = registry or ExtensionRegistry()
+        self._parallel_startup = parallel_startup
+        self._startup_semaphore = anyio.Semaphore(parallel_startup)
         self._owners: dict[str, ExtensionOwner] = {}
+
+    @property
+    def registry(self) -> ExtensionRegistry:
+        return self._registry
 
     def register_extension(
         self,
@@ -301,3 +409,59 @@ class ExtensionLifecycleManager:
         if not owner:
             return False
         return owner.signal(OwnerSignal.RESTART)
+
+    def list_tools(self) -> tuple[ExtensionToolDescriptor, ...]:
+        """Return cached discovered tools from registry memory without spawning any processes."""
+        return tuple(self._registry.active_snapshot.tools.values())
+
+    def get_catalog_snapshot(self) -> ExtensionCatalogSnapshot:
+        """Return authoritative in-memory catalog snapshot."""
+        return self._registry.active_snapshot
+
+    async def start_extension_background(
+        self,
+        extension_id: str,
+        keep_alive_event: anyio.Event | None = None,
+        custom_runner: Callable[[ExtensionOwner], Any] | None = None,
+    ) -> None:
+        """Start a single extension under bounded concurrency semaphore."""
+        owner = self.get_owner(extension_id)
+        if not owner:
+            return
+        # Do not start disabled or unapproved extensions
+        if owner.state == ExtensionState.DISABLED or not owner.definition.enabled:
+            logger.info("Extension '%s' is disabled, skipping startup", extension_id)
+            return
+
+        async def runner(own: ExtensionOwner) -> None:
+            if custom_runner is not None:
+                await custom_runner(own)
+            else:
+                await connect_and_discover_tools(
+                    own,
+                    self._registry,
+                    keep_alive_event=keep_alive_event,
+                )
+
+        async with self._startup_semaphore:
+            # Signal start and run owner loop
+            owner.signal(OwnerSignal.START)
+            await owner.run_owner_loop(runner_fn=runner)
+
+    async def start_all_background(
+        self,
+        tg: anyio.abc.TaskGroup,
+        keep_alive_event: anyio.Event | None = None,
+        custom_runners: dict[str, Callable[[ExtensionOwner], Any]] | None = None,
+    ) -> None:
+        """Start all enabled extensions concurrently in background under parallel budget."""
+        runners = custom_runners or {}
+        for extension_id, owner in self._owners.items():
+            if owner.state != ExtensionState.DISABLED and owner.definition.enabled:
+                runner = runners.get(extension_id)
+                tg.start_soon(
+                    self.start_extension_background,
+                    extension_id,
+                    keep_alive_event,
+                    runner,
+                )

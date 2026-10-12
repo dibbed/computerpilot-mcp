@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import anyio
@@ -331,3 +332,164 @@ def test_owner_actor_runner_failure_transitions_to_failed() -> None:
 
     anyio.run(scenario)
 
+
+def test_slow_ab_concurrency_and_isolated_failure() -> None:
+    """Verify slow A/B: Provider A fails/times out, Provider B succeeds, native unaffected."""
+    manager = ExtensionLifecycleManager()
+    ext_a = _dummy_definition("ext-slow-a", enabled=True)
+    ext_b = _dummy_definition("ext-fast-b", enabled=True)
+
+    owner_a = manager.register_extension(ext_a)
+    owner_b = manager.register_extension(ext_b)
+
+    async def slow_failing_runner(own: ExtensionOwner) -> None:
+        await anyio.sleep(0.02)
+        raise TimeoutError("Provider A startup timed out")
+
+    async def fast_succeeding_runner(own: ExtensionOwner) -> None:
+        await anyio.sleep(0.01)
+        own.state_machine.transition(ExtensionState.HEALTHY)
+
+    async def scenario() -> None:
+        async with anyio.create_task_group() as tg:
+            await manager.start_all_background(
+                tg,
+                custom_runners={
+                    "ext-slow-a": slow_failing_runner,
+                    "ext-fast-b": fast_succeeding_runner,
+                },
+            )
+            await anyio.sleep(0.1)
+
+            # Assert Provider A failed in isolation
+            assert owner_a.state == ExtensionState.FAILED
+            assert not owner_a.is_routable
+
+            # Assert Provider B succeeded and is healthy
+            assert owner_b.state == ExtensionState.HEALTHY
+            assert owner_b.is_routable
+
+            # Teardown
+            owner_a.signal(OwnerSignal.STOP)
+            owner_b.signal(OwnerSignal.STOP)
+
+    anyio.run(scenario)
+
+
+def test_tools_list_no_spawn_queries_memory_snapshot() -> None:
+    """Verify listing tools queries cached registry snapshot without spawning subprocesses."""
+    manager = ExtensionLifecycleManager()
+    ext = _dummy_definition("ext-mem", enabled=True)
+    manager.register_extension(ext)
+
+    # Calling list_tools on manager performs zero spawns and returns in-memory descriptors
+    tools = manager.list_tools()
+    assert isinstance(tools, tuple)
+    assert len(tools) == 0
+
+    snapshot = manager.get_catalog_snapshot()
+    assert snapshot.total_tools == 0
+    assert snapshot.manager_generation == 0
+
+
+def test_disabled_extensions_are_never_started() -> None:
+    """Verify that disabled extensions are skipped by background startup and stay DISABLED."""
+    manager = ExtensionLifecycleManager()
+    ext_enabled = _dummy_definition("ext-active", enabled=True)
+    ext_disabled = _dummy_definition("ext-inactive", enabled=False)
+
+    owner_enabled = manager.register_extension(ext_enabled)
+    owner_disabled = manager.register_extension(ext_disabled)
+
+    assert owner_disabled.state == ExtensionState.DISABLED
+
+    async def dummy_runner(own: ExtensionOwner) -> None:
+        own.state_machine.transition(ExtensionState.HEALTHY)
+
+    async def scenario() -> None:
+        async with anyio.create_task_group() as tg:
+            await manager.start_all_background(
+                tg,
+                custom_runners={
+                    "ext-active": dummy_runner,
+                    "ext-inactive": dummy_runner,
+                },
+            )
+            await anyio.sleep(0.05)
+
+            assert owner_enabled.state == ExtensionState.HEALTHY
+            # Disabled extension must NEVER have run
+            assert owner_disabled.state == ExtensionState.DISABLED
+            assert not owner_disabled.is_routable
+
+            owner_enabled.signal(OwnerSignal.STOP)
+
+    anyio.run(scenario)
+
+
+def test_real_fixture_mcp_discovery_integration(tmp_path: Path) -> None:
+    """Verify real fake_mcp_server subprocess handshake, discovery, and catalog registration."""
+    import sys
+
+    from core.extensions.manager import connect_and_discover_tools
+
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "fake_mcp_server.py"
+
+    definition = ExtensionDefinition.model_validate_json(
+        json.dumps({
+            "extension_id": "fixture-server",
+            "display_name": "Fixture Server",
+            "provider": "fixture",
+            "command": sys.executable,
+            "arguments": [str(fixture_path), "--workspace", str(tmp_path), "--mode", "readonly"],
+            "working_directory": str(tmp_path),
+            "platforms": [normalize_system()],
+            "environment": {
+                "values": {
+                    "PYTHONUNBUFFERED": "1",
+                }
+            },
+            "enabled": True,
+        })
+    )
+
+    for p in ("home", "config", "state", "temp"):
+        (tmp_path / p).mkdir(parents=True, exist_ok=True)
+
+    extra_env = {
+        "HOME": str(tmp_path / "home"),
+        "USERPROFILE": str(tmp_path / "home"),
+        "APPDATA": str(tmp_path / "config"),
+        "LOCALAPPDATA": str(tmp_path / "state"),
+        "TEMP": str(tmp_path / "temp"),
+        "TMP": str(tmp_path / "temp"),
+    }
+
+    manager = ExtensionLifecycleManager()
+    owner = manager.register_extension(definition)
+    owner.state_machine.transition(ExtensionState.STARTING)
+
+    async def scenario() -> None:
+        descriptors = await connect_and_discover_tools(
+            owner,
+            manager.registry,
+            extra_env=extra_env,
+            startup_timeout=5.0,
+            handshake_timeout=3.0,
+            discovery_timeout=3.0,
+        )
+        assert len(descriptors) == 2
+        names = {d.public_name for d in descriptors}
+        assert "external.fixture-server.read_value" in names
+        assert "external.fixture-server.increment_value" in names
+
+        # State must now be HEALTHY after accepted catalog publication
+        assert owner.state == ExtensionState.HEALTHY
+        assert owner.is_routable
+
+        # Catalog snapshot must reflect the discovered tools
+        snapshot = manager.get_catalog_snapshot()
+        assert snapshot.total_tools == 2
+        assert manager.registry.has_tool("external.fixture-server.read_value")
+
+    anyio.run(scenario)
