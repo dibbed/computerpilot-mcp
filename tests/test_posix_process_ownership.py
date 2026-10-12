@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -77,3 +78,23 @@ def test_posix_process_groups_can_be_disabled(tmp_path: Path, monkeypatch: pytes
     result = run_bounded([sys.executable, "-c", "print('ok')"], cwd=tmp_path, timeout_sec=10)
     assert result["ok"] is True
     assert result["process_ownership"] == "psutil"
+
+
+def test_posix_process_groups_disabled_rejects_require_native(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from core.process_ownership import NativeOwnershipRequiredError, spawn_owned_process
+
+    monkeypatch.setenv("MCP_POSIX_PROCESS_GROUPS", "0")
+    with pytest.raises(NativeOwnershipRequiredError, match="POSIX process groups are disabled"):
+        spawn_owned_process(
+            [sys.executable, "-c", "print('ok')"],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=0,
+            require_native=True,
+        )
+

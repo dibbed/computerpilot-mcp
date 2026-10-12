@@ -2,6 +2,8 @@
 
 ComputerPilot MCP is a supervised local MCP runtime that combines typed developer/computer-use tools with durable jobs, explicit recovery, and platform capability detection.
 
+Authoring contracts are in [native tool authoring](development/MCP-TOOL-AUTHORING.md), [extension authoring](development/MCP-EXTENSION-AUTHORING.md), and [testing standards](development/TESTING-STANDARDS.md). The [agent contract](../AGENTS.md) records the brief v0.8 handoff; the full master plan stays outside the repository. This architecture describes current runtime behavior until implementation evidence warrants an update.
+
 ## Runtime overview
 
 ```mermaid

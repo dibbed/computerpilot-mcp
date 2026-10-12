@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  MCP_EXTENSIONS_ENABLED: "0"
+
 jobs:
   platform-validation:
     name: Release Gate (${{ matrix.platform }}, Python 3.12)

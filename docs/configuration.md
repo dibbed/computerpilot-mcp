@@ -125,3 +125,14 @@ MCP_TIMINGS=1
 ```
 
 Timing records are local metadata/durations; they are not intended to log command bodies, file contents, secrets, or typed UI values.
+## Extension configuration foundation (v0.8 in progress)
+
+The offline reader is opt-in: MCP_EXTENSIONS_ENABLED defaults false; only 1, true, yes, or on enable it. MCP_EXTENSIONS_CONFIG may specify an absolute local JSON path; omit it for config_home()/computerpilot-mcp/extensions.json. The existing platform helper gives XDG precedence, then Windows APPDATA, macOS Application Support, or POSIX ~/.config. This does not move native .agent_state.
+
+Disabled mode does not read provider config. Missing files mean zero extensions. Invalid/future-version files disable all extensions with a safe code, preserve the original file, and leave native tools available. Every load independently validates UTF-8, byte/depth limits, duplicate JSON keys, strict schema1 and portable absolute provider paths. Disabled placeholders need no existing executables/directories or resolved references until activation. Definitions are immutable snapshots; disk edits require runtime restart. No watcher, installer or external process is introduced by this reader.
+
+Provisional Core ceilings live in core/extensions/models.py:ExtensionLimits and are measured/frozen by M14. Providers may only tighten timeouts. See [extension authoring](development/MCP-EXTENSION-AUTHORING.md) for the proposed contract and the [agent contract](../AGENTS.md) for the brief implementation handoff. Public exposure and mutation activation remain gated; foundation code does not authorize launching unreviewed providers.
+
+References are env-only, with explicit safe variable names; file references are deferred. Nonsecret values permit only PYTHONUNBUFFERED, PYTHONIOENCODING, LANG, LC_ALL, LC_CTYPE, TZ, NO_COLOR and TERM. Inheritance additionally permits OS launch/temp variables plus explicit HOME/APPDATA/USERPROFILE. No wildcard/PATH/injection-variable inheritance is allowed. HOME-style access still requires operator review; it can enable credential-file discovery.
+
+Known credential flags, interpolation/control characters and resolved credential literals in operator fields are rejected even for disabled definitions. Missing references do not invalidate disabled configuration; resolving a private environment requires all configured credentials and tool-required reference names, otherwise auth_missing is returned without values/names. The builder does not launch code or authorize it. Provisional private environment ceilings are 8 KiB/value and 32 KiB total; no full parent environment is copied or public values projected. Unknown arbitrary text cannot be universally classified as a secret: operator review and reference use remain required.

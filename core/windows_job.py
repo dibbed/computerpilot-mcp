@@ -26,6 +26,10 @@ _SIZE_T = ctypes.c_size_t
 _DWORD = wintypes.DWORD
 
 
+class NativeOwnershipRequiredError(RuntimeError):
+    """Raised when native process-tree ownership is required but unavailable or failed to initialize."""
+
+
 class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
     _fields_ = [
         ("PerProcessUserTimeLimit", _INT64),
@@ -353,9 +357,14 @@ def spawn_owned_process(
     stdout: int | IO[Any] | None,
     stderr: int | IO[Any] | None,
     creationflags: int,
+    require_native: bool = False,
 ) -> OwnedProcess:
     """Spawn atomically inside a kill-on-close Job Object, with safe fallback before user code runs."""
     if not windows_job_objects_enabled():
+        if require_native:
+            raise NativeOwnershipRequiredError(
+                "Windows Job Objects are disabled but native process-tree ownership is required."
+            )
         return _regular_popen(
             command,
             cwd=cwd,
@@ -368,7 +377,11 @@ def spawn_owned_process(
         )
     try:
         job = WindowsJob.create()
-    except OSError:
+    except OSError as exc:
+        if require_native:
+            raise NativeOwnershipRequiredError(
+                f"Failed to create Windows Job Object: {exc}"
+            ) from exc
         return _regular_popen(
             command,
             cwd=cwd,
@@ -399,7 +412,7 @@ def spawn_owned_process(
         job.assign_process_handle(int(raw_handle))
         _resume_primary_thread(process.pid)
         return OwnedProcess(process, job, "windows_job")
-    except BaseException:
+    except BaseException as exc:
         try:
             process.kill()
             process.wait(timeout=5)
@@ -407,6 +420,10 @@ def spawn_owned_process(
             pass
         _close_popen_pipes(process)
         job.close()
+        if require_native:
+            raise NativeOwnershipRequiredError(
+                f"Failed to assign or resume process in Windows Job Object: {exc}"
+            ) from exc
         return _regular_popen(
             command,
             cwd=cwd,

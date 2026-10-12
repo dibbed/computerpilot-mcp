@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  MCP_EXTENSIONS_ENABLED: "0"
+
 jobs:
   validate:
     name: Test & Validate (${{ matrix.platform }}, Python ${{ matrix.python-version }})
