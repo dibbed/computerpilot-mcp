@@ -41,10 +41,6 @@ class CredentialRedactor:
         )}, key=len, reverse=True)
         self._pattern = re.compile("|".join(re.escape(value) for value in literals)) if literals else None
 
-    @property
-    def has_credentials(self) -> bool:
-        return self._pattern is not None
-
     def text(self, value: str) -> str:
         return value if self._pattern is None else self._pattern.sub(
             lambda match: "[REDACTED]" if len(match.group()) >= 10 else "", value,

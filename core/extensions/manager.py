@@ -322,7 +322,7 @@ class ExtensionOwner:
             values += tuple(env[name] for name in self.definition.environment.references)
         return CredentialRedactor(values)
 
-    async def call_tool(
+    async def _call_tool(
         self,
         remote_name: str,
         arguments: Mapping[str, Any] | None = None,
@@ -901,7 +901,7 @@ class ExtensionLifecycleManager:
             timeout_sec=timeout_sec,
             request_callback=request_callback,
         ) as (owner, descriptor):
-            result = await owner.call_tool(
+            result = await owner._call_tool(
                 descriptor.remote_name,
                 args,
                 timeout_sec=timeout_sec,

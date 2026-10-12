@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import math
 from collections.abc import Mapping
@@ -10,6 +11,7 @@ from typing import Any, Literal
 
 from mcp import types
 
+from core.artifacts import deliver_stream
 from core.errors import ToolError
 from core.extensions.models import LIMITS, ExtensionToolDescriptor, StrictDefinition
 from core.extensions.registry import validate_tool_value
@@ -86,7 +88,8 @@ def validate_arguments(descriptor: ExtensionToolDescriptor, arguments: Mapping[s
     if arguments is not None and not isinstance(arguments, Mapping):
         raise ToolError("invalid_arguments", "External tool arguments must be a JSON object.")
     args = dict(arguments) if arguments is not None else {}
-    bounded_json(args, LIMITS.argument_bytes, error_code="invalid_arguments")
+    # Freeze nested values before an admission wait can let the caller mutate them.
+    args = json.loads(bounded_json(args, LIMITS.argument_bytes, error_code="invalid_arguments"))
     if not validate_tool_value(descriptor.input_schema, args).valid:
         raise ToolError("invalid_arguments", "External tool arguments do not match the accepted schema.")
     return args
@@ -97,7 +100,11 @@ def normalize_result(
 ) -> dict[str, Any]:
     if not isinstance(result, types.CallToolResult) or result.result_type != "complete":
         raise ToolError("malformed_result", "External calls require one terminal tool result.")
-    original = bounded_json(result.model_dump(mode="json", by_alias=True), LIMITS.frame_bytes, error_code="output_too_large")
+    try:
+        provider_json = result.model_dump(mode="json", by_alias=True)
+    except Exception:
+        raise ToolError("malformed_result", "The external result cannot be serialized safely.") from None
+    original = bounded_json(provider_json, LIMITS.frame_bytes, error_code="output_too_large")
     redactor = redactor or CredentialRedactor()
     if result.is_error:
         content: list[dict[str, Any]] = []
@@ -136,12 +143,40 @@ def normalize_result(
                 raise ToolError("malformed_result", "External content type is unsupported.")
     sanitized = redactor.json({"content": content, "structured_content": structured})
     content, structured = sanitized["content"], sanitized["structured_content"]
-    returned = bounded_json(sanitized, LIMITS.inline_bytes, error_code="output_too_large")
-    return ExtensionResult(
+    payload = bounded_json(sanitized, LIMITS.artifact_bytes, error_code="output_too_large")
+    truncated = len(payload) > LIMITS.inline_bytes - 2048
+    artifact = None
+    if truncated:
+        if descriptor.policy.allow_output_artifact:
+            try:
+                delivered = deliver_stream(io.BytesIO(payload), encoding="utf-8", total=len(payload), delivery="file")
+            except Exception:
+                raise ToolError("output_unavailable", "The sanitized external output artifact could not be stored.") from None
+            artifact = {
+                "path": delivered["path"], "sha256": delivered["sha256"], "bytes": delivered["bytes"],
+                "media_type": "application/json", "final": True, "snapshot_version": delivered["snapshot_version"],
+            }
+        content = [{"type": "text", "text": payload[:4096].decode("utf-8", errors="ignore")}]
+        structured = None
+    envelope = ExtensionResult(
         ok=not result.is_error, extension_id=descriptor.extension_id, provider=descriptor.identity.provider,
         tool=descriptor.public_name, catalog_generation=descriptor.catalog_generation,
         outcome="failed" if result.is_error else "succeeded", content=tuple(content), structured_content=structured,
-        limits=ResultLimits(returned_bytes=len(returned), original_bytes_if_known=len(original)),
+        limits=ResultLimits(returned_bytes=0, original_bytes_if_known=len(original)),
+        truncated=truncated, artifact=artifact,
         error="provider_error" if result.is_error else None,
         message="The external provider reported a tool error." if result.is_error else None,
     ).model_dump(mode="json")
+    try:
+        for _ in range(3):
+            encoded = bounded_json(envelope, LIMITS.inline_bytes, error_code="output_too_large")
+            if envelope["limits"]["returned_bytes"] == len(encoded):
+                break
+            envelope["limits"]["returned_bytes"] = len(encoded)
+        return envelope
+    except ToolError:
+        if artifact is not None:
+            from pathlib import Path
+
+            Path(artifact["path"]).unlink(missing_ok=True)
+        raise

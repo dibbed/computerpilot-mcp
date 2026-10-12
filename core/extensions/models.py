@@ -162,6 +162,7 @@ class ToolPolicy(StrictDefinition):
     profiles: tuple[str, ...] = Field(default=(), max_length=len(PROFILE_DOMAINS))
     intents: tuple[IntentName, ...] = Field(default=(), max_length=25)
     allow_call: bool = False
+    allow_output_artifact: bool = False
     determinism: int = Field(default=1, ge=1, le=4)
     recoverability: RecoverabilityClass = RecoverabilityClass.WEAK
     capability_confidence: int = Field(default=1, ge=1, le=5)
