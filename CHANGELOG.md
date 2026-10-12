@@ -8,6 +8,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ### Added
 - 2026-10-12: Add the contributor execution contract, native/extension authoring and testing standards, and the tracked extensibility execution ledger.
+- 2026-10-12: Add strict immutable extension definitions, exact namespaces, a bounded opt-in offline configuration reader and private minimal env-only credential references; provider activation remains gated.
 
 ## [0.7.1] - 2026-10-11
 

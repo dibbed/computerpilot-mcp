@@ -5,6 +5,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.extensions.models import ExtensionLimits
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -34,6 +38,8 @@ class Settings:
     server_name: str = "ali_windows_agent_mcp"
     version: str = "0.7.1"
     tool_profile: str = os.getenv("MCP_TOOL_PROFILE", "full")
+    extensions_enabled: bool = os.getenv("MCP_EXTENSIONS_ENABLED", "").strip().casefold() in {"1", "true", "yes", "on"}
+    extensions_config: str | None = os.getenv("MCP_EXTENSIONS_CONFIG")
     execution_router_enabled: bool = _env_bool("MCP_EXECUTION_ROUTER_ENABLED", True)
     execution_router_policy: str = os.getenv("MCP_EXECUTION_ROUTER_POLICY", "deterministic-v1").strip().casefold() or "deterministic-v1"
     execution_router_explain: bool = _env_bool("MCP_EXECUTION_ROUTER_EXPLAIN", True)
@@ -90,6 +96,12 @@ class Settings:
     workflow_cleanup_interval_sec: int = _env_int("MCP_WORKFLOW_CLEANUP_INTERVAL_SEC", 300, 1, 86_400)
     state_dir: Path = PROJECT_ROOT / ".agent_state"
     memory_dir: Path = PROJECT_ROOT / "memory"
+
+    @property
+    def extension_limits(self) -> ExtensionLimits:
+        from core.extensions.models import LIMITS
+
+        return LIMITS
 
     @property
     def audit_log(self) -> Path:
