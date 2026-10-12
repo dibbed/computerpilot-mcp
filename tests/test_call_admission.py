@@ -33,6 +33,8 @@ def _dummy_definition(extension_id: str = "ext-test", enabled: bool = True) -> E
             "working_directory": ".",
             "platforms": [normalize_system()],
             "enabled": enabled,
+            "launch_approved": True,
+            "trust_class": "trusted",
         })
     )
 
@@ -61,6 +63,29 @@ def _create_descriptor(
         policy=policy,
         provider_hints=provider_hints or ProviderToolHints(),
     )
+
+
+@pytest.mark.parametrize("override", [{"launch_approved": False}, {"trust_class": "untrusted"}])
+def test_direct_call_cannot_bypass_operator_launch_or_trust(override: dict[str, object]) -> None:
+    manager = ExtensionLifecycleManager()
+    definition = _dummy_definition().model_copy(update={"launch_approved": True, "trust_class": "trusted", **override})
+    owner = manager.register_extension(definition)
+    owner.state_machine.transition(ExtensionState.STARTING)
+    descriptor = _create_descriptor(definition.extension_id, "read", owner.generation)
+    manager.registry.publish_extension_catalog(definition.extension_id, owner.generation, (descriptor,))
+    owner.state_machine.transition(ExtensionState.HEALTHY)
+    session = MagicMock()
+    session.call_tool = AsyncMock(return_value={"ok": True})
+    owner.register_session(session, "unapproved-call")
+    lease = manager.registry.create_lease(descriptor.public_name)
+    assert lease is not None
+
+    async def scenario() -> None:
+        with pytest.raises(ToolError):
+            await manager.execute_guarded_call(lease)
+        session.call_tool.assert_not_awaited()
+
+    anyio.run(scenario)
 
 
 def test_admitted_read_only_call_executes_successfully() -> None:

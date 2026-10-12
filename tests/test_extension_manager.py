@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import anyio
@@ -34,8 +35,53 @@ def _dummy_definition(extension_id: str = "test-ext", enabled: bool = True) -> E
             "working_directory": ".",
             "platforms": [normalize_system()],
             "enabled": enabled,
+            "launch_approved": True,
+            "trust_class": "trusted",
         })
     )
+
+
+@pytest.mark.parametrize("override", [{"launch_approved": False}, {"trust_class": "untrusted"}])
+def test_unapproved_owner_never_runs_on_start_or_restart(tmp_path: Path, override: dict[str, Any]) -> None:
+    definition = _dummy_definition().model_copy(update={"launch_approved": True, "trust_class": "trusted", **override})
+    owner = ExtensionOwner(definition)
+    marker = tmp_path / "unapproved-provider-ran"
+
+    async def runner(own: ExtensionOwner) -> None:
+        marker.write_text("executed", encoding="utf-8")
+
+    async def scenario() -> None:
+        owner.signal(OwnerSignal.START)
+        owner.signal(OwnerSignal.RESTART)
+        owner.signal(OwnerSignal.STOP)
+        await owner.run_owner_loop(runner_fn=runner)
+
+    anyio.run(scenario)
+    assert not marker.exists()
+
+
+def test_direct_connection_requires_launch_approval_before_transport(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from core.errors import ToolError
+    from core.extensions import manager as module
+
+    definition = _dummy_definition().model_copy(update={"launch_approved": False, "trust_class": "trusted"})
+    owner = ExtensionOwner(definition)
+    opened = False
+
+    def forbidden_transport(*args: Any, **kwargs: Any) -> Any:
+        nonlocal opened
+        opened = True
+        raise AssertionError("transport was entered before operator approval")
+
+    monkeypatch.setattr(module, "bounded_stdio_transport", forbidden_transport)
+
+    async def scenario() -> None:
+        with pytest.raises(ToolError) as denied:
+            await module.connect_and_discover_tools(owner)
+        assert denied.value.code == "launch_not_approved"
+
+    anyio.run(scenario)
+    assert not opened
 
 
 def test_transition_matrix_all_legal_transitions() -> None:
@@ -452,6 +498,8 @@ def test_real_fixture_mcp_discovery_integration(tmp_path: Path) -> None:
                 }
             },
             "enabled": True,
+            "launch_approved": True,
+            "trust_class": "trusted",
         })
     )
 

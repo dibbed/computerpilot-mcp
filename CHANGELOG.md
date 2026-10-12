@@ -14,6 +14,9 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ### Changed
 - 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.
 
+### Fixed
+- 2026-10-12: Require operator launch approval and permitted trust before extension start/restart, direct connection and call admission, including revalidation after queue waits.
+
 ## [0.7.1] - 2026-10-11
 
 ### Fixed

@@ -24,6 +24,7 @@ from core.extensions.models import (
     ExtensionState,
     ExtensionToolDescriptor,
     MutationClass,
+    TrustClass,
 )
 from core.extensions.registry import CatalogLimitExceededError, ExtensionLease, ExtensionRegistry
 from core.extensions.transport import bounded_stdio_transport
@@ -301,6 +302,15 @@ class ExtensionOwner:
         self._active_session = None
         self._active_session_id = None
 
+    def require_launch_authorization(self) -> None:
+        """Recheck operator authority before entering any provider execution path."""
+        if not self.is_enabled:
+            raise ToolError("extension_disabled", "The extension is disabled.")
+        if not self.definition.launch_approved:
+            raise ToolError("launch_not_approved", "The extension has no operator launch approval.")
+        if self.definition.trust_class not in {TrustClass.RESTRICTED, TrustClass.TRUSTED}:
+            raise ToolError("trust_denied", "The extension trust policy prohibits execution.")
+
     async def call_tool(
         self,
         remote_name: str,
@@ -309,6 +319,7 @@ class ExtensionOwner:
         timeout_sec: float = LIMITS.call_sec,
     ) -> Any:
         """Call a remote tool on the active session bounded by timeout."""
+        self.require_launch_authorization()
         session = self._active_session
         if session is None:
             raise ToolError(
@@ -336,6 +347,12 @@ class ExtensionOwner:
         try:
             async with self._receive_channel:
                 async for sig in self._receive_channel:
+                    if sig in {OwnerSignal.START, OwnerSignal.RESTART}:
+                        try:
+                            self.require_launch_authorization()
+                        except ToolError as denied:
+                            logger.warning("Extension launch denied: %s", denied.code)
+                            continue
                     if sig == OwnerSignal.START:
                         if self.state_machine.can_transition(ExtensionState.STARTING):
                             self.state_machine.transition(ExtensionState.STARTING)
@@ -422,6 +439,7 @@ async def connect_and_discover_tools(
     keep_alive_event: anyio.Event | None = None,
 ) -> tuple[ExtensionToolDescriptor, ...]:
     """Connect to subprocess via bounded stdio, perform paginated discovery, and register."""
+    owner.require_launch_authorization()
     definition = owner.definition
     cmd = [definition.command, *definition.arguments]
     cwd = Path(definition.working_directory).resolve()
@@ -786,6 +804,7 @@ class ExtensionLifecycleManager:
                 code="extension_not_routable",
                 message=f"Extension '{descriptor.extension_id}' is not routable in state {owner.state.value}",
             )
+        owner.require_launch_authorization()
 
         # 5. Check operator policy allow_call
         if not descriptor.policy.allow_call:
@@ -825,6 +844,7 @@ class ExtensionLifecycleManager:
 
             try:
                 # 9. Recheck snapshot after queue wait to guard against races
+                owner.require_launch_authorization()
                 if not owner.is_routable:
                     raise ToolError(
                         code="extension_not_routable",
