@@ -141,6 +141,7 @@ def normalize_result(
                     content.append({"type": "resource", "uri": str(resource.uri), "blob": resource.blob})
             else:
                 raise ToolError("malformed_result", "External content type is unsupported.")
+    bounded_json({"content": content, "structured_content": structured}, LIMITS.artifact_bytes, error_code="malformed_result")
     sanitized = redactor.json({"content": content, "structured_content": structured})
     content, structured = sanitized["content"], sanitized["structured_content"]
     payload = bounded_json(sanitized, LIMITS.artifact_bytes, error_code="output_too_large")

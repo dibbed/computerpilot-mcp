@@ -130,19 +130,6 @@ class ExtensionLease:
     policy_revision: int = 0
 
 
-def _find_local_refs(sub: Any, found_set: set[str]) -> None:
-    if isinstance(sub, Mapping):
-        if "$ref" in sub and isinstance(sub["$ref"], str):
-            r = sub["$ref"]
-            if r.startswith(("#/$defs/", "#/definitions/")):
-                found_set.add(r.split("/")[-1])
-        for v in sub.values():
-            _find_local_refs(v, found_set)
-    elif isinstance(sub, (list, tuple)):
-        for item in sub:
-            _find_local_refs(item, found_set)
-
-
 def validate_schema_subset(schema: Any) -> SchemaValidationResult:
     """Validate that a JSON Schema adheres to the strict safe subset without external network resolution."""
     if isinstance(schema, bool):
@@ -259,6 +246,8 @@ def validate_schema_subset(schema: Any) -> SchemaValidationResult:
                             return res
 
             elif key in ("items", "additionalProperties", "not"):
+                if key == "items" and isinstance(val, (list, tuple)):
+                    return SchemaValidationResult(False, "unsupported_tuple_items", "Tuple-form items are unsupported.")
                 if isinstance(val, (Mapping, bool)):
                     res = walk(val, depth + 1)
                     if res is not None:
@@ -280,36 +269,45 @@ def validate_schema_subset(schema: Any) -> SchemaValidationResult:
                 message=f"Local schema definition '{target_name}' referenced by '{ref_str}' does not exist",
             )
 
-    # Detect cycles in local definitions graph
-    def_refs: dict[str, set[str]] = {}
-    for d_name, d_body in local_defs.items():
-        found: set[str] = set()
-        _find_local_refs(d_body, found)
-        def_refs[d_name] = found
+    # Count expanded references, including repeated DAG edges, before validator execution.
+    expanded_nodes = 0
 
-    visited: set[str] = set()
-    rec_stack: set[str] = set()
+    def expanded_work(node: Any, depth: int, active: frozenset[str] = frozenset()) -> SchemaValidationResult | None:
+        nonlocal expanded_nodes
+        expanded_nodes += 1
+        if expanded_nodes > LIMITS.schema_nodes:
+            return SchemaValidationResult(False, "schema_expansion_limit", "Expanded schema work exceeds the Core ceiling.")
+        if depth > LIMITS.json_depth:
+            return SchemaValidationResult(False, "schema_depth_exceeded", "Expanded schema nesting exceeds the Core ceiling.")
+        if not isinstance(node, Mapping):
+            return None
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                target = value.split("/")[-1]
+                if target in active:
+                    return SchemaValidationResult(False, "cyclic_reference_detected", "Cyclic schema references are unsupported.")
+                result = expanded_work(local_defs[target], depth + 1, active | {target})
+                if result is not None:
+                    return result
+            elif key in ("properties", "$defs", "definitions") and isinstance(value, Mapping):
+                for child in value.values():
+                    result = expanded_work(child, depth + 1, active)
+                    if result is not None:
+                        return result
+            elif key in ("allOf", "anyOf", "oneOf") and isinstance(value, (list, tuple)):
+                for child in value:
+                    result = expanded_work(child, depth + 1, active)
+                    if result is not None:
+                        return result
+            elif key in ("items", "additionalProperties", "not") and isinstance(value, (Mapping, bool)):
+                result = expanded_work(value, depth + 1, active)
+                if result is not None:
+                    return result
+        return None
 
-    def has_cycle(node_name: str) -> bool:
-        visited.add(node_name)
-        rec_stack.add(node_name)
-        for neighbor in def_refs.get(node_name, set()):
-            if neighbor not in visited:
-                if has_cycle(neighbor):
-                    return True
-            elif neighbor in rec_stack:
-                return True
-        rec_stack.remove(node_name)
-        return False
-
-    for d_name in local_defs:
-        if d_name not in visited:
-            if has_cycle(d_name):
-                return SchemaValidationResult(
-                    valid=False,
-                    error_code="cyclic_reference_detected",
-                    message=f"Cyclic $ref chain detected involving definition '{d_name}'",
-                )
+    expansion_error = expanded_work(schema, 0)
+    if expansion_error is not None:
+        return expansion_error
 
     try:
         validator_for(dict(schema)).check_schema(dict(schema))

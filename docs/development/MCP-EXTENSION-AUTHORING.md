@@ -4,6 +4,8 @@ Status: **PROPOSED v0.8 public contract; public exposure and mutation activation
 
 The implemented internal call boundary uses `ExtensionLifecycleManager.execute_guarded_call`, validates and freezes exact JSON arguments before admission, and returns the Core `ExtensionResult` envelope. The owner session helper is internal. Large normalized output returns an explicitly truncated JSON preview; operator `ToolPolicy.allow_output_artifact` defaults to `false`. When explicitly enabled, overflow is stored as a bounded sanitized JSON artifact through existing retention, with path, SHA-256, bytes and media type. Credential echoes are scrubbed before previews/artifacts; sensitive binary output and credential-bearing stderr are withheld. Provider output schemas validate the original structured result internally; they are distinct from the public Core envelope schema. Resource links and embedded URIs are data and are never fetched automatically.
 
+The schema subset rejects tuple-form `items` and bounds both syntax nodes and expanded local-reference work/depth before running the installed offline validator. Acyclic references do not waive the complexity limit. Sanitization covers JSON/URL-escaped literals, decoded binary variants and numeric scalar echoes; provider SDK client/dispatcher payload logs are suppressed only within extension IO tasks.
+
 ## Opt-in and local administrator authority
 
 `MCP_EXTENSIONS_ENABLED` defaults false. Missing config means zero extensions. With opt-in and invalid config, extension activation fails closed with safe diagnostics while native tools remain available. Import, `--check`, listing, route planning, health and panel polling never launch/discover providers.

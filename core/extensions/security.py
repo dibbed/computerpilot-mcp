@@ -23,9 +23,10 @@ class _ProviderLogFilter(logging.Filter):
 
 @contextmanager
 def suppress_sdk_payload_logs() -> Iterator[None]:
-    logger = logging.getLogger("client")
-    if not any(isinstance(item, _ProviderLogFilter) for item in logger.filters):
-        logger.addFilter(_ProviderLogFilter())
+    for name in ("client", "mcp.shared.dispatcher", "mcp.shared.jsonrpc_dispatcher", "mcp.shared.direct_dispatcher"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(item, _ProviderLogFilter) for item in logger.filters):
+            logger.addFilter(_ProviderLogFilter())
     token = _EXTERNAL_IO.set(True)
     try:
         yield
@@ -35,10 +36,10 @@ def suppress_sdk_payload_logs() -> Iterator[None]:
 
 class CredentialRedactor:
     def __init__(self, values: Sequence[str] = ()) -> None:
-        self._literal_bytes = tuple(value.encode("utf-8") for value in set(values) if value)
         literals = sorted({variant for value in values if value for variant in (
             value, json.dumps(value, ensure_ascii=True)[1:-1], quote(value, safe=""),
         )}, key=len, reverse=True)
+        self._literal_bytes = tuple(value.encode("utf-8") for value in literals)
         self._pattern = re.compile("|".join(re.escape(value) for value in literals)) if literals else None
 
     def text(self, value: str) -> str:
@@ -59,4 +60,8 @@ class CredentialRedactor:
             if len(result) != len(value):
                 raise ToolError("malformed_result", "Credential redaction would collide with result keys.")
             return result
+        if type(value) in (int, float, bool):
+            encoded = json.dumps(value, allow_nan=False)
+            scrubbed = self.text(encoded)
+            return value if scrubbed == encoded else scrubbed
         return value

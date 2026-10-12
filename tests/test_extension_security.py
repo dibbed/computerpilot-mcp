@@ -12,6 +12,7 @@ import anyio
 import pytest
 from mcp import types
 from mcp.client.session import ClientSession
+from mcp.shared.message import SessionMessage
 
 from core.errors import ToolError
 from core.extensions.config import build_extension_environment
@@ -19,7 +20,7 @@ from core.extensions.manager import ExtensionLifecycleManager
 from core.extensions.models import ExtensionDefinition, ExtensionState, ExtensionToolDescriptor, MutationClass, ToolPolicy
 from core.extensions.output import normalize_result
 from core.extensions.registry import ExtensionLease, validate_schema_subset, validate_tool_arguments
-from core.extensions.security import CredentialRedactor
+from core.extensions.security import CredentialRedactor, suppress_sdk_payload_logs
 from core.extensions.transport import BoundedStderrDrain, bounded_stdio_transport
 from core.platform import normalize_system
 
@@ -279,3 +280,62 @@ def test_redaction_covers_encoded_literals_without_expanding_tiny_values() -> No
     for encoded in (canary, json.dumps(canary)[1:-1], quote(canary, safe="")):
         assert redactor.text(encoded) == "[REDACTED]"
     assert len(CredentialRedactor(["x"]).text("x" * 1000)) <= 1000
+
+
+def test_tuple_items_cannot_hide_forbidden_schema_keywords() -> None:
+    schema = {"$schema": "http://json-schema.org/draft-07/schema#", "type": "object", "properties": {
+        "values": {"type": "array", "items": [{"type": "string", "pattern": "(a+)+$"}]},
+    }}
+    assert not validate_schema_subset(schema).valid
+
+
+def test_acyclic_reference_fanout_has_a_finite_expansion_budget() -> None:
+    definitions: dict[str, Any] = {"L0": {"type": "integer"}}
+    for level in range(1, 8):
+        definitions[f"L{level}"] = {"allOf": [{"$ref": f"#/$defs/L{level - 1}"} for _ in range(5)]}
+    schema = {"type": "object", "$defs": definitions, "properties": {"x": {"$ref": "#/$defs/L7"}}}
+    assert not validate_schema_subset(schema).valid
+
+
+def test_reference_chain_depth_is_bounded_before_validator_recursion() -> None:
+    definitions: dict[str, Any] = {"L0": {"type": "integer"}}
+    for level in range(1, 40):
+        definitions[f"L{level}"] = {"$ref": f"#/$defs/L{level - 1}"}
+    assert not validate_schema_subset({"$defs": definitions, "$ref": "#/$defs/L39"}).valid
+
+
+def test_escaped_unicode_binary_credential_is_withheld() -> None:
+    canary = "private-binary-راز-credential"
+    raw = types.CallToolResult(content=[types.ImageContent(
+        type="image", mime_type="image/png", data=base64.b64encode(json.dumps(canary).encode()).decode(),
+    )])
+    manager, lease, _ = admitted_call({"type": "object"}, raw)
+    descriptor = manager.registry.get_tool(lease.public_name)
+    assert descriptor is not None
+    with pytest.raises(ToolError, match="withheld"):
+        normalize_result(descriptor, raw, CredentialRedactor([canary]))
+
+
+def test_numeric_credential_echo_is_sanitized_as_a_json_scalar() -> None:
+    canary = "704918273645"
+    result = CredentialRedactor([canary]).json({"safe_key": int(canary)})
+    assert canary not in json.dumps(result)
+
+
+def test_real_sdk_dispatcher_cannot_log_private_response_identifiers(caplog: pytest.LogCaptureFixture) -> None:
+    canary = "private-dispatcher-response-credential"
+
+    async def scenario() -> None:
+        incoming, read = anyio.create_memory_object_stream[SessionMessage | Exception](0)
+        write, outgoing = anyio.create_memory_object_stream[SessionMessage](1)
+        with suppress_sdk_payload_logs():
+            async with ClientSession(read, write):
+                await incoming.send(SessionMessage(types.JSONRPCResponse(jsonrpc="2.0", id=canary, result={})))
+                await incoming.aclose()
+        await outgoing.aclose()
+        logging.getLogger("mcp.shared.jsonrpc_dispatcher").debug("native dispatcher log remains visible")
+
+    with caplog.at_level(logging.DEBUG, logger="mcp.shared.jsonrpc_dispatcher"):
+        anyio.run(scenario)
+    assert canary not in caplog.text
+    assert "native dispatcher log remains visible" in caplog.text
