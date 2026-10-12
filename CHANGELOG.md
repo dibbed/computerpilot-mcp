@@ -20,7 +20,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.
 
 ### Fixed
-- 2026-10-13: Validate real HTTP catalog changes by relisting after notifications until the requested state, tolerating earlier startup notifications within the same bounded deadline.
+- 2026-10-13: Validate real HTTP catalog changes by relisting after notifications until the requested state, tolerating earlier startup notifications within the same bounded deadline; separately prove SDK cache invalidation with a public positive-TTL fixture while preserving production TTL0.
 - 2026-10-13: Honor positive finite startup/handshake/discovery/call deadlines and operator/Core ceilings in direct extension calls as well as public calls, including admission queue time.
 - 2026-10-13: Interrupt live extension owners on STOP/RESTART, release startup slots after discovery, revalidate queued launches and reconnect lost transports under the finite budget without replaying calls; verify real stdio/modern HTTP entrypoints and native-only legacy stateless HTTP.
 - 2026-10-12: Require operator launch approval and permitted trust before extension start/restart, direct connection and call admission, including revalidation after queue waits.
