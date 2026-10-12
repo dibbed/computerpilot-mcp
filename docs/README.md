@@ -16,6 +16,14 @@ This directory contains the public technical documentation and release evidence 
 - [Changelog](../CHANGELOG.md) — published release history.
 - [Binary provenance](../BINARY_PROVENANCE.md) — managed tunnel-runtime verification model.
 
+## Development contracts
+
+- [Agent and contributor contract](../AGENTS.md) — scope, authority, safety and execution evidence.
+- [Native tool authoring](development/MCP-TOOL-AUTHORING.md) — current registration, input/result, lifecycle and recovery conventions.
+- [Extension authoring](development/MCP-EXTENSION-AUTHORING.md) — proposed v0.8 operator/provider contract; runtime gates remain pending.
+- [Testing standards](development/TESTING-STANDARDS.md) — isolation, behavior checks, platform and release evidence.
+- [Active v0.8 roadmap](roadmap/V0.8.0-EXTENSIBILITY-AGENT-FOUNDATION-MASTER-PLAN.fa.md) — the single tracked implementation/execution ledger.
+
 ## Release evidence
 
 Current release evidence:
@@ -27,4 +35,4 @@ Versioned files such as `V0.4.0-RELEASE-NOTES.md` and `V0.4.0-VALIDATION.md` are
 
 ## Internal development material
 
-Local planning directories such as `docs/roadmap/` and `docs/superpowers/` are ignored by Git. They are not part of the public documentation contract.
+Local planning directories such as `docs/roadmap/` and `docs/superpowers/` remain ignored by default. The active v0.8 master plan is deliberately tracked as one specific exception for resumable implementation; other local plans are not public documentation.

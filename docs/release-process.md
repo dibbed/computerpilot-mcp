@@ -2,6 +2,8 @@
 
 ComputerPilot MCP uses guarded, same-SHA release publication.
 
+Contributors follow the [agent contract](../AGENTS.md) and [testing standards](development/TESTING-STANDARDS.md). The [active v0.8 roadmap](roadmap/V0.8.0-EXTENSIBILITY-AGENT-FOUNDATION-MASTER-PLAN.fa.md) adds extension acceptance and independent review requirements; those requirements do not waive the existing release gates below or authorize publication.
+
 ## Normal change flow
 
 ```text

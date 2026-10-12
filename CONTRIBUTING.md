@@ -4,6 +4,8 @@ Thanks for helping improve ComputerPilot MCP.
 
 This repository contains a cross-platform MCP runtime with platform-specific adapters, durable local state, process execution, browser/desktop automation, recovery, workflows, and release automation. Changes should preserve those boundaries rather than making one platform or one execution path the implicit default.
 
+Read the [agent and contributor contract](AGENTS.md), [native tool authoring guide](docs/development/MCP-TOOL-AUTHORING.md), and [testing standards](docs/development/TESTING-STANDARDS.md) before implementation. The [extension authoring contract](docs/development/MCP-EXTENSION-AUTHORING.md) describes proposed v0.8 behavior; its [active roadmap](docs/roadmap/V0.8.0-EXTENSIBILITY-AGENT-FOUNDATION-MASTER-PLAN.fa.md) records what is actually verified.
+
 ## Development environment
 
 ### Requirements
