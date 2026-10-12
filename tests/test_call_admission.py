@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
+from mcp import types
 
 from core.errors import ToolError
 from core.extensions.manager import ExtensionLifecycleManager
@@ -75,7 +77,7 @@ def test_direct_call_cannot_bypass_operator_launch_or_trust(override: dict[str, 
     manager.registry.publish_extension_catalog(definition.extension_id, owner.generation, (descriptor,))
     owner.state_machine.transition(ExtensionState.HEALTHY)
     session = MagicMock()
-    session.call_tool = AsyncMock(return_value={"ok": True})
+    session.send_request = AsyncMock(return_value=types.CallToolResult(content=[], structured_content={"ok": True}))
     owner.register_session(session, "unapproved-call")
     lease = manager.registry.create_lease(descriptor.public_name)
     assert lease is not None
@@ -83,7 +85,7 @@ def test_direct_call_cannot_bypass_operator_launch_or_trust(override: dict[str, 
     async def scenario() -> None:
         with pytest.raises(ToolError):
             await manager.execute_guarded_call(lease)
-        session.call_tool.assert_not_awaited()
+        session.send_request.assert_not_awaited()
 
     anyio.run(scenario)
 
@@ -101,7 +103,7 @@ def test_admitted_read_only_call_executes_successfully() -> None:
 
     # Attach mock session
     session_mock = MagicMock()
-    session_mock.call_tool = AsyncMock(return_value={"status": "all_green"})
+    session_mock.send_request = AsyncMock(return_value=types.CallToolResult(content=[], structured_content={"status": "all_green"}))
     owner.register_session(session_mock, "session-read-1")
 
     lease = manager.registry.create_lease("external.ext-read.get_status")
@@ -109,8 +111,9 @@ def test_admitted_read_only_call_executes_successfully() -> None:
 
     async def scenario() -> None:
         result = await manager.execute_guarded_call(lease, {"verbose": True})
-        assert result == {"status": "all_green"}
-        session_mock.call_tool.assert_awaited_once_with("get_status", arguments={"verbose": True})
+        assert result["structured_content"] == {"status": "all_green"}
+        session_mock.send_request.assert_awaited_once()
+        assert session_mock.send_request.await_args.args[0].params.arguments == {"verbose": True}
 
     anyio.run(scenario)
 
@@ -133,12 +136,12 @@ def test_mutation_closed_denial_and_marker_absent(tmp_path: Path) -> None:
 
     marker_file = tmp_path / "mutation_executed.marker"
 
-    async def mock_call_tool(remote_name: str, arguments: dict) -> dict:
+    async def mock_call_tool(*args: Any, **kwargs: Any) -> types.CallToolResult:
         marker_file.write_text("dispatched", encoding="utf-8")
-        return {"ok": True}
+        return types.CallToolResult(content=[], structured_content={"ok": True})
 
     session_mock = MagicMock()
-    session_mock.call_tool = AsyncMock(side_effect=mock_call_tool)
+    session_mock.send_request = AsyncMock(side_effect=mock_call_tool)
     owner.register_session(session_mock, "session-mut-1")
 
     lease = manager.registry.create_lease("external.ext-mut.do_mutation")
@@ -153,7 +156,7 @@ def test_mutation_closed_denial_and_marker_absent(tmp_path: Path) -> None:
 
         # Assert provider was NEVER called and marker file is absent
         assert not marker_file.exists()
-        session_mock.call_tool.assert_not_called()
+        session_mock.send_request.assert_not_called()
 
     anyio.run(scenario)
 
@@ -178,7 +181,7 @@ def test_provider_hints_cannot_bypass_mutation_classification(tmp_path: Path) ->
     owner.state_machine.transition(ExtensionState.HEALTHY)
 
     session_mock = MagicMock()
-    session_mock.call_tool = AsyncMock(return_value={"ok": True})
+    session_mock.send_request = AsyncMock(return_value=types.CallToolResult(content=[], structured_content={"ok": True}))
     owner.register_session(session_mock, "session-bypass-1")
 
     lease = manager.registry.create_lease("external.ext-bypass.tricky_tool")
@@ -190,7 +193,7 @@ def test_provider_hints_cannot_bypass_mutation_classification(tmp_path: Path) ->
             await manager.execute_guarded_call(lease)
         assert exc_info.value.code == "mutation_withheld"
 
-        session_mock.call_tool.assert_not_called()
+        session_mock.send_request.assert_not_called()
 
     anyio.run(scenario)
 
@@ -234,7 +237,7 @@ def test_callbacks_denied() -> None:
     owner.state_machine.transition(ExtensionState.HEALTHY)
 
     session_mock = MagicMock()
-    session_mock.call_tool = AsyncMock(return_value={})
+    session_mock.send_request = AsyncMock(return_value=types.CallToolResult(content=[]))
     owner.register_session(session_mock, "session-cb-1")
 
     lease = manager.registry.create_lease("external.ext-cb.cb_tool")
@@ -245,7 +248,7 @@ def test_callbacks_denied() -> None:
             await manager.execute_guarded_call(lease, request_callback=True)
 
         assert exc_info.value.code == "callbacks_denied"
-        session_mock.call_tool.assert_not_called()
+        session_mock.send_request.assert_not_called()
 
     anyio.run(scenario)
 
@@ -295,7 +298,7 @@ def test_unroutable_and_disabled_extension_denied() -> None:
         # Transition to HEALTHY: now routable
         owner.state_machine.transition(ExtensionState.HEALTHY)
         session_mock = MagicMock()
-        session_mock.call_tool = AsyncMock(return_value={"ok": True})
+        session_mock.send_request = AsyncMock(return_value=types.CallToolResult(content=[], structured_content={"ok": True}))
         owner.register_session(session_mock, "session-state-1")
 
         # Disable extension
@@ -369,19 +372,19 @@ def test_per_extension_semaphore_and_isolation() -> None:
 
     release_a = anyio.Event()
 
-    async def slow_a_call(name: str, arguments: dict) -> dict:
+    async def slow_a_call(*args: Any, **kwargs: Any) -> types.CallToolResult:
         await release_a.wait()
-        return {"provider": "a"}
+        return types.CallToolResult(content=[], structured_content={"provider": "a"})
 
-    async def fast_b_call(name: str, arguments: dict) -> dict:
-        return {"provider": "b"}
+    async def fast_b_call(*args: Any, **kwargs: Any) -> types.CallToolResult:
+        return types.CallToolResult(content=[], structured_content={"provider": "b"})
 
     session_a = MagicMock()
-    session_a.call_tool = AsyncMock(side_effect=slow_a_call)
+    session_a.send_request = AsyncMock(side_effect=slow_a_call)
     owner_a.register_session(session_a, "sess-a")
 
     session_b = MagicMock()
-    session_b.call_tool = AsyncMock(side_effect=fast_b_call)
+    session_b.send_request = AsyncMock(side_effect=fast_b_call)
     owner_b.register_session(session_b, "sess-b")
 
     async def scenario() -> None:
@@ -398,7 +401,7 @@ def test_per_extension_semaphore_and_isolation() -> None:
 
             # Meanwhile, call to B is NOT blocked by slow A!
             res_b = await manager.execute_guarded_call(lease_b)
-            assert res_b == {"provider": "b"}
+            assert res_b["structured_content"] == {"provider": "b"}
 
             # Release A calls to complete task group
             release_a.set()
@@ -433,16 +436,16 @@ def test_global_call_semaphore_queue_timeout() -> None:
 
     release_calls = anyio.Event()
 
-    async def slow_call(name: str, arguments: dict) -> dict:
+    async def slow_call(*args: Any, **kwargs: Any) -> types.CallToolResult:
         await release_calls.wait()
-        return {"ok": True}
+        return types.CallToolResult(content=[], structured_content={"ok": True})
 
     session_1 = MagicMock()
-    session_1.call_tool = AsyncMock(side_effect=slow_call)
+    session_1.send_request = AsyncMock(side_effect=slow_call)
     owner_1.register_session(session_1, "sess-1")
 
     session_2 = MagicMock()
-    session_2.call_tool = AsyncMock(side_effect=slow_call)
+    session_2.send_request = AsyncMock(side_effect=slow_call)
     owner_2.register_session(session_2, "sess-2")
 
     async def scenario() -> None:

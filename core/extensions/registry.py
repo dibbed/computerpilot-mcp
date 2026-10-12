@@ -7,7 +7,11 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
+
+from jsonschema.validators import validator_for
+from referencing import Registry
+from referencing.exceptions import NoSuchResource
 
 from core.extensions.models import (
     LIMITS,
@@ -307,179 +311,49 @@ def validate_schema_subset(schema: Any) -> SchemaValidationResult:
                     message=f"Cyclic $ref chain detected involving definition '{d_name}'",
                 )
 
+    try:
+        validator_for(dict(schema)).check_schema(dict(schema))
+    except Exception:
+        return SchemaValidationResult(False, "invalid_schema", "The schema definition is invalid.")
     return SchemaValidationResult(valid=True)
 
 
-def _validate_value(
-    spec: Any,
-    val: Any,
-    name: str,
-    local_defs: Mapping[str, Any],
-) -> ArgumentValidationResult | None:
-    if isinstance(spec, bool):
-        return None if spec else ArgumentValidationResult(valid=False, error_code=f"disallowed_value:{name}")
-    if not isinstance(spec, Mapping):
-        return None
-
-    if "$ref" in spec and isinstance(spec["$ref"], str):
-        target = spec["$ref"].split("/")[-1]
-        if target in local_defs:
-            spec = local_defs[target]
-
-    expected_type = spec.get("type")
-    if expected_type is not None:
-        types = [expected_type] if isinstance(expected_type, str) else list(expected_type)
-        valid_type = False
-        for t in types:
-            if t == "string" and isinstance(val, str):
-                valid_type = True
-            elif t == "integer" and isinstance(val, int) and not isinstance(val, bool):
-                valid_type = True
-            elif t == "number" and isinstance(val, (int, float)) and not isinstance(val, bool):
-                valid_type = True
-            elif t == "boolean" and isinstance(val, bool):
-                valid_type = True
-            elif t == "array" and isinstance(val, list):
-                valid_type = True
-            elif t == "object" and isinstance(val, dict):
-                valid_type = True
-            elif t == "null" and val is None:
-                valid_type = True
-
-        if not valid_type:
-            return ArgumentValidationResult(
-                valid=False,
-                error_code=f"type_mismatch:{name}",
-                message=f"Argument '{name}' expected type '{expected_type}', got '{type(val).__name__}'",
-            )
-
-    # Check constraints
-    if "enum" in spec and val not in spec["enum"]:
-        return ArgumentValidationResult(
-            valid=False,
-            error_code=f"enum_violation:{name}",
-            message=f"Argument '{name}' value is not in allowed enum options",
-        )
-    if "const" in spec and val != spec["const"]:
-        return ArgumentValidationResult(
-            valid=False,
-            error_code=f"const_violation:{name}",
-            message=f"Argument '{name}' value does not equal const requirement",
-        )
-
-    if isinstance(val, str):
-        if "minLength" in spec and len(val) < spec["minLength"]:
-            return ArgumentValidationResult(
-                valid=False,
-                error_code=f"min_length_violation:{name}",
-                message=f"Argument '{name}' length {len(val)} < minLength {spec['minLength']}",
-            )
-        if "maxLength" in spec and len(val) > spec["maxLength"]:
-            return ArgumentValidationResult(
-                valid=False,
-                error_code=f"max_length_violation:{name}",
-                message=f"Argument '{name}' length {len(val)} > maxLength {spec['maxLength']}",
-            )
-
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        if "minimum" in spec and val < spec["minimum"]:
-            return ArgumentValidationResult(
-                valid=False,
-                error_code=f"minimum_violation:{name}",
-                message=f"Argument '{name}' value {val} < minimum {spec['minimum']}",
-            )
-        if "maximum" in spec and val > spec["maximum"]:
-            return ArgumentValidationResult(
-                valid=False,
-                error_code=f"maximum_violation:{name}",
-                message=f"Argument '{name}' value {val} > maximum {spec['maximum']}",
-            )
-        if "exclusiveMinimum" in spec and val <= spec["exclusiveMinimum"]:
-            return ArgumentValidationResult(
-                valid=False,
-                error_code=f"exclusive_minimum_violation:{name}",
-                message=f"Argument '{name}' value {val} <= exclusiveMinimum {spec['exclusiveMinimum']}",
-            )
-        if "exclusiveMaximum" in spec and val >= spec["exclusiveMaximum"]:
-            return ArgumentValidationResult(
-                valid=False,
-                error_code=f"exclusive_maximum_violation:{name}",
-                message=f"Argument '{name}' value {val} >= exclusiveMaximum {spec['exclusiveMaximum']}",
-            )
-
-    if isinstance(val, list):
-        if "minItems" in spec and len(val) < spec["minItems"]:
-            return ArgumentValidationResult(
-                valid=False,
-                error_code=f"min_items_violation:{name}",
-                message=f"Argument '{name}' item count {len(val)} < minItems {spec['minItems']}",
-            )
-        if "maxItems" in spec and len(val) > spec["maxItems"]:
-            return ArgumentValidationResult(
-                valid=False,
-                error_code=f"max_items_violation:{name}",
-                message=f"Argument '{name}' item count {len(val)} > maxItems {spec['maxItems']}",
-            )
-        if "items" in spec and isinstance(spec["items"], Mapping):
-            for idx, item_val in enumerate(val):
-                sub_res = _validate_value(spec["items"], item_val, f"{name}[{idx}]", local_defs)
-                if sub_res is not None:
-                    return sub_res
-
-    return None
+def _no_schema_retrieval(uri: str) -> Any:
+    raise NoSuchResource(uri)
 
 
-def validate_tool_arguments(
-    schema: Mapping[str, Any],
-    arguments: Mapping[str, Any],
-) -> ArgumentValidationResult:
-    """Validate tool call arguments against accepted safe schema subset without network retrieval."""
+def validate_tool_value(schema: Mapping[str, Any], value: Any) -> ArgumentValidationResult:
+    """Apply every accepted schema rule through the installed no-network validator."""
+    if not validate_schema_subset(schema).valid:
+        return ArgumentValidationResult(False, "schema_unsupported", "The schema is unsupported.")
+    try:
+        validator_cls = validator_for(dict(schema))
+        validator_cls.check_schema(dict(schema))
+        # referencing generates its keyword-only constructor through attrs at runtime.
+        registry = cast(Any, Registry)(retrieve=_no_schema_retrieval)
+        validator = validator_cls(dict(schema), registry=registry)
+        error = next(validator.iter_errors(value), None)
+        if error is None:
+            return ArgumentValidationResult(valid=True)
+        name = ".".join(str(part) for part in error.path)
+        rule = error.validator
+        code = {"type": "type_mismatch", "enum": "enum_violation", "const": "const_violation"}.get(rule, "schema_violation")
+        if rule == "required" and isinstance(error.instance, Mapping):
+            name = next((key for key in error.validator_value if key not in error.instance), name)
+            code = "missing_required_argument"
+        elif rule == "additionalProperties" and isinstance(error.instance, Mapping):
+            properties = error.schema.get("properties", {})
+            name = next((key for key in error.instance if key not in properties), name)
+            code = "unexpected_argument"
+        return ArgumentValidationResult(False, f"{code}:{name}", "The value does not match the accepted schema.")
+    except Exception:
+        return ArgumentValidationResult(False, "schema_invalid", "The schema cannot be safely validated.")
+
+
+def validate_tool_arguments(schema: Mapping[str, Any], arguments: Mapping[str, Any]) -> ArgumentValidationResult:
     if not isinstance(arguments, Mapping):
-        return ArgumentValidationResult(
-            valid=False,
-            error_code="invalid_arguments_type",
-            message="Tool arguments must be a key-value mapping",
-        )
-
-    local_defs: dict[str, Any] = {}
-    if "$defs" in schema and isinstance(schema["$defs"], Mapping):
-        local_defs.update(schema["$defs"])
-    if "definitions" in schema and isinstance(schema["definitions"], Mapping):
-        local_defs.update(schema["definitions"])
-
-    # Required check
-    required_props = schema.get("required", ())
-    if isinstance(required_props, (list, tuple)):
-        for req in required_props:
-            if req not in arguments:
-                return ArgumentValidationResult(
-                    valid=False,
-                    error_code=f"missing_required_argument:{req}",
-                    message=f"Required argument '{req}' is missing",
-                )
-
-    properties: Mapping[str, Any] = schema.get("properties", {})
-    additional_allowed: bool = schema.get("additionalProperties", True) is not False
-
-    # Check unexpected properties
-    if not additional_allowed:
-        for arg_key in arguments:
-            if arg_key not in properties:
-                return ArgumentValidationResult(
-                    valid=False,
-                    error_code=f"unexpected_argument:{arg_key}",
-                    message=f"Additional property '{arg_key}' is not allowed",
-                )
-
-    # Validate each argument value (preserves exact 'file.name' semantics)
-    for arg_name, arg_val in arguments.items():
-        if arg_name in properties:
-            prop_spec = properties[arg_name]
-            val_res = _validate_value(prop_spec, arg_val, arg_name, local_defs)
-            if val_res is not None:
-                return val_res
-
-    return ArgumentValidationResult(valid=True)
+        return ArgumentValidationResult(False, "invalid_arguments_type", "Tool arguments must be a JSON object.")
+    return validate_tool_value(schema, dict(arguments))
 
 
 class ExtensionRegistry:

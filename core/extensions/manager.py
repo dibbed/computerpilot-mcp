@@ -14,6 +14,7 @@ from typing import Any
 import anyio
 import mcp.types as types
 from mcp.client.session import ClientSession
+from pydantic import ValidationError
 
 from core.errors import ToolError
 from core.extensions.config import build_extension_environment
@@ -26,6 +27,7 @@ from core.extensions.models import (
     MutationClass,
     TrustClass,
 )
+from core.extensions.output import normalize_result, validate_arguments
 from core.extensions.registry import CatalogLimitExceededError, ExtensionLease, ExtensionRegistry
 from core.extensions.transport import bounded_stdio_transport
 
@@ -317,7 +319,7 @@ class ExtensionOwner:
         arguments: Mapping[str, Any] | None = None,
         *,
         timeout_sec: float = LIMITS.call_sec,
-    ) -> Any:
+    ) -> types.CallToolResult:
         """Call a remote tool on the active session bounded by timeout."""
         self.require_launch_authorization()
         session = self._active_session
@@ -329,7 +331,12 @@ class ExtensionOwner:
         try:
             with anyio.fail_after(timeout_sec):
                 args_dict = dict(arguments) if arguments is not None else {}
-                return await session.call_tool(remote_name, arguments=args_dict)
+                return await session.send_request(
+                    types.CallToolRequest(params=types.CallToolRequestParams(name=remote_name, arguments=args_dict)),
+                    types.CallToolResult, request_read_timeout_seconds=timeout_sec,
+                )
+        except ValidationError as exc:
+            raise ToolError("malformed_result", "The provider returned an invalid tool result.") from exc
         except TimeoutError as exc:
             raise ToolError(
                 code="call_timeout",
@@ -493,6 +500,8 @@ async def connect_and_discover_tools(
                             remote_name=t.name,
                             description=t.description or "",
                             input_schema=tool_schema,
+                            output_schema=t.output_schema,
+                            policy=definition.tools.get(t.name),
                             catalog_generation=owner.generation,
                         )
                     )
@@ -871,15 +880,18 @@ class ExtensionLifecycleManager:
         *,
         timeout_sec: float = LIMITS.call_sec,
         request_callback: bool = False,
-    ) -> Any:
+    ) -> dict[str, Any]:
         """Admit and execute a tool call under guarded boundaries."""
+        descriptor = self._registry.get_tool(lease.public_name) if isinstance(lease, ExtensionLease) else None
+        args = validate_arguments(descriptor, arguments) if descriptor is not None else arguments
         async with self.guard_call_admission(
             lease,
             timeout_sec=timeout_sec,
             request_callback=request_callback,
         ) as (owner, descriptor):
-            return await owner.call_tool(
+            result = await owner.call_tool(
                 descriptor.remote_name,
-                arguments,
+                args,
                 timeout_sec=timeout_sec,
             )
+            return normalize_result(descriptor, result)
