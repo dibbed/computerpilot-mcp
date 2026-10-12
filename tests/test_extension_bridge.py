@@ -232,3 +232,19 @@ def test_direct_call_cannot_raise_the_operator_deadline() -> None:
         session.send_request.assert_awaited_once()
 
     anyio.run(scenario)
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), 0.0, -1.0])
+def test_direct_call_rejects_invalid_deadlines_before_dispatch(timeout: float) -> None:
+    from core.errors import ToolError
+
+    _, manager, session = bridge()
+    lease = manager.registry.create_lease(manager.list_tools()[0].public_name)
+    assert lease is not None
+
+    async def scenario() -> None:
+        with pytest.raises(ToolError, match="positive and finite"):
+            await manager.execute_guarded_call(lease, timeout_sec=timeout)
+        session.send_request.assert_not_awaited()
+
+    anyio.run(scenario)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from collections import deque
@@ -42,6 +43,12 @@ from core.extensions.transport import BoundedStderrDrain, bounded_stdio_transpor
 from core.platform import normalize_system
 
 logger = logging.getLogger(__name__)
+
+
+def _bounded_timeout(requested: float, configured: float, ceiling: float) -> float:
+    if not math.isfinite(requested) or requested <= 0:
+        raise ToolError("invalid_timeout", "The extension deadline must be positive and finite.")
+    return min(requested, configured, ceiling)
 
 
 class IllegalStateTransitionError(ValueError):
@@ -342,7 +349,7 @@ class ExtensionOwner:
     ) -> types.CallToolResult:
         """Call a remote tool on the active session bounded by timeout."""
         self.require_launch_authorization()
-        timeout_sec = min(timeout_sec, self.definition.timeouts.call_sec, LIMITS.call_sec)
+        timeout_sec = _bounded_timeout(timeout_sec, self.definition.timeouts.call_sec, LIMITS.call_sec)
         session = self._active_session
         if session is None:
             raise ToolError(
@@ -488,11 +495,14 @@ async def connect_and_discover_tools(
     """Own one session, with bounded startup/discovery and coalesced live refresh."""
     owner.require_launch_authorization()
     definition = owner.definition
+    startup_timeout = _bounded_timeout(startup_timeout, definition.timeouts.startup_sec, LIMITS.startup_sec)
+    handshake_timeout = _bounded_timeout(handshake_timeout, definition.timeouts.handshake_sec, LIMITS.handshake_sec)
+    discovery_timeout = _bounded_timeout(discovery_timeout, definition.timeouts.discovery_sec, LIMITS.discovery_sec)
     cwd = Path(definition.working_directory).resolve()
     base_env = build_extension_environment(definition, parent=parent_env)
     owner._credential_values = tuple(base_env[name] for name in definition.environment.references)
     refresh_requested = anyio.Event()
-    startup_deadline = time.monotonic() + min(startup_timeout, definition.timeouts.startup_sec, LIMITS.startup_sec)
+    startup_deadline = time.monotonic() + startup_timeout
     session_id = f"{owner.extension_id}-gen{owner.generation}-{time.monotonic()}"
 
     async def notification(message: Any) -> None:
@@ -519,7 +529,7 @@ async def connect_and_discover_tools(
 
                 async def discover() -> tuple[ExtensionToolDescriptor, ...]:
                     generation = registry.next_catalog_generation(owner.extension_id, owner.generation) if registry else owner.generation
-                    with anyio.fail_after(min(discovery_timeout, definition.timeouts.discovery_sec)):
+                    with anyio.fail_after(discovery_timeout):
                         discovered: list[types.Tool] = []
                         cursor: str | None = None
                         seen_cursors: set[str] = set()
@@ -580,7 +590,7 @@ async def connect_and_discover_tools(
                 try:
                     # The startup scope ends before the live session's keep-alive wait.
                     with anyio.fail_after(max(0.0, startup_deadline - time.monotonic())):
-                        with anyio.fail_after(min(handshake_timeout, definition.timeouts.handshake_sec)):
+                        with anyio.fail_after(handshake_timeout):
                             await session.initialize()
                         descriptors = await discover()
                     if gate_held and startup_gate is not None:
@@ -946,6 +956,7 @@ class ExtensionLifecycleManager:
             raise ToolError(eligibility.rejection_code or "policy_denied", "The external tool is not eligible.")
 
         # 7. Acquire global semaphore bounded by timeout
+        timeout_sec = _bounded_timeout(timeout_sec, owner.definition.timeouts.call_sec, LIMITS.call_sec)
         try:
             with anyio.fail_after(timeout_sec):
                 await self._global_call_semaphore.acquire()
@@ -1003,7 +1014,9 @@ class ExtensionLifecycleManager:
         """Admit and execute a tool call under guarded boundaries."""
         initial = self._registry.get_tool(lease.public_name) if isinstance(lease, ExtensionLease) else None
         initial_owner = self.get_owner(initial.extension_id) if initial is not None else None
-        timeout_sec = min(timeout_sec, LIMITS.call_sec, initial_owner.definition.timeouts.call_sec if initial_owner else LIMITS.call_sec)
+        timeout_sec = _bounded_timeout(
+            timeout_sec, initial_owner.definition.timeouts.call_sec if initial_owner else LIMITS.call_sec, LIMITS.call_sec,
+        )
         dispatched = False
         try:
             with anyio.fail_after(timeout_sec):

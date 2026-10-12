@@ -101,6 +101,25 @@ def test_operator_startup_deadline_stops_a_real_delayed_provider(tmp_path: Path)
     anyio.run(scenario)
 
 
+@pytest.mark.parametrize("deadline", ["startup_timeout", "handshake_timeout", "discovery_timeout"])
+def test_invalid_startup_deadlines_never_launch_a_provider(tmp_path: Path, deadline: str) -> None:
+    manager = configured_manager(tmp_path, "readonly")
+    owner = manager.get_owner("refresh-fixture")
+    assert owner is not None
+    timeouts = {"startup_timeout": 1.0, "handshake_timeout": 1.0, "discovery_timeout": 1.0}
+    timeouts[deadline] = float("nan")
+
+    async def scenario() -> None:
+        with pytest.raises(ToolError, match="positive and finite"):
+            await connect_and_discover_tools(
+                owner, manager.registry, startup_timeout=timeouts["startup_timeout"],
+                handshake_timeout=timeouts["handshake_timeout"], discovery_timeout=timeouts["discovery_timeout"],
+            )
+        assert not (tmp_path / "root_process").exists()
+
+    anyio.run(scenario)
+
+
 def test_real_transport_loss_reconnects_once_without_replaying_the_call(tmp_path: Path) -> None:
     manager = configured_manager(tmp_path, "crash", starting=False)
     owner = manager.get_owner("refresh-fixture")

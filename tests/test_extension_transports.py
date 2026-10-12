@@ -22,6 +22,17 @@ ENTRYPOINT = ROOT / "tests" / "fixtures" / "extension_core_server.py"
 NAME = "external.refresh-fixture.read_value"
 
 
+async def wait_for_provider_exit(pid: int, created: float) -> None:
+    with anyio.fail_after(3):
+        while psutil.pid_exists(pid):
+            try:
+                if psutil.Process(pid).create_time() != created:
+                    return
+            except psutil.NoSuchProcess:
+                return
+            await anyio.sleep(0.01)
+
+
 def configuration(workspace: Path, mode: str = "readonly") -> None:
     manager = configured_manager(workspace, mode)
     owner = manager.get_owner("refresh-fixture")
@@ -64,9 +75,7 @@ def test_actual_stdio_entrypoint_exposes_calls_and_reaps_provider_on_eof(tmp_pat
             denied = await client.call_tool("external.refresh-fixture.increment_value", {"amount": 1})
             assert denied.is_error and not (tmp_path / "counter.json").exists()
         process = json.loads((tmp_path / "root_process").read_text(encoding="utf-8"))
-        with anyio.fail_after(3):
-            while psutil.pid_exists(process["pid"]):
-                await anyio.sleep(0.01)
+        await wait_for_provider_exit(process["pid"], process["created"])
 
     anyio.run(scenario)
 
@@ -125,4 +134,4 @@ def test_actual_http_entrypoint_exposes_modern_external_tools(tmp_path: Path) ->
                 owned.terminate_tree(force=True)
                 owned.close_ownership()
     process = json.loads((tmp_path / "root_process").read_text(encoding="utf-8"))
-    assert not psutil.pid_exists(process["pid"])
+    anyio.run(wait_for_provider_exit, process["pid"], process["created"])
