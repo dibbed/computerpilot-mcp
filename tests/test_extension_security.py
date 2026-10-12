@@ -39,7 +39,9 @@ def admitted_call(
     descriptor = ExtensionToolDescriptor.create(
         extension_id=definition.extension_id, provider=definition.provider, remote_name="read_value", description="Read fixture",
         input_schema=schema, output_schema=output_schema, catalog_generation=owner.generation,
-        policy=ToolPolicy(remote_name="read_value", domain="system", mutation_class=MutationClass.READ_ONLY, allow_call=True),
+        policy=ToolPolicy(
+            remote_name="read_value", domain="system", mutation_class=MutationClass.READ_ONLY, allow_call=True, profiles=("full",),
+        ),
     )
     manager.registry.publish_extension_catalog(definition.extension_id, owner.generation, (descriptor,))
     owner.state_machine.transition(ExtensionState.HEALTHY)

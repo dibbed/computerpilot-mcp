@@ -169,15 +169,19 @@ def normalize_result(
         message="The external provider reported a tool error." if result.is_error else None,
     ).model_dump(mode="json")
     try:
-        for _ in range(3):
-            encoded = bounded_json(envelope, LIMITS.inline_bytes, error_code="output_too_large")
-            if envelope["limits"]["returned_bytes"] == len(encoded):
-                break
-            envelope["limits"]["returned_bytes"] = len(encoded)
-        return envelope
+        return finalize_envelope(envelope)
     except ToolError:
         if artifact is not None:
             from pathlib import Path
 
             Path(artifact["path"]).unlink(missing_ok=True)
         raise
+
+
+def finalize_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    for _ in range(3):
+        encoded = bounded_json(envelope, LIMITS.inline_bytes, error_code="output_too_large")
+        if envelope["limits"]["returned_bytes"] == len(encoded):
+            break
+        envelope["limits"]["returned_bytes"] = len(encoded)
+    return envelope

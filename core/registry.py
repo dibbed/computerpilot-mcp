@@ -11,6 +11,7 @@ from pydantic import ConfigDict
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.execution_models import ExecutionIntent
 from core.execution_router import ExecutionRouter
+from core.extensions.bridge import ExtensionMCPServer
 from core.health_snapshot import collect_server_health
 from core.heartbeat import lifespan
 from core.platform import available_domains, detect_capabilities
@@ -67,7 +68,8 @@ def create_server() -> MCPServer:
     profile = resolve_profile(SETTINGS.tool_profile)
     capabilities = detect_capabilities()
     active_domains = available_domains(profile.domains, capabilities)
-    server = MCPServer(
+    server = ExtensionMCPServer(
+        tool_profile=profile.name,
         name=SETTINGS.server_name,
         title="ComputerPilot MCP",
         description="Cross-platform computer-use and developer-automation MCP backend with structured output.",

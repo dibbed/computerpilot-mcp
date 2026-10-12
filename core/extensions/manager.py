@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -28,9 +29,16 @@ from core.extensions.models import (
     TrustClass,
 )
 from core.extensions.output import normalize_result, validate_arguments
-from core.extensions.registry import CatalogLimitExceededError, ExtensionLease, ExtensionRegistry
+from core.extensions.registry import (
+    CatalogLimitExceededError,
+    ExtensionLease,
+    ExtensionRegistry,
+    ToolEligibilityResult,
+    evaluate_tool_eligibility,
+)
 from core.extensions.security import CredentialRedactor, suppress_sdk_payload_logs
 from core.extensions.transport import BoundedStderrDrain, bounded_stdio_transport
+from core.platform import normalize_system
 
 logger = logging.getLogger(__name__)
 
@@ -318,8 +326,7 @@ class ExtensionOwner:
     def credential_redactor(self) -> CredentialRedactor:
         values = self._credential_values
         if self.definition.environment.references:
-            env = build_extension_environment(self.definition)
-            values += tuple(env[name] for name in self.definition.environment.references)
+            values += tuple(os.environ.get(ref.name, "") for ref in self.definition.environment.references.values())
         return CredentialRedactor(values)
 
     async def _call_tool(
@@ -659,6 +666,34 @@ class ExtensionLifecycleManager:
         """Return cached discovered tools from registry memory without spawning any processes."""
         return tuple(self._registry.active_snapshot.tools.values())
 
+    def tool_eligibility(self, name: str, active_profile: str = "full") -> ToolEligibilityResult:
+        """Read current operator/runtime authority without spawning, RPC or filesystem IO."""
+        snapshot = self.get_catalog_snapshot()
+        descriptor = snapshot.get_tool(name)
+        if descriptor is None:
+            return ToolEligibilityResult(False, "tool_not_found", "The external tool is unavailable.")
+        owner = self.get_owner(descriptor.extension_id)
+        if owner is None or not owner.is_enabled:
+            return ToolEligibilityResult(False, "extension_disabled", "The external tool is disabled.")
+        refs = tuple(key for key, ref in owner.definition.environment.references.items() if os.environ.get(ref.name))
+        eligibility = evaluate_tool_eligibility(
+            descriptor, snapshot=snapshot, definition=owner.definition, runtime_state=owner.state,
+            active_profile=active_profile, platform=normalize_system(), resolved_env_refs=refs,
+        )
+        if not eligibility.eligible:
+            return eligibility
+        if owner._active_session is None:
+            return ToolEligibilityResult(False, "session_not_active", "The external session is unavailable.")
+        try:
+            redactor = owner.credential_redactor()
+            schema = descriptor.input_schema
+            identity = (descriptor.public_name, descriptor.extension_id, descriptor.identity.provider)
+            if redactor.json(schema) != schema or any(redactor.text(value) != value for value in identity):
+                return ToolEligibilityResult(False, "credential_metadata_withheld", "Credential-bearing schema is withheld.")
+        except ToolError:
+            return ToolEligibilityResult(False, "credential_metadata_withheld", "Credential-bearing schema is withheld.")
+        return eligibility
+
     def get_catalog_snapshot(self) -> ExtensionCatalogSnapshot:
         """Return authoritative in-memory catalog snapshot."""
         return self._registry.active_snapshot
@@ -772,6 +807,7 @@ class ExtensionLifecycleManager:
         *,
         timeout_sec: float = LIMITS.call_sec,
         request_callback: bool = False,
+        active_profile: str = "full",
     ) -> AsyncIterator[tuple[ExtensionOwner, ExtensionToolDescriptor]]:
         """Guard call admission across all paths enforcing semaphores, lease validity, and security policies.
 
@@ -842,6 +878,10 @@ class ExtensionLifecycleManager:
                 message=f"Mutating tool '{lease.public_name}' is withheld until M10 activation",
             )
 
+        eligibility = self.tool_eligibility(lease.public_name, active_profile)
+        if not eligibility.eligible:
+            raise ToolError(eligibility.rejection_code or "policy_denied", "The external tool is not eligible.")
+
         # 7. Acquire global semaphore bounded by timeout
         try:
             with anyio.fail_after(timeout_sec):
@@ -876,6 +916,9 @@ class ExtensionLifecycleManager:
                         code="stale_generation",
                         message="Tool lease became invalid while waiting in admission queue",
                     )
+                eligibility = self.tool_eligibility(lease.public_name, active_profile)
+                if not eligibility.eligible:
+                    raise ToolError(eligibility.rejection_code or "policy_denied", "The external tool is no longer eligible.")
 
                 yield owner, descriptor
             finally:
@@ -892,18 +935,20 @@ class ExtensionLifecycleManager:
         *,
         timeout_sec: float = LIMITS.call_sec,
         request_callback: bool = False,
+        active_profile: str = "full",
     ) -> dict[str, Any]:
         """Admit and execute a tool call under guarded boundaries."""
-        descriptor = self._registry.get_tool(lease.public_name) if isinstance(lease, ExtensionLease) else None
-        args = validate_arguments(descriptor, arguments) if descriptor is not None else arguments
-        async with self.guard_call_admission(
-            lease,
-            timeout_sec=timeout_sec,
-            request_callback=request_callback,
-        ) as (owner, descriptor):
-            result = await owner._call_tool(
-                descriptor.remote_name,
-                args,
-                timeout_sec=timeout_sec,
-            )
-            return normalize_result(descriptor, result, owner.credential_redactor())
+        dispatched = False
+        try:
+            with anyio.fail_after(timeout_sec):
+                descriptor = self._registry.get_tool(lease.public_name) if isinstance(lease, ExtensionLease) else None
+                args = validate_arguments(descriptor, arguments) if descriptor is not None else arguments
+                async with self.guard_call_admission(
+                    lease, timeout_sec=timeout_sec, request_callback=request_callback, active_profile=active_profile,
+                ) as (owner, descriptor):
+                    dispatched = True
+                    result = await owner._call_tool(descriptor.remote_name, args, timeout_sec=timeout_sec)
+                    return normalize_result(descriptor, result, owner.credential_redactor())
+        except TimeoutError:
+            code = "call_timeout" if dispatched else "admission_limit_exceeded"
+            raise ToolError(code, "The external call timed out within its total admission/execution deadline.") from None
