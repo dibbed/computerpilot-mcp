@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,66 @@ class IllegalStateTransitionError(ValueError):
 
 class SessionReusedError(RuntimeError):
     """Raised when an already closed or failed session is attempted to be reused."""
+
+
+@dataclass
+class RestartBudget:
+    """Manages reconnect and restart attempt budgets, backoffs, and crash-loop circuit breaker."""
+
+    max_attempts: int = LIMITS.restart_attempts
+    window_sec: float = float(LIMITS.restart_window_sec)
+    base_backoff_sec: float = 0.5
+    max_backoff_sec: float = 30.0
+    clock: Callable[[], float] = time.monotonic
+
+    _restart_timestamps: list[float] = field(default_factory=list)
+    consecutive_failures: int = 0
+    circuit_breaker_tripped: bool = False
+    last_backoff: float = 0.0
+
+    def can_restart(self, now: float | None = None) -> bool:
+        """Check if restart attempt is permitted within the sliding window budget."""
+        current_time = self.clock() if now is None else now
+        cutoff = current_time - self.window_sec
+        self._restart_timestamps = [t for t in self._restart_timestamps if t >= cutoff]
+        if len(self._restart_timestamps) >= self.max_attempts:
+            self.circuit_breaker_tripped = True
+            return False
+        return True
+
+    def record_attempt(self, now: float | None = None) -> float:
+        """Record a restart attempt, calculate monotonic backoff, and return backoff duration."""
+        current_time = self.clock() if now is None else now
+        self._restart_timestamps.append(current_time)
+        if self.consecutive_failures == 0:
+            backoff = 0.0
+        else:
+            backoff = min(
+                self.max_backoff_sec,
+                self.base_backoff_sec * (2 ** (self.consecutive_failures - 1)),
+            )
+        self.last_backoff = backoff
+        self.consecutive_failures += 1
+        return backoff
+
+    def record_success(self) -> None:
+        """Reset consecutive failures upon achieving healthy status."""
+        self.consecutive_failures = 0
+        self.circuit_breaker_tripped = False
+
+    def manual_reset(self) -> None:
+        """Reset budget and circuit breaker on explicit operator intervention."""
+        self._restart_timestamps.clear()
+        self.consecutive_failures = 0
+        self.circuit_breaker_tripped = False
+        self.last_backoff = 0.0
+
+    @property
+    def attempt_count(self) -> int:
+        """Current number of attempts recorded in the active sliding window."""
+        current_time = self.clock()
+        cutoff = current_time - self.window_sec
+        return sum(1 for t in self._restart_timestamps if t >= cutoff)
 
 
 # Exact state transition matrix per Section 21 of the V0.8.0 Master Plan
@@ -138,12 +199,15 @@ class ExtensionOwner:
         self,
         definition: ExtensionDefinition,
         initial_state: ExtensionState = ExtensionState.CONFIGURED,
+        restart_budget: RestartBudget | None = None,
     ) -> None:
         self.definition = definition
         self.extension_id = definition.extension_id
         self.state_machine = ExtensionLifecycleStateMachine(
             self.extension_id, initial_state=initial_state
         )
+        self.restart_budget = restart_budget or RestartBudget()
+        self.is_enabled: bool = definition.enabled
         self._send_channel, self._receive_channel = anyio.create_memory_object_stream[OwnerSignal](
             max_buffer_size=16
         )
@@ -190,6 +254,30 @@ class ExtensionOwner:
             logger.warning("Could not send signal %s to '%s'", sig, self.extension_id)
             return False
 
+    def handle_transport_loss(
+        self,
+        reason: str = "transport_lost",
+        registry: ExtensionRegistry | None = None,
+    ) -> bool:
+        """Handle unexpected transport loss: withdraw catalog, transition to UNREACHABLE, evaluate restart budget."""
+        if self.state in {ExtensionState.HEALTHY, ExtensionState.DEGRADED}:
+            if registry is not None:
+                registry.retire_extension_catalog(self.extension_id)
+            self.state_machine.transition(ExtensionState.UNREACHABLE, reason=reason)
+            self.close_active_session()
+
+        if self.state == ExtensionState.UNREACHABLE:
+            if self.restart_budget.can_restart():
+                return self.signal(OwnerSignal.RESTART)
+            else:
+                logger.warning(
+                    "Restart budget exhausted for '%s'; transitioning to FAILED (circuit breaker tripped)",
+                    self.extension_id,
+                )
+                self.state_machine.transition(ExtensionState.FAILED, reason="restart_budget_exhausted")
+                return False
+        return False
+
     def register_session(self, session: ClientSession, session_id: str) -> None:
         """Register a session ensuring single-use semantics."""
         if session_id in self._used_session_ids:
@@ -209,6 +297,7 @@ class ExtensionOwner:
         self,
         runner_fn: Callable[[ExtensionOwner], Any] | None = None,
         stop_event: anyio.Event | None = None,
+        sleep_fn: Callable[[float], Any] = anyio.sleep,
     ) -> None:
         """Actor event loop processing signals for this extension."""
         self._is_running = True
@@ -221,6 +310,8 @@ class ExtensionOwner:
                             if runner_fn is not None:
                                 try:
                                     await runner_fn(self)
+                                    if self.state == ExtensionState.HEALTHY:
+                                        self.restart_budget.record_success()
                                 except Exception as exc:
                                     logger.exception("Error in extension runner: %s", exc)
                                     if self.state_machine.can_transition(ExtensionState.FAILED):
@@ -234,7 +325,7 @@ class ExtensionOwner:
                         self.close_active_session()
                         target = (
                             ExtensionState.DISABLED
-                            if not self.definition.enabled
+                            if not self.is_enabled
                             else ExtensionState.CONFIGURED
                         )
                         if self.state_machine.can_transition(target):
@@ -244,6 +335,21 @@ class ExtensionOwner:
                         break
 
                     elif sig == OwnerSignal.RESTART:
+                        if not self.restart_budget.can_restart():
+                            logger.warning(
+                                "Restart budget exhausted for '%s' (circuit breaker tripped)",
+                                self.extension_id,
+                            )
+                            if self.state_machine.can_transition(ExtensionState.FAILED):
+                                self.state_machine.transition(
+                                    ExtensionState.FAILED, reason="restart_budget_exhausted"
+                                )
+                            continue
+
+                        backoff = self.restart_budget.record_attempt()
+                        if backoff > 0:
+                            await sleep_fn(backoff)
+
                         if self.state_machine.can_transition(ExtensionState.STOPPING):
                             self.state_machine.transition(ExtensionState.STOPPING)
                         self.close_active_session()
@@ -257,7 +363,16 @@ class ExtensionOwner:
                                 ExtensionState.STARTING, reason="restart"
                             )
                             if runner_fn is not None:
-                                await runner_fn(self)
+                                try:
+                                    await runner_fn(self)
+                                    if self.state == ExtensionState.HEALTHY:
+                                        self.restart_budget.record_success()
+                                except Exception as exc:
+                                    logger.exception("Error during extension restart: %s", exc)
+                                    if self.state_machine.can_transition(ExtensionState.FAILED):
+                                        self.state_machine.transition(
+                                            ExtensionState.FAILED, reason=str(exc)
+                                        )
         finally:
             self._is_running = False
             self.close_active_session()
@@ -369,11 +484,16 @@ class ExtensionLifecycleManager:
         self,
         definition: ExtensionDefinition,
         initial_state: ExtensionState | None = None,
+        restart_budget: RestartBudget | None = None,
     ) -> ExtensionOwner:
         state = initial_state or (
             ExtensionState.CONFIGURED if definition.enabled else ExtensionState.DISABLED
         )
-        owner = ExtensionOwner(definition, initial_state=state)
+        owner = ExtensionOwner(
+            definition,
+            initial_state=state,
+            restart_budget=restart_budget,
+        )
         self._owners[definition.extension_id] = owner
         return owner
 
@@ -383,6 +503,10 @@ class ExtensionLifecycleManager:
     def get_state(self, extension_id: str) -> ExtensionState | None:
         owner = self.get_owner(extension_id)
         return owner.state if owner else None
+
+    def get_restart_budget(self, extension_id: str) -> RestartBudget | None:
+        owner = self.get_owner(extension_id)
+        return owner.restart_budget if owner else None
 
     def is_routable(self, extension_id: str) -> bool:
         owner = self.get_owner(extension_id)
@@ -410,6 +534,51 @@ class ExtensionLifecycleManager:
             return False
         return owner.signal(OwnerSignal.RESTART)
 
+    def restart_extension(self, extension_id: str, manual_override: bool = False) -> bool:
+        """Request restart for an extension under budget control."""
+        owner = self.get_owner(extension_id)
+        if not owner:
+            return False
+        if manual_override:
+            owner.restart_budget.manual_reset()
+        if not owner.restart_budget.can_restart():
+            logger.warning(
+                "Cannot restart '%s': budget exhausted (circuit breaker tripped)",
+                extension_id,
+            )
+            return False
+        return owner.signal(OwnerSignal.RESTART)
+
+    async def disable_extension(self, extension_id: str) -> bool:
+        """Disable an extension: admission closes first, catalog retired, owner stopped."""
+        owner = self.get_owner(extension_id)
+        if not owner:
+            return False
+
+        # Admission closes first: retire catalog from authoritative registry
+        self._registry.retire_extension_catalog(extension_id)
+        owner.is_enabled = False
+
+        # Signal stop to owner actor loop if running
+        owner.signal(OwnerSignal.STOP)
+
+        # Transition state machine directly if not in loop
+        if owner.state_machine.can_transition(ExtensionState.STOPPING):
+            owner.state_machine.transition(ExtensionState.STOPPING, reason="disabled")
+        owner.close_active_session()
+        if owner.state_machine.can_transition(ExtensionState.DISABLED):
+            owner.state_machine.transition(ExtensionState.DISABLED, reason="disabled")
+        return True
+
+    def enable_extension(self, extension_id: str) -> bool:
+        """Enable an extension that was previously disabled."""
+        owner = self.get_owner(extension_id)
+        if not owner:
+            return False
+        owner.is_enabled = True
+        owner.restart_budget.manual_reset()
+        return True
+
     def list_tools(self) -> tuple[ExtensionToolDescriptor, ...]:
         """Return cached discovered tools from registry memory without spawning any processes."""
         return tuple(self._registry.active_snapshot.tools.values())
@@ -429,7 +598,7 @@ class ExtensionLifecycleManager:
         if not owner:
             return
         # Do not start disabled or unapproved extensions
-        if owner.state == ExtensionState.DISABLED or not owner.definition.enabled:
+        if owner.state == ExtensionState.DISABLED or not owner.is_enabled:
             logger.info("Extension '%s' is disabled, skipping startup", extension_id)
             return
 
@@ -457,7 +626,7 @@ class ExtensionLifecycleManager:
         """Start all enabled extensions concurrently in background under parallel budget."""
         runners = custom_runners or {}
         for extension_id, owner in self._owners.items():
-            if owner.state != ExtensionState.DISABLED and owner.definition.enabled:
+            if owner.state != ExtensionState.DISABLED and owner.is_enabled:
                 runner = runners.get(extension_id)
                 tg.start_soon(
                     self.start_extension_background,

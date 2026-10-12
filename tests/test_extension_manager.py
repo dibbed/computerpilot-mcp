@@ -16,9 +16,10 @@ from core.extensions.manager import (
     ExtensionOwner,
     IllegalStateTransitionError,
     OwnerSignal,
+    RestartBudget,
     SessionReusedError,
 )
-from core.extensions.models import ExtensionDefinition, ExtensionState
+from core.extensions.models import ExtensionDefinition, ExtensionState, ExtensionToolDescriptor
 from core.platform import normalize_system
 
 
@@ -493,3 +494,224 @@ def test_real_fixture_mcp_discovery_integration(tmp_path: Path) -> None:
         assert manager.registry.has_tool("external.fixture-server.read_value")
 
     anyio.run(scenario)
+
+
+def test_restart_budget_sliding_window_and_backoff() -> None:
+    """Verify RestartBudget sliding window, exponential backoff, and circuit breaker."""
+    current_time = 1000.0
+
+    def fake_clock() -> float:
+        return current_time
+
+    budget = RestartBudget(
+        max_attempts=3,
+        window_sec=600.0,
+        base_backoff_sec=0.5,
+        max_backoff_sec=30.0,
+        clock=fake_clock,
+    )
+
+    assert budget.can_restart()
+    assert budget.attempt_count == 0
+
+    # 1st attempt: 0.0 backoff on first restart from healthy
+    b1 = budget.record_attempt()
+    assert b1 == 0.0
+    assert budget.consecutive_failures == 1
+    assert budget.attempt_count == 1
+    assert budget.can_restart()
+
+    # 2nd attempt: base backoff (0.5s)
+    current_time += 10.0
+    b2 = budget.record_attempt()
+    assert b2 == 0.5
+    assert budget.consecutive_failures == 2
+    assert budget.attempt_count == 2
+    assert budget.can_restart()
+
+    # 3rd attempt: 2x base backoff (1.0s)
+    current_time += 10.0
+    b3 = budget.record_attempt()
+    assert b3 == 1.0
+    assert budget.consecutive_failures == 3
+    assert budget.attempt_count == 3
+
+    # 4th attempt within same window: budget exhausted, trips circuit breaker
+    assert not budget.can_restart()
+    assert budget.circuit_breaker_tripped
+
+    # Advance clock past 600s window: budget prunes old attempts and is available again
+    current_time += 601.0
+    assert budget.can_restart()
+    assert budget.attempt_count == 0
+
+    # Manual reset clears circuit breaker and counters
+    budget.record_attempt()
+    assert budget.attempt_count == 1
+    budget.manual_reset()
+    assert budget.attempt_count == 0
+    assert budget.consecutive_failures == 0
+    assert not budget.circuit_breaker_tripped
+
+
+def test_disable_extension_closes_admission_and_retires_tools() -> None:
+    """Verify disable_extension closes admission first, retires catalog, and ensures disabled is never callable."""
+    manager = ExtensionLifecycleManager()
+    definition = _dummy_definition("ext-disable-test", enabled=True)
+    owner = manager.register_extension(definition)
+    owner.state_machine.transition(ExtensionState.STARTING)
+
+    tool = ExtensionToolDescriptor.create(
+        extension_id="ext-disable-test",
+        provider="fixture",
+        remote_name="dummy_tool",
+        description="Dummy tool description",
+        input_schema={"type": "object"},
+        catalog_generation=owner.generation,
+    )
+    manager.registry.publish_extension_catalog("ext-disable-test", owner.generation, (tool,))
+    owner.state_machine.transition(ExtensionState.HEALTHY)
+
+    assert owner.is_routable
+    assert manager.is_routable("ext-disable-test")
+    assert manager.registry.has_tool("external.ext-disable-test.dummy_tool")
+    assert len(manager.list_tools()) == 1
+
+    lease = manager.registry.create_lease("external.ext-disable-test.dummy_tool")
+    assert lease is not None
+    assert manager.registry.is_lease_valid(lease)
+
+    async def scenario() -> None:
+        ok = await manager.disable_extension("ext-disable-test")
+        assert ok
+
+        # Admission closed immediately
+        assert owner.state == ExtensionState.DISABLED
+        assert not owner.is_routable
+        assert not manager.is_routable("ext-disable-test")
+
+        # Catalog retired: disabled is never callable
+        assert not manager.registry.has_tool("external.ext-disable-test.dummy_tool")
+        assert len(manager.list_tools()) == 0
+
+        # Old lease is immediately invalid
+        assert not manager.registry.is_lease_valid(lease)
+
+    anyio.run(scenario)
+
+
+def test_crash_loop_stops_and_trips_circuit_breaker() -> None:
+    """Verify that repeated failures exhaust restart budget and stop crash-loop via circuit breaker."""
+    budget = RestartBudget(max_attempts=3, window_sec=600.0, base_backoff_sec=0.01)
+    definition = _dummy_definition("ext-crash-test", enabled=True)
+    owner = ExtensionOwner(definition, restart_budget=budget)
+
+    attempts_executed = 0
+
+    async def failing_runner(own: ExtensionOwner) -> None:
+        nonlocal attempts_executed
+        attempts_executed += 1
+        raise RuntimeError(f"Crashing runner attempt {attempts_executed}")
+
+    async def fast_sleep(_: float) -> None:
+        return
+
+    async def scenario() -> None:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                owner.run_owner_loop,
+                failing_runner,
+                None,
+                fast_sleep,
+            )
+            owner.signal(OwnerSignal.START)
+            await anyio.sleep(0.02)
+            assert owner.state == ExtensionState.FAILED
+
+            # Restart 1
+            owner.signal(OwnerSignal.RESTART)
+            await anyio.sleep(0.02)
+            assert owner.state == ExtensionState.FAILED
+
+            # Restart 2
+            owner.signal(OwnerSignal.RESTART)
+            await anyio.sleep(0.02)
+            assert owner.state == ExtensionState.FAILED
+
+            # Restart 3
+            owner.signal(OwnerSignal.RESTART)
+            await anyio.sleep(0.02)
+            assert owner.state == ExtensionState.FAILED
+
+            # 4th restart: budget exhausted, should NOT restart
+            assert not budget.can_restart()
+            assert budget.circuit_breaker_tripped
+            assert budget.attempt_count == 3
+            assert owner.state == ExtensionState.FAILED
+
+            owner.signal(OwnerSignal.STOP)
+
+    anyio.run(scenario)
+
+
+def test_transport_loss_reconnect_and_budget_exhaustion() -> None:
+    """Verify handle_transport_loss triggers reconnect within budget and transitions to FAILED when exhausted."""
+    manager = ExtensionLifecycleManager()
+    budget = RestartBudget(max_attempts=2, window_sec=600.0, base_backoff_sec=0.01)
+    definition = _dummy_definition("ext-loss-test", enabled=True)
+    owner = manager.register_extension(definition, restart_budget=budget)
+    owner.state_machine.transition(ExtensionState.STARTING)
+    owner.state_machine.transition(ExtensionState.HEALTHY)
+
+    # 1st transport loss: within budget, signals RESTART
+    reconnect_signaled = owner.handle_transport_loss(registry=manager.registry)
+    assert reconnect_signaled
+    assert owner.state == ExtensionState.UNREACHABLE
+    assert not owner.is_routable
+
+    # Consume attempts
+    budget.record_attempt()
+    budget.record_attempt()
+    assert not budget.can_restart()
+
+    # Reset to HEALTHY
+    owner.state_machine.transition(ExtensionState.STARTING)
+    owner.state_machine.transition(ExtensionState.HEALTHY)
+
+    # 2nd transport loss: budget exhausted, transitions directly to FAILED, does NOT reconnect
+    reconnect_signaled_2 = owner.handle_transport_loss(registry=manager.registry)
+    assert not reconnect_signaled_2
+    assert owner.state == ExtensionState.FAILED
+    assert budget.circuit_breaker_tripped
+
+
+def test_fresh_session_and_generation_on_reconnect() -> None:
+    """Verify reconnect assigns fresh generation and enforces single-use session semantics."""
+    definition = _dummy_definition("ext-fresh-test", enabled=True)
+    owner = ExtensionOwner(definition)
+
+    gen_1 = owner.generation
+    session_mock_1 = MagicMock()
+    owner.state_machine.transition(ExtensionState.STARTING)
+    gen_starting_1 = owner.generation
+    assert gen_starting_1 == gen_1 + 1
+
+    owner.register_session(session_mock_1, "session-1")
+    owner.state_machine.transition(ExtensionState.HEALTHY)
+
+    # Reconnect/restart
+    owner.state_machine.transition(ExtensionState.STOPPING)
+    owner.close_active_session()
+    owner.state_machine.transition(ExtensionState.CONFIGURED)
+    owner.state_machine.transition(ExtensionState.STARTING)
+    gen_starting_2 = owner.generation
+    assert gen_starting_2 == gen_starting_1 + 1
+
+    # Attempting to register old session ID raises SessionReusedError
+    with pytest.raises(SessionReusedError):
+        owner.register_session(session_mock_1, "session-1")
+
+    # Fresh session ID succeeds
+    session_mock_2 = MagicMock()
+    owner.register_session(session_mock_2, "session-2")
+    assert owner.generation == 2
