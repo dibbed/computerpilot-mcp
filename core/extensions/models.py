@@ -324,6 +324,10 @@ class ExtensionToolDescriptor:
             + len(self.public_name.encode("utf-8"))
         )
 
+    @property
+    def extension_id(self) -> str:
+        return self.identity.extension_id
+
     def to_capability_metadata(self, trust_class: TrustClass | str) -> ExtensionCapabilityMetadata:
         if str(trust_class) == "built_in":
             raise ValueError("built_in claim denied for external capabilities")

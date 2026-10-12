@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -14,6 +15,7 @@ import anyio
 import mcp.types as types
 from mcp.client.session import ClientSession
 
+from core.errors import ToolError
 from core.extensions.config import build_extension_environment
 from core.extensions.models import (
     LIMITS,
@@ -21,8 +23,9 @@ from core.extensions.models import (
     ExtensionDefinition,
     ExtensionState,
     ExtensionToolDescriptor,
+    MutationClass,
 )
-from core.extensions.registry import CatalogLimitExceededError, ExtensionRegistry
+from core.extensions.registry import CatalogLimitExceededError, ExtensionLease, ExtensionRegistry
 from core.extensions.transport import bounded_stdio_transport
 
 logger = logging.getLogger(__name__)
@@ -215,6 +218,7 @@ class ExtensionOwner:
         self._active_session: ClientSession | None = None
         self._active_session_id: str | None = None
         self._is_running = False
+        self.call_semaphore = anyio.Semaphore(LIMITS.calls_per_extension)
 
     @property
     def state(self) -> ExtensionState:
@@ -296,6 +300,30 @@ class ExtensionOwner:
         """Retire active session reference to prevent any reuse."""
         self._active_session = None
         self._active_session_id = None
+
+    async def call_tool(
+        self,
+        remote_name: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        timeout_sec: float = LIMITS.call_sec,
+    ) -> Any:
+        """Call a remote tool on the active session bounded by timeout."""
+        session = self._active_session
+        if session is None:
+            raise ToolError(
+                code="session_not_active",
+                message=f"Extension '{self.extension_id}' has no active session",
+            )
+        try:
+            with anyio.fail_after(timeout_sec):
+                args_dict = dict(arguments) if arguments is not None else {}
+                return await session.call_tool(remote_name, arguments=args_dict)
+        except TimeoutError as exc:
+            raise ToolError(
+                code="call_timeout",
+                message=f"Tool call '{remote_name}' on extension '{self.extension_id}' timed out after {timeout_sec}s",
+            ) from exc
 
     async def run_owner_loop(
         self,
@@ -474,10 +502,13 @@ class ExtensionLifecycleManager:
         self,
         registry: ExtensionRegistry | None = None,
         parallel_startup: int = LIMITS.parallel_startup,
+        max_global_calls: int = LIMITS.global_calls,
     ) -> None:
         self._registry = registry or ExtensionRegistry()
         self._parallel_startup = parallel_startup
         self._startup_semaphore = anyio.Semaphore(parallel_startup)
+        self._max_global_calls = max_global_calls
+        self._global_call_semaphore = anyio.Semaphore(max_global_calls)
         self._owners: dict[str, ExtensionOwner] = {}
         self._unresolved_mutation_hooks: list[Callable[[str], None]] = []
         self._shutdown_event: anyio.Event = anyio.Event()
@@ -694,3 +725,141 @@ class ExtensionLifecycleManager:
         event = keep_alive_event or self._shutdown_event
         async with anyio.create_task_group() as tg:
             await self.start_all_background(tg, keep_alive_event=event, custom_runners=custom_runners)
+
+    @asynccontextmanager
+    async def guard_call_admission(
+        self,
+        lease: ExtensionLease,
+        *,
+        timeout_sec: float = LIMITS.call_sec,
+        request_callback: bool = False,
+    ) -> AsyncIterator[tuple[ExtensionOwner, ExtensionToolDescriptor]]:
+        """Guard call admission across all paths enforcing semaphores, lease validity, and security policies.
+
+        - Rejects callbacks under security policy.
+        - Validates lease structure and confirms descriptor exists in registry snapshot.
+        - Validates extension owner is enabled and in routable (HEALTHY) state.
+        - Enforces mutation closed gate (withheld until M10) regardless of provider hints.
+        - Enforces operator allow_call policy.
+        - Acquires global and per-extension semaphores bounded by timeout.
+        - Re-checks snapshot and lease validity after queue wait to prevent race conditions.
+        - Guarantees semaphores are released upon exit or failure.
+        """
+        # 1. Deny callbacks
+        if request_callback:
+            raise ToolError(
+                code="callbacks_denied",
+                message="MCP callbacks are denied under security policy",
+            )
+
+        # 2. Validate lease structure and lookup descriptor
+        if not isinstance(lease, ExtensionLease):
+            raise ToolError(
+                code="invalid_lease",
+                message="Expected valid ExtensionLease",
+            )
+
+        descriptor = self._registry.get_tool(lease.public_name)
+        if descriptor is None:
+            raise ToolError(
+                code="tool_not_found",
+                message=f"Tool '{lease.public_name}' not found in registry",
+            )
+
+        # 3. Check lease validity against current registry state
+        if not self._registry.is_lease_valid(lease):
+            raise ToolError(
+                code="stale_generation",
+                message="Tool lease is invalid or catalog generation has changed",
+            )
+
+        # 4. Check extension owner
+        owner = self.get_owner(descriptor.extension_id)
+        if owner is None or not owner.is_enabled:
+            raise ToolError(
+                code="extension_disabled",
+                message=f"Extension '{descriptor.extension_id}' is disabled",
+            )
+
+        if not owner.is_routable:
+            raise ToolError(
+                code="extension_not_routable",
+                message=f"Extension '{descriptor.extension_id}' is not routable in state {owner.state.value}",
+            )
+
+        # 5. Check operator policy allow_call
+        if not descriptor.policy.allow_call:
+            raise ToolError(
+                code="policy_denied",
+                message=f"Tool '{lease.public_name}' is disallowed by operator policy",
+            )
+
+        # 6. Check mutation closure (closed until M10)
+        # Non-authoritative provider hints cannot bypass operator mutation classification!
+        if descriptor.policy.mutation_class != MutationClass.READ_ONLY:
+            raise ToolError(
+                code="mutation_withheld",
+                message=f"Mutating tool '{lease.public_name}' is withheld until M10 activation",
+            )
+
+        # 7. Acquire global semaphore bounded by timeout
+        try:
+            with anyio.fail_after(timeout_sec):
+                await self._global_call_semaphore.acquire()
+        except TimeoutError as exc:
+            raise ToolError(
+                code="admission_limit_exceeded",
+                message="Global call admission semaphore queue exceeded timeout",
+            ) from exc
+
+        try:
+            # 8. Acquire per-extension semaphore bounded by timeout
+            try:
+                with anyio.fail_after(timeout_sec):
+                    await owner.call_semaphore.acquire()
+            except TimeoutError as exc:
+                raise ToolError(
+                    code="admission_limit_exceeded",
+                    message=f"Extension '{owner.extension_id}' call semaphore queue exceeded timeout",
+                ) from exc
+
+            try:
+                # 9. Recheck snapshot after queue wait to guard against races
+                if not owner.is_routable:
+                    raise ToolError(
+                        code="extension_not_routable",
+                        message=f"Extension '{owner.extension_id}' is not routable in state {owner.state.value}",
+                    )
+                if not self._registry.is_lease_valid(lease):
+                    raise ToolError(
+                        code="stale_generation",
+                        message="Tool lease became invalid while waiting in admission queue",
+                    )
+
+                yield owner, descriptor
+            finally:
+                with anyio.CancelScope(shield=True):
+                    owner.call_semaphore.release()
+        finally:
+            with anyio.CancelScope(shield=True):
+                self._global_call_semaphore.release()
+
+    async def execute_guarded_call(
+        self,
+        lease: ExtensionLease,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        timeout_sec: float = LIMITS.call_sec,
+        request_callback: bool = False,
+    ) -> Any:
+        """Admit and execute a tool call under guarded boundaries."""
+        async with self.guard_call_admission(
+            lease,
+            timeout_sec=timeout_sec,
+            request_callback=request_callback,
+        ) as (owner, descriptor):
+            return await owner.call_tool(
+                descriptor.remote_name,
+                arguments,
+                timeout_sec=timeout_sec,
+            )
