@@ -2,7 +2,7 @@
 
 ComputerPilot MCP uses guarded, same-SHA release publication.
 
-Contributors follow the [agent contract](../AGENTS.md) and [testing standards](development/TESTING-STANDARDS.md). The [active v0.8 roadmap](roadmap/V0.8.0-EXTENSIBILITY-AGENT-FOUNDATION-MASTER-PLAN.fa.md) adds extension acceptance and independent review requirements; those requirements do not waive the existing release gates below or authorize publication.
+Contributors follow the [agent contract](../AGENTS.md) and [testing standards](development/TESTING-STANDARDS.md). The v0.8 master plan is local to the operator's Windows Downloads directory; extension acceptance and independent review requirements do not waive the existing release gates below.
 
 ## Normal change flow
 
@@ -19,6 +19,8 @@ merge to main
 ```
 
 Do not rewrite published release history, force-push release branches, or modify existing release tags.
+
+Use a short-lived branch for each milestone, push tested checkpoints, and create a PR against `main`; branch pushes alone do not trigger the current workflows. Merge after the current head's six CI jobs, three Platform Release Validation jobs and Release Packaging Smoke all succeed. Verify those workflows again on the resulting `main` SHA before starting the next milestone from current `origin/main`. Local, FreeBuff and Cloud work resume from that baseline and fetch the small active branch when needed. The full master plan must never be copied into a checkout; use the agent contract's brief handoff, source and current CI.
 
 ## Required GitHub gates
 

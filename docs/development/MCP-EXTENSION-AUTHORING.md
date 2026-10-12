@@ -1,6 +1,6 @@
 # External MCP extension authoring
 
-Status: **PROPOSED v0.8 contract; runtime activation is not implemented or verified yet.** Follow the [active roadmap](../roadmap/V0.8.0-EXTENSIBILITY-AGENT-FOUNDATION-MASTER-PLAN.fa.md) for current unit evidence, open decisions, provisional budgets and next task. This guide is the operator/provider contract, not a claim of shipping support. [Architecture](../architecture.md), [configuration](../configuration.md), [testing standards](TESTING-STANDARDS.md), and [release process](../release-process.md) remain their existing authorities.
+Status: **PROPOSED v0.8 public contract; public exposure and mutation activation remain gated.** Follow the [agent contract](../../AGENTS.md) for the brief verified handoff and next task, and inspect current source and CI for evidence. The full master plan remains only in the operator's Windows Downloads directory. This guide is the operator/provider contract, not a claim of shipping support. [Architecture](../architecture.md), [configuration](../configuration.md), [testing standards](TESTING-STANDARDS.md), and [release process](../release-process.md) remain their existing authorities.
 
 ## Opt-in and local administrator authority
 

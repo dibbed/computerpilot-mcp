@@ -11,6 +11,9 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Add strict immutable extension definitions, exact namespaces, a bounded opt-in offline configuration reader and private minimal env-only credential references; provider activation remains gated.
 - 2026-10-12: Add isolated local MCP fixtures for protocol, catalog, cancellation, lost-response and owned process-tree tests; keep extensions disabled in both CI matrices.
 
+### Changed
+- 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.
+
 ## [0.7.1] - 2026-10-11
 
 ### Fixed
