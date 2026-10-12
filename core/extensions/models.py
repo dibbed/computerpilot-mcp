@@ -279,6 +279,96 @@ class ExtensionToolDescriptor:
     def output_schema(self) -> dict[str, Any] | None:
         return None if self.output_schema_json is None else cast(dict[str, Any], json.loads(self.output_schema_json))
 
+    @property
+    def byte_size(self) -> int:
+        output_len = 0 if self.output_schema_json is None else len(self.output_schema_json)
+        return (
+            len(self.input_schema_json)
+            + output_len
+            + len(self.description.encode("utf-8"))
+            + len(self.public_name.encode("utf-8"))
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        extension_id: str,
+        provider: str,
+        remote_name: str,
+        description: str,
+        input_schema: Mapping[str, Any],
+        output_schema: Mapping[str, Any] | None = None,
+        policy: ToolPolicy | None = None,
+        catalog_generation: int = 1,
+    ) -> ExtensionToolDescriptor:
+        pub_name = public_tool_name(extension_id, remote_name)
+        in_bytes = json.dumps(
+            dict(input_schema),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        out_bytes = (
+            None
+            if output_schema is None
+            else json.dumps(
+                dict(output_schema),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        fingerprint = schema_fingerprint(input_schema, output_schema)
+        pol = policy or ToolPolicy(remote_name=remote_name, domain="testing")
+        return cls(
+            public_name=pub_name,
+            remote_name=remote_name,
+            identity=ExtensionIdentity(extension_id=extension_id, provider=provider),
+            description=description,
+            input_schema_json=in_bytes,
+            output_schema_json=out_bytes,
+            policy=pol,
+            catalog_generation=catalog_generation,
+            schema_fingerprint=fingerprint,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExtensionCatalogSnapshot:
+    manager_generation: int
+    extension_generations: Mapping[str, int]
+    tools: Mapping[str, ExtensionToolDescriptor]
+    total_tools: int
+    total_bytes: int
+    observed_at: str
+
+    @classmethod
+    def empty(cls) -> ExtensionCatalogSnapshot:
+        return cls(
+            manager_generation=0,
+            extension_generations=MappingProxyType({}),
+            tools=MappingProxyType({}),
+            total_tools=0,
+            total_bytes=0,
+            observed_at="",
+        )
+
+    def get_tool(self, public_name: str) -> ExtensionToolDescriptor | None:
+        return self.tools.get(public_name)
+
+    def has_tool(self, public_name: str) -> bool:
+        return public_name in self.tools
+
+    @property
+    def tool_names(self) -> tuple[str, ...]:
+        return tuple(self.tools.keys())
+
+    def extension_tools(self, extension_id: str) -> tuple[ExtensionToolDescriptor, ...]:
+        return tuple(desc for desc in self.tools.values() if desc.identity.extension_id == extension_id)
+
 
 @dataclass(frozen=True, slots=True)
 class ExtensionHealth:
