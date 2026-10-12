@@ -13,6 +13,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Validate complete accepted provider schemas without network retrieval and return a Core-owned external result envelope through public SDK requests.
 - 2026-10-12: Bound complete external result envelopes, return explicit overflow previews, and allow sanitized retained JSON artifacts only through an explicit operator tool policy.
 - 2026-10-12: Add a public MCPServer list/call bridge for approved read-only external tools, preserving exact provider input schemas and native tool dispatch.
+- 2026-10-12: Report separate native/external/total discovery counts and attribute only eligible live external recommendations across all nine existing profiles.
 
 ### Changed
 - 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.

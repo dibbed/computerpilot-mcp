@@ -46,6 +46,7 @@ class ExtensionMCPServer(MCPServer):
                 _meta={
                     "source_type": "external_mcp", "extension_id": descriptor.extension_id,
                     "provider": descriptor.identity.provider, "catalog_generation": descriptor.catalog_generation,
+                    "domain": descriptor.policy.domain,
                 },
             )
             size += len(tool.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
