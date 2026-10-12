@@ -1,0 +1,333 @@
+"""Tests for extension lifecycle state machine, owner channels, and manager."""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import MagicMock
+
+import anyio
+import pytest
+
+from core.extensions.manager import (
+    LEGAL_TRANSITIONS,
+    ExtensionLifecycleManager,
+    ExtensionLifecycleStateMachine,
+    ExtensionOwner,
+    IllegalStateTransitionError,
+    OwnerSignal,
+    SessionReusedError,
+)
+from core.extensions.models import ExtensionDefinition, ExtensionState
+from core.platform import normalize_system
+
+
+def _dummy_definition(extension_id: str = "test-ext", enabled: bool = True) -> ExtensionDefinition:
+    return ExtensionDefinition.model_validate_json(
+        json.dumps({
+            "extension_id": extension_id,
+            "display_name": "Test Extension",
+            "provider": "fixture",
+            "command": "python",
+            "working_directory": ".",
+            "platforms": [normalize_system()],
+            "enabled": enabled,
+        })
+    )
+
+
+def test_transition_matrix_all_legal_transitions() -> None:
+    """Verify that every transition in LEGAL_TRANSITIONS succeeds."""
+    expected_transitions = [
+        (ExtensionState.CONFIGURED, ExtensionState.DISABLED),
+        (ExtensionState.CONFIGURED, ExtensionState.STARTING),
+        (ExtensionState.DISABLED, ExtensionState.STARTING),
+        (ExtensionState.STARTING, ExtensionState.HEALTHY),
+        (ExtensionState.STARTING, ExtensionState.FAILED),
+        (ExtensionState.STARTING, ExtensionState.STOPPING),
+        (ExtensionState.HEALTHY, ExtensionState.DEGRADED),
+        (ExtensionState.HEALTHY, ExtensionState.UNREACHABLE),
+        (ExtensionState.HEALTHY, ExtensionState.STOPPING),
+        (ExtensionState.DEGRADED, ExtensionState.HEALTHY),
+        (ExtensionState.DEGRADED, ExtensionState.UNREACHABLE),
+        (ExtensionState.DEGRADED, ExtensionState.STOPPING),
+        (ExtensionState.UNREACHABLE, ExtensionState.STARTING),
+        (ExtensionState.UNREACHABLE, ExtensionState.FAILED),
+        (ExtensionState.UNREACHABLE, ExtensionState.STOPPING),
+        (ExtensionState.FAILED, ExtensionState.STARTING),
+        (ExtensionState.STOPPING, ExtensionState.DISABLED),
+        (ExtensionState.STOPPING, ExtensionState.CONFIGURED),
+    ]
+
+    for source, target in expected_transitions:
+        sm = ExtensionLifecycleStateMachine("test", initial_state=source)
+        assert sm.can_transition(target), f"Expected legal transition {source} -> {target}"
+        sm.transition(target)
+        assert sm.state == target
+
+
+def test_transition_matrix_illegal_transitions_raise() -> None:
+    """Verify that any transition outside Section 21 raises IllegalStateTransitionError."""
+    illegal_cases = [
+        (ExtensionState.CONFIGURED, ExtensionState.HEALTHY),
+        (ExtensionState.CONFIGURED, ExtensionState.DEGRADED),
+        (ExtensionState.CONFIGURED, ExtensionState.UNREACHABLE),
+        (ExtensionState.CONFIGURED, ExtensionState.FAILED),
+        (ExtensionState.CONFIGURED, ExtensionState.STOPPING),
+        (ExtensionState.DISABLED, ExtensionState.HEALTHY),
+        (ExtensionState.DISABLED, ExtensionState.CONFIGURED),
+        (ExtensionState.DISABLED, ExtensionState.STOPPING),
+        (ExtensionState.STARTING, ExtensionState.CONFIGURED),
+        (ExtensionState.STARTING, ExtensionState.DISABLED),
+        (ExtensionState.STARTING, ExtensionState.DEGRADED),
+        (ExtensionState.HEALTHY, ExtensionState.CONFIGURED),
+        (ExtensionState.HEALTHY, ExtensionState.STARTING),
+        (ExtensionState.HEALTHY, ExtensionState.FAILED),
+        (ExtensionState.FAILED, ExtensionState.HEALTHY),
+        (ExtensionState.FAILED, ExtensionState.STOPPING),
+        (ExtensionState.FAILED, ExtensionState.DEGRADED),
+        (ExtensionState.STOPPING, ExtensionState.HEALTHY),
+        (ExtensionState.STOPPING, ExtensionState.STARTING),
+    ]
+
+    for source, target in illegal_cases:
+        sm = ExtensionLifecycleStateMachine("test", initial_state=source)
+        assert not sm.can_transition(target)
+        with pytest.raises(IllegalStateTransitionError):
+            sm.transition(target)
+        # Verify state did not change
+        assert sm.state == source
+
+
+def test_configured_is_not_healthy_or_routable() -> None:
+    """Verify core requirement: CONFIGURED != HEALTHY, and only HEALTHY is routable."""
+    sm = ExtensionLifecycleStateMachine("test", initial_state=ExtensionState.CONFIGURED)
+    assert not sm.is_healthy
+    assert not sm.is_routable
+
+    # Transition through states
+    sm.transition(ExtensionState.STARTING)
+    assert not sm.is_healthy
+    assert not sm.is_routable
+
+    sm.transition(ExtensionState.HEALTHY)
+    assert sm.is_healthy
+    assert sm.is_routable
+
+    sm.transition(ExtensionState.DEGRADED)
+    assert not sm.is_healthy
+    assert not sm.is_routable
+
+    sm.transition(ExtensionState.UNREACHABLE)
+    assert not sm.is_healthy
+    assert not sm.is_routable
+
+    sm.transition(ExtensionState.FAILED)
+    assert not sm.is_healthy
+    assert not sm.is_routable
+
+
+def test_generation_increments_on_starting() -> None:
+    """Verify that generation monotonically increments upon entering STARTING."""
+    sm = ExtensionLifecycleStateMachine("test", initial_state=ExtensionState.CONFIGURED)
+    assert sm.generation == 0
+
+    sm.transition(ExtensionState.STARTING)
+    assert sm.generation == 1
+
+    sm.transition(ExtensionState.HEALTHY)
+    assert sm.generation == 1
+
+    sm.transition(ExtensionState.UNREACHABLE)
+    sm.transition(ExtensionState.STARTING)
+    assert sm.generation == 2
+
+
+def test_single_use_session_rule() -> None:
+    """Verify that an active session cannot be reused once closed or retired."""
+    owner = ExtensionOwner(_dummy_definition("ext-1"))
+    session_mock = MagicMock()
+
+    # First use succeeds
+    owner.register_session(session_mock, "session-123")
+
+    # Closing active session
+    owner.close_active_session()
+
+    # Attempting to reuse same session ID fails closed
+    with pytest.raises(SessionReusedError):
+        owner.register_session(session_mock, "session-123")
+
+    # A different session ID succeeds
+    session_mock2 = MagicMock()
+    owner.register_session(session_mock2, "session-456")
+
+
+def test_coalesce_duplicate_start_signals() -> None:
+    """Verify that duplicate START signals are coalesced when already starting/running."""
+    owner = ExtensionOwner(_dummy_definition("ext-1"))
+    assert owner.state == ExtensionState.CONFIGURED
+
+    # First start signal succeeds
+    assert owner.signal(OwnerSignal.START) is True
+
+    # Simulate transition to STARTING
+    owner.state_machine.transition(ExtensionState.STARTING)
+
+    # Subsequent start signal is coalesced
+    assert owner.signal(OwnerSignal.START) is False
+
+    # Simulate transition to HEALTHY
+    owner.state_machine.transition(ExtensionState.HEALTHY)
+    assert owner.signal(OwnerSignal.START) is False
+
+    # Simulate transition to DEGRADED
+    owner.state_machine.transition(ExtensionState.DEGRADED)
+    assert owner.signal(OwnerSignal.START) is False
+
+
+def test_owner_actor_event_loop_start_and_stop() -> None:
+    """Verify owner actor task processes START, transitions to HEALTHY, and STOP cleanly."""
+    definition = _dummy_definition("ext-actor")
+    owner = ExtensionOwner(definition)
+    stop_event = anyio.Event()
+
+    async def mock_runner(own: ExtensionOwner) -> None:
+        own.state_machine.transition(ExtensionState.HEALTHY)
+
+    async def scenario() -> None:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(owner.run_owner_loop, mock_runner, stop_event)
+
+            # Signal start
+            assert owner.signal(OwnerSignal.START) is True
+            # Allow actor to process
+            await anyio.sleep(0.05)
+            assert owner.state == ExtensionState.HEALTHY
+            assert owner.is_routable
+
+            # Signal stop
+            assert owner.signal(OwnerSignal.STOP) is True
+            await stop_event.wait()
+            assert owner.state in {ExtensionState.CONFIGURED, ExtensionState.DISABLED}
+            assert not owner.is_routable
+
+    anyio.run(scenario)
+
+
+def test_owner_actor_restart_cycle() -> None:
+    """Verify owner actor handles RESTART signal cleanly."""
+    definition = _dummy_definition("ext-restart")
+    owner = ExtensionOwner(definition)
+    stop_event = anyio.Event()
+    starts_count = 0
+
+    async def mock_runner(own: ExtensionOwner) -> None:
+        nonlocal starts_count
+        starts_count += 1
+        own.state_machine.transition(ExtensionState.HEALTHY)
+
+    async def scenario() -> None:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(owner.run_owner_loop, mock_runner, stop_event)
+
+            # Initial start
+            owner.signal(OwnerSignal.START)
+            await anyio.sleep(0.05)
+            assert owner.state == ExtensionState.HEALTHY
+            assert starts_count == 1
+            assert owner.state_machine.generation == 1
+
+            # Signal restart
+            owner.signal(OwnerSignal.RESTART)
+            await anyio.sleep(0.05)
+            assert owner.state == ExtensionState.HEALTHY
+            assert starts_count == 2
+            assert owner.state_machine.generation == 2
+            assert owner.state_machine.restart_count == 1
+
+            # Teardown
+            owner.signal(OwnerSignal.STOP)
+            await stop_event.wait()
+
+    anyio.run(scenario)
+
+
+def test_manager_coordinates_multiple_extensions() -> None:
+    """Verify ExtensionLifecycleManager coordinates multiple extensions independently."""
+    manager = ExtensionLifecycleManager()
+    ext_a = _dummy_definition("ext-a", enabled=True)
+    ext_b = _dummy_definition("ext-b", enabled=False)
+
+    manager.register_extension(ext_a)
+    manager.register_extension(ext_b)
+
+    assert manager.get_state("ext-a") == ExtensionState.CONFIGURED
+    assert manager.get_state("ext-b") == ExtensionState.DISABLED
+
+    assert not manager.is_routable("ext-a")
+    assert not manager.is_routable("ext-b")
+    assert not manager.is_healthy("ext-a")
+    assert not manager.is_healthy("ext-b")
+
+    # Unknown extension
+    assert manager.get_state("unknown") is None
+    assert not manager.is_routable("unknown")
+    assert not manager.signal_start("unknown")
+
+    # Signal start for ext_a
+    assert manager.signal_start("ext-a") is True
+
+
+def test_exhaustive_pairwise_illegal_transitions() -> None:
+    """Check every illegal state pair in the 8x8 matrix raises IllegalStateTransitionError."""
+    states = list(ExtensionState)
+    illegal_count = 0
+    for s1 in states:
+        for s2 in states:
+            if s2 not in LEGAL_TRANSITIONS.get(s1, frozenset()):
+                sm = ExtensionLifecycleStateMachine("test", initial_state=s1)
+                assert not sm.can_transition(s2)
+                with pytest.raises(IllegalStateTransitionError):
+                    sm.transition(s2)
+                assert sm.state == s1
+                illegal_count += 1
+    # Total pairs: 64, legal: 18, illegal: 46
+    assert illegal_count == 46
+
+
+def test_all_states_healthy_and_routable_strictness() -> None:
+    """Verify that only HEALTHY is routable and healthy; all 7 other states are false."""
+    for s in ExtensionState:
+        sm = ExtensionLifecycleStateMachine("test", initial_state=s)
+        if s == ExtensionState.HEALTHY:
+            assert sm.is_healthy is True
+            assert sm.is_routable is True
+        else:
+            assert sm.is_healthy is False, f"State {s} should not be healthy"
+            assert sm.is_routable is False, f"State {s} should not be routable"
+
+
+def test_owner_actor_runner_failure_transitions_to_failed() -> None:
+    """Verify that an exception in the runner task transitions the owner to FAILED with error recorded."""
+    definition = _dummy_definition("ext-failed")
+    owner = ExtensionOwner(definition)
+    stop_event = anyio.Event()
+
+    async def failing_runner(own: ExtensionOwner) -> None:
+        raise RuntimeError("Subprocess connection failed")
+
+    async def scenario() -> None:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(owner.run_owner_loop, failing_runner, stop_event)
+
+            owner.signal(OwnerSignal.START)
+            await anyio.sleep(0.05)
+            assert owner.state == ExtensionState.FAILED
+            assert owner.state_machine.last_error == "Subprocess connection failed"
+            assert not owner.is_routable
+
+            owner.signal(OwnerSignal.STOP)
+            await stop_event.wait()
+
+    anyio.run(scenario)
+
