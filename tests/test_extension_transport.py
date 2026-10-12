@@ -6,7 +6,10 @@ import sys
 import time
 from pathlib import Path
 
+import anyio
+import mcp.types as types
 import pytest
+from mcp.client.session import ClientSession
 from mcp.shared.message import SessionMessage
 
 from core.extensions.transport import (
@@ -20,6 +23,7 @@ from core.extensions.transport import (
     FrameEncodingError,
     FrameOversizeError,
     NotificationFloodCoalescer,
+    bounded_stdio_transport,
     parse_session_message,
     scan_json_depth,
 )
@@ -385,3 +389,108 @@ def test_fixture_stderr_flood_with_bounded_drain(tmp_path: Path) -> None:
     assert len(tail.encode("utf-8")) <= MAX_STDERR_BYTES
     assert "synthetic-canary" not in tail, "Synthetic canary must be sanitized"
     assert "[REDACTED_SECRET]" in tail
+
+
+def test_bounded_stdio_transport_roundtrip(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        async with bounded_stdio_transport(
+            [sys.executable, str(FIXTURE_PATH.resolve()), "--workspace", str(tmp_path), "--mode", "readonly"],
+            cwd=tmp_path,
+            env=_fixture_env(tmp_path),
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                tools = await session.list_tools()
+                assert len(tools.tools) == 2
+                res = await session.call_tool("read_value", {})
+                first = res.content[0]
+                assert isinstance(first, types.TextContent)
+                assert first.text is not None
+
+    anyio.run(scenario)
+
+
+def test_bounded_stdio_transport_blocked_stdin_is_bounded(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        start_t = time.monotonic()
+        try:
+            with anyio.fail_after(5.0):
+                async with bounded_stdio_transport(
+                    [sys.executable, str(FIXTURE_PATH.resolve()), "--workspace", str(tmp_path), "--mode", "blocked_stdin"],
+                    cwd=tmp_path,
+                    env=_fixture_env(tmp_path),
+                    write_timeout=1.0,
+                    shutdown_timeout=1.5,
+                ) as (read_stream, write_stream):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+        except (TimeoutError, Exception):
+            pass
+        elapsed = time.monotonic() - start_t
+        # Blocked stdin must not hang forever; must cleanly terminate within bounds
+        assert elapsed < 7.0, f"Blocked stdin elapsed {elapsed}s exceeded limit"
+
+    anyio.run(scenario)
+
+
+def test_bounded_stdio_transport_ignore_cancel_forced_reap(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        start_t = time.monotonic()
+        async with bounded_stdio_transport(
+            [sys.executable, str(FIXTURE_PATH.resolve()), "--workspace", str(tmp_path), "--mode", "ignore_cancel"],
+            cwd=tmp_path,
+            env=_fixture_env(tmp_path),
+            shutdown_timeout=2.0,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+        elapsed = time.monotonic() - start_t
+        # Courtesy cancel stall broken by Job Object / POSIX group force reap
+        assert elapsed < 6.0, f"Ignore cancel cleanup took {elapsed}s, stall was not broken"
+
+    anyio.run(scenario)
+
+
+def test_bounded_stdio_transport_ab_isolation(tmp_path: Path) -> None:
+    path_a = tmp_path / "provider_a"
+    path_b = tmp_path / "provider_b"
+    path_a.mkdir(parents=True, exist_ok=True)
+    path_b.mkdir(parents=True, exist_ok=True)
+
+    b_succeeded = False
+
+    async def run_b() -> None:
+        nonlocal b_succeeded
+        async with bounded_stdio_transport(
+            [sys.executable, str(FIXTURE_PATH.resolve()), "--workspace", str(path_b), "--mode", "readonly"],
+            cwd=path_b,
+            env=_fixture_env(path_b),
+        ) as (read_b, write_b):
+            async with ClientSession(read_b, write_b) as session_b:
+                await session_b.initialize()
+                tools_b = await session_b.list_tools()
+                assert len(tools_b.tools) == 2
+                b_succeeded = True
+
+    async def run_a() -> None:
+        try:
+            with anyio.fail_after(3.0):
+                async with bounded_stdio_transport(
+                    [sys.executable, str(FIXTURE_PATH.resolve()), "--workspace", str(path_a), "--mode", "delayed"],
+                    cwd=path_a,
+                    env=_fixture_env(path_a),
+                    shutdown_timeout=1.0,
+                ) as (read_a, write_a):
+                    async with ClientSession(read_a, write_a) as session_a:
+                        await session_a.initialize()
+                        await session_a.call_tool("read_value", {})
+        except (TimeoutError, Exception):
+            pass
+
+    async def scenario() -> None:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_a)
+            tg.start_soon(run_b)
+
+    anyio.run(scenario)
+    assert b_succeeded, "Provider B must succeed independently even while Provider A is delayed"

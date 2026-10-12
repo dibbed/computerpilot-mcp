@@ -4,9 +4,17 @@ from __future__ import annotations
 
 import collections
 import re
+import subprocess
+from collections.abc import AsyncGenerator, Sequence
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import IO
 
+import anyio
 from mcp import types
 from mcp.shared.message import SessionMessage
+
+from core.process_ownership import OwnedProcess, spawn_owned_process
 
 # Section 35 Provisional Experiment Defaults
 MAX_FRAME_BYTES: int = 2 * 1024 * 1024  # 2 MiB max frame size
@@ -42,6 +50,10 @@ class FrameEncodingError(TransportFramingError):
 
 class FrameMalformedError(TransportFramingError):
     """Raised when frame cannot be parsed into a valid JSON-RPC message."""
+
+
+class WriteTimeoutError(TransportFramingError):
+    """Raised when writing a message to the subprocess stdin exceeds the write deadline."""
 
 
 def scan_json_depth(text: str, max_depth: int = MAX_JSON_DEPTH) -> int:
@@ -316,3 +328,159 @@ class NotificationFloodCoalescer:
         if not self._errors:
             return None
         return self._errors.popleft()
+
+
+@asynccontextmanager
+async def bounded_stdio_transport(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    max_frame_bytes: int = MAX_FRAME_BYTES,
+    max_json_depth: int = MAX_JSON_DEPTH,
+    write_timeout: float = 10.0,
+    shutdown_timeout: float = 5.0,
+    stderr_drain: BoundedStderrDrain | None = None,
+    creationflags: int = 0,
+) -> AsyncGenerator[
+    tuple[
+        anyio.streams.memory.MemoryObjectReceiveStream[SessionMessage | Exception],
+        anyio.streams.memory.MemoryObjectSendStream[SessionMessage],
+    ],
+    None,
+]:
+    """Bounded, fail-closed stdio transport adapter for MCP subprocesses.
+
+    Spawns the child process strictly under native process-tree ownership
+    (Windows kill-on-close Job Object or POSIX process group) before any code executes.
+    Yields (read_stream, write_stream) compatible with MCP SDK ClientSession.
+    Enforces frame size limits, strict UTF-8 decoding, JSON structural depth ceilings,
+    write deadlines on stdin, and continuous sanitized stderr draining.
+    """
+    read_stream_writer, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](0)
+    write_stream, write_stream_reader = anyio.create_memory_object_stream[SessionMessage](0)
+
+    drain = stderr_drain or BoundedStderrDrain()
+    frame_reader = BoundedByteFrameReader(
+        max_frame_bytes=max_frame_bytes, max_json_depth=max_json_depth
+    )
+
+    owned: OwnedProcess = spawn_owned_process(
+        command=command,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=creationflags,
+        require_native=True,
+    )
+
+    proc = owned.process
+    assert proc.stdin and proc.stdout and proc.stderr
+
+    shutting_down = False
+    writer_done = anyio.Event()
+
+    def sync_read_chunk(pipe: IO[bytes] | None) -> bytes:
+        if not pipe:
+            return b""
+        try:
+            if hasattr(pipe, "read1"):
+                return pipe.read1(CHUNK_SIZE)
+            return pipe.read(CHUNK_SIZE)
+        except (ValueError, OSError):
+            return b""
+
+    def sync_write(data: bytes) -> None:
+        assert proc.stdin
+        proc.stdin.write(data)
+        proc.stdin.flush()
+
+    async def stdout_worker() -> None:
+        try:
+            while not shutting_down:
+                chunk = await anyio.to_thread.run_sync(sync_read_chunk, proc.stdout)
+                if not chunk:
+                    break
+                try:
+                    lines = frame_reader.feed_chunk(chunk)
+                    for line in lines:
+                        msg = parse_session_message(line)
+                        await read_stream_writer.send(msg)
+                except Exception as exc:
+                    await read_stream_writer.send(exc)
+                    break
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+            pass
+        finally:
+            with anyio.CancelScope(shield=True):
+                await read_stream_writer.aclose()
+
+    async def stderr_worker() -> None:
+        try:
+            while not shutting_down:
+                chunk = await anyio.to_thread.run_sync(sync_read_chunk, proc.stderr)
+                if not chunk:
+                    break
+                drain.feed_chunk(chunk)
+        except (ValueError, OSError):
+            pass
+
+    async def stdin_worker() -> None:
+        try:
+            async with write_stream_reader:
+                async for session_message in write_stream_reader:
+                    if shutting_down:
+                        break
+                    json_str = session_message.message.model_dump_json(
+                        by_alias=True, exclude_unset=True
+                    )
+                    data = (json_str + "\n").encode("utf-8")
+                    try:
+                        with anyio.fail_after(write_timeout):
+                            await anyio.to_thread.run_sync(sync_write, data)
+                    except TimeoutError as exc:
+                        raise WriteTimeoutError(
+                            f"Write to subprocess stdin exceeded timeout of {write_timeout}s"
+                        ) from exc
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError, OSError):
+            pass
+        finally:
+            writer_done.set()
+
+    async def shutdown() -> None:
+        nonlocal shutting_down
+        shutting_down = True
+        read_stream.close()
+        write_stream.close()
+
+        with anyio.move_on_after(shutdown_timeout):
+            await writer_done.wait()
+
+        # Terminate entire process tree natively via Job Object / POSIX group
+        owned.terminate_tree(force=True)
+
+        # Close all pipes to immediately unblock any thread reading stdout/stderr
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except (ValueError, OSError):
+                    pass
+
+        owned.close_ownership()
+        await read_stream_writer.aclose()
+        await write_stream_reader.aclose()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(stdout_worker)
+        tg.start_soon(stderr_worker)
+        tg.start_soon(stdin_worker)
+        try:
+            yield read_stream, write_stream
+        finally:
+            with anyio.CancelScope(shield=True):
+                await shutdown()
+            tg.cancel_scope.cancel()
+
