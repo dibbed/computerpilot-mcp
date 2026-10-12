@@ -114,12 +114,16 @@ def test_actual_http_entrypoint_exposes_modern_external_tools(tmp_path: Path) ->
                     async with client.listen(tools_list_changed=True) as subscription:
                         (tmp_path / "catalog_epoch").write_text("2", encoding="utf-8")
                         with anyio.fail_after(5):
-                            assert isinstance(await subscription.__anext__(), ToolsListChanged)
-                        assert NAME not in {tool.name for tool in (await client.list_tools()).tools}
+                            while True:
+                                assert isinstance(await subscription.__anext__(), ToolsListChanged)
+                                if NAME not in {tool.name for tool in (await client.list_tools()).tools}:
+                                    break
                         (tmp_path / "catalog_epoch").write_text("0", encoding="utf-8")
                         with anyio.fail_after(5):
-                            assert isinstance(await subscription.__anext__(), ToolsListChanged)
-                        assert NAME in {tool.name for tool in (await client.list_tools()).tools}
+                            while True:
+                                assert isinstance(await subscription.__anext__(), ToolsListChanged)
+                                if NAME in {tool.name for tool in (await client.list_tools()).tools}:
+                                    break
                     denied = await client.call_tool("external.refresh-fixture.increment_value", {"amount": 1})
                     assert denied.is_error and not (tmp_path / "counter.json").exists()
                 async with Client(f"http://127.0.0.1:{port}/mcp", mode="legacy") as client:

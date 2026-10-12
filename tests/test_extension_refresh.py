@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -38,7 +39,7 @@ def configured_manager(tmp_path: Path, mode: str, *, starting: bool = True) -> E
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_real_sdk_clients_receive_catalog_change_and_drop_cached_tools(legacy: bool) -> None:
+def test_real_sdk_clients_receive_catalog_change_and_relist_tools(legacy: bool) -> None:
     server, manager, _ = bridge()
     received = anyio.Event()
 
@@ -63,6 +64,52 @@ def test_real_sdk_clients_receive_catalog_change_and_drop_cached_tools(legacy: b
                     assert isinstance(event, ToolsListChanged)
             after = await client.list_tools()
             assert not any(tool.name.startswith("external.") for tool in after.tools)
+
+    anyio.run(scenario)
+
+
+@pytest.mark.parametrize("ttl_ms", [0, 60_000])
+def test_real_modern_sdk_response_cache_is_invalidated_by_notifications(ttl_ms: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    server, manager, session = bridge(list_cache_ttl_ms=ttl_ms)
+    descriptor = manager.list_tools()[0]
+    permit = anyio.Event()
+    original_publish = server.catalog_subscriptions.publish
+
+    async def publish(event: Any) -> None:
+        await permit.wait()
+        await original_publish(event)
+
+    monkeypatch.setattr(server.catalog_subscriptions, "publish", publish)
+
+    async def scenario() -> None:
+        nonlocal permit
+        async with Client(server) as client, client.listen(tools_list_changed=True) as subscription:
+            assert descriptor.public_name in {tool.name for tool in (await client.list_tools()).tools}
+            manager.registry.retire_extension_catalog(descriptor.extension_id)
+            before_event = {tool.name for tool in (await client.list_tools()).tools}
+            assert (descriptor.public_name in before_event) == bool(ttl_ms)
+            denied = await client.call_tool(descriptor.public_name, {})
+            assert denied.is_error and denied.structured_content is not None
+            assert denied.structured_content["outcome"] == "not_dispatched"
+            session.send_request.assert_not_awaited()
+            assert (descriptor.public_name in {tool.name for tool in (await client.list_tools()).tools}) == bool(ttl_ms)
+            permit.set()
+            with anyio.fail_after(3):
+                assert isinstance(await subscription.__anext__(), ToolsListChanged)
+            assert descriptor.public_name not in {tool.name for tool in (await client.list_tools()).tools}
+
+            permit = anyio.Event()
+            generation = manager.registry.next_catalog_generation(descriptor.extension_id)
+            manager.registry.publish_extension_catalog(
+                descriptor.extension_id, generation, (replace(descriptor, catalog_generation=generation),),
+            )
+            before_event = {tool.name for tool in (await client.list_tools()).tools}
+            assert (descriptor.public_name not in before_event) == bool(ttl_ms)
+            permit.set()
+            with anyio.fail_after(3):
+                assert isinstance(await subscription.__anext__(), ToolsListChanged)
+            restored = next(tool for tool in (await client.list_tools()).tools if tool.name == descriptor.public_name)
+            assert restored.meta is not None and restored.meta["catalog_generation"] == generation
 
     anyio.run(scenario)
 

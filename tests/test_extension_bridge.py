@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import anyio
 import pytest
 from mcp import Client, types
+from mcp.server import CacheHint
 from test_extension_security import admitted_call
 
 from core.extensions.bridge import ExtensionMCPServer
@@ -15,13 +16,15 @@ from core.extensions.models import ExtensionEnvironment, ExtensionState, Mutatio
 from core.extensions.output import ExtensionResult
 
 
-def bridge(profile: str = "full") -> tuple[ExtensionMCPServer, ExtensionLifecycleManager, MagicMock]:
+def bridge(profile: str = "full", *, list_cache_ttl_ms: int = 0) -> tuple[ExtensionMCPServer, ExtensionLifecycleManager, MagicMock]:
     schema = {
         "type": "object", "properties": {"file.name": {"type": "string", "default": "not injected"}},
         "additionalProperties": True,
     }
     manager, _, session = admitted_call(schema, types.CallToolResult(content=[], structured_content={"value": "safe"}))
-    server = ExtensionMCPServer("bridge-fixture", tool_profile=profile)
+    server = ExtensionMCPServer(
+        "bridge-fixture", tool_profile=profile, cache_hints={"tools/list": CacheHint(ttl_ms=list_cache_ttl_ms)},
+    )
     server.extension_manager = manager
 
     @server.tool(structured_output=True)
