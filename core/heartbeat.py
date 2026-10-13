@@ -93,9 +93,7 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
             server.extension_config_error_code = config_res.error_code
         if config_res.config.extensions:
             config_owned_manager = True
-            extension_manager = ExtensionLifecycleManager()
-            for ext_def in config_res.config.extensions:
-                extension_manager.register_extension(ext_def)
+            extension_manager = ExtensionLifecycleManager(config=config_res.config)
             if hasattr(server, "__dict__"):
                 server.extension_manager = extension_manager
 

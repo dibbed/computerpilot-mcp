@@ -8,6 +8,7 @@ import ntpath
 import os
 import posixpath
 import re
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,9 @@ from typing import Any
 from core.config import SETTINGS, Settings
 from core.errors import ToolError
 from core.extensions.models import LIMITS, ExtensionConfig, ExtensionDefinition
+from core.file_lock import exclusive_file_lock
 from core.platform import config_home
+from core.state_paths import unlinked_directory_tree
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,3 +202,157 @@ def load_extension_config(settings: Settings = SETTINGS) -> ConfigLoadResult:
         return ConfigLoadResult(config, revision=hashlib.sha256(data).hexdigest())
     except (OSError, ValueError, UnicodeError):
         return ConfigLoadResult(empty, "config_invalid")
+
+
+def _validate_candidate_payload(
+    candidate: bytes | str | dict[str, Any] | ExtensionConfig,
+    settings: Settings = SETTINGS,
+) -> tuple[ExtensionConfig, str, bytes]:
+    """Offline validation of an extension configuration candidate.
+
+    Returns the validated ExtensionConfig model, its SHA-256 revision hash, and canonical bytes.
+    Raises ToolError on any validation failure.
+    """
+    if isinstance(candidate, ExtensionConfig):
+        raw_bytes = candidate.model_dump_json(indent=2).encode("utf-8")
+    elif isinstance(candidate, dict):
+        raw_bytes = json.dumps(candidate, indent=2).encode("utf-8")
+    elif isinstance(candidate, str):
+        raw_bytes = candidate.encode("utf-8")
+    elif isinstance(candidate, bytes):
+        raw_bytes = candidate
+    else:
+        raise ToolError("config_invalid", f"Unsupported candidate type: {type(candidate).__name__}")
+
+    if len(raw_bytes) > settings.extension_limits.config_bytes:
+        raise ToolError("config_invalid", "Extension configuration exceeds byte limit.")
+
+    try:
+        text = raw_bytes.decode("utf-8", errors="strict")
+    except UnicodeError as err:
+        raise ToolError("config_invalid", f"Configuration is not valid UTF-8: {err}") from None
+
+    try:
+        _check_json_depth(text, settings.extension_limits.json_depth)
+    except ValueError as err:
+        raise ToolError("config_invalid", f"Configuration exceeds JSON depth limit or is malformed: {err}") from None
+
+    try:
+        parsed = json.loads(text, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+    except ValueError as err:
+        raise ToolError("config_invalid", f"Configuration JSON syntax or duplicate key error: {err}") from None
+
+    if not isinstance(parsed, dict):
+        raise ToolError("config_invalid", "Configuration root must be an object.")
+
+    version = parsed.get("schema_version")
+    if type(version) is int and version != 1:
+        raise ToolError("config_version_unsupported", f"Unsupported schema version: {version}")
+    if type(version) is not int or version < 1:
+        raise ToolError("config_invalid", "Invalid schema version.")
+
+    try:
+        config = ExtensionConfig.model_validate_json(raw_bytes)
+    except Exception as err:
+        raise ToolError("config_invalid", f"Configuration schema validation failed: {err}") from None
+
+    for definition in config.extensions:
+        try:
+            _validate_operator_definition(definition, os.environ)
+            if not _absolute_local_path(definition.command, portable=True) or not _absolute_local_path(
+                definition.working_directory, portable=True,
+            ):
+                raise ValueError("provider paths must be absolute and local")
+        except Exception as err:
+            raise ToolError("config_invalid", f"Extension definition validation failed: {err}") from None
+
+    revision = hashlib.sha256(raw_bytes).hexdigest()
+    return config, revision, raw_bytes
+
+
+def validate_extension_config_candidate(
+    candidate: bytes | str | dict[str, Any] | ExtensionConfig,
+    settings: Settings = SETTINGS,
+) -> tuple[ExtensionConfig, str]:
+    """Validate a candidate extension configuration offline; raises ToolError on any validation failure."""
+    config, revision, _ = _validate_candidate_payload(candidate, settings=settings)
+    return config, revision
+
+
+def publish_extension_config(
+    candidate: bytes | str | dict[str, Any] | ExtensionConfig,
+    target_path: Path | None = None,
+    expected_revision: str | None = None,
+    settings: Settings = SETTINGS,
+) -> tuple[ExtensionConfig, str, Path]:
+    """Atomically publish validated extension configuration to disk under exclusive file lock."""
+    target = resolve_extension_config_path(settings) if target_path is None else Path(target_path)
+    if not _absolute_local_path(str(target)):
+        raise ToolError("config_invalid", "Config path must be absolute and local.")
+    if target.is_symlink():
+        raise ToolError("config_invalid", "Symlinks are forbidden for extension config.")
+    parent = target.parent
+    if not unlinked_directory_tree(parent, allow_missing=True):
+        raise ToolError("config_invalid", "Config parent directory contains symlinks or reparse points.")
+
+    config, revision, raw_bytes = _validate_candidate_payload(candidate, settings=settings)
+
+    lock_path = target.with_name(f"{target.name}.lock")
+    with exclusive_file_lock(lock_path, label=f"extension config {target}"):
+        if target.exists():
+            if target.is_symlink():
+                raise ToolError("config_invalid", "Config target cannot be a symlink.")
+            try:
+                current_bytes = target.read_bytes()
+            except OSError as err:
+                raise ToolError("config_invalid", f"Failed to read existing configuration: {err}") from None
+
+            try:
+                existing_parsed = json.loads(current_bytes.decode("utf-8", errors="replace"))
+                if isinstance(existing_parsed, dict):
+                    existing_version = existing_parsed.get("schema_version")
+                    if type(existing_version) is int and existing_version > 1:
+                        raise ToolError(
+                            "config_version_unsupported",
+                            f"Current configuration has unsupported schema version {existing_version}; refusing overwrite.",
+                        )
+            except (ValueError, UnicodeError):
+                pass
+
+            if expected_revision is not None:
+                current_revision = hashlib.sha256(current_bytes).hexdigest()
+                if current_revision != expected_revision:
+                    raise ToolError(
+                        "config_conflict",
+                        f"Configuration conflict: expected revision {expected_revision}, but current revision is {current_revision}.",
+                    )
+        else:
+            if expected_revision is not None:
+                raise ToolError(
+                    "config_conflict",
+                    f"Configuration conflict: expected revision {expected_revision}, but configuration file does not exist.",
+                )
+
+        parent.mkdir(parents=True, exist_ok=True)
+        temp_name = f".{target.name}.tmp.{uuid.uuid4().hex}"
+        temp_path = parent / temp_name
+        try:
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+            mode = 0o600
+            fd = os.open(str(temp_path), flags, mode)
+            try:
+                with open(fd, "wb", closefd=False) as handle:
+                    handle.write(raw_bytes)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                os.close(fd)
+            os.replace(temp_path, target)
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+    return config, revision, target

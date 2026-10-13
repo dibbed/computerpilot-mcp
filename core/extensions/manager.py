@@ -30,6 +30,7 @@ from core.extensions.config import build_extension_environment
 from core.extensions.models import (
     LIMITS,
     ExtensionCatalogSnapshot,
+    ExtensionConfig,
     ExtensionDefinition,
     ExtensionState,
     ExtensionToolDescriptor,
@@ -686,6 +687,7 @@ class ExtensionLifecycleManager:
         recovery_journal: OperationRecoveryJournal | None = None,
         *,
         _mutation_gate_closed: bool = False,
+        config: ExtensionConfig | None = None,
     ) -> None:
         self._registry = registry or ExtensionRegistry()
         self._parallel_startup = parallel_startup
@@ -697,6 +699,14 @@ class ExtensionLifecycleManager:
         self._owners: dict[str, ExtensionOwner] = {}
         self._unresolved_mutation_hooks: list[Callable[[str], None]] = []
         self._shutdown_event: anyio.Event = anyio.Event()
+        self._config: ExtensionConfig | None = config
+        if config is not None:
+            for definition in config.extensions:
+                self.register_extension(definition)
+
+    @property
+    def config(self) -> ExtensionConfig | None:
+        return self._config
 
     @property
     def registry(self) -> ExtensionRegistry:
@@ -869,6 +879,21 @@ class ExtensionLifecycleManager:
         owner.close_active_session()
         if owner.state_machine.can_transition(ExtensionState.DISABLED):
             owner.state_machine.transition(ExtensionState.DISABLED, reason="disabled")
+        return True
+
+    async def unregister_extension(self, extension_id: str) -> bool:
+        """Completely unregister and remove an extension: disable, retire catalog, and stop owner."""
+        owner = self._owners.pop(extension_id, None)
+        if not owner:
+            return False
+        self._registry.retire_extension_catalog(extension_id)
+        owner.is_enabled = False
+        owner.signal(OwnerSignal.STOP)
+        if owner.state_machine.can_transition(ExtensionState.STOPPING):
+            owner.state_machine.transition(ExtensionState.STOPPING, reason="unregistered")
+        owner.close_active_session()
+        if owner.state_machine.can_transition(ExtensionState.DISABLED):
+            owner.state_machine.transition(ExtensionState.DISABLED, reason="unregistered")
         return True
 
     def enable_extension(self, extension_id: str) -> bool:
