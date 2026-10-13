@@ -494,3 +494,36 @@ def test_bounded_stdio_transport_ab_isolation(tmp_path: Path) -> None:
 
     anyio.run(scenario)
     assert b_succeeded, "Provider B must succeed independently even while Provider A is delayed"
+
+
+def test_bounded_stdio_transport_root_exit_child_reaps_entire_tree(tmp_path: Path) -> None:
+    import psutil
+
+    async def scenario() -> None:
+        try:
+            async with bounded_stdio_transport(
+                [sys.executable, str(FIXTURE_PATH.resolve()), "--workspace", str(tmp_path), "--mode", "root_exit_child"],
+                cwd=tmp_path,
+                env=_fixture_env(tmp_path),
+                shutdown_timeout=2.0,
+            ) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    await session.call_tool("read_value", {})
+        except Exception:
+            pass
+
+    anyio.run(scenario)
+
+    descendants = []
+    for name in ("child_ready", "grandchild_ready"):
+        marker = tmp_path / name
+        if marker.exists():
+            record = json.loads(marker.read_text(encoding="utf-8"))
+            try:
+                descendants.append(psutil.Process(record["pid"]))
+            except psutil.NoSuchProcess:
+                pass
+    if descendants:
+        _, alive = psutil.wait_procs(descendants, timeout=5)
+        assert not alive, f"Descendant processes remained alive after transport exit: {alive}"
