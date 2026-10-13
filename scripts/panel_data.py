@@ -332,6 +332,8 @@ def doctor_snapshot(
         add("Runtime health", "warning", reason_text)
     elif health_status == "healthy":
         add("Runtime health", "ok", "runtime health is healthy")
+    elif health_status == "stale":
+        add("Runtime health", "warning", "runtime health snapshot is stale; live claims are unavailable")
     else:
         add("Runtime health", "pending", "runtime health snapshot is not available yet")
 

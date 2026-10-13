@@ -141,8 +141,14 @@ async def collect_server_health(
         if extension_manager is not None else empty_extension_health()
     )
     extensions["enabled"] = settings.extensions_enabled or extension_manager is not None
+    config_error = getattr(server, "extension_config_error_code", None) if extensions["enabled"] else None
+    extensions["config_error_code"] = (
+        config_error if config_error in {"config_invalid", "config_version_unsupported"} else "config_invalid" if config_error else None
+    )
     resource_usage = resources.pop("budgets")
     degraded_reasons: list[str] = []
+    if extensions["config_error_code"]:
+        degraded_reasons.append("extension_config_invalid")
     if int(operation_recovery["uncertain_count"]) > 0:
         degraded_reasons.append("operation_recovery_uncertain")
     if int(operation_recovery["pending_count"]) > 0:

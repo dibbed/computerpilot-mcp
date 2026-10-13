@@ -279,6 +279,97 @@ def test_heartbeat_publishes_one_complete_bounded_snapshot(tmp_path: Any, monkey
     assert calls == 1
 
 
+def test_startup_revalidates_changed_config_despite_native_doctor_cache_and_never_spawns_disabled(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from core import heartbeat
+    from core.extensions import transport
+    from core.health_snapshot import collect_server_health
+    from scripts import doctor
+
+    config = tmp_path / "outside-native-root" / "extensions.json"
+    config.parent.mkdir()
+    native_root = tmp_path / "native"
+    (native_root / ".agent_state").mkdir(parents=True)
+    monkeypatch.setattr(doctor.sysconfig, "get_paths", lambda: {"purelib": str(tmp_path / "site")})
+    monkeypatch.setenv("MCP_EXTENSIONS_CONFIG", str(config))
+    for name in ("MCP_LIFECYCLE_CONTROL_FILE", "MCP_LIFECYCLE_STATUS_FILE", "MCP_HEARTBEAT_FILE", "MCP_TOOL_ACTIVITY_FILE",
+                 "MCP_RUNTIME_HEALTH_FILE", "MCP_RUNTIME_GENERATION_ID"):
+        monkeypatch.delenv(name, raising=False)
+    settings = replace(heartbeat.SETTINGS, state_dir=tmp_path / "state", extensions_enabled=True, extensions_config=str(config))
+    monkeypatch.setattr(heartbeat, "SETTINGS", settings)
+    for name in ("schedule_artifact_retention", "schedule_job_history_retention", "schedule_workflow_history_retention"):
+        monkeypatch.setattr(heartbeat, name, lambda **kwargs: None)
+    monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("disabled or invalid configuration spawned a provider")
+
+    spawn = MagicMock(side_effect=forbidden)
+    monkeypatch.setattr(transport, "spawn_owned_process", spawn)
+    store = MagicMock()
+    store.health_summary.return_value = dict.fromkeys((
+        "unresolved_operation_count", "workflow_db_bytes", "workflow_total", "workflow_operation_total", "workflow_event_total",
+        "active_workflow_leases", "queued_workflows", "running_workflows", "uncertain_workflows", "unresolved_workflow_operations",
+    ), 0)
+    store.list.return_value = {"items": [], "total_count": 0}
+    recovery = MagicMock()
+    recovery.summary.return_value = {"uncertain_count": 0, "pending_count": 0}
+
+    class Browser:
+        async def stats(self) -> dict[str, int]:
+            return {}
+
+    class Server:
+        extension_manager = None
+
+        extension_config_error_code: str | None = None
+
+        async def list_tools(self) -> list[Any]:
+            return [SimpleNamespace(name="native_read")]
+
+    config.write_text('{"schema_version":1,"extensions":[]}', encoding="utf-8")
+    fingerprint = doctor.fingerprint(native_root, "local-http", "full")
+    (native_root / ".agent_state/startup-validation.json").write_text(json.dumps({
+        "version": 1, "fingerprint": fingerprint, "ok": True,
+    }), encoding="utf-8")
+    template, _, _ = admitted_call({"type": "object"}, types.CallToolResult(content=[]))
+    owner = template.get_owner("security-fixture")
+    assert owner is not None
+    disabled = owner.definition.model_copy(update={"enabled": False, "working_directory": str(tmp_path),
+                                                  "command": sys.executable}).model_dump(mode="json")
+
+    async def scenario() -> None:
+        server = Server()
+        for contents, enabled, expected in [
+            ('{"schema_version":1,"extensions":[]}', True, None),
+            (json.dumps({"schema_version": 1, "extensions": [disabled]}), True, None),
+            ('{"schema_version":1,"secret":"private-config-canary"}', True, "config_invalid"),
+            ('{"schema_version":2,"extensions":[]}', True, "config_version_unsupported"),
+            ("private-config-canary invalid", False, None),
+        ]:
+            config.write_text(contents, encoding="utf-8")
+            assert doctor.cache_matches(native_root, doctor.fingerprint(native_root, "local-http", "full"))
+            current = replace(settings, extensions_enabled=enabled)
+            monkeypatch.setattr(heartbeat, "SETTINGS", current)
+            async with heartbeat.lifespan(server):
+                await anyio.sleep(0.02)
+                assert server.extension_config_error_code == expected
+                health = await collect_server_health(server, settings=current, browser_manager=Browser(), recovery=recovery,
+                                                     resource_collector=lambda _: {"budgets": {}}, workflow_store_factory=lambda _: store)
+                assert health["extensions"]["config_error_code"] == expected
+                assert health["extensions"]["live_count"] == health["extensions"]["eligible_tool_count"] == 0
+                assert health["tool_count"] == 1 and health["health_status"] == ("degraded" if expected else "healthy")
+                assert "private-config-canary" not in json.dumps(health)
+        spawn.assert_not_called()
+
+    anyio.run(scenario)
+
+
 def test_call_observation_and_persisted_audit_exclude_payload_canaries(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     from core import audit, timings
     from core.audit import AuditPolicy, AuditWriter

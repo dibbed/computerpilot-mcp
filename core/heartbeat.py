@@ -81,12 +81,18 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     )
     maintenance_task = asyncio.create_task(maintain_state())
     extension_manager: Any = getattr(server, "extension_manager", None)
+    config_owned_manager = False
+    if hasattr(server, "__dict__"):
+        server.extension_config_error_code = None
     if extension_manager is None and SETTINGS.extensions_enabled:
         from core.extensions.config import load_extension_config
         from core.extensions.manager import ExtensionLifecycleManager
 
         config_res = load_extension_config(settings=SETTINGS)
+        if hasattr(server, "__dict__"):
+            server.extension_config_error_code = config_res.error_code
         if config_res.config.extensions:
+            config_owned_manager = True
             extension_manager = ExtensionLifecycleManager()
             for ext_def in config_res.config.extensions:
                 extension_manager.register_extension(ext_def)
@@ -134,3 +140,6 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
         OPERATION_RECOVERY.configure(None, None)
         RUNTIME_LIFECYCLE.configure(None, None)
         TOOL_ACTIVITY.configure(None, None)
+        if config_owned_manager and hasattr(server, "__dict__"):
+            # A reused server must validate current configuration on its next startup.
+            server.extension_manager = None
