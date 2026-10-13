@@ -6,6 +6,8 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-13
+
 ### Added
 - 2026-10-13: Record finite per-owner 64-call outcome and latency windows, separating uncertain mutations from failures, and publish metadata-only external-call audit records through the existing bounded writer.
 - 2026-10-13: Add a bounded in-memory extension owner/catalog health projection to the shared runtime collector, with generation, safe counts, UTC update/success/error times and monotonic state ages; disabled and policy-blocked definitions remain neutral.
