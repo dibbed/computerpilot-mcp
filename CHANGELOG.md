@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Added
+- 2026-10-13: Add the external.mcp route value and bounded immutable operator-policy provenance while preserving native route serialization and the deterministic-v1 policy.
 - 2026-10-12: Add the contributor execution contract, native/extension authoring and testing standards, and the local extensibility execution ledger.
 - 2026-10-12: Add strict immutable extension definitions, exact namespaces, a bounded opt-in offline configuration reader and private minimal env-only credential references; provider activation remains gated.
 - 2026-10-12: Add isolated local MCP fixtures for protocol, catalog, cancellation, lost-response and owned process-tree tests; keep extensions disabled in both CI matrices.

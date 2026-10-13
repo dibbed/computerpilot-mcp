@@ -29,6 +29,7 @@ def test_execution_models_have_stable_values_and_normalize_intent() -> None:
         "semantic.windows_uia",
         "visual.desktop",
         "raw.desktop",
+        "external.mcp",
     ]
     assert [item.value for item in models.RiskClass] == ["low", "medium", "high"]
     assert [item.value for item in models.RecoverabilityClass] == ["weak", "medium", "strong"]
