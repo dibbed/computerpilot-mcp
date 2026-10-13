@@ -246,7 +246,7 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 
 <nav class="section-nav" aria-label="Section navigation">
 <div class="section-nav-list">
-<a href="#overview">Overview</a><a href="#runtime">Runtime</a><a href="#transport">Transport</a><a href="#resources">Resources</a><a href="#routing">Routing</a><a href="#work">Work</a><a href="#recovery">Recovery</a><a href="#state-config">State &amp; Config</a><a href="#diagnostics">Diagnostics</a>
+<a href="#overview">Overview</a><a href="#runtime">Runtime</a><a href="#transport">Transport</a><a href="#resources">Resources</a><a href="#routing">Routing</a><a href="#extensions">Extensions</a><a href="#work">Work</a><a href="#recovery">Recovery</a><a href="#state-config">State &amp; Config</a><a href="#diagnostics">Diagnostics</a>
 </div>
 </nav>
 
@@ -424,6 +424,24 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 <div class="panel-head"><div><h2>Runtime Processes</h2><div class="panel-note">Click a runtime-owned process for CPU, memory, thread, I/O and command metadata.</div></div><span id="processSummary" class="pill">0 processes</span></div>
 <div class="table-wrap"><table><thead><tr><th>Role</th><th>Name</th><th>PID</th><th>Status</th><th>RAM</th><th>Started</th></tr></thead><tbody id="processRows"></tbody></table></div>
 <div id="processDetail" class="meta-grid" style="margin-top:10px"><div class="empty" style="grid-column:1/-1">Select a process to inspect it.</div></div>
+</section>
+
+<div id="extensions" class="section-anchor"><span>Extensions</span></div>
+<section class="panel">
+<div class="panel-head"><div><h2>Extensions / External MCPs</h2><div class="panel-note">External MCP providers, capability inventory, lifecycle states and call observability. Read-only.</div></div><span id="extensionsPill" class="pill">Pending</span></div>
+<div class="meta-grid">
+<div class="meta"><span>Status</span><strong id="extStatus">—</strong></div>
+<div class="meta"><span>Configured</span><strong id="extConfigured" class="mono">0</strong></div>
+<div class="meta"><span>Live / Routable</span><strong id="extLiveRoutable" class="mono">0 / 0</strong></div>
+<div class="meta"><span>Eligible Tools</span><strong id="extEligibleTools" class="mono">0</strong></div>
+<div class="meta"><span>Catalog Generation</span><strong id="extCatalogGen" class="mono">0</strong></div>
+<div class="meta"><span>Snapshot Status</span><strong id="extSnapshotStatus">—</strong></div>
+<div class="meta"><span>Observed At</span><strong id="extObservedAt">—</strong></div>
+<div class="meta"><span>Config Error</span><strong id="extConfigError">—</strong></div>
+</div>
+<div class="section-title">Registered Extensions</div>
+<div class="table-wrap"><table><thead><tr><th>Extension ID</th><th>Provider</th><th>State</th><th>Trust</th><th>Tools (D/A/E)</th><th>Owner Gen</th><th>Age</th><th>Calls (S/F/U)</th><th>Last Error</th></tr></thead><tbody id="extensionRows"></tbody></table></div>
+<div id="extensionEmpty" class="panel-note" style="margin-top:12px;display:none">No extensions configured or enabled.</div>
 </section>
 
 <div id="work" class="section-anchor"><span>Work</span></div>
@@ -874,6 +892,94 @@ async function openWorkflow(id){
   }catch(e){box.replaceChildren();const m=document.createElement('div');m.className='empty';m.textContent='Unable to load workflow checkpoints.';box.append(m)}
 }
 
+function extStateTone(state){
+  const s=String(state||'').toLowerCase();
+  if(['healthy','live'].includes(s))return'ok';
+  if(['degraded','stale','starting'].includes(s))return'warn';
+  if(['failed','unreachable','bad','error'].includes(s))return'bad';
+  return'';
+}
+
+function renderExtensions(d){
+  if(!d)return;
+  const pillNode=$('extensionsPill');
+  const isEnabled=Boolean(d.enabled);
+  const totalItems=(d.items||[]).length;
+
+  if(!isEnabled){
+    pill(pillNode,'Disabled','');
+    $('extStatus').textContent='Disabled';
+    $('extConfigured').textContent=fmtNum(d.configured_count||0);
+    $('extLiveRoutable').textContent='0 / 0';
+    $('extEligibleTools').textContent='0';
+    $('extCatalogGen').textContent=fmtNum(d.catalog_generation||0);
+    $('extSnapshotStatus').textContent=safe(d.snapshot_status);
+    $('extObservedAt').textContent=d.observed_at?iso(d.observed_at):'—';
+    $('extConfigError').textContent=d.config_error_code?String(d.config_error_code):'None';
+    const body=$('extensionRows');
+    body.replaceChildren();
+    emptyRow(body,9,'Extensions are disabled by configuration.');
+    $('extensionEmpty').style.display='block';
+    $('extensionEmpty').textContent='Extensions are disabled by configuration (MCP_EXTENSIONS_ENABLED=0).';
+    return;
+  }
+
+  const statusText=String(d.status||'healthy');
+  const t=extStateTone(statusText);
+  pill(pillNode,statusText.toUpperCase(),t);
+
+  $('extStatus').textContent=statusText;
+  $('extConfigured').textContent=fmtNum(d.configured_count||0);
+  const liveCount=Number(d.live_count||0);
+  const routableCount=(d.items||[]).filter(x=>x.routable).length;
+  $('extLiveRoutable').textContent=fmtNum(liveCount)+' / '+fmtNum(routableCount);
+  $('extEligibleTools').textContent=fmtNum(d.eligible_tool_count||0);
+  $('extCatalogGen').textContent=fmtNum(d.catalog_generation||0);
+  $('extSnapshotStatus').textContent=safe(d.snapshot_status);
+  $('extObservedAt').textContent=d.observed_at?iso(d.observed_at):'—';
+  $('extConfigError').textContent=d.config_error_code?String(d.config_error_code):'None';
+
+  const body=$('extensionRows');
+  body.replaceChildren();
+  if(!totalItems){
+    emptyRow(body,9,'No extensions configured.');
+    $('extensionEmpty').style.display='block';
+    $('extensionEmpty').textContent='No extensions configured.';
+    return;
+  }
+  $('extensionEmpty').style.display='none';
+
+  for(const x of d.items||[]){
+    const tr=document.createElement('tr');
+    cell(tr,x.extension_id||'—','mono');
+    cell(tr,x.provider||'—');
+    const stTd=document.createElement('td');
+    const stBadge=document.createElement('span');
+    stBadge.className='pill '+extStateTone(x.state);
+    stBadge.textContent=safe(x.state);
+    stTd.append(stBadge);
+    tr.append(stTd);
+    cell(tr,x.trust_class||'—');
+    cell(tr,fmtNum(x.discovered_tool_count)+' / '+fmtNum(x.approved_tool_count)+' / '+fmtNum(x.eligible_tool_count),'mono');
+    cell(tr,fmtNum(x.owner_generation),'mono');
+    cell(tr,x.state_age_sec!==null&&x.state_age_sec!==undefined?duration(x.state_age_sec):'—');
+    const calls=x.calls||{};
+    cell(tr,fmtNum(calls.succeeded||0)+' / '+fmtNum(calls.failed||0)+' / '+fmtNum(calls.uncertain||0),'mono');
+    const errTd=document.createElement('td');
+    if(x.last_error_code){
+      const errBadge=document.createElement('span');
+      errBadge.className='pill bad';
+      errBadge.textContent=String(x.last_error_code);
+      errTd.append(errBadge);
+    }else{
+      errTd.textContent='None';
+      errTd.className='muted';
+    }
+    tr.append(errTd);
+    body.append(tr);
+  }
+}
+
 function renderWorkflows(d){
   const body=$('workflowRows');body.replaceChildren();
   for(const w of d.items||[]){const tr=document.createElement('tr');tr.className='clickable';tr.tabIndex=0;tr.setAttribute('role','button');tr.onclick=()=>openWorkflow(w.workflow_id);tr.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openWorkflow(w.workflow_id)}};cell(tr,String(w.workflow_id||'').slice(0,10)+'…','mono');cell(tr,w.state);cell(tr,w.current_step,'mono');cell(tr,w.version,'mono');cell(tr,iso(w.updated_at));body.append(tr)}
@@ -1006,13 +1112,14 @@ async function refreshInsights(){if(panelApiMode!=='modern')return;try{renderIns
 async function refreshEvents(){try{renderEvents(await getJson(panelApiMode==='modern'?'/api/events':'/api/status',panelApiMode==='modern'))}catch(e){$('eventCounter').textContent='Events temporarily unavailable.'}}
 async function refreshSecondary(){
   if(panelApiMode!=='modern')return;
-  const [th,a,w,r,c,d]=await Promise.allSettled([getJson('/api/transport/history?limit=100'),getJson('/api/audit?limit=200'),getJson('/api/workflows'),getJson('/api/recovery'),getJson('/api/config'),getJson('/api/doctor')]);
+  const [th,a,w,r,c,d,ext]=await Promise.allSettled([getJson('/api/transport/history?limit=100'),getJson('/api/audit?limit=200'),getJson('/api/workflows'),getJson('/api/recovery'),getJson('/api/config'),getJson('/api/doctor'),getJson('/api/extensions')]);
   if(th.status==='fulfilled')renderTransportHistory(th.value);else pill($('transportHistoryPill'),'Unavailable','warn');
   if(a.status==='fulfilled')renderAudit(a.value);else pill($('auditPill'),'Unavailable','warn');
   if(w.status==='fulfilled')renderWorkflows(w.value);else pill($('workflowPill'),'Unavailable','warn');
   if(r.status==='fulfilled')renderRecovery(r.value);else pill($('recoveryPill'),'Unavailable','warn');
   if(c.status==='fulfilled')renderConfig(c.value);
-  if(d.status==='fulfilled')renderDoctor(d.value);else pill($('doctorPill'),'Unavailable','warn')
+  if(d.status==='fulfilled')renderDoctor(d.value);else pill($('doctorPill'),'Unavailable','warn');
+  if(ext.status==='fulfilled')renderExtensions(ext.value);else pill($('extensionsPill'),'Unavailable','warn');
 }
 async function refreshAll(manual=false){
   if(stopped)return;

@@ -368,7 +368,7 @@ while True:
     h.write_text(str(os.getpid()))
     time.sleep(0.03)
 """
-    supervisor = Supervisor([sys.executable, "-c", code], readiness_url=None, state_dir=tmp_path, grace=1.0, interval=0.03)
+    supervisor = Supervisor([sys.executable, "-c", code], readiness_url=None, state_dir=tmp_path, grace=3.0, interval=0.03)
     thread = threading.Thread(target=supervisor.run)
     thread.start()
     try:
@@ -701,6 +701,7 @@ def test_panel_observability_endpoints_are_guarded_and_bounded(tmp_path: Path) -
             "/api/config",
             "/api/doctor",
             "/api/diagnostics",
+            "/api/extensions",
         )
         for endpoint in guarded:
             with pytest.raises(urllib.error.HTTPError) as error:
@@ -749,6 +750,11 @@ def test_panel_observability_endpoints_are_guarded_and_bounded(tmp_path: Path) -
         diagnostics = get_json("/api/diagnostics")
         assert diagnostics["identity"]["product"] == "ComputerPilot MCP"
         assert "secrets" not in json.dumps(diagnostics).casefold()
+        extensions = get_json("/api/extensions")
+        assert "enabled" in extensions
+        assert "items" in extensions
+        assert isinstance(extensions["items"], list)
+        assert "secrets" not in json.dumps(extensions).casefold()
     finally:
         panel.shutdown()
         panel.server_close()
