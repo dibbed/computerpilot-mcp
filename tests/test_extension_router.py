@@ -358,3 +358,54 @@ def test_external_ties_are_stable_and_reasons_never_copy_raw_provider_descriptio
     assert results[0]["truncated"]
     assert "RAW_UNTRUSTED_PROVIDER_INSTRUCTION" not in json.dumps(results)
     session.send_request.assert_not_awaited()
+
+
+def test_metrics_use_a_bounded_external_family_and_preserve_zero_extension_keys() -> None:
+    from core.execution_models import ExecutionIntent
+    from core.router_metrics import RouterMetrics
+
+    metrics = RouterMetrics(max_recent=2)
+    assert "external" not in metrics.snapshot()["usage"]
+    _, manager, _ = routing_fixture("operator.read")
+    router = routed(manager)
+    router.metrics = metrics
+    for _ in range(3):
+        router.recommend(ExecutionIntent("operator.read"))
+    snapshot = metrics.snapshot()
+    assert snapshot["usage"]["external"] == 3 and snapshot["usage"]["other"] == 0
+    assert snapshot["route_distribution"] == {"external.mcp": 3}
+    assert len(snapshot["recent_decisions"]) == 2
+
+
+def test_discovery_metadata_is_consistent_with_advisory_routes_and_cannot_expand_workflow_execution() -> None:
+    import anyio
+    from mcp import types
+
+    from core.errors import ToolError
+    from core.extensions.bridge import ExtensionMCPServer
+    from core.registry import create_server
+    from core.workflow_actions import execute_action
+
+    _, manager, session = routing_fixture("operator.read")
+    descriptor = manager.list_tools()[0]
+    server = create_server()
+    assert isinstance(server, ExtensionMCPServer)
+    server.extension_manager = manager
+
+    async def scenario() -> None:
+        recommendation = await server.call_tool("recommend_tools", {"query": descriptor.public_name})
+        assert isinstance(recommendation, types.CallToolResult) and recommendation.structured_content is not None
+        item = next(item for item in recommendation.structured_content["items"] if item["name"] == descriptor.public_name)
+        assert item["execution"]["route"] == "external.mcp"
+        assert item["execution"]["determinism"] == descriptor.policy.determinism
+        assert item["execution"]["risk_class"] == descriptor.policy.risk_class.value
+        assert not any(tool.name == "execution_run" for tool in await server.list_tools())
+        manager.registry.retire_extension_catalog(descriptor.extension_id)
+        after = await server.call_tool("recommend_tools", {"query": descriptor.public_name})
+        assert isinstance(after, types.CallToolResult) and after.structured_content is not None
+        assert not any(item["name"] == descriptor.public_name for item in after.structured_content["items"])
+
+    anyio.run(scenario)
+    with pytest.raises(ToolError, match="not allowlisted"):
+        execute_action(descriptor.public_name, {}, 1)
+    session.send_request.assert_not_awaited()

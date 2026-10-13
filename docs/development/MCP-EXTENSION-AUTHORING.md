@@ -119,6 +119,10 @@ The existing Router may add `external.mcp` candidates for exact reviewed symboli
 
 For example, reviewed mapping `github.issue.create` may recommend `external.github.create_issue` after the tool is actually discovered/allowed. The caller then invokes that typed tool separately. Natural language prose cannot create authority. Recommendation does not dispatch, grant permission, execute a browser fallback, or add arbitrary external workflow actions.
 
+`execution_recommend` and `execution_candidates` project one eligibility snapshot per request. External results attribute `source_type`, `extension_id`, `provider`, `catalog_generation` and `classification_source="operator_policy"`; their confidence/cost/latency are reviewed estimates. For a discovered approved read-only tool mapped to `operator.read`, invoke `execution_recommend` with `{"intent":"operator.read"}` and then call the returned typed tool separately. A stale, denied or unavailable candidate is explained but cannot be selected.
+
+`recommend_tools` attaches the same operator execution metadata only while that listed generation remains eligible. Router metrics aggregate `external.mcp` under `usage.external`; provider identities never become metric labels. With no external decisions, native metric keys stay unchanged. Visual desktop routing remains unavailable until v0.9.0, and workflow execution remains limited to its existing native typed action allowlist.
+
 ## Core result and output contract
 
 Every approved external tool advertises the Core `ExtensionResult` envelope, with:

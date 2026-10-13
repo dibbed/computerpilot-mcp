@@ -35,6 +35,8 @@ class RouterMetrics:
             return "raw"
         if route == "visual.desktop":
             return "visual"
+        if route == "external.mcp":
+            return "external"
         return "other"
 
     def record(
@@ -90,6 +92,7 @@ class RouterMetrics:
                     "raw": self._usage.get("raw", 0),
                     "visual": self._usage.get("visual", 0),
                     "other": self._usage.get("other", 0),
+                    **({"external": self._usage["external"]} if self._usage.get("external", 0) else {}),
                 },
                 "latency_ms": {
                     "average": (self._latency_total_ms / count) if count else 0.0,

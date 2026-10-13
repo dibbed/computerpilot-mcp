@@ -9,7 +9,7 @@ from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict
 
 from core.config import SETTINGS, ensure_runtime_dirs
-from core.execution_models import ExecutionIntent
+from core.execution_models import ExecutionIntent, ExternalRouteMetadata
 from core.execution_router import ExecutionRouter
 from core.extensions.bridge import ExtensionMCPServer
 from core.health_snapshot import collect_server_health
@@ -18,7 +18,7 @@ from core.platform import available_domains, detect_capabilities
 from core.recovery import OPERATION_RECOVERY
 from core.resource_health import collect_resource_metrics
 from core.timings import ToolRequestTimingMiddleware, install_sdk_timing_hooks
-from core.tool_catalog import tool_execution_metadata
+from core.tool_catalog import ToolExecutionMetadata, external_tool_execution_metadata, tool_execution_metadata
 from core.tool_profiles import ALL_DOMAINS, PREFERRED_USE, PROFILE_DOMAINS, resolve_profile
 from core.tooling import READ_ONLY, compact_errors
 from core.workflow_store import workflow_store
@@ -123,19 +123,31 @@ def create_server() -> MCPServer:
             raise ValueError("query must not be empty")
         bounded_limit = min(max(limit, 1), 25)
         terms = set(normalized.replace("_", " ").split())
-        scored: list[tuple[int, str, str, str | None, dict[str, Any]]] = []
+        scored: list[tuple[int, str, str, str | None, dict[str, Any], ToolExecutionMetadata | None]] = []
         for tool in await server.list_tools():
+            meta = tool.meta or {}
+            metadata = tool_execution_metadata(tool.name)
+            if meta.get("source_type") == "external_mcp":
+                manager = server.extension_manager
+                descriptor = manager.registry.get_tool(tool.name) if manager is not None else None
+                if (
+                    manager is None or descriptor is None or not manager.tool_eligibility(tool.name, profile.name).eligible
+                    or descriptor.catalog_generation != meta.get("catalog_generation")
+                ):
+                    continue
+                metadata = external_tool_execution_metadata(tool.name, descriptor.policy, ExternalRouteMetadata(
+                    descriptor.extension_id, descriptor.identity.provider, descriptor.catalog_generation,
+                ))
             haystack = f"{tool.name} {tool.description or ''} {PREFERRED_USE.get(tool.name, '')}".casefold()
             score = sum(3 if term in tool.name.casefold() else 1 for term in terms if term in haystack)
             if normalized in haystack:
                 score += 4
             if score:
-                meta = tool.meta or {}
                 attribution = {
                     key: meta[key] for key in ("source_type", "extension_id", "provider", "domain", "catalog_generation")
                     if key in meta
                 } if meta.get("source_type") == "external_mcp" else {}
-                scored.append((score, tool.name, tool.description or "", PREFERRED_USE.get(tool.name), attribution))
+                scored.append((score, tool.name, tool.description or "", PREFERRED_USE.get(tool.name), attribution, metadata))
         scored.sort(key=lambda item: (-item[0], item[1]))
         return {
             "ok": True,
@@ -155,11 +167,11 @@ def create_server() -> MCPServer:
                                 "recoverability": metadata.recoverability.value,
                             }
                         }
-                        if (metadata := tool_execution_metadata(name)) is not None
+                        if metadata is not None
                         else {}
                     ),
                 }
-                for _, name, description, guidance, attribution in scored[:bounded_limit]
+                for _, name, description, guidance, attribution, metadata in scored[:bounded_limit]
             ],
             "count": min(len(scored), bounded_limit),
             "total_matches": len(scored),

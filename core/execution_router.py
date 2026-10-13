@@ -67,7 +67,7 @@ class ExecutionRouter:
     def _hard_rejection(intent: ExecutionIntent, candidate: RouteCandidate) -> tuple[str, str] | None:
         route = candidate.route
         if route is RouteClass.VISUAL_DESKTOP:
-            return "visual_route_unavailable", "visual desktop routing is reserved for v0.8.0"
+            return "visual_route_unavailable", "visual desktop routing is deferred to v0.9.0"
         if intent.semantic_stale and route in {
             RouteClass.SEMANTIC_BROWSER,
             RouteClass.SEMANTIC_WINDOWS_UIA,
