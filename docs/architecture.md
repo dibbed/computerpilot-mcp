@@ -224,3 +224,18 @@ Project memory is advisory data, not execution authority or a policy override.
 Health/status paths are designed to remain lighter than the workloads they observe. Runtime resource budgets cover browser sessions, jobs, caches, artifacts, backups, audit files, and history retention.
 
 See [Configuration](configuration.md) for the exposed budget controls.
+
+## External MCP extensions (v0.8)
+
+ComputerPilot MCP v0.8 adds an extensibility and agent foundation enabling operators to attach external MCP servers over local bounded stdio.
+
+### Key architecture boundaries
+
+- **Lifecycle & Process Ownership**: A single `ExtensionLifecycleManager` manages configured providers. Each external provider process is entered and exited by exactly one connection owner task (`bounded_stdio_transport`). Native process ownership is strictly enforced: Windows Job Objects prevent child/grandchild process leaks, and POSIX process groups enforce tree termination. Abrupt root exits reap the entire process tree.
+- **Catalog Discovery & Generations**: Discovery reads external tools via `MCPServer.list_tools` overrides without invoking provider RPC or spawning processes during registration, `--check`, or listing. Discovered tool catalogs are tracked by `CatalogGenerationTracker` with monotonic generation numbers. Provider schemas are validated against a strict offline subset (no network, depth/complexity bounded); the first accepted schema fingerprint is frozen across reconnects.
+- **Execution Boundary & Isolation**: External calls execute via `ExtensionLifecycleManager.execute_guarded_call` with immutable admission leases. All calls return the standard Core `ExtensionResult` envelope (`ok`, `source_type='external_mcp'`, `extension_id`, `provider`, `tool`, `outcome`, `content`, `structured_content`, `truncated`, `limits`, `artifact`, `error`, `message`). Large outputs produce bounded previews with optional sanitized artifacts; credentials and split-stream leaks are scrubbed before any sink.
+- **Mutation Durability & Uncertainty**: Trusted mutating tools operate under a two-stage checkpoint journal (`prepared` -> `may_dispatch`) using schema-1 operation journals. Unresolved external operations are bounded by quota (128 max). If a crash, timeout, or lost response occurs after `may_dispatch`, the operation is marked `uncertain` with no automatic replay. Manual resolution is supported via inspection and acknowledgement APIs.
+- **Advisory Routing**: The Adaptive Execution Router considers `external.mcp` candidates when operator intent mappings match, bounding determinism at 4 and prioritizing native determinism 5 on ties. Router recommendations remain strictly advisory.
+- **Observability**: Health and loopback panel projections read cached state with zero provider RPC. Bounded telemetry tracks the last 64 call outcomes per owner without per-provider dynamic labels.
+
+For authoring and contract details, see [External MCP extension authoring](development/MCP-EXTENSION-AUTHORING.md) and [Configuration](configuration.md).

@@ -288,3 +288,12 @@ Detailed panel endpoints are control-token guarded. The panel is intended for lo
 `server_health` reports runtime/platform capability state plus resource/job/browser/workflow/recovery summaries and a bounded in-memory `execution_router` snapshot with policy, route distribution, fallback/no-route/rejection counts, native/semantic/raw usage, latency, and recent decisions.
 
 Use health metadata for diagnostics, not as a substitute for validating the external effect you care about.
+
+## External MCP extensions (v0.8)
+
+When enabled, configured external MCP tools are registered directly on the server surface alongside native tools:
+
+- **Naming convention**: Tools use the namespaced pattern `external.<extension_id>.<remote_tool_name>` (e.g., `external.fixture.read_value`).
+- **Profile eligibility**: External tools must belong to the active profile (`MCP_TOOL_PROFILE`). In `minimal`, only approved read-only external tools are allowed. In `full`, tools require explicit profile assignment in their operator configuration.
+- **Output format**: External tool invocations return the standard Core `ExtensionResult` structure with `ok`, `source_type="external_mcp"`, `extension_id`, `provider`, `tool`, `outcome`, `content`, `structured_content`, `truncated`, `limits`, `artifact`, `error`, and `message`.
+- **Advisory routing**: The execution router integrates external tools via `external.mcp` candidates when operator intent mappings match. Determinism is capped at 4, preserving native priority on ties. Router recommendations are advisory and do not execute external tools automatically.

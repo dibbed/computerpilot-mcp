@@ -39,6 +39,14 @@ Depending on the active tool profile and platform, an authorized MCP client may 
 - inspect system metadata;
 - use Windows native input/UI Automation.
 
+### External extensions trust boundaries
+
+When external extensions are enabled (`MCP_EXTENSIONS_ENABLED=true`), reviewed provider executables run with the permissions of the OS user running the server.
+
+- **Not an OS sandbox**: Trust classes, environment filtering, and process group / Job Object ownership restrict communication channels and manage process trees, but they do not provide an OS-level sandbox.
+- **Environment isolation**: Providers receive a minimal private environment. Full parent environments, wildcards, and arbitrary paths are not passed. Credential references are resolved in private memory and scrubbed before logs, audits, health snapshots, and artifacts.
+- See [Extension authoring contracts](docs/development/MCP-EXTENSION-AUTHORING.md) and [Agent contract](AGENTS.md) for full trust policy definitions.
+
 Run it only under an account whose local permissions match the access you intend to grant.
 
 ## Network exposure
