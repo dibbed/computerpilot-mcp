@@ -7,6 +7,8 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Added
+- 2026-10-13: Project exact operator-mapped external intents into advisory routing through shared live eligibility, with bounded safe rejection reasons and generation attribution.
+- 2026-10-13: Add the external.mcp route value and bounded immutable operator-policy provenance while preserving native route serialization and the deterministic-v1 policy.
 - 2026-10-12: Add the contributor execution contract, native/extension authoring and testing standards, and the local extensibility execution ledger.
 - 2026-10-12: Add strict immutable extension definitions, exact namespaces, a bounded opt-in offline configuration reader and private minimal env-only credential references; provider activation remains gated.
 - 2026-10-12: Add isolated local MCP fixtures for protocol, catalog, cancellation, lost-response and owned process-tree tests; keep extensions disabled in both CI matrices.
@@ -17,9 +19,12 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Coalesce provider catalog refresh and public modern/legacy change notifications, preserving runtime schema fingerprints and monotonic catalog generations.
 
 ### Changed
+- 2026-10-13: Keep external discovery execution metadata consistent with eligible router policy, aggregate external routing metrics without provider labels, and defer visual routing to v0.9.0.
+- 2026-10-13: Use one live candidate snapshot for routing decisions and explanations, preserving deterministic-v1 ordering and identifying external scores as operator policy estimates.
 - 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.
 
 ### Fixed
+- 2026-10-13: Reject diagnostic all and unknown execution profiles at the shared extension guard, and retain legacy connection exposure limits in router recommendations.
 - 2026-10-13: Validate real HTTP catalog changes by relisting after notifications until the requested state, tolerating earlier startup notifications within the same bounded deadline; separately prove SDK cache invalidation with a public positive-TTL fixture while preserving production TTL0.
 - 2026-10-13: Honor positive finite startup/handshake/discovery/call deadlines and operator/Core ceilings in direct extension calls as well as public calls, including admission queue time.
 - 2026-10-13: Interrupt live extension owners on STOP/RESTART, release startup slots after discovery, revalidate queued launches and reconnect lost transports under the finite budget without replaying calls; verify real stdio/modern HTTP entrypoints and native-only legacy stateless HTTP.

@@ -50,6 +50,10 @@ class ExtensionMCPServer(MCPServer):
         middleware = [*kwargs.pop("middleware", ()), self.observe_client]
         super().__init__(*args, **kwargs, subscriptions=self.catalog_subscriptions, lifespan=managed_lifespan, middleware=middleware)
 
+    @property
+    def external_catalog_visible(self) -> bool:
+        return _EXTERNAL_VISIBLE.get()
+
     async def observe_client(self, ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
         visible = True
         if ctx.protocol_version < "2026-07-28":
@@ -91,7 +95,7 @@ class ExtensionMCPServer(MCPServer):
 
     def external_tools(self) -> list[types.Tool]:
         manager = self.extension_manager
-        if manager is None or not _EXTERNAL_VISIBLE.get():
+        if manager is None or not self.external_catalog_visible:
             return []
         tools: list[types.Tool] = []
         size = 0

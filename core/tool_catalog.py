@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from core.errors import ToolError
-from core.execution_models import RecoverabilityClass, RiskClass, RouteClass
+from core.execution_models import ExternalRouteMetadata, RecoverabilityClass, RiskClass, RouteClass
+
+if TYPE_CHECKING:
+    from core.extensions.models import ToolPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +21,17 @@ class ToolExecutionMetadata:
     risk: RiskClass
     recoverability: RecoverabilityClass
     preserves_macros: bool = False
+    external_metadata: ExternalRouteMetadata | None = None
+
+
+def external_tool_execution_metadata(
+    public_name: str, policy: ToolPolicy, provenance: ExternalRouteMetadata,
+) -> ToolExecutionMetadata:
+    return ToolExecutionMetadata(
+        name=public_name, domain=policy.domain, route=RouteClass.EXTERNAL_MCP,
+        determinism=policy.determinism, risk=policy.risk_class, recoverability=policy.recoverability,
+        external_metadata=provenance,
+    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.errors import ToolError
 from core.execution_models import ExecutionIntent, RecoverabilityClass, RiskClass, RouteCandidate, RouteClass, RouteDecision
 from core.platform import PlatformCapabilities
 from core.router_metrics import ROUTER_METRICS, RouterMetrics
 from core.tool_catalog import IntentRouteRule, intent_route_rules
+
+if TYPE_CHECKING:
+    from core.extensions.manager import ExtensionLifecycleManager
 
 ROUTER_POLICY_VERSION = "deterministic-v1"
 MAX_CANDIDATES = 25
@@ -36,12 +39,16 @@ class ExecutionRouter:
         policy_version: str = ROUTER_POLICY_VERSION,
         enabled: bool = True,
         metrics: RouterMetrics | None = None,
+        extension_manager: ExtensionLifecycleManager | None = None,
+        active_profile: str = "full",
     ) -> None:
         self.registered_tools = frozenset(registered_tools)
         self.capabilities = capabilities
         self.policy_version = policy_version.strip().casefold()
         self.enabled = enabled
         self.metrics = metrics or ROUTER_METRICS
+        self.extension_manager = extension_manager
+        self.active_profile = active_profile
 
     def _validate_policy(self) -> None:
         if not self.enabled:
@@ -60,7 +67,7 @@ class ExecutionRouter:
     def _hard_rejection(intent: ExecutionIntent, candidate: RouteCandidate) -> tuple[str, str] | None:
         route = candidate.route
         if route is RouteClass.VISUAL_DESKTOP:
-            return "visual_route_unavailable", "visual desktop routing is reserved for v0.8.0"
+            return "visual_route_unavailable", "visual desktop routing is deferred to v0.9.0"
         if intent.semantic_stale and route in {
             RouteClass.SEMANTIC_BROWSER,
             RouteClass.SEMANTIC_WINDOWS_UIA,
@@ -145,7 +152,24 @@ class ExecutionRouter:
         )
 
     def _all_candidates(self, intent: ExecutionIntent) -> list[RouteCandidate]:
-        items = [self._candidate(rule, intent) for rule in intent_route_rules(intent.name)]
+        external = list(self.extension_manager.routing_candidates(intent, self.active_profile)) if self.extension_manager else []
+        for index, candidate in enumerate(external):
+            if not candidate.supported:
+                continue
+            rejection = (
+                ("tool_unavailable", "external tool is absent from the current client catalog")
+                if candidate.representative_tool not in self.registered_tools else self._hard_rejection(intent, candidate)
+            )
+            if rejection is not None:
+                external[index] = replace(candidate, supported=False, rejection_code=rejection[0], reason=rejection[1])
+        try:
+            rules = intent_route_rules(intent.name)
+        except ToolError as error:
+            if error.code != "unknown_execution_intent" or not external:
+                raise
+            rules = ()
+        items = [self._candidate(rule, intent) for rule in rules]
+        items.extend(external)
         valid = sorted((item for item in items if item.supported), key=self._sort_key)
         rejected = sorted(
             (item for item in items if not item.supported),
@@ -160,8 +184,12 @@ class ExecutionRouter:
         max_candidates: int = 8,
     ) -> dict[str, Any]:
         self._validate_policy()
+        return self._candidate_response(intent, self._all_candidates(intent), max_candidates)
+
+    def _candidate_response(
+        self, intent: ExecutionIntent, all_candidates: list[RouteCandidate], max_candidates: int,
+    ) -> dict[str, Any]:
         bounded_limit = min(max(int(max_candidates), 1), MAX_CANDIDATES)
-        all_candidates = self._all_candidates(intent)
         returned = all_candidates[:bounded_limit]
         valid_count = sum(item.supported for item in all_candidates)
         return {
@@ -184,25 +212,29 @@ class ExecutionRouter:
         max_candidates: int = 8,
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        candidate_result = self.candidates(intent, max_candidates=max_candidates)
+        self._validate_policy()
         all_candidates = self._all_candidates(intent)
+        candidate_result = self._candidate_response(intent, all_candidates, max_candidates)
         valid = [candidate for candidate in all_candidates if candidate.supported]
         selected = valid[0] if valid else None
+        selection_reason = (
+            "highest deterministic valid route under deterministic-v1"
+            if selected is not None else "no valid route under current tool and capability snapshot"
+        )
+        if selected is not None and selected.external_metadata is not None:
+            selection_reason = "highest valid route under deterministic-v1 using operator policy estimates"
 
         decision = RouteDecision(
             intent=intent.name,
             selected_route=selected.route if selected else None,
             representative_tool=selected.representative_tool if selected else None,
             candidate_count=len(valid),
-            selection_reason=(
-                "highest deterministic valid route under deterministic-v1"
-                if selected is not None
-                else "no valid route under current tool and capability snapshot"
-            ),
+            selection_reason=selection_reason,
             fallback_level=selected.fallback_level if selected else None,
             capability_checks=selected.capability_checks if selected else (),
             risk=selected.risk if selected else None,
             router_policy_version=self.policy_version,
+            external_metadata=selected.external_metadata if selected is not None else None,
         )
         result = {"ok": selected is not None, **decision.as_dict()}
         if explain:

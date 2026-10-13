@@ -20,6 +20,7 @@ class RouteClass(str, Enum):
     SEMANTIC_WINDOWS_UIA = "semantic.windows_uia"
     VISUAL_DESKTOP = "visual.desktop"
     RAW_DESKTOP = "raw.desktop"
+    EXTERNAL_MCP = "external.mcp"
 
 
 class RiskClass(str, Enum):
@@ -32,6 +33,25 @@ class RecoverabilityClass(str, Enum):
     WEAK = "weak"
     MEDIUM = "medium"
     STRONG = "strong"
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalRouteMetadata:
+    extension_id: str
+    provider: str
+    catalog_generation: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.extension_id) <= 32 or not 1 <= len(self.provider) <= 64:
+            raise ValueError("external route identity exceeds its bounds")
+        if type(self.catalog_generation) is not int or self.catalog_generation < 0:
+            raise ValueError("external catalog generation must be a nonnegative integer")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source_type": "external_mcp", "extension_id": self.extension_id, "provider": self.provider,
+            "catalog_generation": self.catalog_generation, "classification_source": "operator_policy",
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +103,7 @@ class RouteCandidate:
     reason: str = ""
     rejection_code: str | None = None
     preserves_macros: bool = False
+    external_metadata: ExternalRouteMetadata | None = None
 
     def __post_init__(self) -> None:
         if not self.representative_tool or len(self.representative_tool) > 200:
@@ -97,6 +118,12 @@ class RouteCandidate:
                 raise ValueError(f"{name} must be between 1 and 5")
         if not 0 <= self.fallback_level <= 10:
             raise ValueError("fallback_level must be between 0 and 10")
+        if (self.route is RouteClass.EXTERNAL_MCP) != (self.external_metadata is not None):
+            raise ValueError("external route metadata must match the route class")
+        if self.route is RouteClass.EXTERNAL_MCP and self.determinism > 4:
+            raise ValueError("external route determinism must not exceed 4")
+        if self.supported and self.external_metadata is not None and self.external_metadata.catalog_generation == 0:
+            raise ValueError("a supported external route requires a live catalog generation")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -114,6 +141,7 @@ class RouteCandidate:
             "reason": self.reason,
             "rejection_code": self.rejection_code,
             "preserves_macros": self.preserves_macros,
+            **(self.external_metadata.as_dict() if self.external_metadata is not None else {}),
         }
 
 
@@ -128,6 +156,7 @@ class RouteDecision:
     capability_checks: tuple[str, ...]
     risk: RiskClass | None
     router_policy_version: str
+    external_metadata: ExternalRouteMetadata | None = None
 
     def __post_init__(self) -> None:
         if self.candidate_count < 0:
@@ -136,6 +165,10 @@ class RouteDecision:
             raise ValueError("fallback_level must be between 0 and 10")
         if not self.router_policy_version or len(self.router_policy_version) > 100:
             raise ValueError("router_policy_version must be between 1 and 100 characters")
+        if (self.selected_route is RouteClass.EXTERNAL_MCP) != (self.external_metadata is not None):
+            raise ValueError("external decision metadata must match the selected route")
+        if self.external_metadata is not None and self.external_metadata.catalog_generation == 0:
+            raise ValueError("a selected external route requires a live catalog generation")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -148,4 +181,5 @@ class RouteDecision:
             "capability_checks": list(self.capability_checks),
             "risk_class": self.risk.value if self.risk else None,
             "router_policy_version": self.router_policy_version,
+            **(self.external_metadata.as_dict() if self.external_metadata is not None else {}),
         }
