@@ -621,3 +621,116 @@ def process_details(pid: int, allowed_pids: set[int]) -> dict[str, Any] | None:
         return info
     except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         return None
+
+
+def extensions_snapshot(health: dict[str, Any] | None) -> dict[str, Any]:
+    """Return bounded safe read-only projection of extensions from runtime health."""
+
+    if not isinstance(health, dict):
+        return {
+            "enabled": False,
+            "status": "unavailable",
+            "snapshot_status": "unavailable",
+            "configured_count": 0,
+            "enabled_count": 0,
+            "healthy_count": 0,
+            "degraded_count": 0,
+            "failed_count": 0,
+            "unreachable_count": 0,
+            "disabled_count": 0,
+            "blocked_count": 0,
+            "live_count": 0,
+            "discovered_tool_count": 0,
+            "approved_tool_count": 0,
+            "eligible_tool_count": 0,
+            "unresolved_external_count": 0,
+            "catalog_generation": 0,
+            "observed_at": None,
+            "config_error_code": None,
+            "truncated": False,
+            "items": [],
+        }
+
+    ext = health.get("extensions")
+    if not isinstance(ext, dict):
+        return {
+            "enabled": False,
+            "status": "unavailable",
+            "snapshot_status": health.get("snapshot_status", "unavailable"),
+            "configured_count": 0,
+            "enabled_count": 0,
+            "healthy_count": 0,
+            "degraded_count": 0,
+            "failed_count": 0,
+            "unreachable_count": 0,
+            "disabled_count": 0,
+            "blocked_count": 0,
+            "live_count": 0,
+            "discovered_tool_count": 0,
+            "approved_tool_count": 0,
+            "eligible_tool_count": 0,
+            "unresolved_external_count": 0,
+            "catalog_generation": 0,
+            "observed_at": None,
+            "config_error_code": None,
+            "truncated": False,
+            "items": [],
+        }
+
+    snapshot_status = health.get("snapshot_status", "fresh")
+    items = ext.get("items")
+    safe_items: list[dict[str, Any]] = []
+    if isinstance(items, list):
+        for item in items[:128]:
+            if isinstance(item, dict):
+                safe_items.append({
+                    "extension_id": _safe_text(item.get("extension_id"), 64),
+                    "display_name": _safe_text(item.get("display_name"), 180),
+                    "provider": _safe_text(item.get("provider"), 64),
+                    "enabled": bool(item.get("enabled")),
+                    "state": _safe_text(item.get("state"), 32),
+                    "trust_class": _safe_text(item.get("trust_class"), 32),
+                    "live": bool(item.get("live")),
+                    "routable": bool(item.get("routable")),
+                    "blocked": bool(item.get("blocked")),
+                    "discovered_tool_count": int(item.get("discovered_tool_count", 0)),
+                    "approved_tool_count": int(item.get("approved_tool_count", 0)),
+                    "eligible_tool_count": int(item.get("eligible_tool_count", 0)),
+                    "owner_generation": int(item.get("owner_generation", 0)),
+                    "catalog_generation": int(item.get("catalog_generation", 0)),
+                    "last_changed_at": item.get("last_changed_at"),
+                    "last_success_at": item.get("last_success_at"),
+                    "state_age_sec": item.get("state_age_sec"),
+                    "last_error_code": item.get("last_error_code"),
+                    "last_error_at": item.get("last_error_at"),
+                    "restart_count": int(item.get("restart_count", 0)),
+                    "calls": item.get("calls", {}),
+                    "call_window_size": int(item.get("call_window_size", 0)),
+                    "call_duration_mean_sec": item.get("call_duration_mean_sec"),
+                    "call_duration_max_sec": item.get("call_duration_max_sec"),
+                    "snapshot_status": item.get("snapshot_status", snapshot_status),
+                })
+
+    return {
+        "enabled": bool(ext.get("enabled", False)),
+        "status": "disabled" if not ext.get("enabled") else health.get("health_status", "healthy"),
+        "snapshot_status": snapshot_status,
+        "configured_count": int(ext.get("configured_count", 0)),
+        "enabled_count": int(ext.get("enabled_count", 0)),
+        "healthy_count": int(ext.get("healthy_count", 0)),
+        "degraded_count": int(ext.get("degraded_count", 0)),
+        "failed_count": int(ext.get("failed_count", 0)),
+        "unreachable_count": int(ext.get("unreachable_count", 0)),
+        "disabled_count": int(ext.get("disabled_count", 0)),
+        "blocked_count": int(ext.get("blocked_count", 0)),
+        "live_count": int(ext.get("live_count", 0)),
+        "discovered_tool_count": int(ext.get("discovered_tool_count", 0)),
+        "approved_tool_count": int(ext.get("approved_tool_count", 0)),
+        "eligible_tool_count": int(ext.get("eligible_tool_count", 0)),
+        "unresolved_external_count": int(ext.get("unresolved_external_count", 0)),
+        "catalog_generation": int(ext.get("catalog_generation", 0)),
+        "observed_at": ext.get("observed_at"),
+        "config_error_code": ext.get("config_error_code"),
+        "truncated": bool(ext.get("truncated", False)),
+        "items": safe_items,
+    }

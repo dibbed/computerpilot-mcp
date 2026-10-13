@@ -40,6 +40,7 @@ from scripts.panel_data import (
     build_identity,
     config_snapshot,
     doctor_snapshot,
+    extensions_snapshot,
     memory_summary,
     process_details,
     redact_diagnostics,
@@ -65,6 +66,7 @@ def restart_delay(failures: int) -> int:
 
 PANEL_PROCESS_TTL_SEC = 2.0
 PANEL_JOBS_TTL_SEC = 2.0
+PANEL_EXTENSIONS_TTL_SEC = 2.0
 PANEL_STORAGE_TTL_SEC = 20.0
 PANEL_JOB_OUTPUT_PREVIEW_BYTES = 32 * 1024
 LIFECYCLE_STATUS_MAX_BYTES = 16_384
@@ -976,6 +978,24 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
         snapshot["runtime_health_status"] = health.get("health_status")
         snapshot["resource_pressure"] = health.get("resource_pressure")
         snapshot["runtime_tool_count"] = health.get("tool_count")
+        ext = health.get("extensions")
+        if isinstance(ext, dict):
+            snapshot["extension_counts"] = {
+                "enabled": bool(ext.get("enabled", False)),
+                "configured_count": int(ext.get("configured_count", 0)),
+                "enabled_count": int(ext.get("enabled_count", 0)),
+                "healthy_count": int(ext.get("healthy_count", 0)),
+                "degraded_count": int(ext.get("degraded_count", 0)),
+                "failed_count": int(ext.get("failed_count", 0)),
+                "unreachable_count": int(ext.get("unreachable_count", 0)),
+                "disabled_count": int(ext.get("disabled_count", 0)),
+                "blocked_count": int(ext.get("blocked_count", 0)),
+                "live_count": int(ext.get("live_count", 0)),
+                "discovered_tool_count": int(ext.get("discovered_tool_count", 0)),
+                "approved_tool_count": int(ext.get("approved_tool_count", 0)),
+                "eligible_tool_count": int(ext.get("eligible_tool_count", 0)),
+                "unresolved_external_count": int(ext.get("unresolved_external_count", 0)),
+            }
         snapshot["panel_api_version"] = 2
         return snapshot
 
@@ -1233,6 +1253,14 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
 
             if path == "/api/insights":
                 self.send_json(insights_snapshot())
+            elif path == "/api/extensions":
+                self.send_json(
+                    cache.get(
+                        "extensions",
+                        PANEL_EXTENSIONS_TTL_SEC,
+                        lambda: extensions_snapshot(runtime_health_snapshot()),
+                    )
+                )
             elif path == "/api/events":
                 self.send_json(events_snapshot())
             elif path == "/api/jobs":
@@ -1368,7 +1396,9 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
                 return
             self.send(b"{}", status=404)
 
-    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.token = token  # type: ignore[attr-defined]
+    return server
 
 
 def _default_profile() -> str:
