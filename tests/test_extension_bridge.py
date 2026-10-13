@@ -237,6 +237,18 @@ def test_direct_call_cannot_raise_the_operator_deadline() -> None:
     anyio.run(scenario)
 
 
+def test_all_is_not_an_execution_profile_and_cannot_bypass_operator_approval() -> None:
+    server, manager, session = bridge(profile="all")
+    descriptor = manager.list_tools()[0]
+
+    async def scenario() -> None:
+        result = await server.call_tool(descriptor.public_name, {})
+        assert isinstance(result, types.CallToolResult) and result.is_error
+        session.send_request.assert_not_awaited()
+
+    anyio.run(scenario)
+
+
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), 0.0, -1.0])
 def test_direct_call_rejects_invalid_deadlines_before_dispatch(timeout: float) -> None:
     from core.errors import ToolError

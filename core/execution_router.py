@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.errors import ToolError
 from core.execution_models import ExecutionIntent, RecoverabilityClass, RiskClass, RouteCandidate, RouteClass, RouteDecision
 from core.platform import PlatformCapabilities
 from core.router_metrics import ROUTER_METRICS, RouterMetrics
 from core.tool_catalog import IntentRouteRule, intent_route_rules
+
+if TYPE_CHECKING:
+    from core.extensions.manager import ExtensionLifecycleManager
 
 ROUTER_POLICY_VERSION = "deterministic-v1"
 MAX_CANDIDATES = 25
@@ -36,12 +39,16 @@ class ExecutionRouter:
         policy_version: str = ROUTER_POLICY_VERSION,
         enabled: bool = True,
         metrics: RouterMetrics | None = None,
+        extension_manager: ExtensionLifecycleManager | None = None,
+        active_profile: str = "full",
     ) -> None:
         self.registered_tools = frozenset(registered_tools)
         self.capabilities = capabilities
         self.policy_version = policy_version.strip().casefold()
         self.enabled = enabled
         self.metrics = metrics or ROUTER_METRICS
+        self.extension_manager = extension_manager
+        self.active_profile = active_profile
 
     def _validate_policy(self) -> None:
         if not self.enabled:
@@ -145,7 +152,24 @@ class ExecutionRouter:
         )
 
     def _all_candidates(self, intent: ExecutionIntent) -> list[RouteCandidate]:
-        items = [self._candidate(rule, intent) for rule in intent_route_rules(intent.name)]
+        external = list(self.extension_manager.routing_candidates(intent, self.active_profile)) if self.extension_manager else []
+        for index, candidate in enumerate(external):
+            if not candidate.supported:
+                continue
+            rejection = (
+                ("tool_unavailable", "external tool is absent from the current client catalog")
+                if candidate.representative_tool not in self.registered_tools else self._hard_rejection(intent, candidate)
+            )
+            if rejection is not None:
+                external[index] = replace(candidate, supported=False, rejection_code=rejection[0], reason=rejection[1])
+        try:
+            rules = intent_route_rules(intent.name)
+        except ToolError as error:
+            if error.code != "unknown_execution_intent" or not external:
+                raise
+            rules = ()
+        items = [self._candidate(rule, intent) for rule in rules]
+        items.extend(external)
         valid = sorted((item for item in items if item.supported), key=self._sort_key)
         rejected = sorted(
             (item for item in items if not item.supported),
@@ -203,6 +227,7 @@ class ExecutionRouter:
             capability_checks=selected.capability_checks if selected else (),
             risk=selected.risk if selected else None,
             router_policy_version=self.policy_version,
+            external_metadata=selected.external_metadata if selected is not None else None,
         )
         result = {"ok": selected is not None, **decision.as_dict()}
         if explain:

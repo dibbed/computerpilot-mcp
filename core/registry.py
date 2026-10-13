@@ -172,6 +172,8 @@ def create_server() -> MCPServer:
             capabilities=capabilities,
             policy_version=SETTINGS.execution_router_policy,
             enabled=SETTINGS.execution_router_enabled,
+            extension_manager=server.extension_manager if server.external_catalog_visible else None,
+            active_profile=profile.name,
         )
 
     def _execution_intent(

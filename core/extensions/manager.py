@@ -20,6 +20,7 @@ from mcp.client.session import ClientSession
 from pydantic import ValidationError
 
 from core.errors import ToolError
+from core.execution_models import ExecutionIntent, ExternalRouteMetadata, RouteCandidate
 from core.extensions.config import build_extension_environment
 from core.extensions.models import (
     LIMITS,
@@ -41,6 +42,8 @@ from core.extensions.registry import (
 from core.extensions.security import CredentialRedactor, suppress_sdk_payload_logs
 from core.extensions.transport import BoundedStderrDrain, bounded_stdio_transport
 from core.platform import normalize_system
+from core.tool_catalog import external_tool_execution_metadata
+from core.tool_profiles import PROFILE_DOMAINS
 
 logger = logging.getLogger(__name__)
 
@@ -739,6 +742,8 @@ class ExtensionLifecycleManager:
 
     def tool_eligibility(self, name: str, active_profile: str = "full") -> ToolEligibilityResult:
         """Read current operator/runtime authority without spawning, RPC or filesystem IO."""
+        if active_profile not in PROFILE_DOMAINS:
+            return ToolEligibilityResult(False, "profile_mismatch", "The external execution profile is unavailable.")
         snapshot = self.get_catalog_snapshot()
         descriptor = snapshot.get_tool(name)
         if descriptor is None:
@@ -770,6 +775,41 @@ class ExtensionLifecycleManager:
     def get_catalog_snapshot(self) -> ExtensionCatalogSnapshot:
         """Return authoritative in-memory catalog snapshot."""
         return self._registry.active_snapshot
+
+    def routing_candidates(self, intent: ExecutionIntent, active_profile: str = "full") -> tuple[RouteCandidate, ...]:
+        snapshot = self.get_catalog_snapshot()
+        candidates: list[RouteCandidate] = []
+        for owner in self._owners.values():
+            definition = owner.definition
+            redactor = owner.credential_redactor()
+            for remote_name, configured_policy in definition.tools.items():
+                name = f"external.{definition.extension_id}.{remote_name}"
+                descriptor = snapshot.get_tool(name)
+                policy = descriptor.policy if descriptor is not None else configured_policy
+                if intent.name not in policy.intents:
+                    continue
+                provider = descriptor.identity.provider if descriptor is not None else definition.provider
+                if redactor.text(name) != name or redactor.text(provider) != provider:
+                    continue
+                eligibility = self.tool_eligibility(name, active_profile)
+                if descriptor is not None and self._registry.get_tool(name) is not descriptor:
+                    eligibility = ToolEligibilityResult(False, "stale_generation", "The external catalog changed.")
+                metadata = external_tool_execution_metadata(name, policy, ExternalRouteMetadata(
+                    definition.extension_id, provider, descriptor.catalog_generation if descriptor is not None else 0,
+                ))
+                candidates.append(RouteCandidate(
+                    route=metadata.route, representative_tool=name, determinism=metadata.determinism,
+                    risk=metadata.risk, recoverability=metadata.recoverability,
+                    capability_confidence=policy.capability_confidence, cost_tier=policy.cost_tier,
+                    latency_tier=policy.latency_tier, fallback_level=1, external_metadata=metadata.external_metadata,
+                    supported=eligibility.eligible, rejection_code=eligibility.rejection_code,
+                    capability_checks=("source:external_mcp", "classification:operator_policy", "eligibility:core_policy"),
+                    reason=(
+                        "operator policy estimates; current Core eligibility permits this capability"
+                        if eligibility.eligible else "current Core eligibility rejects this external capability"
+                    ),
+                ))
+        return tuple(candidates)
 
     async def start_extension_background(
         self,
