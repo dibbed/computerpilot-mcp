@@ -194,3 +194,84 @@ def test_api_status_and_summary_do_not_leak_extensions_details(tmp_path: Path) -
         thread.join(timeout=5)
         panel.server_close()
         close_logger(supervisor)
+
+
+def test_panel_html_contains_extensions_section_and_is_readonly(tmp_path: Path) -> None:
+    """T13: Verify panel HTML contains Extensions section, polling hook, and no management buttons."""
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    panel = make_panel(supervisor, 0)
+    thread = threading.Thread(target=panel.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{panel.server_port}"
+
+    try:
+        with urllib.request.urlopen(base, timeout=2) as response:
+            html = response.read().decode("utf-8")
+
+        # Navigation and structure
+        assert '<a href="#extensions">Extensions</a>' in html
+        assert '<div id="extensions" class="section-anchor"><span>Extensions</span></div>' in html
+        assert "Extensions / External MCPs" in html
+        assert 'id="extensionsPill"' in html
+        assert 'id="extStatus"' in html
+        assert 'id="extConfigured"' in html
+        assert 'id="extLiveRoutable"' in html
+        assert 'id="extEligibleTools"' in html
+        assert 'id="extCatalogGen"' in html
+        assert 'id="extensionRows"' in html
+        assert 'id="extensionEmpty"' in html
+
+        # Script functions and polling
+        assert "renderExtensions" in html
+        assert "/api/extensions" in html
+
+        # Section must be read-only: no buttons inside extensions panel
+        start_idx = html.index('id="extensions"')
+        end_idx = html.index('id="work"', start_idx)
+        ext_section = html[start_idx:end_idx]
+        assert "<button" not in ext_section
+        assert "start" not in ext_section.lower() or "started" in ext_section.lower()
+        assert "delete" not in ext_section.lower()
+    finally:
+        panel.shutdown()
+        thread.join(timeout=5)
+        panel.server_close()
+        close_logger(supervisor)
+
+
+def test_extensions_snapshot_sanitizes_html_and_script_injection() -> None:
+    """T13: Ensure malicious strings in provider metadata are safely bounded and neutralized."""
+    adversarial_health: dict[str, Any] = {
+        "ok": True,
+        "health_status": "healthy",
+        "snapshot_status": "fresh",
+        "extensions": {
+            "enabled": True,
+            "configured_count": 1,
+            "items": [
+                {
+                    "extension_id": "<script>alert('xss')</script>",
+                    "display_name": "<img src=x onerror=alert(1)>" * 20,
+                    "provider": "<svg/onload=alert('mcp')>",
+                    "enabled": True,
+                    "state": "healthy",
+                    "trust_class": "trusted",
+                    "live": True,
+                    "routable": True,
+                    "blocked": False,
+                    "last_error_code": "<b>danger</b>",
+                }
+            ],
+        },
+    }
+
+    result = extensions_snapshot(adversarial_health)
+    assert result["enabled"] is True
+    assert len(result["items"]) == 1
+    item = result["items"][0]
+    # Lengths must be bounded
+    assert len(item["extension_id"]) <= 64
+    assert len(item["display_name"]) <= 180
+    assert len(item["provider"]) <= 64
+    assert item["state"] == "healthy"
+    assert item["last_error_code"] == "<b>danger</b>"
