@@ -355,12 +355,21 @@ class Supervisor:
         if path is None:
             return None
         try:
-            if path.stat().st_size > max_bytes:
+            with path.open("rb") as stream:
+                raw = stream.read(max_bytes + 1)
+            if len(raw) > max_bytes:
                 return None
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(raw.decode("utf-8"))
         except (OSError, ValueError, TypeError):
             return None
         return payload if isinstance(payload, dict) else None
+
+    def runtime_health_snapshot(self) -> dict[str, Any]:
+        from core.health_snapshot import MAX_RUNTIME_HEALTH_BYTES, validate_runtime_health
+
+        path = self.current_runtime_health_path
+        generation = path.stem.removeprefix("health-") if path is not None and path.stem.startswith("health-") else None
+        return validate_runtime_health(self._read_bounded_json(path, MAX_RUNTIME_HEALTH_BYTES), generation)
 
     def _fetch_tunnel_health(self) -> dict[str, Any] | None:
         if self.health_details_url is None:
@@ -953,7 +962,7 @@ def make_panel(supervisor: Supervisor, port: int) -> ThreadingHTTPServer:
         }
 
     def runtime_health_snapshot() -> dict[str, Any]:
-        return supervisor._read_bounded_json(supervisor.current_runtime_health_path, 512 * 1024) or {}
+        return supervisor.runtime_health_snapshot()
 
     def summary_snapshot() -> dict[str, Any]:
         snapshot = supervisor.state_snapshot()

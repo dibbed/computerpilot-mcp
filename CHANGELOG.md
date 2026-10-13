@@ -7,6 +7,8 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Added
+- 2026-10-13: Record finite per-owner 64-call outcome and latency windows, separating uncertain mutations from failures, and publish metadata-only external-call audit records through the existing bounded writer.
+- 2026-10-13: Add a bounded in-memory extension owner/catalog health projection to the shared runtime collector, with generation, safe counts, UTC update/success/error times and monotonic state ages; disabled and policy-blocked definitions remain neutral.
 - 2026-10-13: Add bounded schema-1 external recovery metadata (`external_metadata_version=1`), runtime-only random HMAC request correlation, and two-stage durable dispatch barriers (`prepared` -> `may_dispatch`) for external mutations without storing raw arguments or secrets.
 - 2026-10-13: Activate guarded external mutation eligibility across direct calls, MCP wire, and advisory routing when trusted, explicitly classified and allowed, profile-eligible (`minimal` remains read-only for extensions), backed by a live catalog lease, `RUNTIME_LIFECYCLE` is `RUNNING`, and the recovery journal has unresolved capacity.
 - 2026-10-13: Project exact operator-mapped external intents into advisory routing through shared live eligibility, with bounded safe rejection reasons and generation attribution.
@@ -27,6 +29,8 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.
 
 ### Fixed
+- 2026-10-13: Expose safe startup extension-configuration errors independently of the native Doctor cache, preserve disabled/empty zero-provider behavior, and identify stale runtime diagnostics in the panel Doctor summary.
+- 2026-10-13: Keep runtime health totals coherent with one final extension generation; cap complete native/extension publication at 512 KiB, preserve truncation and suppress stale or prior-generation routability in the bounded Supervisor reader.
 - 2026-10-13: Derive external tool annotations from operator mutation policy; stream bounded recovery admission and operation lookups, record policy fingerprints, and keep read-only calls responsive during deadline-limited mutation journal contention.
 - 2026-10-13: Execute recovery acknowledgement, reconciliation, and external quota admission inside a full interprocess file-lock read-check-append transaction, and preserve `known_result='returned_error'` alongside `external_outcome='not_dispatched'` for pre-dispatch failures.
 - 2026-10-13: Reject diagnostic all and unknown execution profiles at the shared extension guard, and retain legacy connection exposure limits in router recommendations.

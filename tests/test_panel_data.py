@@ -111,6 +111,13 @@ def test_doctor_snapshot_reports_pending_when_runtime_snapshot_is_missing() -> N
     assert result["pending_count"] > 0
 
 
+def test_doctor_snapshot_reports_stale_runtime_as_warning() -> None:
+    result = doctor_snapshot(runtime_health={"health_status": "stale"}, transport={},
+                             system={"memory": {"percent": 20}, "disk": {"percent": 20}}, tunnel={"mode": "local-http"})
+    runtime = next(item for item in result["checks"] if item["name"] == "Runtime health")
+    assert runtime["status"] == "warning" and "stale" in runtime["summary"]
+
+
 def test_redact_diagnostics_removes_sensitive_keys_and_literal_secrets() -> None:
     result = redact_diagnostics(
         {

@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -22,6 +23,7 @@ import mcp.types as types
 from mcp.client.session import ClientSession
 from pydantic import ValidationError
 
+from core.audit import audit_action
 from core.errors import ToolError
 from core.execution_models import ExecutionIntent, ExternalRouteMetadata, RouteCandidate
 from core.extensions.config import build_extension_environment
@@ -60,6 +62,24 @@ from core.tool_catalog import external_tool_execution_metadata
 from core.tool_profiles import PROFILE_DOMAINS
 
 logger = logging.getLogger(__name__)
+_HEALTH_ERROR_CODES = frozenset({
+    "config_invalid", "config_version_unsupported", "startup_failed", "ownership_unavailable", "handshake_timeout",
+    "handshake_failed", "discovery_failed", "schema_unsupported", "catalog_limit", "transport_eof", "transport_lost",
+    "connection_closed", "extension_crashed", "call_timeout", "provider_error", "malformed_result", "output_too_large",
+    "recovery_unavailable", "recovery_journal_failed", "operation_limit", "uncertain_side_effect", "shutdown_timeout",
+    "restart_budget_exhausted", "external_failure",
+})
+_HEALTH_COUNT_NAMES = ("enabled", "healthy", "degraded", "unreachable", "failed", "disabled", "blocked", "pending", "live")
+_CALL_OUTCOMES = ("succeeded", "failed", "uncertain", "not_dispatched")
+
+
+def empty_extension_health() -> dict[str, Any]:
+    return {
+        "configured_count": 0, **{f"{key}_count": 0 for key in _HEALTH_COUNT_NAMES},
+        "discovered_tool_count": 0, "approved_tool_count": 0, "eligible_tool_count": 0,
+        "catalog_generation": 0, "observed_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "unresolved_external_count": 0, "items": [], "truncated": False,
+    }
 
 
 def _bounded_timeout(requested: float, configured: float, ceiling: float) -> float:
@@ -178,6 +198,10 @@ class ExtensionLifecycleStateMachine:
         self.generation: int = 0
         self.restart_count: int = 0
         self.last_error: str | None = None
+        self.last_changed_monotonic = time.monotonic()
+        self.last_changed_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        self.last_success_at = self.last_changed_at if initial_state is ExtensionState.HEALTHY else None
+        self.last_error_at: str | None = None
         self.history: deque[tuple[ExtensionState, str | None]] = deque([(initial_state, "initial")], maxlen=LIMITS.recent_errors)
 
     @property
@@ -208,10 +232,16 @@ class ExtensionLifecycleStateMachine:
         if target == ExtensionState.STARTING:
             self.generation += 1
 
-        if target in {ExtensionState.FAILED, ExtensionState.UNREACHABLE}:
+        if target in {ExtensionState.FAILED, ExtensionState.UNREACHABLE, ExtensionState.DEGRADED}:
             self.last_error = reason
 
         self._state = target
+        self.last_changed_monotonic = time.monotonic()
+        self.last_changed_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        if target in {ExtensionState.FAILED, ExtensionState.UNREACHABLE, ExtensionState.DEGRADED}:
+            self.last_error_at = self.last_changed_at
+        if target is ExtensionState.HEALTHY:
+            self.last_success_at = self.last_changed_at
         self.history.append((target, reason))
         logger.debug(
             "Extension '%s' transitioned to %s (gen=%d, reason=%s)",
@@ -258,6 +288,7 @@ class ExtensionOwner:
         self.call_semaphore = anyio.Semaphore(LIMITS.calls_per_extension)
         self._credential_values: tuple[str, ...] = ()
         self._runner_scope: anyio.CancelScope | None = None
+        self.call_observations: deque[tuple[str, float]] = deque(maxlen=64)
 
     @property
     def state(self) -> ExtensionState:
@@ -693,6 +724,72 @@ class ExtensionLifecycleManager:
         owner = self.get_owner(extension_id)
         return owner.state if owner else None
 
+    def health_snapshot(self, active_profile: str = "full", *, unresolved_external_count: int | None = None) -> dict[str, Any]:
+        """Project cached owner/catalog authority without provider I/O or journal reads."""
+        catalog = self.get_catalog_snapshot()
+        observed = time.monotonic()
+        counts = dict.fromkeys(_HEALTH_COUNT_NAMES, 0)
+        items: list[dict[str, Any]] = []
+        discovered_total = approved_total = eligible_total = 0
+        capacity = unresolved_external_count is not None and unresolved_external_count < self._recovery_journal.external_mutation_limit
+        for owner in self._owners.values():
+            definition = owner.definition
+            enabled = owner.is_enabled and definition.enabled
+            blocked = enabled and (not definition.launch_approved or definition.trust_class is TrustClass.UNTRUSTED)
+            live = enabled and not blocked and owner._active_session is not None
+            descriptors = tuple(tool for tool in catalog.tools.values() if tool.extension_id == owner.extension_id)
+            eligible = sum(
+                self.tool_eligibility(tool.public_name, active_profile, check_capacity=False).eligible
+                for tool in descriptors if tool.policy.mutation_class is MutationClass.READ_ONLY or capacity
+            )
+            approved = sum(tool.policy.allow_call for tool in descriptors)
+            discovered_total += len(descriptors)
+            approved_total += approved
+            eligible_total += eligible
+            counts["enabled"] += int(enabled)
+            counts["live"] += int(live)
+            if not enabled:
+                counts["disabled"] += 1
+            elif blocked:
+                counts["blocked"] += 1
+            elif owner.state is ExtensionState.HEALTHY and live:
+                counts["healthy"] += 1
+            elif owner.state.value.casefold() in {"degraded", "unreachable", "failed"}:
+                counts[owner.state.value.casefold()] += 1
+            else:
+                counts["pending"] += 1
+            redactor = owner.credential_redactor()
+            error = owner.state_machine.last_error
+            safe_error = error if error in _HEALTH_ERROR_CODES else "external_failure" if error else None
+            items.append({
+                "extension_id": redactor.text(owner.extension_id), "display_name": redactor.text(definition.display_name)[:180],
+                "provider": redactor.text(definition.provider)[:64], "enabled": enabled,
+                "state": owner.state.value, "trust_class": definition.trust_class.value,
+                "live": live, "routable": live and eligible > 0, "blocked": blocked,
+                "discovered_tool_count": len(descriptors), "approved_tool_count": approved, "eligible_tool_count": eligible,
+                "owner_generation": owner.generation, "catalog_generation": catalog.extension_generations.get(owner.extension_id, 0),
+                "last_changed_at": owner.state_machine.last_changed_at, "last_success_at": owner.state_machine.last_success_at,
+                "state_age_sec": max(0.0, observed - owner.state_machine.last_changed_monotonic),
+                "last_error_code": safe_error if redactor.text(safe_error or "") == (safe_error or "") else "external_failure",
+                "last_error_at": owner.state_machine.last_error_at,
+                "restart_count": owner.state_machine.restart_count,
+                "calls": {key: sum(outcome == key for outcome, _ in owner.call_observations) for key in _CALL_OUTCOMES},
+                "call_window_size": len(owner.call_observations),
+                "call_duration_mean_sec": sum(duration for _, duration in owner.call_observations) / max(1, len(owner.call_observations)),
+                "call_duration_max_sec": max((duration for _, duration in owner.call_observations), default=0.0),
+            })
+        result: dict[str, Any] = {
+            "configured_count": len(self._owners), **{f"{key}_count": value for key, value in counts.items()},
+            "discovered_tool_count": discovered_total, "approved_tool_count": approved_total, "eligible_tool_count": eligible_total,
+            "catalog_generation": catalog.manager_generation, "observed_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "unresolved_external_count": unresolved_external_count, "items": items[:LIMITS.configured], "truncated": False,
+        }
+        while len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > LIMITS.health_bytes and result["items"]:
+            result["items"].pop()
+            result["truncated"] = True
+        result["truncated"] = result["truncated"] or len(items) > len(result["items"])
+        return result
+
     def get_restart_budget(self, extension_id: str) -> RestartBudget | None:
         owner = self.get_owner(extension_id)
         return owner.restart_budget if owner else None
@@ -1113,6 +1210,9 @@ class ExtensionLifecycleManager:
             timeout_sec, initial_owner.definition.timeouts.call_sec if initial_owner else LIMITS.call_sec, LIMITS.call_sec,
         )
         dispatched = False
+        observed_start = time.monotonic()
+        observed_outcome = "not_dispatched"
+        observed_error: str | None = None
         may_dispatch_durable = False
         uncertain_envelope: dict[str, Any] | None = None
         try:
@@ -1125,8 +1225,12 @@ class ExtensionLifecycleManager:
                     with TOOL_ACTIVITY.track(descriptor.public_name), tool_timing(descriptor.public_name):
                         if descriptor.policy.mutation_class == MutationClass.READ_ONLY:
                             dispatched = True
+                            observed_outcome = "failed"
                             result = await owner._call_tool(descriptor.remote_name, args, timeout_sec=timeout_sec)
-                            return normalize_result(descriptor, result, owner.credential_redactor())
+                            envelope = normalize_result(descriptor, result, owner.credential_redactor())
+                            observed_outcome = "succeeded" if envelope.get("ok") else "failed"
+                            observed_error = envelope.get("error")
+                            return envelope
 
                         with RUNTIME_LIFECYCLE.mutation(descriptor.public_name):
                             # Mutating external call: enforce M10.2 durable dispatch barrier
@@ -1180,8 +1284,11 @@ class ExtensionLifecycleManager:
                                 await anyio.to_thread.run_sync(self._recovery_journal.checkpoint_external_dispatch, handle)
                             may_dispatch_durable = True
                             dispatched = True
+                            observed_outcome = "uncertain"
 
                             async def _record_uncertain(reason: str) -> dict[str, Any]:
+                                nonlocal observed_error
+                                observed_error = "uncertain_side_effect"
                                 with anyio.CancelScope(shield=True):
                                     try:
                                         await anyio.to_thread.run_sync(self._recovery_journal.mark_uncertain, handle, reason)
@@ -1254,6 +1361,7 @@ class ExtensionLifecycleManager:
                                         receipt_id=receipt_id,
                                     ))
                                 except ToolError:
+                                    observed_error = "uncertain_side_effect"
                                     if owner.state_machine.can_transition(ExtensionState.DEGRADED):
                                         owner.state_machine.transition(
                                             ExtensionState.DEGRADED,
@@ -1275,9 +1383,30 @@ class ExtensionLifecycleManager:
                                     )
 
                             envelope["operation_id"] = handle.operation_id
+                            observed_outcome = "succeeded"
                             return finalize_envelope(envelope)
         except TimeoutError:
             if may_dispatch_durable and uncertain_envelope is not None:
                 return uncertain_envelope
             code = "call_timeout" if dispatched else "admission_limit_exceeded"
+            observed_error = code
             raise ToolError(code, "The external call timed out within its total admission/execution deadline.") from None
+        except ToolError as exc:
+            observed_error = exc.code
+            raise
+        finally:
+            if initial_owner is not None and initial is not None:
+                duration = max(0.0, time.monotonic() - observed_start)
+                initial_owner.call_observations.append((observed_outcome, duration))
+                safe_error = observed_error if observed_error in _HEALTH_ERROR_CODES else "external_failure" if observed_error else None
+                try:
+                    redactor = initial_owner.credential_redactor()
+                    audit_action("external_tool_call", target=redactor.text(initial.public_name),
+                                 outcome=observed_outcome, details=redactor.json({
+                                     "extension_id": initial.extension_id, "catalog_generation": initial.catalog_generation,
+                                     "mutation_class": initial.policy.mutation_class.value,
+                                     "error_code": safe_error, "duration_sec": duration,
+                                 }))
+                except Exception:
+                    # Optional telemetry cannot replace the durable dispatch/recovery outcome.
+                    pass

@@ -14,7 +14,7 @@ from core.artifact_retention import schedule_artifact_retention
 from core.audit import flush_audit
 from core.backups import BACKUP_RETENTION
 from core.config import SETTINGS
-from core.health_snapshot import collect_server_health
+from core.health_snapshot import bound_runtime_health, collect_server_health
 from core.job_retention import schedule_job_history_retention
 from core.lifecycle import RUNTIME_LIFECYCLE
 from core.recovery import OPERATION_RECOVERY
@@ -36,7 +36,7 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     async def publish_health(path: Path) -> None:
         while True:
             try:
-                payload = await collect_server_health(server, settings=SETTINGS)
+                payload = bound_runtime_health(await collect_server_health(server, settings=SETTINGS))
                 temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
                 temporary.write_text(
                     json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
@@ -81,12 +81,18 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     )
     maintenance_task = asyncio.create_task(maintain_state())
     extension_manager: Any = getattr(server, "extension_manager", None)
+    config_owned_manager = False
+    if hasattr(server, "__dict__"):
+        server.extension_config_error_code = None
     if extension_manager is None and SETTINGS.extensions_enabled:
         from core.extensions.config import load_extension_config
         from core.extensions.manager import ExtensionLifecycleManager
 
         config_res = load_extension_config(settings=SETTINGS)
+        if hasattr(server, "__dict__"):
+            server.extension_config_error_code = config_res.error_code
         if config_res.config.extensions:
+            config_owned_manager = True
             extension_manager = ExtensionLifecycleManager()
             for ext_def in config_res.config.extensions:
                 extension_manager.register_extension(ext_def)
@@ -134,3 +140,6 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
         OPERATION_RECOVERY.configure(None, None)
         RUNTIME_LIFECYCLE.configure(None, None)
         TOOL_ACTIVITY.configure(None, None)
+        if config_owned_manager and hasattr(server, "__dict__"):
+            # A reused server must validate current configuration on its next startup.
+            server.extension_manager = None

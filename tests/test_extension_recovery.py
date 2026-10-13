@@ -1222,6 +1222,9 @@ def test_possible_dispatch_failures_stay_uncertain_without_retry(tmp_path: Path,
                 assert result["outcome"] == "uncertain", result
             operations = journal.list_operations(state=OperationState.UNCERTAIN)
             assert operations["count"] == 1
+            row = manager.health_snapshot(unresolved_external_count=1)["items"][0]
+            assert row["calls"]["uncertain"] == 1
+            assert row["calls"]["failed"] == row["calls"]["succeeded"] == 0
             assert operations["items"][0]["external"]["dispatch_stage"] == "may_dispatch"
             assert (tmp_path / "counter.json").read_text(encoding="utf-8") == "1"
             await manager.drain_and_stop()
