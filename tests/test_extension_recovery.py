@@ -274,3 +274,246 @@ def test_m10_1_unresolved_external_metadata_survives_restart_compaction_and_lega
     )
     assert reconciled_legacy["state"] == "failed"
     assert "external" not in reconciled_legacy
+
+
+def test_m10_2_journal_checkpoint_not_dispatched_and_uncertain_transitions(tmp_path: Path) -> None:
+    path = tmp_path / "operation-recovery.jsonl"
+    disabled_journal = OperationRecoveryJournal()
+    base_meta = {
+        "extension_id": "github",
+        "provider": "GitHub",
+        "public_name": "external.github.increment_value",
+        "remote_name": "increment_value",
+        "catalog_generation": 1,
+        "schema_fingerprint": "e" * 64,
+        "mutation_class": "remote_mutation",
+    }
+    with pytest.raises(ToolError) as exc_info:
+        disabled_journal.begin("external.github.increment_value", external_metadata=base_meta)
+    assert exc_info.value.code == "recovery_unavailable"
+
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "runtime-a")
+
+    # 1. Pre-dispatch deterministic failure -> finish_not_dispatched
+    h_not_sent = journal.begin("external.github.increment_value", external_metadata=base_meta)
+    assert h_not_sent is not None
+    journal.finish_not_dispatched(h_not_sent, "stale_generation")
+    view_not_sent = journal.inspect(h_not_sent.operation_id)
+    assert view_not_sent["state"] == "failed"
+    assert view_not_sent["external_outcome"] == "not_dispatched"
+    assert view_not_sent["external"]["external_outcome"] == "not_dispatched"
+    assert view_not_sent["external"]["dispatch_stage"] == "prepared"
+    assert view_not_sent["external"]["reason_code"] == "stale_generation"
+
+    # Verify schema1 downgrade contract: raw result record uses known_result == 'returned_error'
+    result_records = [
+        r for r in _records(path)
+        if r.get("operation_id") == h_not_sent.operation_id and r.get("type") == "result"
+    ]
+    assert len(result_records) == 1
+    assert result_records[0]["known_result"] == "returned_error"
+    assert result_records[0]["external_outcome"] == "not_dispatched"
+
+    # 2. Durable may_dispatch barrier -> cannot finish_not_dispatched afterwards
+    h_dispatched = journal.begin("external.github.increment_value", external_metadata=base_meta)
+    assert h_dispatched is not None
+    journal.checkpoint_external_dispatch(h_dispatched)
+    # Idempotent repeat of checkpoint_external_dispatch
+    journal.checkpoint_external_dispatch(h_dispatched)
+
+    with pytest.raises(ToolError) as exc_info:
+        journal.finish_not_dispatched(h_dispatched, "late_error")
+    assert exc_info.value.code == "operation_already_dispatched"
+
+    # Mark uncertain after may_dispatch
+    journal.mark_uncertain(h_dispatched, "call_timeout", receipt_id="rcpt-123")
+    view_unc = journal.inspect(h_dispatched.operation_id)
+    assert view_unc["state"] == "uncertain"
+    assert view_unc["external_outcome"] == "uncertain"
+    assert view_unc["external"]["dispatch_stage"] == "may_dispatch"
+    assert view_unc["external"]["external_outcome"] == "uncertain"
+    assert view_unc["external"]["reason_code"] == "call_timeout"
+    assert view_unc["external"]["receipt_id"] == "rcpt-123"
+
+    # Cannot finish as succeeded after mark_uncertain
+    with pytest.raises(ToolError) as exc_info:
+        journal.finish(h_dispatched, known_result="ok")
+    assert exc_info.value.code == "operation_already_uncertain"
+
+
+def test_m10_2_manager_durable_dispatch_barrier_and_outcome_taxonomy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    import anyio
+
+    from core.extensions.manager import ExtensionLifecycleManager
+    from core.extensions.models import (
+        ExtensionDefinition,
+        ExtensionState,
+        MutationClass,
+        ToolPolicy,
+        TrustClass,
+    )
+
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "fake_mcp_server.py"
+
+    def make_definition(workspace: Path, mode: str) -> ExtensionDefinition:
+        return ExtensionDefinition(
+            extension_id="fake",
+            display_name="Fake Provider",
+            provider="Fake MCP",
+            trust_class=TrustClass.TRUSTED,
+            launch_approved=True,
+            enabled=True,
+            command=sys.executable,
+            arguments=(str(fixture_path), "--workspace", str(workspace), "--mode", mode),
+            working_directory=str(workspace),
+            platforms=("windows", "linux", "macos"),
+            tools={
+                "increment_value": ToolPolicy(
+                    remote_name="increment_value",
+                    domain="process",
+                    allow_call=True,
+                    mutation_class=MutationClass.REMOTE_MUTATION,
+                    profiles=("full",),
+                ),
+                "read_value": ToolPolicy(
+                    remote_name="read_value",
+                    domain="process",
+                    allow_call=True,
+                    mutation_class=MutationClass.READ_ONLY,
+                    profiles=("full",),
+                ),
+            },
+        )
+
+    def read_dispatch_count(workspace: Path) -> int:
+        counter = workspace / "counter.json"
+        return int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+
+    async def run_scenarios() -> None:
+        # Verify default manager keeps mutation gate closed before M10.4
+        default_mgr = ExtensionLifecycleManager()
+        assert default_mgr.is_mutation_gate_closed is True
+
+        # Scenario 1: Journal disabled -> deny before dispatch (marker == 0)
+        ws1 = tmp_path / "ws1"
+        ws1.mkdir()
+        disabled_journal = OperationRecoveryJournal()
+        mgr1 = ExtensionLifecycleManager(
+            recovery_journal=disabled_journal,
+            _mutation_gate_closed=False,
+        )
+        mgr1.register_extension(make_definition(ws1, "mutation_success"))
+        keep1 = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            await mgr1.start_all_background(tg, keep_alive_event=keep1)
+            for _ in range(200):
+                if mgr1.get_state("fake") == ExtensionState.HEALTHY:
+                    break
+                await anyio.sleep(0.02)
+            assert mgr1.get_state("fake") == ExtensionState.HEALTHY
+            lease1 = mgr1.registry.create_lease("external.fake.increment_value")
+            assert lease1 is not None
+            with pytest.raises(ToolError) as exc_info:
+                await mgr1.execute_guarded_call(lease1, {"amount": 2})
+            assert exc_info.value.code == "recovery_unavailable"
+            assert read_dispatch_count(ws1) == 0
+            await mgr1.drain_and_stop()
+
+        # Scenario 2: Second checkpoint failure -> DO NOT SEND (marker == 0)
+        ws2 = tmp_path / "ws2"
+        ws2.mkdir()
+        journal2 = OperationRecoveryJournal()
+        journal2.configure(tmp_path / "journal2.jsonl", "runtime-2")
+        mgr2 = ExtensionLifecycleManager(
+            recovery_journal=journal2,
+            _mutation_gate_closed=False,
+        )
+        mgr2.register_extension(make_definition(ws2, "mutation_success"))
+        keep2 = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            await mgr2.start_all_background(tg, keep_alive_event=keep2)
+            for _ in range(200):
+                if mgr2.get_state("fake") == ExtensionState.HEALTHY:
+                    break
+                await anyio.sleep(0.02)
+            lease2 = mgr2.registry.create_lease("external.fake.increment_value")
+            assert lease2 is not None
+
+            orig_ckpt = journal2.checkpoint_external_dispatch
+
+            def fail_ckpt(handle: Any) -> None:
+                raise ToolError("operation_journal_unavailable", "Simulated fsync failure on may_dispatch")
+
+            monkeypatch.setattr(journal2, "checkpoint_external_dispatch", fail_ckpt)
+            with pytest.raises(ToolError) as exc_info:
+                await mgr2.execute_guarded_call(lease2, {"amount": 3})
+            assert exc_info.value.code in {"recovery_unavailable", "operation_journal_unavailable"}
+            assert read_dispatch_count(ws2) == 0
+            monkeypatch.setattr(journal2, "checkpoint_external_dispatch", orig_ckpt)
+
+            # Scenario 3: Conclusive validated success -> marker == 1, journal succeeded
+            res_ok = await mgr2.execute_guarded_call(lease2, {"amount": 4})
+            assert res_ok["ok"] is True
+            assert res_ok["outcome"] == "succeeded"
+            assert isinstance(res_ok["operation_id"], str)
+            assert read_dispatch_count(ws2) == 1
+            inspected_ok = journal2.inspect(res_ok["operation_id"])
+            assert inspected_ok["state"] == "succeeded"
+            assert inspected_ok["external_outcome"] == "succeeded"
+            assert inspected_ok["external"]["dispatch_stage"] == "may_dispatch"
+
+            # Scenario 4: Post-dispatch terminal journal failure -> uncertain, not succeeded, owner degraded
+            orig_finish = journal2.finish
+
+            def fail_finish(*args: Any, **kwargs: Any) -> None:
+                raise ToolError("operation_journal_unavailable", "Simulated post-dispatch fsync failure")
+
+            monkeypatch.setattr(journal2, "finish", fail_finish)
+            res_post_fail = await mgr2.execute_guarded_call(lease2, {"amount": 5})
+            assert res_post_fail["ok"] is False
+            assert res_post_fail["outcome"] == "uncertain"
+            assert res_post_fail["error"] == "uncertain_side_effect"
+            assert read_dispatch_count(ws2) == 2
+            assert mgr2.get_state("fake") == ExtensionState.DEGRADED
+            monkeypatch.setattr(journal2, "finish", orig_finish)
+            await mgr2.drain_and_stop()
+
+        # Scenario 5: Provider crash/disconnect after durable side effect
+        # (uncertain_mutation) -> marker == 1, outcome == uncertain, no retry
+        ws3 = tmp_path / "ws3"
+        ws3.mkdir()
+        journal3 = OperationRecoveryJournal()
+        journal3.configure(tmp_path / "journal3.jsonl", "runtime-3")
+        mgr3 = ExtensionLifecycleManager(
+            recovery_journal=journal3,
+            _mutation_gate_closed=False,
+        )
+        mgr3.register_extension(make_definition(ws3, "uncertain_mutation"))
+        keep3 = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            await mgr3.start_all_background(tg, keep_alive_event=keep3)
+            for _ in range(200):
+                if mgr3.get_state("fake") == ExtensionState.HEALTHY:
+                    break
+                await anyio.sleep(0.02)
+            lease3 = mgr3.registry.create_lease("external.fake.increment_value")
+            assert lease3 is not None
+            res_unc = await mgr3.execute_guarded_call(lease3, {"amount": 7})
+            assert res_unc["ok"] is False
+            assert res_unc["outcome"] == "uncertain"
+            assert res_unc["error"] == "uncertain_side_effect"
+            assert isinstance(res_unc["operation_id"], str)
+            assert read_dispatch_count(ws3) == 1
+            inspected_unc = journal3.inspect(res_unc["operation_id"])
+            assert inspected_unc["state"] == "uncertain"
+            assert inspected_unc["external"]["dispatch_stage"] == "may_dispatch"
+            assert inspected_unc["external"]["external_outcome"] == "uncertain"
+            await mgr3.drain_and_stop()
+
+    anyio.run(run_scenarios)

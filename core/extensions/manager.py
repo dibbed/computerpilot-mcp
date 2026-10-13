@@ -31,7 +31,13 @@ from core.extensions.models import (
     MutationClass,
     TrustClass,
 )
-from core.extensions.output import normalize_result, validate_arguments
+from core.extensions.output import (
+    ExtensionResult,
+    ResultLimits,
+    finalize_envelope,
+    normalize_result,
+    validate_arguments,
+)
 from core.extensions.registry import (
     CatalogLimitExceededError,
     ExtensionLease,
@@ -42,6 +48,8 @@ from core.extensions.registry import (
 from core.extensions.security import CredentialRedactor, suppress_sdk_payload_logs
 from core.extensions.transport import BoundedStderrDrain, bounded_stdio_transport
 from core.platform import normalize_system
+from core.recovery import OPERATION_RECOVERY, OperationRecoveryJournal
+from core.recovery_models import ExternalOperationMetadata
 from core.tool_catalog import external_tool_execution_metadata
 from core.tool_profiles import PROFILE_DOMAINS
 
@@ -623,12 +631,17 @@ class ExtensionLifecycleManager:
         registry: ExtensionRegistry | None = None,
         parallel_startup: int = LIMITS.parallel_startup,
         max_global_calls: int = LIMITS.global_calls,
+        recovery_journal: OperationRecoveryJournal | None = None,
+        *,
+        _mutation_gate_closed: bool = True,
     ) -> None:
         self._registry = registry or ExtensionRegistry()
         self._parallel_startup = parallel_startup
         self._startup_semaphore = anyio.Semaphore(parallel_startup)
         self._max_global_calls = max_global_calls
         self._global_call_semaphore = anyio.Semaphore(max_global_calls)
+        self._recovery_journal = recovery_journal if recovery_journal is not None else OPERATION_RECOVERY
+        self._mutation_gate_closed = _mutation_gate_closed
         self._owners: dict[str, ExtensionOwner] = {}
         self._unresolved_mutation_hooks: list[Callable[[str], None]] = []
         self._shutdown_event: anyio.Event = anyio.Event()
@@ -636,6 +649,14 @@ class ExtensionLifecycleManager:
     @property
     def registry(self) -> ExtensionRegistry:
         return self._registry
+
+    @property
+    def recovery_journal(self) -> OperationRecoveryJournal:
+        return self._recovery_journal
+
+    @property
+    def is_mutation_gate_closed(self) -> bool:
+        return self._mutation_gate_closed
 
     def register_extension(
         self,
@@ -757,6 +778,8 @@ class ExtensionLifecycleManager:
         eligibility = evaluate_tool_eligibility(
             descriptor, snapshot=snapshot, definition=owner.definition, runtime_state=owner.state,
             active_profile=active_profile, platform=normalize_system(), resolved_env_refs=refs,
+            is_mutation_gate_closed=self._mutation_gate_closed,
+            is_recovery_available=self._recovery_journal.enabled,
         )
         if not eligibility.eligible:
             return eligibility
@@ -983,13 +1006,19 @@ class ExtensionLifecycleManager:
                 message=f"Tool '{lease.public_name}' is disallowed by operator policy",
             )
 
-        # 6. Check mutation closure (closed until M10)
+        # 6. Check mutation closure (closed until M10.4 activation)
         # Non-authoritative provider hints cannot bypass operator mutation classification!
         if descriptor.policy.mutation_class != MutationClass.READ_ONLY:
-            raise ToolError(
-                code="mutation_withheld",
-                message=f"Mutating tool '{lease.public_name}' is withheld until M10 activation",
-            )
+            if self._mutation_gate_closed:
+                raise ToolError(
+                    code="mutation_withheld",
+                    message=f"Mutating tool '{lease.public_name}' is withheld until M10 activation",
+                )
+            if not self._recovery_journal.enabled:
+                raise ToolError(
+                    code="recovery_unavailable",
+                    message="Mutating external tool requires an enabled recovery journal.",
+                )
 
         eligibility = self.tool_eligibility(lease.public_name, active_profile)
         if not eligibility.eligible:
@@ -1058,6 +1087,8 @@ class ExtensionLifecycleManager:
             timeout_sec, initial_owner.definition.timeouts.call_sec if initial_owner else LIMITS.call_sec, LIMITS.call_sec,
         )
         dispatched = False
+        may_dispatch_durable = False
+        uncertain_envelope: dict[str, Any] | None = None
         try:
             with anyio.fail_after(timeout_sec):
                 descriptor = self._registry.get_tool(lease.public_name) if isinstance(lease, ExtensionLease) else None
@@ -1065,9 +1096,149 @@ class ExtensionLifecycleManager:
                 async with self.guard_call_admission(
                     lease, timeout_sec=timeout_sec, request_callback=request_callback, active_profile=active_profile,
                 ) as (owner, descriptor):
+                    if descriptor.policy.mutation_class == MutationClass.READ_ONLY:
+                        dispatched = True
+                        result = await owner._call_tool(descriptor.remote_name, args, timeout_sec=timeout_sec)
+                        return normalize_result(descriptor, result, owner.credential_redactor())
+
+                    # Mutating external call: enforce M10.2 durable dispatch barrier
+                    correlation = self._recovery_journal.correlate_external_request(
+                        extension_id=descriptor.extension_id,
+                        public_name=descriptor.public_name,
+                        catalog_generation=descriptor.catalog_generation,
+                        schema_fingerprint=descriptor.schema_fingerprint,
+                        arguments=args if isinstance(args, Mapping) else None,
+                    )
+                    ext_meta = ExternalOperationMetadata(
+                        extension_id=descriptor.extension_id,
+                        provider=descriptor.identity.provider,
+                        public_name=descriptor.public_name,
+                        remote_name=descriptor.remote_name,
+                        catalog_generation=descriptor.catalog_generation,
+                        schema_fingerprint=descriptor.schema_fingerprint,
+                        mutation_class=descriptor.policy.mutation_class.value,
+                        dispatch_stage="prepared",
+                        correlation=correlation,
+                    )
+                    handle = self._recovery_journal.begin(
+                        descriptor.public_name,
+                        f"extension={descriptor.extension_id};tool={descriptor.remote_name}",
+                        external_metadata=ext_meta,
+                    )
+                    if handle is None:
+                        raise ToolError(
+                            "recovery_unavailable",
+                            "Operation recovery journal must be enabled for external mutations.",
+                        )
+
+                    # Re-check lease and owner before durable may_dispatch checkpoint
+                    if not owner.is_routable or not self._registry.is_lease_valid(lease):
+                        with anyio.CancelScope(shield=True):
+                            self._recovery_journal.finish_not_dispatched(handle, "stale_generation")
+                        raise ToolError(
+                            "stale_generation",
+                            "Tool lease or extension state changed before dispatch.",
+                        )
+
+                    # Durable may_dispatch barrier BEFORE transport receives the call
+                    self._recovery_journal.checkpoint_external_dispatch(handle)
+                    may_dispatch_durable = True
                     dispatched = True
-                    result = await owner._call_tool(descriptor.remote_name, args, timeout_sec=timeout_sec)
-                    return normalize_result(descriptor, result, owner.credential_redactor())
+
+                    def _record_uncertain(reason: str) -> dict[str, Any]:
+                        with anyio.CancelScope(shield=True):
+                            try:
+                                self._recovery_journal.mark_uncertain(handle, reason)
+                            except ToolError:
+                                if owner.state_machine.can_transition(ExtensionState.DEGRADED):
+                                    owner.state_machine.transition(
+                                        ExtensionState.DEGRADED,
+                                        reason="recovery_journal_failed",
+                                    )
+                            for hook in self._unresolved_mutation_hooks:
+                                try:
+                                    hook(reason)
+                                except Exception:
+                                    pass
+                        return finalize_envelope(
+                            ExtensionResult(
+                                ok=False,
+                                extension_id=descriptor.extension_id,
+                                provider=descriptor.identity.provider,
+                                tool=descriptor.public_name,
+                                catalog_generation=descriptor.catalog_generation,
+                                operation_id=handle.operation_id,
+                                outcome="uncertain",
+                                limits=ResultLimits(returned_bytes=0, original_bytes_if_known=None),
+                                error="uncertain_side_effect",
+                                message="External mutation outcome is uncertain; do not retry automatically.",
+                            ).model_dump(mode="json")
+                        )
+
+                    try:
+                        result = await owner._call_tool(descriptor.remote_name, args, timeout_sec=timeout_sec)
+                        envelope = normalize_result(descriptor, result, owner.credential_redactor())
+                    except ToolError as exc:
+                        uncertain_envelope = _record_uncertain(exc.code)
+                        return uncertain_envelope
+                    except TimeoutError:
+                        uncertain_envelope = _record_uncertain("call_timeout")
+                        return uncertain_envelope
+                    except BaseException as exc:
+                        reason = (
+                            "call_timeout"
+                            if isinstance(exc, anyio.get_cancelled_exc_class())
+                            else "external_call_failed"
+                        )
+                        uncertain_envelope = _record_uncertain(reason)
+                        if isinstance(exc, anyio.get_cancelled_exc_class()):
+                            raise
+                        return uncertain_envelope
+
+                    if not envelope.get("ok"):
+                        uncertain_envelope = _record_uncertain(str(envelope.get("error") or "provider_error"))
+                        return uncertain_envelope
+
+                    structured = envelope.get("structured_content")
+                    receipt_id: str | None = None
+                    if isinstance(structured, Mapping) and isinstance(structured.get("receipt_id"), str):
+                        candidate_rcpt = structured["receipt_id"]
+                        if 1 <= len(candidate_rcpt) <= 128:
+                            receipt_id = candidate_rcpt
+
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            self._recovery_journal.finish(
+                                handle,
+                                known_result="ok",
+                                external_outcome="succeeded",
+                                receipt_id=receipt_id,
+                            )
+                        except ToolError:
+                            if owner.state_machine.can_transition(ExtensionState.DEGRADED):
+                                owner.state_machine.transition(
+                                    ExtensionState.DEGRADED,
+                                    reason="recovery_journal_failed",
+                                )
+                            return finalize_envelope(
+                                ExtensionResult(
+                                    ok=False,
+                                    extension_id=descriptor.extension_id,
+                                    provider=descriptor.identity.provider,
+                                    tool=descriptor.public_name,
+                                    catalog_generation=descriptor.catalog_generation,
+                                    operation_id=handle.operation_id,
+                                    outcome="uncertain",
+                                    limits=ResultLimits(returned_bytes=0, original_bytes_if_known=None),
+                                    error="uncertain_side_effect",
+                                    message="The external mutation executed, but terminal recovery journal update failed.",
+                                ).model_dump(mode="json")
+                            )
+
+                    envelope["operation_id"] = handle.operation_id
+                    return finalize_envelope(envelope)
         except TimeoutError:
+            if may_dispatch_durable and uncertain_envelope is not None:
+                return uncertain_envelope
             code = "call_timeout" if dispatched else "admission_limit_exceeded"
             raise ToolError(code, "The external call timed out within its total admission/execution deadline.") from None

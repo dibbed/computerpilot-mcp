@@ -764,6 +764,11 @@ class OperationRecoveryJournal:
         )
         with self._lock:
             if not self._enabled:
+                if normalized_external is not None:
+                    raise ToolError(
+                        "recovery_unavailable",
+                        "Operation recovery journal must be enabled for external mutations.",
+                    )
                 return None
             runtime_id = self._runtime_id
             assert runtime_id is not None
@@ -790,6 +795,143 @@ class OperationRecoveryJournal:
                 record["external"] = normalized_external
             self._append_locked(record)
             return handle
+
+    def checkpoint_external_dispatch(self, handle: OperationHandle | None) -> None:
+        if handle is None:
+            raise ToolError(
+                "recovery_unavailable",
+                "Operation recovery handle is required before external mutation dispatch.",
+            )
+        with self._lock:
+            if not self._enabled:
+                raise ToolError(
+                    "recovery_unavailable",
+                    "Operation recovery journal must be enabled before external mutation dispatch.",
+                )
+            current = self._state(self._load_locked()).get(handle.operation_id)
+            if current is None or current.get("begin") is None:
+                raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
+            if (
+                current.get("result") is not None
+                or current.get("uncertain") is not None
+                or current.get("reconciliation") is not None
+                or current.get("acknowledged") is not None
+            ):
+                raise ToolError(
+                    "operation_already_completed",
+                    "Operation already has a terminal or uncertain state.",
+                )
+            merged_ext = self._merged_external_metadata(current)
+            if merged_ext is None:
+                raise ToolError(
+                    "invalid_external_recovery_metadata",
+                    "checkpoint_external_dispatch requires an external operation.",
+                )
+            existing = current.get("checkpoint")
+            if existing is not None:
+                existing_ext = existing.get("external")
+                if isinstance(existing_ext, dict) and existing_ext.get("dispatch_stage") == "may_dispatch":
+                    return
+                raise ToolError(
+                    "operation_checkpoint_conflict",
+                    "Operation already has a conflicting recovery checkpoint.",
+                )
+            merged_ext["dispatch_stage"] = "may_dispatch"
+            self._append_locked({
+                "schema_version": JOURNAL_SCHEMA_VERSION,
+                "type": "checkpoint",
+                "status": "in_progress",
+                "operation_id": handle.operation_id,
+                "runtime_id": handle.runtime_id,
+                "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "external": merged_ext,
+            })
+            self._maybe_compact_locked()
+
+    def finish_not_dispatched(self, handle: OperationHandle | None, reason_code: str) -> None:
+        if handle is None:
+            return
+        if not isinstance(reason_code, str) or _has_forbidden_text(reason_code, max_len=128):
+            raise ToolError("invalid_external_recovery_metadata", "Invalid not_dispatched reason_code.")
+        with self._lock:
+            if not self._enabled:
+                raise ToolError("recovery_unavailable", "Operation recovery journal is not enabled.")
+            current = self._state(self._load_locked()).get(handle.operation_id)
+            if current is None or current.get("begin") is None:
+                raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
+            if current.get("result") is not None:
+                raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
+            if current.get("uncertain") is not None:
+                raise ToolError("operation_already_uncertain", "Operation is already marked uncertain.")
+            merged_ext = self._merged_external_metadata(current)
+            if merged_ext is None:
+                raise ToolError(
+                    "invalid_external_recovery_metadata",
+                    "finish_not_dispatched requires an external operation.",
+                )
+            if merged_ext.get("dispatch_stage") == "may_dispatch":
+                raise ToolError(
+                    "operation_already_dispatched",
+                    "Cannot record not_dispatched after may_dispatch checkpoint is durable.",
+                )
+            merged_ext["dispatch_stage"] = "prepared"
+            merged_ext["external_outcome"] = "not_dispatched"
+            merged_ext["reason_code"] = reason_code
+            self._append_locked({
+                "schema_version": JOURNAL_SCHEMA_VERSION,
+                "type": "result",
+                "status": "completed",
+                "operation_id": handle.operation_id,
+                "runtime_id": handle.runtime_id,
+                "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "known_result": "returned_error",
+                "external_outcome": "not_dispatched",
+                "external": merged_ext,
+            })
+            self._maybe_compact_locked()
+
+    def mark_uncertain(
+        self,
+        handle: OperationHandle | None,
+        reason_code: str,
+        *,
+        receipt_id: str | None = None,
+    ) -> None:
+        if handle is None:
+            return
+        if not isinstance(reason_code, str) or _has_forbidden_text(reason_code, max_len=128):
+            raise ToolError("invalid_external_recovery_metadata", "Invalid uncertain reason_code.")
+        if receipt_id is not None and (not isinstance(receipt_id, str) or _has_forbidden_text(receipt_id, max_len=128)):
+            raise ToolError("invalid_external_recovery_metadata", "Invalid uncertain receipt_id.")
+        with self._lock:
+            if not self._enabled:
+                raise ToolError("recovery_unavailable", "Operation recovery journal is not enabled.")
+            current = self._state(self._load_locked()).get(handle.operation_id)
+            if current is None or current.get("begin") is None:
+                raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
+            if current.get("result") is not None:
+                raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
+            if current.get("uncertain") is not None:
+                return
+            record: dict[str, Any] = {
+                "schema_version": JOURNAL_SCHEMA_VERSION,
+                "type": "uncertain",
+                "status": "uncertain",
+                "operation_id": handle.operation_id,
+                "runtime_id": handle.runtime_id,
+                "marked_by_runtime_id": self._runtime_id,
+                "marked_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "reason": reason_code,
+            }
+            merged_ext = self._merged_external_metadata(current)
+            if merged_ext is not None:
+                merged_ext["external_outcome"] = "uncertain"
+                merged_ext["reason_code"] = reason_code
+                if receipt_id is not None:
+                    merged_ext["receipt_id"] = receipt_id
+                record["external"] = merged_ext
+            self._append_locked(record)
+            self._maybe_compact_locked()
 
     def checkpoint_postcondition(
         self,
@@ -835,10 +977,22 @@ class OperationRecoveryJournal:
         *,
         known_result: str,
         postcondition: dict[str, Any] | None = None,
+        external_outcome: str | None = None,
+        receipt_id: str | None = None,
     ) -> None:
         if handle is None:
             return
+        if external_outcome is not None and external_outcome not in _ALLOWED_EXTERNAL_OUTCOMES:
+            raise ToolError("invalid_external_recovery_metadata", "Invalid external_outcome.")
+        if receipt_id is not None and (not isinstance(receipt_id, str) or _has_forbidden_text(receipt_id, max_len=128)):
+            raise ToolError("invalid_external_recovery_metadata", "Invalid receipt_id.")
         with self._lock:
+            current = self._state(self._load_locked()).get(handle.operation_id)
+            if current is not None and current.get("uncertain") is not None:
+                raise ToolError(
+                    "operation_already_uncertain",
+                    "Cannot mark an uncertain operation as completed without reconciliation or acknowledgment.",
+                )
             record: dict[str, Any] = {
                 "schema_version": JOURNAL_SCHEMA_VERSION,
                 "type": "result",
@@ -850,6 +1004,18 @@ class OperationRecoveryJournal:
             }
             if postcondition is not None:
                 record["postcondition"] = postcondition
+            merged_ext = self._merged_external_metadata(current) if current is not None else None
+            if merged_ext is not None:
+                resolved_outcome = external_outcome or (
+                    "failed" if known_result in {"raised", "returned_error"} else "succeeded"
+                )
+                merged_ext["external_outcome"] = resolved_outcome
+                if receipt_id is not None:
+                    merged_ext["receipt_id"] = receipt_id
+                record["external_outcome"] = resolved_outcome
+                record["external"] = merged_ext
+            elif external_outcome is not None:
+                record["external_outcome"] = external_outcome
             self._append_locked(record)
             self._maybe_compact_locked()
 
