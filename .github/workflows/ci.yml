@@ -16,6 +16,7 @@ jobs:
   validate:
     name: Test & Validate (${{ matrix.platform }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
