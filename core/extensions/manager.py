@@ -285,6 +285,7 @@ class ExtensionOwner:
         self._active_session: ClientSession | None = None
         self._active_session_id: str | None = None
         self._is_running = False
+        self._stopped = False
         self.call_semaphore = anyio.Semaphore(LIMITS.calls_per_extension)
         self._credential_values: tuple[str, ...] = ()
         self._runner_scope: anyio.CancelScope | None = None
@@ -312,6 +313,11 @@ class ExtensionOwner:
 
     def signal(self, sig: OwnerSignal) -> bool:
         """Send a control signal to the owner actor. Duplicate starts are coalesced."""
+        if sig == OwnerSignal.STOP:
+            self._stopped = True
+        elif self._stopped and sig in {OwnerSignal.START, OwnerSignal.RESTART}:
+            return False
+
         # Coalesce duplicate start signals if already starting, healthy, or degraded
         if sig == OwnerSignal.START and self.state in {
             ExtensionState.STARTING,
@@ -346,7 +352,7 @@ class ExtensionOwner:
             self.state_machine.transition(ExtensionState.UNREACHABLE, reason=reason)
             self.close_active_session()
 
-        if self.state == ExtensionState.UNREACHABLE:
+        if self.state == ExtensionState.UNREACHABLE and not self._stopped:
             if self.restart_budget.can_restart():
                 return self.signal(OwnerSignal.RESTART)
             else:
@@ -434,6 +440,8 @@ class ExtensionOwner:
         try:
             async with self._receive_channel:
                 async for sig in self._receive_channel:
+                    if self._stopped and sig != OwnerSignal.STOP:
+                        continue
                     if sig in {OwnerSignal.START, OwnerSignal.RESTART}:
                         try:
                             self.require_launch_authorization()
@@ -648,6 +656,13 @@ async def connect_and_discover_tools(
                         async with anyio.create_task_group() as tasks:
                             tasks.start_soon(refresh)
                             tasks.start_soon(watch_transport)
+
+                            async def watch_stop() -> None:
+                                while not owner._stopped:
+                                    await anyio.sleep(0.05)
+                                tasks.cancel_scope.cancel()
+
+                            tasks.start_soon(watch_stop)
                             await keep_alive_event.wait()
                             tasks.cancel_scope.cancel()
                     return descriptors
@@ -1025,6 +1040,9 @@ class ExtensionLifecycleManager:
                 owner.signal(OwnerSignal.STOP)
 
             while any(owner.is_running for owner in self._owners.values()):
+                for owner in self._owners.values():
+                    if owner._runner_scope is not None:
+                        owner._runner_scope.cancel()
                 await anyio.sleep(0.01)
 
             for owner in list(self._owners.values()):
