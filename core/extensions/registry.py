@@ -670,7 +670,7 @@ class ExtensionRegistry:
         active_profile: str | None = None,
         platform: str | None = None,
         resolved_env_refs: Collection[str] | None = None,
-        is_mutation_gate_closed: bool = True,
+        is_mutation_gate_closed: bool = False,
         is_recovery_available: bool = False,
         trust_class: TrustClass | str | None = None,
     ) -> ToolEligibilityResult:
@@ -698,7 +698,7 @@ class ExtensionRegistry:
         active_profile: str | None = None,
         platform: str | None = None,
         resolved_env_refs: Collection[str] | None = None,
-        is_mutation_gate_closed: bool = True,
+        is_mutation_gate_closed: bool = False,
         is_recovery_available: bool = False,
         default_trust_class: TrustClass | str | None = None,
     ) -> tuple[ExtensionToolDescriptor, ...]:
@@ -723,7 +723,7 @@ def evaluate_tool_trust_mutation(
     mutation_class: MutationClass | str,
     allow_call: bool,
     *,
-    is_mutation_gate_closed: bool = True,
+    is_mutation_gate_closed: bool = False,
     provider_hints: ProviderToolHints | None = None,
 ) -> tuple[bool, str | None]:
     """Authoritatively evaluate tool call eligibility against Trust x Mutation x AllowCall matrix.
@@ -760,7 +760,7 @@ def evaluate_tool_trust_mutation(
 def evaluate_capability_trust_mutation(
     metadata: ExtensionCapabilityMetadata,
     *,
-    is_mutation_gate_closed: bool = True,
+    is_mutation_gate_closed: bool = False,
 ) -> tuple[bool, str | None]:
     """Authoritatively evaluate capability metadata against Trust x Mutation x AllowCall matrix."""
     return evaluate_tool_trust_mutation(
@@ -781,7 +781,7 @@ def evaluate_tool_eligibility(
     active_profile: str | None = None,
     platform: str | None = None,
     resolved_env_refs: Collection[str] | None = None,
-    is_mutation_gate_closed: bool = True,
+    is_mutation_gate_closed: bool = False,
     is_recovery_available: bool = False,
     trust_class: TrustClass | str | None = None,
 ) -> ToolEligibilityResult:
@@ -848,6 +848,9 @@ def evaluate_tool_eligibility(
         if active_profile not in desc.policy.profiles:
             msg = f"Tool '{desc.public_name}' is not permitted under active profile '{active_profile}'"
             return ToolEligibilityResult(False, "profile_mismatch", msg)
+        if active_profile == "minimal" and desc.policy.mutation_class != MutationClass.READ_ONLY:
+            msg = f"Mutating tool '{desc.public_name}' is not permitted under 'minimal' profile"
+            return ToolEligibilityResult(False, "profile_mismatch", msg)
 
     # Gate 6: Authentication / Required Environment References
     if desc.policy.required_env_refs:
@@ -886,7 +889,7 @@ def filter_eligible_tools(
     active_profile: str | None = None,
     platform: str | None = None,
     resolved_env_refs: Collection[str] | None = None,
-    is_mutation_gate_closed: bool = True,
+    is_mutation_gate_closed: bool = False,
     is_recovery_available: bool = False,
     default_trust_class: TrustClass | str | None = None,
 ) -> tuple[ExtensionToolDescriptor, ...]:

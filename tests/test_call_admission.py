@@ -20,6 +20,7 @@ from core.extensions.models import (
     MutationClass,
     ProviderToolHints,
     ToolPolicy,
+    TrustClass,
 )
 from core.extensions.registry import ExtensionLease
 from core.platform import normalize_system
@@ -120,87 +121,102 @@ def test_admitted_read_only_call_executes_successfully() -> None:
 
 
 def test_mutation_closed_denial_and_marker_absent(tmp_path: Path) -> None:
-    """Verify mutating tool is denied before dispatch and leaves no marker (T02/T07)."""
-    manager = ExtensionLifecycleManager()
-    definition = _dummy_definition("ext-mut", enabled=True)
-    owner = manager.register_extension(definition)
-    owner.state_machine.transition(ExtensionState.STARTING)
+    """Verify mutating tool is denied before dispatch when gate closed or recovery unavailable (T02/T07)."""
+    closed_manager = ExtensionLifecycleManager(_mutation_gate_closed=True)
+    default_manager = ExtensionLifecycleManager()
+    for idx, (manager, expected_code) in enumerate(
+        (
+            (closed_manager, "mutation_withheld"),
+            (default_manager, "recovery_unavailable"),
+        )
+    ):
+        definition = _dummy_definition("ext-mut", enabled=True)
+        owner = manager.register_extension(definition)
+        owner.state_machine.transition(ExtensionState.STARTING)
 
-    desc = _create_descriptor(
-        "ext-mut",
-        "do_mutation",
-        owner.generation,
-        mutation_class=MutationClass.LOCAL_MUTATION,
-    )
-    manager.registry.publish_extension_catalog("ext-mut", owner.generation, (desc,))
-    owner.state_machine.transition(ExtensionState.HEALTHY)
+        desc = _create_descriptor(
+            "ext-mut",
+            "do_mutation",
+            owner.generation,
+            mutation_class=MutationClass.LOCAL_MUTATION,
+        )
+        manager.registry.publish_extension_catalog("ext-mut", owner.generation, (desc,))
+        owner.state_machine.transition(ExtensionState.HEALTHY)
 
-    marker_file = tmp_path / "mutation_executed.marker"
+        marker_file = tmp_path / f"mutation_executed_{idx}.marker"
 
-    async def mock_call_tool(*args: Any, **kwargs: Any) -> types.CallToolResult:
-        marker_file.write_text("dispatched", encoding="utf-8")
-        return types.CallToolResult(content=[], structured_content={"ok": True})
+        async def mock_call_tool(*args: Any, marker_file: Path = marker_file, **kwargs: Any) -> types.CallToolResult:
+            marker_file.write_text("dispatched", encoding="utf-8")
+            return types.CallToolResult(content=[], structured_content={"ok": True})
 
-    session_mock = MagicMock()
-    session_mock.send_request = AsyncMock(side_effect=mock_call_tool)
-    owner.register_session(session_mock, "session-mut-1")
+        session_mock = MagicMock()
+        session_mock.send_request = AsyncMock(side_effect=mock_call_tool)
+        owner.register_session(session_mock, f"session-mut-{idx}")
 
-    lease = manager.registry.create_lease("external.ext-mut.do_mutation")
-    assert lease is not None
+        lease = manager.registry.create_lease("external.ext-mut.do_mutation")
+        assert lease is not None
 
-    async def scenario() -> None:
-        with pytest.raises(ToolError) as exc_info:
-            await manager.execute_guarded_call(lease)
+        async def scenario(
+            manager: ExtensionLifecycleManager = manager, lease: ExtensionLease | None = lease,
+            expected_code: str = expected_code, marker_file: Path = marker_file, session_mock: Any = session_mock,
+        ) -> None:
+            assert lease is not None
+            with pytest.raises(ToolError) as exc_info:
+                await manager.execute_guarded_call(lease)
 
-        assert exc_info.value.code == "mutation_withheld"
-        assert "withheld until M10" in exc_info.value.message
+            assert exc_info.value.code == expected_code
+            assert not marker_file.exists()
+            session_mock.send_request.assert_not_called()
 
-        # Assert provider was NEVER called and marker file is absent
-        assert not marker_file.exists()
-        session_mock.send_request.assert_not_called()
-
-    anyio.run(scenario)
+        anyio.run(scenario)
 
 
 def test_provider_hints_cannot_bypass_mutation_classification(tmp_path: Path) -> None:
     """Verify non-authoritative provider hints (e.g. read_only=True) cannot bypass operator policy."""
-    manager = ExtensionLifecycleManager()
-    definition = _dummy_definition("ext-bypass", enabled=True)
-    owner = manager.register_extension(definition)
-    owner.state_machine.transition(ExtensionState.STARTING)
+    for manager, trust_class, expected_code in (
+        (ExtensionLifecycleManager(_mutation_gate_closed=True), TrustClass.TRUSTED, "mutation_withheld"),
+        (ExtensionLifecycleManager(), TrustClass.TRUSTED, "recovery_unavailable"),
+        (ExtensionLifecycleManager(), TrustClass.RESTRICTED, "recovery_unavailable"),
+    ):
+        definition = _dummy_definition("ext-bypass", enabled=True).model_copy(update={"trust_class": trust_class})
+        owner = manager.register_extension(definition)
+        owner.state_machine.transition(ExtensionState.STARTING)
 
-    # Provider hints claim read_only=True, but operator policy is LOCAL_MUTATION
-    hints = ProviderToolHints(read_only=True, idempotent=True)
-    desc = _create_descriptor(
-        "ext-bypass",
-        "tricky_tool",
-        owner.generation,
-        mutation_class=MutationClass.LOCAL_MUTATION,
-        provider_hints=hints,
-    )
-    manager.registry.publish_extension_catalog("ext-bypass", owner.generation, (desc,))
-    owner.state_machine.transition(ExtensionState.HEALTHY)
+        # Provider hints claim read_only=True, but operator policy is LOCAL_MUTATION
+        hints = ProviderToolHints(read_only=True, idempotent=True)
+        desc = _create_descriptor(
+            "ext-bypass",
+            "tricky_tool",
+            owner.generation,
+            mutation_class=MutationClass.LOCAL_MUTATION,
+            provider_hints=hints,
+        )
+        manager.registry.publish_extension_catalog("ext-bypass", owner.generation, (desc,))
+        owner.state_machine.transition(ExtensionState.HEALTHY)
 
-    session_mock = MagicMock()
-    session_mock.send_request = AsyncMock(return_value=types.CallToolResult(content=[], structured_content={"ok": True}))
-    owner.register_session(session_mock, "session-bypass-1")
+        session_mock = MagicMock()
+        session_mock.send_request = AsyncMock(return_value=types.CallToolResult(content=[], structured_content={"ok": True}))
+        owner.register_session(session_mock, "session-bypass-1")
 
-    lease = manager.registry.create_lease("external.ext-bypass.tricky_tool")
-    assert lease is not None
+        lease = manager.registry.create_lease("external.ext-bypass.tricky_tool")
+        assert lease is not None
 
-    async def scenario() -> None:
-        # LOCAL_MUTATION denied
-        with pytest.raises(ToolError) as exc_info:
-            await manager.execute_guarded_call(lease)
-        assert exc_info.value.code == "mutation_withheld"
+        async def scenario(
+            manager: ExtensionLifecycleManager = manager, lease: ExtensionLease | None = lease,
+            expected_code: str = expected_code, session_mock: Any = session_mock,
+        ) -> None:
+            assert lease is not None
+            with pytest.raises(ToolError) as exc_info:
+                await manager.execute_guarded_call(lease)
+            assert exc_info.value.code == expected_code
 
-        session_mock.send_request.assert_not_called()
+            session_mock.send_request.assert_not_called()
 
-    anyio.run(scenario)
+        anyio.run(scenario)
 
 
 def test_unknown_mutation_class_denied() -> None:
-    """Verify tools with UNKNOWN side effect are denied under mutation-closed gate."""
+    """Verify tools with UNKNOWN side effect are unconditionally denied."""
     manager = ExtensionLifecycleManager()
     definition = _dummy_definition("ext-unk", enabled=True)
     owner = manager.register_extension(definition)
@@ -221,7 +237,7 @@ def test_unknown_mutation_class_denied() -> None:
     async def scenario() -> None:
         with pytest.raises(ToolError) as exc_info:
             await manager.execute_guarded_call(lease)
-        assert exc_info.value.code == "mutation_withheld"
+        assert exc_info.value.code == "unknown_mutation_class_forbidden"
 
     anyio.run(scenario)
 
