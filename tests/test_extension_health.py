@@ -277,3 +277,93 @@ def test_heartbeat_publishes_one_complete_bounded_snapshot(tmp_path: Any, monkey
             assert validate_runtime_health(snapshot, "a" * 32)["snapshot_status"] == "fresh"
     anyio.run(scenario)
     assert calls == 1
+
+
+def test_call_observation_and_persisted_audit_exclude_payload_canaries(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import audit, timings
+    from core.audit import AuditPolicy, AuditWriter
+    from core.errors import ToolError
+
+    canary = "private-call-payload-85362"
+    ref = "CALL_SECRET_REF"
+    monkeypatch.setenv(ref, canary)
+    monkeypatch.setenv("MCP_TIMINGS", "1")
+    monkeypatch.setenv("MCP_TIMINGS_FILE", str(tmp_path / "timings.jsonl"))
+    manager, lease, session = admitted_call({"type": "object"}, types.CallToolResult(
+        content=[types.TextContent(type="text", text=canary)],
+    ))
+    owner = manager.get_owner("security-fixture")
+    assert owner is not None
+    owner.definition = owner.definition.model_copy(update={"environment": ExtensionEnvironment.model_validate_json(json.dumps({
+        "references": {"TOKEN": {"kind": "env", "name": ref}},
+    }))})
+    writer = AuditWriter(tmp_path / "audit.jsonl", AuditPolicy(8, 0.01, 32, 2048, 2))
+    monkeypatch.setattr(audit, "_get_writer", lambda: writer)
+
+    async def scenario() -> None:
+        result = await manager.execute_guarded_call(lease, {"innocent": canary})
+        assert result["ok"] and canary not in json.dumps(result)
+        session.send_request.side_effect = ToolError(canary, canary)
+        with pytest.raises(ToolError):
+            await manager.execute_guarded_call(lease, {"innocent": canary})
+        with pytest.raises(ToolError):
+            await manager.execute_guarded_call(lease, active_profile="minimal")
+        manager.registry.retire_extension_catalog(owner.extension_id)
+        with pytest.raises(ToolError):
+            await manager.execute_guarded_call(lease)
+
+    try:
+        anyio.run(scenario)
+    finally:
+        writer.close()
+        timings.flush_timings()
+    snapshot = manager.health_snapshot()
+    row = snapshot["items"][0]
+    assert row["calls"] == {"succeeded": 1, "failed": 1, "uncertain": 0, "not_dispatched": 1}
+    # A retired lease has no current owner attribution and adds no arbitrary label.
+    records = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [item["outcome"] for item in records] == ["succeeded", "failed", "not_dispatched"]
+    assert records[1]["details"]["error_code"] == "external_failure"
+    for text in [json.dumps(snapshot), *(p.read_text(encoding="utf-8") for p in tmp_path.glob("*.jsonl"))]:
+        assert canary not in text and ref not in text and "innocent" not in text
+    assert row["call_duration_max_sec"] >= row["call_duration_mean_sec"] >= 0
+
+
+def test_call_telemetry_flood_has_fixed_window_and_memory_plateau(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gc
+    import tracemalloc
+
+    from core.extensions import manager as module
+    from core.timings import flush_timings
+
+    manager, lease, _ = admitted_call({"type": "object"}, types.CallToolResult(content=[]))
+    owner = manager.get_owner("security-fixture")
+    assert owner is not None
+    monkeypatch.setattr(module, "audit_action", lambda *args, **kwargs: None)
+
+    async def call(*args: Any, **kwargs: Any) -> types.CallToolResult:
+        return types.CallToolResult(content=[])
+
+    monkeypatch.setattr(owner, "_call_tool", call)
+
+    async def scenario() -> None:
+        for _ in range(200):
+            await manager.execute_guarded_call(lease)
+        flush_timings()
+        tracemalloc.start()
+        try:
+            gc.collect()
+            baseline = tracemalloc.get_traced_memory()[0]
+            for _ in range(1000):
+                await manager.execute_guarded_call(lease)
+            flush_timings()
+            await anyio.sleep(0)
+            gc.collect()
+            assert tracemalloc.get_traced_memory()[0] - baseline < 512 * 1024
+        finally:
+            tracemalloc.stop()
+        row = manager.health_snapshot()["items"][0]
+        assert row["call_window_size"] == row["calls"]["succeeded"] == 64
+        assert len(owner.call_observations) == 64 and len(row["calls"]) == 4
+
+    anyio.run(scenario)

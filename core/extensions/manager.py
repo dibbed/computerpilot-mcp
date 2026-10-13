@@ -23,6 +23,7 @@ import mcp.types as types
 from mcp.client.session import ClientSession
 from pydantic import ValidationError
 
+from core.audit import audit_action
 from core.errors import ToolError
 from core.execution_models import ExecutionIntent, ExternalRouteMetadata, RouteCandidate
 from core.extensions.config import build_extension_environment
@@ -69,6 +70,7 @@ _HEALTH_ERROR_CODES = frozenset({
     "restart_budget_exhausted", "external_failure",
 })
 _HEALTH_COUNT_NAMES = ("enabled", "healthy", "degraded", "unreachable", "failed", "disabled", "blocked", "pending", "live")
+_CALL_OUTCOMES = ("succeeded", "failed", "uncertain", "not_dispatched")
 
 
 def empty_extension_health() -> dict[str, Any]:
@@ -286,6 +288,7 @@ class ExtensionOwner:
         self.call_semaphore = anyio.Semaphore(LIMITS.calls_per_extension)
         self._credential_values: tuple[str, ...] = ()
         self._runner_scope: anyio.CancelScope | None = None
+        self.call_observations: deque[tuple[str, float]] = deque(maxlen=64)
 
     @property
     def state(self) -> ExtensionState:
@@ -770,6 +773,10 @@ class ExtensionLifecycleManager:
                 "last_error_code": safe_error if redactor.text(safe_error or "") == (safe_error or "") else "external_failure",
                 "last_error_at": owner.state_machine.last_error_at,
                 "restart_count": owner.state_machine.restart_count,
+                "calls": {key: sum(outcome == key for outcome, _ in owner.call_observations) for key in _CALL_OUTCOMES},
+                "call_window_size": len(owner.call_observations),
+                "call_duration_mean_sec": sum(duration for _, duration in owner.call_observations) / max(1, len(owner.call_observations)),
+                "call_duration_max_sec": max((duration for _, duration in owner.call_observations), default=0.0),
             })
         result: dict[str, Any] = {
             "configured_count": len(self._owners), **{f"{key}_count": value for key, value in counts.items()},
@@ -1203,6 +1210,9 @@ class ExtensionLifecycleManager:
             timeout_sec, initial_owner.definition.timeouts.call_sec if initial_owner else LIMITS.call_sec, LIMITS.call_sec,
         )
         dispatched = False
+        observed_start = time.monotonic()
+        observed_outcome = "not_dispatched"
+        observed_error: str | None = None
         may_dispatch_durable = False
         uncertain_envelope: dict[str, Any] | None = None
         try:
@@ -1215,8 +1225,12 @@ class ExtensionLifecycleManager:
                     with TOOL_ACTIVITY.track(descriptor.public_name), tool_timing(descriptor.public_name):
                         if descriptor.policy.mutation_class == MutationClass.READ_ONLY:
                             dispatched = True
+                            observed_outcome = "failed"
                             result = await owner._call_tool(descriptor.remote_name, args, timeout_sec=timeout_sec)
-                            return normalize_result(descriptor, result, owner.credential_redactor())
+                            envelope = normalize_result(descriptor, result, owner.credential_redactor())
+                            observed_outcome = "succeeded" if envelope.get("ok") else "failed"
+                            observed_error = envelope.get("error")
+                            return envelope
 
                         with RUNTIME_LIFECYCLE.mutation(descriptor.public_name):
                             # Mutating external call: enforce M10.2 durable dispatch barrier
@@ -1270,8 +1284,11 @@ class ExtensionLifecycleManager:
                                 await anyio.to_thread.run_sync(self._recovery_journal.checkpoint_external_dispatch, handle)
                             may_dispatch_durable = True
                             dispatched = True
+                            observed_outcome = "uncertain"
 
                             async def _record_uncertain(reason: str) -> dict[str, Any]:
+                                nonlocal observed_error
+                                observed_error = "uncertain_side_effect"
                                 with anyio.CancelScope(shield=True):
                                     try:
                                         await anyio.to_thread.run_sync(self._recovery_journal.mark_uncertain, handle, reason)
@@ -1344,6 +1361,7 @@ class ExtensionLifecycleManager:
                                         receipt_id=receipt_id,
                                     ))
                                 except ToolError:
+                                    observed_error = "uncertain_side_effect"
                                     if owner.state_machine.can_transition(ExtensionState.DEGRADED):
                                         owner.state_machine.transition(
                                             ExtensionState.DEGRADED,
@@ -1365,9 +1383,30 @@ class ExtensionLifecycleManager:
                                     )
 
                             envelope["operation_id"] = handle.operation_id
+                            observed_outcome = "succeeded"
                             return finalize_envelope(envelope)
         except TimeoutError:
             if may_dispatch_durable and uncertain_envelope is not None:
                 return uncertain_envelope
             code = "call_timeout" if dispatched else "admission_limit_exceeded"
+            observed_error = code
             raise ToolError(code, "The external call timed out within its total admission/execution deadline.") from None
+        except ToolError as exc:
+            observed_error = exc.code
+            raise
+        finally:
+            if initial_owner is not None and initial is not None:
+                duration = max(0.0, time.monotonic() - observed_start)
+                initial_owner.call_observations.append((observed_outcome, duration))
+                safe_error = observed_error if observed_error in _HEALTH_ERROR_CODES else "external_failure" if observed_error else None
+                try:
+                    redactor = initial_owner.credential_redactor()
+                    audit_action("external_tool_call", target=redactor.text(initial.public_name),
+                                 outcome=observed_outcome, details=redactor.json({
+                                     "extension_id": initial.extension_id, "catalog_generation": initial.catalog_generation,
+                                     "mutation_class": initial.policy.mutation_class.value,
+                                     "error_code": safe_error, "duration_sec": duration,
+                                 }))
+                except Exception:
+                    # Optional telemetry cannot replace the durable dispatch/recovery outcome.
+                    pass

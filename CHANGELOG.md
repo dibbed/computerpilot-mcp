@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Added
+- 2026-10-13: Record finite per-owner 64-call outcome and latency windows, separating uncertain mutations from failures, and publish metadata-only external-call audit records through the existing bounded writer.
 - 2026-10-13: Add a bounded in-memory extension owner/catalog health projection to the shared runtime collector, with generation, safe counts, UTC update/success/error times and monotonic state ages; disabled and policy-blocked definitions remain neutral.
 - 2026-10-13: Add bounded schema-1 external recovery metadata (`external_metadata_version=1`), runtime-only random HMAC request correlation, and two-stage durable dispatch barriers (`prepared` -> `may_dispatch`) for external mutations without storing raw arguments or secrets.
 - 2026-10-13: Activate guarded external mutation eligibility across direct calls, MCP wire, and advisory routing when trusted, explicitly classified and allowed, profile-eligible (`minimal` remains read-only for extensions), backed by a live catalog lease, `RUNTIME_LIFECYCLE` is `RUNNING`, and the recovery journal has unresolved capacity.
