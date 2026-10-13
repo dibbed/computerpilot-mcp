@@ -408,6 +408,10 @@ class OperationRecoveryJournal:
         # Admission hint; durable methods recheck configuration while holding the journal lock.
         return self._enabled
 
+    @property
+    def external_mutation_limit(self) -> int:
+        return self._max_unresolved_external
+
     @staticmethod
     def _is_unresolved_external_item(item: Mapping[str, Any]) -> bool:
         begin = item.get("begin")

@@ -9,6 +9,7 @@ import threading
 from typing import Any
 
 from core.config import SETTINGS, Settings
+from core.extensions.manager import empty_extension_health
 from core.platform import available_domains, detect_capabilities
 from core.recovery import OPERATION_RECOVERY
 from core.resource_health import collect_resource_metrics
@@ -38,8 +39,9 @@ async def collect_server_health(
     tools = await server.list_tools()
     browser_stats = await browser_manager.stats()
     router_snapshot = router_metrics.snapshot()
+    extension_manager = getattr(server, "extension_manager", None)
 
-    def collect_durable_metrics() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    def collect_durable_metrics() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], int]:
         # File walks, psutil and SQLite operations are synchronous. The health
         # publisher runs periodically on the MCP loop, so keep them together
         # in a worker thread without changing their read order.
@@ -53,9 +55,16 @@ async def collect_server_health(
                 workflows.health_summary(),
                 workflows.list(offset=0, limit=20),
                 recovery.summary(max_items=20),
+                extension_manager.recovery_journal.unresolved_external_count() if extension_manager is not None else 0,
             )
 
-    resources, workflow_health, recent_workflows, operation_recovery = await asyncio.to_thread(collect_durable_metrics)
+    (resources, workflow_health, recent_workflows, operation_recovery,
+     unresolved_external_count) = await asyncio.to_thread(collect_durable_metrics)
+    extensions = (
+        extension_manager.health_snapshot(profile.name, unresolved_external_count=unresolved_external_count)
+        if extension_manager is not None else empty_extension_health()
+    )
+    extensions["enabled"] = settings.extensions_enabled or extension_manager is not None
     resource_usage = resources.pop("budgets")
     degraded_reasons: list[str] = []
     if int(operation_recovery["uncertain_count"]) > 0:
@@ -69,6 +78,8 @@ async def collect_server_health(
     resource_pressure = resources.get("resource_pressure")
     if resource_pressure in {"warning", "critical"}:
         degraded_reasons.append("resource_pressure")
+    if sum(extensions[f"{state}_count"] for state in ("failed", "degraded", "unreachable")):
+        degraded_reasons.append("extension_unavailable")
     if resource_pressure == "critical":
         health_status = "unhealthy"
     elif degraded_reasons:
@@ -98,6 +109,7 @@ async def collect_server_health(
             **router_snapshot,
         },
         "operation_recovery": operation_recovery,
+        "extensions": extensions,
         "health_status": health_status,
         "degraded_reasons": degraded_reasons,
         "workflow_total": workflow_health["workflow_total"],
