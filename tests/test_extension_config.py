@@ -24,11 +24,16 @@ def definition(tmp_path: Path) -> dict[str, Any]:
 
 
 def test_disabled_does_not_even_open_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def forbidden(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("config opened while disabled")
+    target = tmp_path / "must-not-open.json"
+    original_open = Path.open
+
+    def forbidden(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == target or "must-not-open.json" in str(self):
+            raise AssertionError("config opened while disabled")
+        return original_open(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", forbidden)
-    settings = replace(SETTINGS, extensions_enabled=False, extensions_config=str(tmp_path / "must-not-open.json"))
+    settings = replace(SETTINGS, extensions_enabled=False, extensions_config=str(target))
     result = load_extension_config(settings)
     assert result.error_code is None and result.config.extensions == ()
 
