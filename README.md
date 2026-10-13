@@ -354,6 +354,9 @@ Browse the [latest release](https://github.com/dibbed/computerpilot-mcp/releases
 | [Configuration](docs/configuration.md) | environment variables and resource budgets |
 | [Troubleshooting](docs/troubleshooting.md) | startup, browser, tunnel, catalog, recovery |
 | [Release process](docs/release-process.md) | release gates, artifacts, publication contract |
+| [Native tool authoring](docs/development/MCP-TOOL-AUTHORING.md) | registration, inputs, outputs, lifecycle, and testing |
+| [Extension authoring](docs/development/MCP-EXTENSION-AUTHORING.md) | external MCP provider integration, transport, and safety |
+| [Testing standards](docs/development/TESTING-STANDARDS.md) | test isolation, fixtures, and platform validation |
 | [Security policy](SECURITY.md) | vulnerability reporting and operator security |
 | [Changelog](CHANGELOG.md) | release history |
 | [Binary provenance](BINARY_PROVENANCE.md) | managed tunnel runtime trust model |
@@ -364,7 +367,7 @@ Historical release notes and validation records remain under `docs/`. Internal l
 
 - Native desktop screenshot/input and semantic UI Automation are Windows-only.
 - Linux and macOS support is still labeled preview.
-- Linux arm64 and macOS amd64 are package targets without a dedicated native hosted-runner claim in v0.4.0.
+- Linux arm64 and macOS amd64 are package targets without a dedicated native hosted-runner claim in v0.7.1 / v0.8.0.
 - Browser automation requires Playwright and installed browser runtimes.
 - Excel document tools support `.xlsx` and `.xlsm`; macro mutation is accepted only when VBA bytes can be verified unchanged.
 - DOCX mutation is intentionally conservative: `.docm`, tracked changes, comments, headers/footers, arbitrary XML edits, and ambiguous mixed-format replacements are not supported.

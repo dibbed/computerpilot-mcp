@@ -20,17 +20,17 @@ This directory contains the public technical documentation and release evidence 
 
 - [Agent and contributor contract](../AGENTS.md) — scope, authority, safety and execution evidence.
 - [Native tool authoring](development/MCP-TOOL-AUTHORING.md) — current registration, input/result, lifecycle and recovery conventions.
-- [Extension authoring](development/MCP-EXTENSION-AUTHORING.md) — proposed v0.8 operator/provider contract; runtime gates remain pending.
+- [Extension authoring](development/MCP-EXTENSION-AUTHORING.md) — verified v0.8 extensibility contracts, transport, lifecycle, and safety boundaries.
 - [Testing standards](development/TESTING-STANDARDS.md) — isolation, behavior checks, platform and release evidence.
 
 ## Release evidence
 
 Current release evidence:
 
-- [v0.4.0 release notes](V0.4.0-RELEASE-NOTES.md)
-- [v0.4.0 validation](V0.4.0-VALIDATION.md)
+- [v0.7.1 release notes](V0.7.1-RELEASE-NOTES.md)
+- [v0.7.1 validation](V0.7.1-VALIDATION.md)
 
-Versioned files such as `V0.4.0-RELEASE-NOTES.md` and `V0.4.0-VALIDATION.md` are immutable evidence for a specific release. They may contain version-specific counts or platform claims that should not be copied forward without re-validation.
+Versioned files such as `V0.7.1-RELEASE-NOTES.md` and `V0.7.1-VALIDATION.md` are immutable evidence for a specific release. They may contain version-specific counts or platform claims that should not be copied forward without re-validation.
 
 ## Internal development material
 
