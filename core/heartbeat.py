@@ -14,7 +14,7 @@ from core.artifact_retention import schedule_artifact_retention
 from core.audit import flush_audit
 from core.backups import BACKUP_RETENTION
 from core.config import SETTINGS
-from core.health_snapshot import collect_server_health
+from core.health_snapshot import bound_runtime_health, collect_server_health
 from core.job_retention import schedule_job_history_retention
 from core.lifecycle import RUNTIME_LIFECYCLE
 from core.recovery import OPERATION_RECOVERY
@@ -36,7 +36,7 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     async def publish_health(path: Path) -> None:
         while True:
             try:
-                payload = await collect_server_health(server, settings=SETTINGS)
+                payload = bound_runtime_health(await collect_server_health(server, settings=SETTINGS))
                 temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
                 temporary.write_text(
                     json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),

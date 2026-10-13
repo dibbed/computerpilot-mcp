@@ -141,3 +141,139 @@ def test_shared_collector_uses_canonical_extension_counts_without_rpc() -> None:
         session.send_request.assert_not_called()
 
     anyio.run(scenario)
+
+
+def test_catalog_retirement_during_native_collection_keeps_total_and_generation_coherent() -> None:
+    from test_extension_bridge import bridge
+
+    from core.health_snapshot import collect_server_health
+
+    server, manager, session = bridge()
+    store = MagicMock()
+    store.health_summary.return_value = dict.fromkeys((
+        "unresolved_operation_count", "workflow_db_bytes", "workflow_total", "workflow_operation_total", "workflow_event_total",
+        "active_workflow_leases", "queued_workflows", "running_workflows", "uncertain_workflows", "unresolved_workflow_operations",
+    ), 0)
+    store.list.return_value = {"items": [], "total_count": 0}
+    recovery = MagicMock()
+    recovery.summary.return_value = {"uncertain_count": 0, "pending_count": 0}
+
+    class Browser:
+        async def stats(self) -> dict[str, int]:
+            manager.registry.retire_extension_catalog("security-fixture")
+            return {}
+
+    async def scenario() -> None:
+        assert len(await server.list_tools()) == 2
+        result = await collect_server_health(server, browser_manager=Browser(), recovery=recovery,
+                                             resource_collector=lambda _: {"budgets": {}}, workflow_store_factory=lambda _: store)
+        assert result["tool_count"] == len(await server.list_tools()) == 1
+        assert result["extensions"]["eligible_tool_count"] == 0
+        assert result["extensions"]["catalog_generation"] == manager.registry.manager_generation
+        session.send_request.assert_not_called()
+
+    anyio.run(scenario)
+
+
+def test_complete_native_and_extension_payload_budget_and_stale_generation() -> None:
+    import time
+
+    from core.health_snapshot import MAX_RUNTIME_HEALTH_BYTES, bound_runtime_health, validate_runtime_health
+
+    manager, _, session = admitted_call({"type": "object"}, types.CallToolResult(content=[]))
+    now = time.monotonic()
+    payload = {
+        "ok": True, "health_status": "degraded", "tool_count": 150, "snapshot_schema_version": 1,
+        "runtime_generation": "a" * 32, "collected_monotonic": now, "collected_at": "2026-10-13T00:00:00+00:00",
+        "extensions": manager.health_snapshot(), "native_noise": "x" * (2 * MAX_RUNTIME_HEALTH_BYTES),
+        "operation_recovery": {"uncertain_count": 5, "pending_count": 3, "uncertain": [{"note": "y" * 20_000}] * 20},
+    }
+    bounded = bound_runtime_health(payload)
+    assert len(json.dumps(bounded, ensure_ascii=False).encode("utf-8")) <= MAX_RUNTIME_HEALTH_BYTES
+    assert bounded["snapshot_truncated"]
+    assert bound_runtime_health(bounded)["snapshot_truncated"]
+    assert bounded["tool_count"] == 150
+    assert bounded["operation_recovery"]["uncertain_count"] == 5
+    assert bounded["extensions"]["eligible_tool_count"] == 1
+    fresh = validate_runtime_health(bounded, "a" * 32, now=now + 1)
+    assert fresh["snapshot_status"] == "fresh" and fresh["health_status"] == "degraded"
+    stale = validate_runtime_health(bounded, "a" * 32, now=now + 31)
+    assert stale["snapshot_status"] == stale["health_status"] == "stale"
+    assert stale["extensions"]["eligible_tool_count"] == stale["extensions"]["healthy_count"] == 0
+    assert not stale["extensions"]["items"][0]["routable"]
+    mismatch = validate_runtime_health(bounded, "b" * 32, now=now + 1)
+    assert mismatch["snapshot_status"] == "stale"
+    assert mismatch["snapshot_reason"] == "generation_mismatch"
+    assert validate_runtime_health(bounded, "a" * 32, now=now - 1)["snapshot_status"] == "stale"
+    assert validate_runtime_health({**bounded, "collected_monotonic": 10**400}, "a" * 32)["snapshot_status"] == "stale"
+    assert validate_runtime_health({**bounded, "snapshot_schema_version": True}, "a" * 32)["snapshot_status"] == "stale"
+    session.send_request.assert_not_called()
+
+
+def test_supervisor_snapshot_rejects_corrupt_missing_oversize_and_prior_generation(tmp_path: Any) -> None:
+    import time
+
+    from core.health_snapshot import MAX_RUNTIME_HEALTH_BYTES
+    from scripts.supervisor import Supervisor
+
+    supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
+    path = tmp_path / f"health-{'a' * 32}.json"
+    supervisor.current_runtime_health_path = path
+    payload = {"snapshot_schema_version": 1, "runtime_generation": "a" * 32, "collected_monotonic": time.monotonic(),
+               "health_status": "healthy", "extensions": {"items": [], "eligible_tool_count": 1, "healthy_count": 1}}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert supervisor.runtime_health_snapshot()["snapshot_status"] == "fresh"
+    payload["runtime_generation"] = "b" * 32
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert supervisor.runtime_health_snapshot()["snapshot_status"] == "stale"
+    path.write_text("{broken", encoding="utf-8")
+    assert supervisor.runtime_health_snapshot()["snapshot_status"] == "unavailable"
+    path.write_bytes(b"x" * (MAX_RUNTIME_HEALTH_BYTES + 1))
+    assert supervisor.runtime_health_snapshot()["snapshot_status"] == "unavailable"
+    supervisor.current_runtime_health_path = None
+    assert supervisor.runtime_health_snapshot()["snapshot_status"] == "unavailable"
+
+
+def test_heartbeat_publishes_one_complete_bounded_snapshot(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+    import time
+    from dataclasses import replace
+
+    from core import heartbeat
+    from core.health_snapshot import MAX_RUNTIME_HEALTH_BYTES, validate_runtime_health
+
+    path = tmp_path / f"health-{'a' * 32}.json"
+    monkeypatch.setenv("MCP_RUNTIME_HEALTH_FILE", str(path))
+    monkeypatch.setenv("MCP_RUNTIME_GENERATION_ID", "a" * 32)
+    for name in ("MCP_LIFECYCLE_CONTROL_FILE", "MCP_LIFECYCLE_STATUS_FILE", "MCP_HEARTBEAT_FILE", "MCP_TOOL_ACTIVITY_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(heartbeat, "SETTINGS", replace(heartbeat.SETTINGS, state_dir=tmp_path / "state", extensions_enabled=False))
+    for name in ("schedule_artifact_retention", "schedule_job_history_retention", "schedule_workflow_history_retention"):
+        monkeypatch.setattr(heartbeat, name, lambda **kwargs: None)
+    monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
+    calls = 0
+
+    async def collect(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"ok": True, "health_status": "healthy", "tool_count": 150, "snapshot_schema_version": 1,
+                "runtime_generation": "a" * 32, "collected_monotonic": time.monotonic(), "extensions": {"items": []},
+                "large_native_history": "x" * (2 * MAX_RUNTIME_HEALTH_BYTES)}
+
+    monkeypatch.setattr(heartbeat, "collect_server_health", collect)
+
+    class Server:
+        extension_manager = None
+
+    async def scenario() -> None:
+        async with heartbeat.lifespan(Server()):
+            with anyio.fail_after(3):
+                while not path.exists():
+                    await asyncio.sleep(0.01)
+            assert path.stat().st_size <= MAX_RUNTIME_HEALTH_BYTES
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+            assert snapshot["snapshot_truncated"]
+            assert snapshot["tool_count"] == 150
+            assert validate_runtime_health(snapshot, "a" * 32)["snapshot_status"] == "fresh"
+    anyio.run(scenario)
+    assert calls == 1

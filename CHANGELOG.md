@@ -28,6 +28,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.
 
 ### Fixed
+- 2026-10-13: Keep runtime health totals coherent with one final extension generation; cap complete native/extension publication at 512 KiB, preserve truncation and suppress stale or prior-generation routability in the bounded Supervisor reader.
 - 2026-10-13: Derive external tool annotations from operator mutation policy; stream bounded recovery admission and operation lookups, record policy fingerprints, and keep read-only calls responsive during deadline-limited mutation journal contention.
 - 2026-10-13: Execute recovery acknowledgement, reconciliation, and external quota admission inside a full interprocess file-lock read-check-append transaction, and preserve `known_result='returned_error'` alongside `external_outcome='not_dispatched'` for pre-dispatch failures.
 - 2026-10-13: Reject diagnostic all and unknown execution profiles at the shared extension guard, and retain legacy connection exposure limits in router recommendations.
