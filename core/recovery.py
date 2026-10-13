@@ -13,7 +13,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -30,6 +30,9 @@ from core.recovery_models import (
 JOURNAL_SCHEMA_VERSION = 1
 EXTERNAL_METADATA_VERSION = 1
 COMPACT_AFTER_RECORDS = 4_096
+MAX_UNRESOLVED_EXTERNAL_OPERATIONS = 128
+MAX_EXTERNAL_TERMINAL_HISTORY = 1_000
+MAX_EXTERNAL_TERMINAL_DAYS = 30
 _MAX_LINE_BYTES = 32_768
 _MAX_TARGET_CHARS = 1_000
 _JOURNAL_LOCK_WAIT_SEC = 10.0
@@ -293,10 +296,28 @@ def operation_recovery_context(handle: OperationHandle | None) -> Iterator[None]
         _CURRENT_OPERATION_HANDLE.reset(token)
 
 
+def _parse_iso_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
 class OperationRecoveryJournal:
     """Append-only fsync journal; incomplete previous-runtime mutations become uncertain."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_unresolved_external: int = MAX_UNRESOLVED_EXTERNAL_OPERATIONS,
+        max_external_terminal_history: int = MAX_EXTERNAL_TERMINAL_HISTORY,
+        max_external_terminal_days: int = MAX_EXTERNAL_TERMINAL_DAYS,
+    ) -> None:
         self._lock = threading.RLock()
         self._path: Path | None = None
         self._runtime_id: str | None = None
@@ -305,6 +326,9 @@ class OperationRecoveryJournal:
         self._next_compact_at = COMPACT_AFTER_RECORDS
         self._hmac_key: bytes = os.urandom(32)
         self._hmac_key_id: str = os.urandom(8).hex()
+        self._max_unresolved_external = max_unresolved_external
+        self._max_external_terminal_history = max_external_terminal_history
+        self._max_external_terminal_days = max_external_terminal_days
 
     def configure(self, path: Path | None, runtime_id: str | None) -> None:
         with self._lock:
@@ -318,9 +342,9 @@ class OperationRecoveryJournal:
             if self._enabled:
                 assert path is not None
                 path.parent.mkdir(parents=True, exist_ok=True)
-                records = self._load_locked()
-                self._record_count = len(records)
-                self._recover_previous_locked(records)
+                with self._journal_transaction() as records:
+                    self._record_count = len(records)
+                    self._recover_previous_unlocked(records)
                 self._maybe_compact_locked()
 
     def correlate_external_request(
@@ -358,7 +382,6 @@ class OperationRecoveryJournal:
             scope="runtime_only",
         )
 
-
     def configure_from_env(self, state_dir: Path) -> None:
         runtime_id = os.environ.get("MCP_RUNTIME_GENERATION_ID", "").strip() or None
         path = state_dir / "operation-recovery.jsonl" if runtime_id else None
@@ -369,27 +392,76 @@ class OperationRecoveryJournal:
         with self._lock:
             return self._enabled
 
-    def _append_locked(self, record: dict[str, Any]) -> None:
+    @staticmethod
+    def _is_unresolved_external_item(item: Mapping[str, Any]) -> bool:
+        begin = item.get("begin")
+        if not isinstance(begin, dict) or not isinstance(begin.get("external"), dict):
+            return False
+        return (
+            item.get("result") is None
+            and item.get("reconciliation") is None
+            and item.get("acknowledged") is None
+        )
+
+    def unresolved_external_count(self) -> int:
+        with self._lock:
+            if not self._enabled or self._path is None:
+                return 0
+            state = self._state(self._load_locked())
+            return sum(1 for item in state.values() if self._is_unresolved_external_item(item))
+
+    def has_external_mutation_capacity(self) -> bool:
+        with self._lock:
+            if not self._enabled or self._path is None:
+                return False
+            return self.unresolved_external_count() < self._max_unresolved_external
+
+    def _append_unlocked_file(self, record: dict[str, Any]) -> None:
         path = self._path
         if not self._enabled or path is None:
             return
         payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
         if len(payload) > _MAX_LINE_BYTES:
             raise ToolError("operation_journal_record_too_large", "Recovery journal metadata exceeded its bounded record size.")
+        with path.open("a+b", buffering=0) as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size:
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(b"\n")
+            handle.seek(0, os.SEEK_END)
+            handle.write(payload)
+            os.fsync(handle.fileno())
+        self._record_count += 1
+
+    def _append_locked(self, record: dict[str, Any]) -> None:
+        path = self._path
+        if not self._enabled or path is None:
+            return
         try:
             with _interprocess_journal_lock(path):
-                with path.open("a+b", buffering=0) as handle:
-                    handle.seek(0, os.SEEK_END)
-                    size = handle.tell()
-                    if size:
-                        handle.seek(-1, os.SEEK_END)
-                        if handle.read(1) != b"\n":
-                            handle.seek(0, os.SEEK_END)
-                            handle.write(b"\n")
-                    handle.seek(0, os.SEEK_END)
-                    handle.write(payload)
-                    os.fsync(handle.fileno())
-            self._record_count += 1
+                self._append_unlocked_file(record)
+        except ToolError:
+            raise
+        except (OSError, TimeoutError) as exc:
+            raise ToolError(
+                "operation_journal_unavailable",
+                "Could not durably update the operation recovery journal.",
+                hint="Do not retry a possibly-started mutation blindly; inspect runtime storage first.",
+            ) from exc
+
+    @contextmanager
+    def _journal_transaction(self) -> Iterator[list[dict[str, Any]]]:
+        path = self._path
+        if not self._enabled or path is None:
+            raise ToolError("recovery_unavailable", "Operation recovery journal is not enabled.")
+        try:
+            with _interprocess_journal_lock(path):
+                yield self._load_locked()
+        except ToolError:
+            raise
         except (OSError, TimeoutError) as exc:
             raise ToolError(
                 "operation_journal_unavailable",
@@ -459,16 +531,16 @@ class OperationRecoveryJournal:
                         merged[key] = dict(val) if isinstance(val, dict) else val
             if record_key == "result" and isinstance(record.get("external_outcome"), str):
                 merged["external_outcome"] = record["external_outcome"]
+            elif record_key in {"reconciliation", "acknowledged"} and isinstance(record.get("state"), str):
+                merged["external_outcome"] = record["state"]
             elif record_key == "uncertain" and "external_outcome" not in merged:
                 merged["external_outcome"] = "uncertain"
         return merged
 
-    def _recover_previous_locked(self, records: list[dict[str, Any]] | None = None) -> None:
+    def _recover_previous_unlocked(self, records: list[dict[str, Any]]) -> None:
         runtime_id = self._runtime_id
         if runtime_id is None:
             return
-        if records is None:
-            records = self._load_locked()
         for operation_id, item in self._state(records).items():
             begin = item.get("begin")
             if (
@@ -496,10 +568,26 @@ class OperationRecoveryJournal:
                 merged_ext["external_outcome"] = "uncertain"
                 merged_ext.setdefault("reason_code", "runtime_ended_without_known_result")
                 uncertain_record["external"] = merged_ext
-            self._append_locked(uncertain_record)
+            self._append_unlocked_file(uncertain_record)
+
+    def _recover_previous_locked(self, records: list[dict[str, Any]] | None = None) -> None:
+        if not self._enabled or self._path is None:
+            return
+        if records is not None:
+            try:
+                with _interprocess_journal_lock(self._path):
+                    self._recover_previous_unlocked(records)
+            except (OSError, TimeoutError) as exc:
+                raise ToolError(
+                    "operation_journal_unavailable",
+                    "Could not durably update the operation recovery journal.",
+                ) from exc
+            return
+        with self._journal_transaction() as loaded:
+            self._recover_previous_unlocked(loaded)
 
     def _compact_locked(self) -> None:
-        """Drop ordinary completed history while preserving recovery evidence."""
+        """Drop ordinary completed history and bound resolved external history while preserving all unresolved and native evidence."""
         path = self._path
         if not self._enabled or path is None:
             return
@@ -508,11 +596,49 @@ class OperationRecoveryJournal:
         try:
             with _interprocess_journal_lock(path):
                 records = self._load_locked()
-                for item in self._state(records).values():
+                state = self._state(records)
+                now = datetime.now(timezone.utc)
+                max_age = timedelta(days=max(0, self._max_external_terminal_days))
+
+                external_terminal_candidates: list[tuple[str, int, str]] = []
+                for idx, (op_id, item) in enumerate(state.items()):
                     begin = item.get("begin")
                     if begin is None or item.get("result") is not None:
                         continue
                     terminal = item.get("acknowledged") or item.get("reconciliation")
+                    if terminal is None:
+                        # Unresolved operations (running or uncertain) are NEVER evicted.
+                        continue
+                    if not isinstance(begin.get("external"), dict):
+                        # Native resolved operations are always preserved.
+                        continue
+                    ts = _parse_iso_utc(terminal.get("recorded_at")) or _parse_iso_utc(begin.get("started_at"))
+                    if ts is not None and (now - ts) > max_age:
+                        continue
+                    ts_key = str(terminal.get("recorded_at") or begin.get("started_at") or "")
+                    external_terminal_candidates.append((ts_key, idx, op_id))
+
+                if self._max_external_terminal_history <= 0:
+                    allowed_external_terminal_ids: set[str] = set()
+                elif len(external_terminal_candidates) > self._max_external_terminal_history:
+                    sorted_candidates = sorted(external_terminal_candidates, key=lambda entry: (entry[0], entry[1]))
+                    allowed_external_terminal_ids = {
+                        entry[2] for entry in sorted_candidates[-self._max_external_terminal_history:]
+                    }
+                else:
+                    allowed_external_terminal_ids = {entry[2] for entry in external_terminal_candidates}
+
+                for op_id, item in state.items():
+                    begin = item.get("begin")
+                    if begin is None or item.get("result") is not None:
+                        continue
+                    terminal = item.get("acknowledged") or item.get("reconciliation")
+                    if (
+                        terminal is not None
+                        and isinstance(begin.get("external"), dict)
+                        and op_id not in allowed_external_terminal_ids
+                    ):
+                        continue
                     retained.append(begin)
                     checkpoint = item.get("checkpoint")
                     if checkpoint is not None:
@@ -678,28 +804,37 @@ class OperationRecoveryJournal:
         if evidence is None or not evidence.source.strip() or not evidence.data:
             raise ToolError("evidence_required", "Acknowledgment requires non-empty evidence.")
         with self._lock:
-            current = self._state(self._load_locked()).get(operation_id)
-            if current is None or current.get("begin") is None:
-                raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
-            existing = current.get("acknowledged")
-            serialized = asdict(evidence)
-            if existing is not None:
-                if existing.get("state") == state.value and existing.get("evidence") == serialized:
-                    return self._operation_view(operation_id, current)
-                raise ToolError("operation_already_acknowledged", "Operation already has a different acknowledgment.")
-            record = {
-                "schema_version": JOURNAL_SCHEMA_VERSION,
-                "type": "acknowledged",
-                "status": "completed",
-                "state": state.value,
-                "operation_id": operation_id,
-                "runtime_id": self._runtime_id,
-                "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "evidence": serialized,
-            }
-            self._append_locked(record)
+            with self._journal_transaction() as records:
+                current = self._state(records).get(operation_id)
+                if current is None or current.get("begin") is None:
+                    raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
+                if current.get("result") is not None:
+                    raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
+                if current.get("reconciliation") is not None:
+                    raise ToolError("operation_already_reconciled", "Operation already has reconciliation evidence.")
+                existing = current.get("acknowledged")
+                serialized = asdict(evidence)
+                if existing is not None:
+                    if existing.get("state") == state.value and existing.get("evidence") == serialized:
+                        return self._operation_view(operation_id, current)
+                    raise ToolError("operation_already_acknowledged", "Operation already has a different acknowledgment.")
+                record: dict[str, Any] = {
+                    "schema_version": JOURNAL_SCHEMA_VERSION,
+                    "type": "acknowledged",
+                    "status": "completed",
+                    "state": state.value,
+                    "operation_id": operation_id,
+                    "runtime_id": self._runtime_id,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "evidence": serialized,
+                }
+                merged_ext = self._merged_external_metadata(current)
+                if merged_ext is not None:
+                    merged_ext["external_outcome"] = state.value
+                    record["external"] = merged_ext
+                self._append_unlocked_file(record)
+                current["acknowledged"] = record
             self._maybe_compact_locked()
-            current["acknowledged"] = record
             return self._operation_view(operation_id, current)
 
     def record_reconciliation(
@@ -714,36 +849,43 @@ class OperationRecoveryJournal:
         if state in {OperationState.SUCCEEDED, OperationState.FAILED} and evidence.data.get("conclusive") is not True:
             raise ToolError("conclusive_evidence_required", "A conclusive reconciliation requires evidence marked conclusive.")
         with self._lock:
-            current = self._state(self._load_locked()).get(operation_id)
-            if current is None or current.get("begin") is None:
-                raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
-            if current.get("result") is not None:
-                raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
-            serialized_postcondition = asdict(postcondition)
-            serialized_evidence = asdict(evidence)
-            existing = current.get("reconciliation")
-            if existing is not None:
-                if (
-                    existing.get("state") == state.value
-                    and existing.get("postcondition") == serialized_postcondition
-                    and existing.get("evidence") == serialized_evidence
-                ):
-                    return self._operation_view(operation_id, current)
-                raise ToolError("operation_already_reconciled", "Operation already has different reconciliation evidence.")
-            record = {
-                "schema_version": JOURNAL_SCHEMA_VERSION,
-                "type": "reconciliation",
-                "status": "completed",
-                "state": state.value,
-                "operation_id": operation_id,
-                "runtime_id": self._runtime_id,
-                "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "postcondition": serialized_postcondition,
-                "evidence": serialized_evidence,
-            }
-            self._append_locked(record)
+            with self._journal_transaction() as records:
+                current = self._state(records).get(operation_id)
+                if current is None or current.get("begin") is None:
+                    raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
+                if current.get("result") is not None:
+                    raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
+                if current.get("acknowledged") is not None:
+                    raise ToolError("operation_already_acknowledged", "Operation is already acknowledged.")
+                serialized_postcondition = asdict(postcondition)
+                serialized_evidence = asdict(evidence)
+                existing = current.get("reconciliation")
+                if existing is not None:
+                    if (
+                        existing.get("state") == state.value
+                        and existing.get("postcondition") == serialized_postcondition
+                        and existing.get("evidence") == serialized_evidence
+                    ):
+                        return self._operation_view(operation_id, current)
+                    raise ToolError("operation_already_reconciled", "Operation already has different reconciliation evidence.")
+                record: dict[str, Any] = {
+                    "schema_version": JOURNAL_SCHEMA_VERSION,
+                    "type": "reconciliation",
+                    "status": "completed",
+                    "state": state.value,
+                    "operation_id": operation_id,
+                    "runtime_id": self._runtime_id,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "postcondition": serialized_postcondition,
+                    "evidence": serialized_evidence,
+                }
+                merged_ext = self._merged_external_metadata(current)
+                if merged_ext is not None:
+                    merged_ext["external_outcome"] = state.value
+                    record["external"] = merged_ext
+                self._append_unlocked_file(record)
+                current["reconciliation"] = record
             self._maybe_compact_locked()
-            current["reconciliation"] = record
             return self._operation_view(operation_id, current)
 
     def compact(self) -> None:
@@ -793,6 +935,19 @@ class OperationRecoveryJournal:
             }
             if normalized_external is not None:
                 record["external"] = normalized_external
+                with self._journal_transaction() as records:
+                    state = self._state(records)
+                    unresolved_external = sum(
+                        1 for item in state.values() if self._is_unresolved_external_item(item)
+                    )
+                    if unresolved_external >= self._max_unresolved_external:
+                        raise ToolError(
+                            "operation_limit",
+                            f"Unresolved external operation limit ({self._max_unresolved_external}) reached; "
+                            "reconcile or acknowledge uncertain operations before starting new external mutations.",
+                        )
+                    self._append_unlocked_file(record)
+                return handle
             self._append_locked(record)
             return handle
 
@@ -808,44 +963,45 @@ class OperationRecoveryJournal:
                     "recovery_unavailable",
                     "Operation recovery journal must be enabled before external mutation dispatch.",
                 )
-            current = self._state(self._load_locked()).get(handle.operation_id)
-            if current is None or current.get("begin") is None:
-                raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
-            if (
-                current.get("result") is not None
-                or current.get("uncertain") is not None
-                or current.get("reconciliation") is not None
-                or current.get("acknowledged") is not None
-            ):
-                raise ToolError(
-                    "operation_already_completed",
-                    "Operation already has a terminal or uncertain state.",
-                )
-            merged_ext = self._merged_external_metadata(current)
-            if merged_ext is None:
-                raise ToolError(
-                    "invalid_external_recovery_metadata",
-                    "checkpoint_external_dispatch requires an external operation.",
-                )
-            existing = current.get("checkpoint")
-            if existing is not None:
-                existing_ext = existing.get("external")
-                if isinstance(existing_ext, dict) and existing_ext.get("dispatch_stage") == "may_dispatch":
-                    return
-                raise ToolError(
-                    "operation_checkpoint_conflict",
-                    "Operation already has a conflicting recovery checkpoint.",
-                )
-            merged_ext["dispatch_stage"] = "may_dispatch"
-            self._append_locked({
-                "schema_version": JOURNAL_SCHEMA_VERSION,
-                "type": "checkpoint",
-                "status": "in_progress",
-                "operation_id": handle.operation_id,
-                "runtime_id": handle.runtime_id,
-                "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "external": merged_ext,
-            })
+            with self._journal_transaction() as records:
+                current = self._state(records).get(handle.operation_id)
+                if current is None or current.get("begin") is None:
+                    raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
+                if (
+                    current.get("result") is not None
+                    or current.get("uncertain") is not None
+                    or current.get("reconciliation") is not None
+                    or current.get("acknowledged") is not None
+                ):
+                    raise ToolError(
+                        "operation_already_completed",
+                        "Operation already has a terminal or uncertain state.",
+                    )
+                merged_ext = self._merged_external_metadata(current)
+                if merged_ext is None:
+                    raise ToolError(
+                        "invalid_external_recovery_metadata",
+                        "checkpoint_external_dispatch requires an external operation.",
+                    )
+                existing = current.get("checkpoint")
+                if existing is not None:
+                    existing_ext = existing.get("external")
+                    if isinstance(existing_ext, dict) and existing_ext.get("dispatch_stage") == "may_dispatch":
+                        return
+                    raise ToolError(
+                        "operation_checkpoint_conflict",
+                        "Operation already has a conflicting recovery checkpoint.",
+                    )
+                merged_ext["dispatch_stage"] = "may_dispatch"
+                self._append_unlocked_file({
+                    "schema_version": JOURNAL_SCHEMA_VERSION,
+                    "type": "checkpoint",
+                    "status": "in_progress",
+                    "operation_id": handle.operation_id,
+                    "runtime_id": handle.runtime_id,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "external": merged_ext,
+                })
             self._maybe_compact_locked()
 
     def finish_not_dispatched(self, handle: OperationHandle | None, reason_code: str) -> None:
@@ -856,38 +1012,39 @@ class OperationRecoveryJournal:
         with self._lock:
             if not self._enabled:
                 raise ToolError("recovery_unavailable", "Operation recovery journal is not enabled.")
-            current = self._state(self._load_locked()).get(handle.operation_id)
-            if current is None or current.get("begin") is None:
-                raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
-            if current.get("result") is not None:
-                raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
-            if current.get("uncertain") is not None:
-                raise ToolError("operation_already_uncertain", "Operation is already marked uncertain.")
-            merged_ext = self._merged_external_metadata(current)
-            if merged_ext is None:
-                raise ToolError(
-                    "invalid_external_recovery_metadata",
-                    "finish_not_dispatched requires an external operation.",
-                )
-            if merged_ext.get("dispatch_stage") == "may_dispatch":
-                raise ToolError(
-                    "operation_already_dispatched",
-                    "Cannot record not_dispatched after may_dispatch checkpoint is durable.",
-                )
-            merged_ext["dispatch_stage"] = "prepared"
-            merged_ext["external_outcome"] = "not_dispatched"
-            merged_ext["reason_code"] = reason_code
-            self._append_locked({
-                "schema_version": JOURNAL_SCHEMA_VERSION,
-                "type": "result",
-                "status": "completed",
-                "operation_id": handle.operation_id,
-                "runtime_id": handle.runtime_id,
-                "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "known_result": "returned_error",
-                "external_outcome": "not_dispatched",
-                "external": merged_ext,
-            })
+            with self._journal_transaction() as records:
+                current = self._state(records).get(handle.operation_id)
+                if current is None or current.get("begin") is None:
+                    raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
+                if current.get("result") is not None:
+                    raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
+                if current.get("uncertain") is not None:
+                    raise ToolError("operation_already_uncertain", "Operation is already marked uncertain.")
+                merged_ext = self._merged_external_metadata(current)
+                if merged_ext is None:
+                    raise ToolError(
+                        "invalid_external_recovery_metadata",
+                        "finish_not_dispatched requires an external operation.",
+                    )
+                if merged_ext.get("dispatch_stage") == "may_dispatch":
+                    raise ToolError(
+                        "operation_already_dispatched",
+                        "Cannot record not_dispatched after may_dispatch checkpoint is durable.",
+                    )
+                merged_ext["dispatch_stage"] = "prepared"
+                merged_ext["external_outcome"] = "not_dispatched"
+                merged_ext["reason_code"] = reason_code
+                self._append_unlocked_file({
+                    "schema_version": JOURNAL_SCHEMA_VERSION,
+                    "type": "result",
+                    "status": "completed",
+                    "operation_id": handle.operation_id,
+                    "runtime_id": handle.runtime_id,
+                    "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "known_result": "returned_error",
+                    "external_outcome": "not_dispatched",
+                    "external": merged_ext,
+                })
             self._maybe_compact_locked()
 
     def mark_uncertain(
@@ -906,31 +1063,32 @@ class OperationRecoveryJournal:
         with self._lock:
             if not self._enabled:
                 raise ToolError("recovery_unavailable", "Operation recovery journal is not enabled.")
-            current = self._state(self._load_locked()).get(handle.operation_id)
-            if current is None or current.get("begin") is None:
-                raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
-            if current.get("result") is not None:
-                raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
-            if current.get("uncertain") is not None:
-                return
-            record: dict[str, Any] = {
-                "schema_version": JOURNAL_SCHEMA_VERSION,
-                "type": "uncertain",
-                "status": "uncertain",
-                "operation_id": handle.operation_id,
-                "runtime_id": handle.runtime_id,
-                "marked_by_runtime_id": self._runtime_id,
-                "marked_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "reason": reason_code,
-            }
-            merged_ext = self._merged_external_metadata(current)
-            if merged_ext is not None:
-                merged_ext["external_outcome"] = "uncertain"
-                merged_ext["reason_code"] = reason_code
-                if receipt_id is not None:
-                    merged_ext["receipt_id"] = receipt_id
-                record["external"] = merged_ext
-            self._append_locked(record)
+            with self._journal_transaction() as records:
+                current = self._state(records).get(handle.operation_id)
+                if current is None or current.get("begin") is None:
+                    raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
+                if current.get("result") is not None:
+                    raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
+                if current.get("uncertain") is not None:
+                    return
+                record: dict[str, Any] = {
+                    "schema_version": JOURNAL_SCHEMA_VERSION,
+                    "type": "uncertain",
+                    "status": "uncertain",
+                    "operation_id": handle.operation_id,
+                    "runtime_id": handle.runtime_id,
+                    "marked_by_runtime_id": self._runtime_id,
+                    "marked_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "reason": reason_code,
+                }
+                merged_ext = self._merged_external_metadata(current)
+                if merged_ext is not None:
+                    merged_ext["external_outcome"] = "uncertain"
+                    merged_ext["reason_code"] = reason_code
+                    if receipt_id is not None:
+                        merged_ext["receipt_id"] = receipt_id
+                    record["external"] = merged_ext
+                self._append_unlocked_file(record)
             self._maybe_compact_locked()
 
     def checkpoint_postcondition(
@@ -947,28 +1105,31 @@ class OperationRecoveryJournal:
                 "Recovery checkpoint requires a bounded file_sha256 postcondition.",
             )
         with self._lock:
-            current = self._state(self._load_locked()).get(handle.operation_id)
-            if current is None or current.get("begin") is None:
-                raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
-            if current.get("result") is not None:
-                raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
-            existing = current.get("checkpoint")
-            if existing is not None:
-                if existing.get("postcondition") == bounded:
-                    return
-                raise ToolError(
-                    "operation_checkpoint_conflict",
-                    "Operation already has a different recovery checkpoint.",
-                )
-            self._append_locked({
-                "schema_version": JOURNAL_SCHEMA_VERSION,
-                "type": "checkpoint",
-                "status": "in_progress",
-                "operation_id": handle.operation_id,
-                "runtime_id": handle.runtime_id,
-                "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "postcondition": bounded,
-            })
+            if not self._enabled or self._path is None:
+                return
+            with self._journal_transaction() as records:
+                current = self._state(records).get(handle.operation_id)
+                if current is None or current.get("begin") is None:
+                    raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
+                if current.get("result") is not None:
+                    raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
+                existing = current.get("checkpoint")
+                if existing is not None:
+                    if existing.get("postcondition") == bounded:
+                        return
+                    raise ToolError(
+                        "operation_checkpoint_conflict",
+                        "Operation already has a different recovery checkpoint.",
+                    )
+                self._append_unlocked_file({
+                    "schema_version": JOURNAL_SCHEMA_VERSION,
+                    "type": "checkpoint",
+                    "status": "in_progress",
+                    "operation_id": handle.operation_id,
+                    "runtime_id": handle.runtime_id,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "postcondition": bounded,
+                })
             self._maybe_compact_locked()
 
     def finish(
@@ -987,36 +1148,39 @@ class OperationRecoveryJournal:
         if receipt_id is not None and (not isinstance(receipt_id, str) or _has_forbidden_text(receipt_id, max_len=128)):
             raise ToolError("invalid_external_recovery_metadata", "Invalid receipt_id.")
         with self._lock:
-            current = self._state(self._load_locked()).get(handle.operation_id)
-            if current is not None and current.get("uncertain") is not None:
-                raise ToolError(
-                    "operation_already_uncertain",
-                    "Cannot mark an uncertain operation as completed without reconciliation or acknowledgment.",
-                )
-            record: dict[str, Any] = {
-                "schema_version": JOURNAL_SCHEMA_VERSION,
-                "type": "result",
-                "status": "completed",
-                "operation_id": handle.operation_id,
-                "runtime_id": handle.runtime_id,
-                "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "known_result": known_result[:100],
-            }
-            if postcondition is not None:
-                record["postcondition"] = postcondition
-            merged_ext = self._merged_external_metadata(current) if current is not None else None
-            if merged_ext is not None:
-                resolved_outcome = external_outcome or (
-                    "failed" if known_result in {"raised", "returned_error"} else "succeeded"
-                )
-                merged_ext["external_outcome"] = resolved_outcome
-                if receipt_id is not None:
-                    merged_ext["receipt_id"] = receipt_id
-                record["external_outcome"] = resolved_outcome
-                record["external"] = merged_ext
-            elif external_outcome is not None:
-                record["external_outcome"] = external_outcome
-            self._append_locked(record)
+            if not self._enabled or self._path is None:
+                return
+            with self._journal_transaction() as records:
+                current = self._state(records).get(handle.operation_id)
+                if current is not None and current.get("uncertain") is not None:
+                    raise ToolError(
+                        "operation_already_uncertain",
+                        "Cannot mark an uncertain operation as completed without reconciliation or acknowledgment.",
+                    )
+                record: dict[str, Any] = {
+                    "schema_version": JOURNAL_SCHEMA_VERSION,
+                    "type": "result",
+                    "status": "completed",
+                    "operation_id": handle.operation_id,
+                    "runtime_id": handle.runtime_id,
+                    "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "known_result": known_result[:100],
+                }
+                if postcondition is not None:
+                    record["postcondition"] = postcondition
+                merged_ext = self._merged_external_metadata(current) if current is not None else None
+                if merged_ext is not None:
+                    resolved_outcome = external_outcome or (
+                        "failed" if known_result in {"raised", "returned_error"} else "succeeded"
+                    )
+                    merged_ext["external_outcome"] = resolved_outcome
+                    if receipt_id is not None:
+                        merged_ext["receipt_id"] = receipt_id
+                    record["external_outcome"] = resolved_outcome
+                    record["external"] = merged_ext
+                elif external_outcome is not None:
+                    record["external_outcome"] = external_outcome
+                self._append_unlocked_file(record)
             self._maybe_compact_locked()
 
     def finish_returned(self, handle: OperationHandle | None, result: Any) -> None:

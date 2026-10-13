@@ -21,6 +21,18 @@ def _records(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _sample_external_metadata() -> ExternalOperationMetadata:
+    return ExternalOperationMetadata(
+        extension_id="github",
+        provider="GitHub MCP",
+        public_name="external.github.create_issue",
+        remote_name="create_issue",
+        catalog_generation=1,
+        schema_fingerprint="a" * 64,
+        mutation_class="remote_mutation",
+        dispatch_stage="prepared",
+    )
+
 
 def test_m10_1_additive_external_metadata_and_native_isolation(tmp_path: Path) -> None:
     path = tmp_path / "operation-recovery.jsonl"
@@ -517,3 +529,359 @@ def test_m10_2_manager_durable_dispatch_barrier_and_outcome_taxonomy(
             await mgr3.drain_and_stop()
 
     anyio.run(run_scenarios)
+
+
+def test_m10_3_unresolved_quota_exhaustion_denies_before_dispatch_without_eviction(
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    import anyio
+
+    from core.extensions.manager import ExtensionLifecycleManager
+    from core.extensions.models import (
+        ExtensionDefinition,
+        ExtensionState,
+        MutationClass,
+        ToolPolicy,
+        TrustClass,
+    )
+    from core.recovery import MAX_UNRESOLVED_EXTERNAL_OPERATIONS
+
+    assert MAX_UNRESOLVED_EXTERNAL_OPERATIONS == 128
+
+    path = tmp_path / "quota.jsonl"
+    journal = OperationRecoveryJournal(max_unresolved_external=4)
+    journal.configure(path, "runtime-quota")
+
+    ext_meta = _sample_external_metadata()
+    h1 = journal.begin("external.github.create_issue", "t1", external_metadata=ext_meta)
+    assert h1 is not None
+    h2 = journal.begin("external.github.create_issue", "t2", external_metadata=ext_meta)
+    assert h2 is not None
+    journal.checkpoint_external_dispatch(h2)
+    h3 = journal.begin("external.github.create_issue", "t3", external_metadata=ext_meta)
+    assert h3 is not None
+    journal.mark_uncertain(h3, "call_timeout")
+    h4 = journal.begin("external.github.create_issue", "t4", external_metadata=ext_meta)
+    assert h4 is not None
+    journal.mark_uncertain(h4, "connection_closed")
+
+    assert journal.unresolved_external_count() == 4
+    assert journal.has_external_mutation_capacity() is False
+
+    # 5th direct begin is denied with operation_limit without evicting existing unresolved ops
+    with pytest.raises(ToolError) as exc_info:
+        journal.begin("external.github.create_issue", "t5", external_metadata=ext_meta)
+    assert exc_info.value.code == "operation_limit"
+    assert journal.unresolved_external_count() == 4
+
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "fake_mcp_server.py"
+    ws = tmp_path / "ws_quota"
+    ws.mkdir()
+
+    defn = ExtensionDefinition(
+        extension_id="fake",
+        display_name="Fake Provider",
+        provider="Fake MCP",
+        trust_class=TrustClass.TRUSTED,
+        launch_approved=True,
+        enabled=True,
+        command=sys.executable,
+        arguments=(str(fixture_path), "--workspace", str(ws), "--mode", "mutation_success"),
+        working_directory=str(ws),
+        platforms=("windows", "linux", "macos"),
+        tools={
+            "increment_value": ToolPolicy(
+                remote_name="increment_value",
+                domain="process",
+                allow_call=True,
+                mutation_class=MutationClass.REMOTE_MUTATION,
+                profiles=("full",),
+            ),
+        },
+    )
+
+    async def verify_manager_quota() -> None:
+        mgr = ExtensionLifecycleManager(
+            recovery_journal=journal,
+            _mutation_gate_closed=False,
+        )
+        mgr.register_extension(defn)
+        keep = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            await mgr.start_all_background(tg, keep_alive_event=keep)
+            for _ in range(200):
+                if mgr.get_state("fake") == ExtensionState.HEALTHY:
+                    break
+                await anyio.sleep(0.02)
+            lease = mgr.registry.create_lease("external.fake.increment_value")
+            assert lease is not None
+
+            with pytest.raises(ToolError) as call_err:
+                await mgr.execute_guarded_call(lease, {"amount": 1})
+            assert call_err.value.code == "operation_limit"
+            assert not (ws / "counter.json").exists()
+
+            # Acknowledge one uncertain operation -> capacity freed -> call succeeds
+            journal.acknowledge(
+                h3.operation_id,
+                OperationState.ACKNOWLEDGED,
+                Evidence("operator", {"confirmed": True}),
+            )
+            assert journal.unresolved_external_count() == 3
+            assert journal.has_external_mutation_capacity() is True
+
+            res = await mgr.execute_guarded_call(lease, {"amount": 5})
+            assert res["ok"] is True
+            assert int((ws / "counter.json").read_text(encoding="utf-8")) == 1
+            await mgr.drain_and_stop()
+
+    anyio.run(verify_manager_quota)
+
+
+def test_m10_3_compaction_bounds_resolved_external_history_and_preserves_native_and_unresolved(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    path = tmp_path / "compact_bounds.jsonl"
+    journal = OperationRecoveryJournal(
+        max_external_terminal_history=3,
+        max_external_terminal_days=30,
+    )
+    journal.configure(path, "runtime-compact")
+
+    now = datetime.now(timezone.utc)
+    old_iso = (now - timedelta(days=45)).isoformat(timespec="milliseconds")
+
+    # 1. Native resolved operations (including an old 45-day-old one) -> all preserved
+    native_ids: list[str] = []
+    for idx in range(4):
+        nh = journal.begin("write_file", f"path=C:/work/n{idx}.txt")
+        assert nh is not None
+        native_ids.append(nh.operation_id)
+        journal.acknowledge(
+            nh.operation_id,
+            OperationState.ACKNOWLEDGED,
+            Evidence("operator", {"native": idx}),
+        )
+
+    # Manually age the first native acknowledgment to 45 days ago
+    records = _records(path)
+    for rec in records:
+        if rec.get("operation_id") == native_ids[0]:
+            if "started_at" in rec:
+                rec["started_at"] = old_iso
+            if "recorded_at" in rec:
+                rec["recorded_at"] = old_iso
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+
+    # 2. Unresolved external operations (prepared, may_dispatch, uncertain) -> never evicted
+    ext_meta = _sample_external_metadata()
+    u_prep = journal.begin("external.github.create_issue", "u1", external_metadata=ext_meta)
+    assert u_prep is not None
+    u_disp = journal.begin("external.github.create_issue", "u2", external_metadata=ext_meta)
+    assert u_disp is not None
+    journal.checkpoint_external_dispatch(u_disp)
+    u_unc = journal.begin("external.github.create_issue", "u3", external_metadata=ext_meta)
+    assert u_unc is not None
+    journal.mark_uncertain(u_unc, "call_timeout")
+
+    # 3. Resolved external operations: 1 expired (45 days old) + 5 recent -> only newest 3 recent kept
+    expired_ext = journal.begin("external.github.create_issue", "exp", external_metadata=ext_meta)
+    assert expired_ext is not None
+    journal.mark_uncertain(expired_ext, "call_timeout")
+    journal.acknowledge(
+        expired_ext.operation_id,
+        OperationState.ACKNOWLEDGED,
+        Evidence("operator", {"expired": True}),
+    )
+    records = _records(path)
+    for rec in records:
+        if rec.get("operation_id") == expired_ext.operation_id:
+            if "started_at" in rec:
+                rec["started_at"] = old_iso
+            if "recorded_at" in rec:
+                rec["recorded_at"] = old_iso
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+
+    recent_ext_ids: list[str] = []
+    for idx in range(5):
+        rh = journal.begin("external.github.create_issue", f"rec-{idx}", external_metadata=ext_meta)
+        assert rh is not None
+        recent_ext_ids.append(rh.operation_id)
+        journal.mark_uncertain(rh, "call_timeout")
+        journal.acknowledge(
+            rh.operation_id,
+            OperationState.ACKNOWLEDGED,
+            Evidence("operator", {"recent_idx": idx}),
+        )
+
+    journal.compact()
+
+    # All 4 native resolved operations survive
+    for nid in native_ids:
+        assert journal.inspect(nid)["state"] == "acknowledged"
+
+    # All 3 unresolved external operations survive
+    assert journal.inspect(u_prep.operation_id)["state"] == "running"
+    assert journal.inspect(u_disp.operation_id)["state"] == "running"
+    assert journal.inspect(u_unc.operation_id)["state"] == "uncertain"
+
+    # Expired external terminal operation was pruned
+    with pytest.raises(ToolError) as exc_info:
+        journal.inspect(expired_ext.operation_id)
+    assert exc_info.value.code == "operation_not_found"
+
+    # Oldest 2 recent external terminal operations pruned; newest 3 retained
+    for dropped_id in recent_ext_ids[:2]:
+        with pytest.raises(ToolError):
+            journal.inspect(dropped_id)
+    for kept_id in recent_ext_ids[2:]:
+        inspected = journal.inspect(kept_id)
+        assert inspected["state"] == "acknowledged"
+        assert inspected["external_outcome"] == "acknowledged"
+
+
+def test_m10_3_interprocess_atomic_admission_and_cas_ack_reconcile_conflict(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+    import sys
+    import time
+
+    from core.recovery_models import Postcondition
+
+    repo = Path(__file__).resolve().parents[1]
+    path = tmp_path / "interprocess.jsonl"
+    go = tmp_path / "go"
+
+    # Seed one uncertain operation for CAS conflict test
+    seed_journal = OperationRecoveryJournal(max_unresolved_external=6)
+    seed_journal.configure(path, "runtime-seed")
+    ext_meta = _sample_external_metadata()
+    conflict_handle = seed_journal.begin(
+        "external.github.create_issue",
+        "conflict-op",
+        external_metadata=ext_meta,
+    )
+    assert conflict_handle is not None
+    seed_journal.mark_uncertain(conflict_handle, "call_timeout")
+
+    # Also seed a second uncertain operation for ack vs reconcile conflict
+    reconcile_vs_ack = seed_journal.begin(
+        "external.github.create_issue",
+        "reconcile-vs-ack",
+        external_metadata=ext_meta,
+    )
+    assert reconcile_vs_ack is not None
+    seed_journal.mark_uncertain(reconcile_vs_ack, "call_timeout")
+    postcondition = Postcondition(kind="file_absent", expected={"path": str(tmp_path / "missing.txt")})
+    conc_evidence = Evidence(source="filesystem", data={"exists": False, "conclusive": True})
+    seed_journal.record_reconciliation(
+        reconcile_vs_ack.operation_id,
+        OperationState.SUCCEEDED,
+        postcondition,
+        conc_evidence,
+    )
+    with pytest.raises(ToolError) as ack_after_rec:
+        seed_journal.acknowledge(
+            reconcile_vs_ack.operation_id,
+            OperationState.ACKNOWLEDGED,
+            Evidence("operator", {"note": "late ack"}),
+        )
+    assert ack_after_rec.value.code == "operation_already_reconciled"
+
+    # Now conflict_handle is the 1 remaining unresolved external op (1 of 6 used).
+    # Spawn 2 processes that each try to:
+    # 1) resolve conflict_handle with DIFFERENT state/evidence (one ACKNOWLEDGED, one UNRESOLVABLE)
+    # 2) admit 5 new external mutations each (10 total attempts, only 6 slots total when conflict_handle is resolved)
+    worker_script = tmp_path / "cas_worker.py"
+    worker_script.write_text(
+        "\n".join(
+            [
+                "import json, sys, time",
+                "from pathlib import Path",
+                f"sys.path.insert(0, {str(repo)!r})",
+                "from core.errors import ToolError",
+                "from core.recovery import OperationRecoveryJournal",
+                "from core.recovery_models import Evidence, ExternalOperationMetadata, OperationState",
+                "path = Path(sys.argv[1])",
+                "go = Path(sys.argv[2])",
+                "ready = Path(sys.argv[3])",
+                "worker_id = int(sys.argv[4])",
+                "conflict_op_id = sys.argv[5]",
+                "journal = OperationRecoveryJournal(max_unresolved_external=6)",
+                "journal.configure(path, 'runtime-seed')",
+                "ready.write_text('ready', encoding='utf-8')",
+                "deadline = time.monotonic() + 10.0",
+                "while not go.exists():",
+                "    if time.monotonic() >= deadline: raise SystemExit(3)",
+                "    time.sleep(0.002)",
+                "target_state = OperationState.ACKNOWLEDGED if worker_id == 0 else OperationState.UNRESOLVABLE",
+                "ack_outcome = 'none'",
+                "try:",
+                "    journal.acknowledge(conflict_op_id, target_state, Evidence('operator', {'worker': worker_id}))",
+                "    ack_outcome = 'won'",
+                "except ToolError as exc:",
+                "    ack_outcome = exc.code",
+                "meta = ExternalOperationMetadata(",
+                "    extension_id='github',",
+                "    provider='GitHub MCP',",
+                "    public_name='external.github.create_issue',",
+                "    remote_name='create_issue',",
+                "    catalog_generation=1,",
+                "    schema_fingerprint='a' * 64,",
+                "    mutation_class='remote_mutation',",
+                "    dispatch_stage='prepared',",
+                ")",
+                "admitted = 0",
+                "denied = 0",
+                "for idx in range(5):",
+                "    try:",
+                "        journal.begin('external.github.create_issue', f'w{worker_id}-{idx}', external_metadata=meta)",
+                "        admitted += 1",
+                "    except ToolError as exc:",
+                "        if exc.code == 'operation_limit':",
+                "            denied += 1",
+                "        else:",
+                "            raise",
+                "print(json.dumps({'ack_outcome': ack_outcome, 'admitted': admitted, 'denied': denied}))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    procs: list[subprocess.Popen[str]] = []
+    for wid in (0, 1):
+        rfile = tmp_path / f"ready-w{wid}"
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, str(worker_script), str(path), str(go), str(rfile), str(wid), conflict_handle.operation_id],
+                cwd=repo,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        )
+
+    deadline = time.monotonic() + 10.0
+    while len(list(tmp_path.glob("ready-w*"))) < 2 and time.monotonic() < deadline:
+        time.sleep(0.002)
+    assert len(list(tmp_path.glob("ready-w*"))) == 2
+    go.write_text("go", encoding="utf-8")
+
+    outputs: list[dict[str, Any]] = []
+    for proc in procs:
+        stdout, stderr = proc.communicate(timeout=30)
+        assert proc.returncode == 0, stderr
+        outputs.append(json.loads(stdout.strip()))
+
+    assert sorted(o["ack_outcome"] for o in outputs) == ["operation_already_acknowledged", "won"]
+    total_admitted = sum(int(o["admitted"]) for o in outputs)
+    total_denied = sum(int(o["denied"]) for o in outputs)
+    assert total_admitted == 6
+    assert total_denied == 4
+    assert seed_journal.unresolved_external_count() == 6
