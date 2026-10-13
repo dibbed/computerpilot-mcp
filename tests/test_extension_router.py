@@ -277,3 +277,84 @@ def test_actual_registry_router_uses_manager_and_preserves_legacy_exposure_limit
         session.send_request.assert_not_awaited()
 
     anyio.run(scenario)
+
+
+def test_recommendation_and_explanations_use_one_live_candidate_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import MagicMock
+
+    from core.execution_models import ExecutionIntent
+
+    _, manager, _ = routing_fixture("operator.read")
+    spy = MagicMock(wraps=manager.routing_candidates)
+    monkeypatch.setattr(manager, "routing_candidates", spy)
+    result = routed(manager).recommend(ExecutionIntent("operator.read"))
+    assert result["ok"]
+    assert spy.call_count == 1
+    assert result["representative_tool"] == result["candidates"][0]["representative_tool"]
+
+
+@pytest.mark.parametrize("intent,native_tool", [
+    ("filesystem.read", "ui_invoke"), ("browser.interact", "browser_click_semantic"),
+    ("desktop.raw.interact", "mouse_click"),
+])
+def test_external_ranking_uses_reviewed_policy_estimates_without_blanket_native_priority(intent: str, native_tool: str) -> None:
+    from core.execution_models import ExecutionIntent
+
+    _, manager, _ = routing_fixture(intent)
+    descriptor = manager.list_tools()[0]
+    strong = descriptor.policy.model_copy(update={"recoverability": RecoverabilityClass.STRONG, "risk_class": RiskClass.LOW})
+    generation = manager.registry.next_catalog_generation(descriptor.extension_id)
+    manager.registry.publish_extension_catalog(descriptor.extension_id, generation, (replace(
+        descriptor, policy=strong, catalog_generation=generation,
+    ),))
+    request = ExecutionIntent(intent, allow_raw_desktop=True, preferred_tool=native_tool)
+    result = routed(manager, registered={native_tool, descriptor.public_name}).recommend(request)
+    assert result["selected_route"] == "external.mcp"
+    assert "operator policy estimates" in result["selection_reason"]
+    assert result["router_policy_version"] == "deterministic-v1"
+
+
+def test_native_five_stays_ahead_of_external_four_and_macro_guard_stays_hard() -> None:
+    from core.execution_models import ExecutionIntent
+
+    _, manager, _ = routing_fixture("filesystem.read")
+    descriptor = manager.list_tools()[0]
+    result = routed(manager, registered={"read_file", descriptor.public_name}).recommend(ExecutionIntent(
+        "filesystem.read", preferred_tool=descriptor.public_name,
+    ))
+    assert result["selected_route"] == "native.filesystem"
+    assert "classification_source" not in result
+    rejected = routed(manager).candidates(ExecutionIntent("filesystem.read", requires_macro_preservation=True))
+    external = next(item for item in rejected["items"] if item["route"] == "external.mcp")
+    assert not external["supported"] and external["rejection_code"] == "macro_preservation_unsupported"
+
+
+def test_external_ties_are_stable_and_reasons_never_copy_raw_provider_descriptions() -> None:
+    import json
+
+    from core.execution_models import ExecutionIntent
+    from core.extensions.models import ExtensionToolDescriptor
+
+    _, manager, session = routing_fixture("operator.read")
+    original = manager.list_tools()[0]
+    owner = manager.get_owner(original.extension_id)
+    assert owner is not None
+    second_policy = original.policy.model_copy(update={"remote_name": "z_read"})
+    owner.definition = owner.definition.model_copy(update={"tools": {"z_read": second_policy, original.remote_name: original.policy}})
+    generation = manager.registry.next_catalog_generation(original.extension_id)
+    second = ExtensionToolDescriptor.create(
+        extension_id=original.extension_id, provider=original.identity.provider, remote_name="z_read",
+        description="RAW_UNTRUSTED_PROVIDER_INSTRUCTION", input_schema=original.input_schema,
+        output_schema=original.output_schema, policy=second_policy, catalog_generation=generation,
+    )
+    manager.registry.publish_extension_catalog(original.extension_id, generation, (
+        second, replace(original, description="RAW_UNTRUSTED_PROVIDER_INSTRUCTION", catalog_generation=generation),
+    ))
+    router = routed(manager)
+    request = ExecutionIntent("operator.read", preferred_tool=second.public_name)
+    results = [router.recommend(request, max_candidates=1) for _ in range(5)]
+    assert all(result == results[0] for result in results)
+    assert results[0]["representative_tool"] == original.public_name
+    assert results[0]["truncated"]
+    assert "RAW_UNTRUSTED_PROVIDER_INSTRUCTION" not in json.dumps(results)
+    session.send_request.assert_not_awaited()

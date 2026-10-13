@@ -184,8 +184,12 @@ class ExecutionRouter:
         max_candidates: int = 8,
     ) -> dict[str, Any]:
         self._validate_policy()
+        return self._candidate_response(intent, self._all_candidates(intent), max_candidates)
+
+    def _candidate_response(
+        self, intent: ExecutionIntent, all_candidates: list[RouteCandidate], max_candidates: int,
+    ) -> dict[str, Any]:
         bounded_limit = min(max(int(max_candidates), 1), MAX_CANDIDATES)
-        all_candidates = self._all_candidates(intent)
         returned = all_candidates[:bounded_limit]
         valid_count = sum(item.supported for item in all_candidates)
         return {
@@ -208,21 +212,24 @@ class ExecutionRouter:
         max_candidates: int = 8,
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        candidate_result = self.candidates(intent, max_candidates=max_candidates)
+        self._validate_policy()
         all_candidates = self._all_candidates(intent)
+        candidate_result = self._candidate_response(intent, all_candidates, max_candidates)
         valid = [candidate for candidate in all_candidates if candidate.supported]
         selected = valid[0] if valid else None
+        selection_reason = (
+            "highest deterministic valid route under deterministic-v1"
+            if selected is not None else "no valid route under current tool and capability snapshot"
+        )
+        if selected is not None and selected.external_metadata is not None:
+            selection_reason = "highest valid route under deterministic-v1 using operator policy estimates"
 
         decision = RouteDecision(
             intent=intent.name,
             selected_route=selected.route if selected else None,
             representative_tool=selected.representative_tool if selected else None,
             candidate_count=len(valid),
-            selection_reason=(
-                "highest deterministic valid route under deterministic-v1"
-                if selected is not None
-                else "no valid route under current tool and capability snapshot"
-            ),
+            selection_reason=selection_reason,
             fallback_level=selected.fallback_level if selected else None,
             capability_checks=selected.capability_checks if selected else (),
             risk=selected.risk if selected else None,

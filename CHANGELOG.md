@@ -19,6 +19,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Coalesce provider catalog refresh and public modern/legacy change notifications, preserving runtime schema fingerprints and monotonic catalog generations.
 
 ### Changed
+- 2026-10-13: Use one live candidate snapshot for routing decisions and explanations, preserving deterministic-v1 ordering and identifying external scores as operator policy estimates.
 - 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.
 
 ### Fixed
