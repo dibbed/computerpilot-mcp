@@ -34,6 +34,40 @@ def bridge(profile: str = "full", *, list_cache_ttl_ms: int = 0) -> tuple[Extens
     return server, manager, session
 
 
+@pytest.mark.parametrize("mutation", [
+    MutationClass.READ_ONLY, MutationClass.LOCAL_MUTATION, MutationClass.REMOTE_MUTATION,
+    MutationClass.DESTRUCTIVE_LOCAL_MUTATION, MutationClass.DESTRUCTIVE_REMOTE_MUTATION,
+])
+def test_wire_annotations_use_operator_mutation_policy(mutation: MutationClass, tmp_path: Any) -> None:
+    from dataclasses import replace
+
+    from core.extensions.models import TrustClass
+
+    server, manager, _ = bridge()
+    manager._recovery_journal.configure(tmp_path / "operations.jsonl", "annotations-runtime")
+    descriptor = manager.list_tools()[0]
+    owner = manager.get_owner(descriptor.extension_id)
+    assert owner is not None
+    owner.definition = owner.definition.model_copy(update={"trust_class": TrustClass.TRUSTED})
+    generation = manager.registry.next_catalog_generation(descriptor.extension_id)
+    descriptor = replace(descriptor, catalog_generation=generation,
+                         policy=descriptor.policy.model_copy(update={"mutation_class": mutation}))
+    manager.registry.publish_extension_catalog(descriptor.extension_id, generation, (descriptor,))
+
+    async def scenario() -> None:
+        async with Client(server) as client:
+            listing = await client.list_tools()
+            tool = next(item for item in listing.tools if item.name == descriptor.public_name)
+            assert tool.annotations is not None
+            assert tool.annotations.read_only_hint is (mutation is MutationClass.READ_ONLY)
+            assert tool.annotations.destructive_hint is mutation.value.startswith("destructive_")
+
+    try:
+        anyio.run(scenario)
+    finally:
+        manager._recovery_journal.configure(None, None)
+
+
 def test_public_list_and_direct_wire_calls_preserve_exact_external_schema_and_native_path() -> None:
     server, manager, session = bridge()
 

@@ -53,6 +53,8 @@ def tools(mode: str = "readonly", epoch: int = 0) -> list[types.Tool]:
         ),
     ]
     read = catalog[1]
+    if mode == "invalid_output":
+        catalog[0].output_schema = {"type": "object", "properties": {"receipt": {"type": "string"}}, "required": ["receipt"]}
     if mode == "duplicate":
         catalog.append(read)
     elif mode == "schema_remote_ref":
@@ -163,6 +165,8 @@ async def run(workspace: Path, page_size: int, mode: str) -> None:
                     await wait_control(workspace, "close")
         elif mode in {"malformed", "oversize", "no_newline", "nesting", "split_utf8"}:
             await raw_result(workspace, mode, context.request_id, data)
+        elif mode == "provider_error":
+            return types.CallToolResult(content=[types.TextContent(type="text", text="fixture_failure_after_effect")], is_error=True)
         elif mode == "notification_flood":
             for _ in range(128):
                 await context.session.send_tool_list_changed()
@@ -242,7 +246,7 @@ def main() -> None:
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--page-size", type=int, default=128)
     parser.add_argument("--mode", choices=[
-        "readonly", "mutation_success", "malformed", "oversize", "no_newline", "nesting", "split_utf8",
+        "readonly", "mutation_success", "provider_error", "invalid_output", "malformed", "oversize", "no_newline", "nesting", "split_utf8",
         "duplicate", "cursor_loop", "schema_remote_ref", "schema_regex", "recursive_schema",
         "catalog_change", "remove", "unknown", "dangerous_annotation", "notification_flood", "stderr_flood",
         "delayed", "call_timeout", "startup_timeout", "startup_delayed", "handshake_failed", "blocked_stdin", "crash", "root_exit_child",

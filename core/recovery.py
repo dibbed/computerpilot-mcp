@@ -8,6 +8,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
@@ -36,6 +37,16 @@ MAX_EXTERNAL_TERMINAL_DAYS = 30
 _MAX_LINE_BYTES = 32_768
 _MAX_TARGET_CHARS = 1_000
 _JOURNAL_LOCK_WAIT_SEC = 10.0
+_EXTERNAL_DISPATCH_DEADLINE: ContextVar[float | None] = ContextVar("external_dispatch_deadline", default=None)
+
+
+@contextmanager
+def external_dispatch_deadline(deadline: float) -> Iterator[None]:
+    token = _EXTERNAL_DISPATCH_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _EXTERNAL_DISPATCH_DEADLINE.reset(token)
 
 RecordType = Literal["begin", "checkpoint", "result", "uncertain", "reconciliation", "acknowledged"]
 
@@ -268,7 +279,8 @@ def _interprocess_journal_lock(path: Path) -> AbstractContextManager[None]:
     lock_path = path.with_name(f".{path.name}.lock")
     return exclusive_file_lock(
         lock_path,
-        timeout_sec=_JOURNAL_LOCK_WAIT_SEC,
+        timeout_sec=min(_JOURNAL_LOCK_WAIT_SEC, max(0.0, deadline - time.monotonic()))
+        if (deadline := _EXTERNAL_DISPATCH_DEADLINE.get()) is not None else _JOURNAL_LOCK_WAIT_SEC,
         label=f"recovery journal {path}",
     )
 
@@ -329,6 +341,8 @@ class OperationRecoveryJournal:
         self._max_unresolved_external = max_unresolved_external
         self._max_external_terminal_history = max_external_terminal_history
         self._max_external_terminal_days = max_external_terminal_days
+        self._cached_stat_key: tuple[int, int] | None = None
+        self._cached_unresolved_external_count: int = 0
 
     def configure(self, path: Path | None, runtime_id: str | None) -> None:
         with self._lock:
@@ -339,6 +353,8 @@ class OperationRecoveryJournal:
             self._next_compact_at = COMPACT_AFTER_RECORDS
             self._hmac_key = os.urandom(32)
             self._hmac_key_id = os.urandom(8).hex()
+            self._cached_stat_key = None
+            self._cached_unresolved_external_count = 0
             if self._enabled:
                 assert path is not None
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -389,8 +405,8 @@ class OperationRecoveryJournal:
 
     @property
     def enabled(self) -> bool:
-        with self._lock:
-            return self._enabled
+        # Admission hint; durable methods recheck configuration while holding the journal lock.
+        return self._enabled
 
     @staticmethod
     def _is_unresolved_external_item(item: Mapping[str, Any]) -> bool:
@@ -407,14 +423,35 @@ class OperationRecoveryJournal:
         with self._lock:
             if not self._enabled or self._path is None:
                 return 0
-            state = self._state(self._load_locked())
-            return sum(1 for item in state.values() if self._is_unresolved_external_item(item))
+            try:
+                st = self._path.stat()
+                stat_key = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                self._cached_stat_key = None
+                self._cached_unresolved_external_count = 0
+                return 0
+            if stat_key == self._cached_stat_key:
+                return self._cached_unresolved_external_count
+            state = self._read_state_locked(unresolved_external_only=True)
+            count = sum(1 for item in state.values() if self._is_unresolved_external_item(item))
+            self._cached_stat_key = stat_key
+            self._cached_unresolved_external_count = count
+            return count
 
     def has_external_mutation_capacity(self) -> bool:
-        with self._lock:
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
             if not self._enabled or self._path is None:
                 return False
-            return self.unresolved_external_count() < self._max_unresolved_external
+            try:
+                return self.unresolved_external_count() < self._max_unresolved_external
+            except ToolError as exc:
+                if exc.code == "operation_limit":
+                    return False
+                raise
+        finally:
+            self._lock.release()
 
     def _append_unlocked_file(self, record: dict[str, Any]) -> None:
         path = self._path
@@ -435,6 +472,7 @@ class OperationRecoveryJournal:
             handle.write(payload)
             os.fsync(handle.fileno())
         self._record_count += 1
+        self._cached_stat_key = None
 
     def _append_locked(self, record: dict[str, Any]) -> None:
         path = self._path
@@ -453,13 +491,21 @@ class OperationRecoveryJournal:
             ) from exc
 
     @contextmanager
-    def _journal_transaction(self) -> Iterator[list[dict[str, Any]]]:
+    def _journal_transaction(
+        self, *, operation_id: str | None = None, external_admission: bool = False,
+    ) -> Iterator[list[dict[str, Any]]]:
         path = self._path
         if not self._enabled or path is None:
             raise ToolError("recovery_unavailable", "Operation recovery journal is not enabled.")
         try:
             with _interprocess_journal_lock(path):
-                yield self._load_locked()
+                if operation_id is not None or external_admission:
+                    state = self._read_state_locked(operation_id=operation_id, unresolved_external_only=external_admission)
+                    if (deadline := _EXTERNAL_DISPATCH_DEADLINE.get()) is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("External dispatch journal deadline expired.")
+                    yield [record for item in state.values() for record in item.values()]
+                else:
+                    yield self._load_locked()
         except ToolError:
             raise
         except (OSError, TimeoutError) as exc:
@@ -469,15 +515,18 @@ class OperationRecoveryJournal:
                 hint="Do not retry a possibly-started mutation blindly; inspect runtime storage first.",
             ) from exc
 
-    def _load_locked(self) -> list[dict[str, Any]]:
+    def _iter_records_locked(self) -> Iterator[dict[str, Any]]:
         path = self._path
         if path is None or not path.is_file():
-            return []
-        records: list[dict[str, Any]] = []
+            return
         try:
             with path.open("rb") as handle:
-                for raw in handle:
+                while raw := handle.readline(_MAX_LINE_BYTES + 1):
                     if len(raw) > _MAX_LINE_BYTES:
+                        while not raw.endswith(b"\n"):
+                            raw = handle.readline(_MAX_LINE_BYTES + 1)
+                            if not raw:
+                                break
                         continue
                     try:
                         record = json.loads(raw.decode("utf-8"))
@@ -485,13 +534,37 @@ class OperationRecoveryJournal:
                         # A crash can leave only the final append truncated.
                         continue
                     if isinstance(record, dict) and record.get("schema_version") == JOURNAL_SCHEMA_VERSION:
-                        records.append(record)
+                        yield record
         except OSError as exc:
             raise ToolError(
                 "operation_journal_unavailable",
                 "Could not read the operation recovery journal.",
             ) from exc
-        return records
+
+    def _load_locked(self) -> list[dict[str, Any]]:
+        return list(self._iter_records_locked())
+
+    def _read_state_locked(
+        self, *, operation_id: str | None = None, unresolved_external_only: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        state: dict[str, dict[str, Any]] = {}
+        for record in self._iter_records_locked():
+            op_id = record.get("operation_id")
+            kind = record.get("type")
+            if not isinstance(op_id, str) or (operation_id is not None and op_id != operation_id):
+                continue
+            if kind == "begin":
+                if unresolved_external_only and not isinstance(record.get("external"), dict):
+                    continue
+                state[op_id] = {"begin": record}
+            elif op_id in state and kind in {"checkpoint", "result", "uncertain", "reconciliation", "acknowledged"}:
+                if unresolved_external_only and kind in {"result", "reconciliation", "acknowledged"}:
+                    state.pop(op_id)
+                else:
+                    state[op_id][kind] = record
+            if unresolved_external_only and len(state) > self._max_unresolved_external:
+                raise ToolError("operation_limit", "Retained external operation admission exceeds the current quota.")
+        return state
 
     @staticmethod
     def _state(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -672,6 +745,7 @@ class OperationRecoveryJournal:
             ) from exc
         self._record_count = len(retained)
         self._next_compact_at = self._record_count + COMPACT_AFTER_RECORDS
+        self._cached_stat_key = None
 
     def _maybe_compact_locked(self) -> None:
         if self._record_count < self._next_compact_at:
@@ -772,7 +846,7 @@ class OperationRecoveryJournal:
 
     def inspect(self, operation_id: str) -> dict[str, Any]:
         with self._lock:
-            item = self._state(self._load_locked()).get(operation_id)
+            item = self._read_state_locked(operation_id=operation_id).get(operation_id)
             if item is None or item.get("begin") is None:
                 raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
             return self._operation_view(operation_id, item)
@@ -780,7 +854,7 @@ class OperationRecoveryJournal:
     def history(self, operation_id: str, offset: int = 0, max_items: int = 100) -> dict[str, Any]:
         offset, max_items = self._pagination(offset, max_items)
         with self._lock:
-            items = [record for record in self._load_locked() if record.get("operation_id") == operation_id]
+            items = [record for record in self._iter_records_locked() if record.get("operation_id") == operation_id]
         if not items:
             raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
         total_count = len(items)
@@ -804,7 +878,7 @@ class OperationRecoveryJournal:
         if evidence is None or not evidence.source.strip() or not evidence.data:
             raise ToolError("evidence_required", "Acknowledgment requires non-empty evidence.")
         with self._lock:
-            with self._journal_transaction() as records:
+            with self._journal_transaction(operation_id=operation_id) as records:
                 current = self._state(records).get(operation_id)
                 if current is None or current.get("begin") is None:
                     raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
@@ -849,7 +923,7 @@ class OperationRecoveryJournal:
         if state in {OperationState.SUCCEEDED, OperationState.FAILED} and evidence.data.get("conclusive") is not True:
             raise ToolError("conclusive_evidence_required", "A conclusive reconciliation requires evidence marked conclusive.")
         with self._lock:
-            with self._journal_transaction() as records:
+            with self._journal_transaction(operation_id=operation_id) as records:
                 current = self._state(records).get(operation_id)
                 if current is None or current.get("begin") is None:
                     raise ToolError("operation_not_found", f"Operation {operation_id!r} was not found.")
@@ -935,7 +1009,7 @@ class OperationRecoveryJournal:
             }
             if normalized_external is not None:
                 record["external"] = normalized_external
-                with self._journal_transaction() as records:
+                with self._journal_transaction(external_admission=True) as records:
                     state = self._state(records)
                     unresolved_external = sum(
                         1 for item in state.values() if self._is_unresolved_external_item(item)
@@ -963,7 +1037,7 @@ class OperationRecoveryJournal:
                     "recovery_unavailable",
                     "Operation recovery journal must be enabled before external mutation dispatch.",
                 )
-            with self._journal_transaction() as records:
+            with self._journal_transaction(operation_id=handle.operation_id) as records:
                 current = self._state(records).get(handle.operation_id)
                 if current is None or current.get("begin") is None:
                     raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
@@ -1012,7 +1086,7 @@ class OperationRecoveryJournal:
         with self._lock:
             if not self._enabled:
                 raise ToolError("recovery_unavailable", "Operation recovery journal is not enabled.")
-            with self._journal_transaction() as records:
+            with self._journal_transaction(operation_id=handle.operation_id) as records:
                 current = self._state(records).get(handle.operation_id)
                 if current is None or current.get("begin") is None:
                     raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
@@ -1063,7 +1137,7 @@ class OperationRecoveryJournal:
         with self._lock:
             if not self._enabled:
                 raise ToolError("recovery_unavailable", "Operation recovery journal is not enabled.")
-            with self._journal_transaction() as records:
+            with self._journal_transaction(operation_id=handle.operation_id) as records:
                 current = self._state(records).get(handle.operation_id)
                 if current is None or current.get("begin") is None:
                     raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
@@ -1107,7 +1181,7 @@ class OperationRecoveryJournal:
         with self._lock:
             if not self._enabled or self._path is None:
                 return
-            with self._journal_transaction() as records:
+            with self._journal_transaction(operation_id=handle.operation_id) as records:
                 current = self._state(records).get(handle.operation_id)
                 if current is None or current.get("begin") is None:
                     raise ToolError("operation_not_found", f"Operation {handle.operation_id!r} was not found.")
@@ -1150,7 +1224,7 @@ class OperationRecoveryJournal:
         with self._lock:
             if not self._enabled or self._path is None:
                 return
-            with self._journal_transaction() as records:
+            with self._journal_transaction(operation_id=handle.operation_id) as records:
                 current = self._state(records).get(handle.operation_id)
                 if current is not None and current.get("uncertain") is not None:
                     raise ToolError(

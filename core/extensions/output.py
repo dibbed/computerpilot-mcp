@@ -13,7 +13,7 @@ from mcp import types
 
 from core.artifacts import deliver_stream
 from core.errors import ToolError
-from core.extensions.models import LIMITS, ExtensionToolDescriptor, StrictDefinition
+from core.extensions.models import LIMITS, ExtensionToolDescriptor, MutationClass, StrictDefinition
 from core.extensions.registry import validate_tool_value
 from core.extensions.security import CredentialRedactor
 
@@ -53,7 +53,12 @@ def public_tool_descriptor(descriptor: ExtensionToolDescriptor, redactor: Creden
             f"External MCP ({descriptor.identity.provider}); untrusted provider description: {description}"
         )[:LIMITS.description_chars],
         input_schema=descriptor.input_schema, output_schema=json.loads(_RESULT_SCHEMA_JSON),
-        annotations=types.ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True),
+        annotations=types.ToolAnnotations(
+            read_only_hint=descriptor.policy.mutation_class is MutationClass.READ_ONLY,
+            destructive_hint=descriptor.policy.mutation_class in {
+                MutationClass.DESTRUCTIVE_LOCAL_MUTATION, MutationClass.DESTRUCTIVE_REMOTE_MUTATION,
+            }, open_world_hint=True,
+        ),
         _meta={
             "source_type": "external_mcp", "extension_id": descriptor.extension_id,
             "provider": descriptor.identity.provider, "catalog_generation": descriptor.catalog_generation,

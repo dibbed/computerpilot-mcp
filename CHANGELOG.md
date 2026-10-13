@@ -7,6 +7,8 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Added
+- 2026-10-13: Add bounded schema-1 external recovery metadata (`external_metadata_version=1`), runtime-only random HMAC request correlation, and two-stage durable dispatch barriers (`prepared` -> `may_dispatch`) for external mutations without storing raw arguments or secrets.
+- 2026-10-13: Activate guarded external mutation eligibility across direct calls, MCP wire, and advisory routing when trusted, explicitly classified and allowed, profile-eligible (`minimal` remains read-only for extensions), backed by a live catalog lease, `RUNTIME_LIFECYCLE` is `RUNNING`, and the recovery journal has unresolved capacity.
 - 2026-10-13: Project exact operator-mapped external intents into advisory routing through shared live eligibility, with bounded safe rejection reasons and generation attribution.
 - 2026-10-13: Add the external.mcp route value and bounded immutable operator-policy provenance while preserving native route serialization and the deterministic-v1 policy.
 - 2026-10-12: Add the contributor execution contract, native/extension authoring and testing standards, and the local extensibility execution ledger.
@@ -19,11 +21,14 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-12: Coalesce provider catalog refresh and public modern/legacy change notifications, preserving runtime schema fingerprints and monotonic catalog generations.
 
 ### Changed
+- 2026-10-13: Bound resolved external operation history during journal compaction (`1,000` resolved operations / `30` days) while preserving native history and never evicting unresolved operations; enforce an unresolved external mutation quota of `128`.
 - 2026-10-13: Keep external discovery execution metadata consistent with eligible router policy, aggregate external routing metrics without provider labels, and defer visual routing to v0.9.0.
 - 2026-10-13: Use one live candidate snapshot for routing decisions and explanations, preserving deterministic-v1 ordering and identifying external scores as operator policy estimates.
 - 2026-10-12: Keep the v0.8 master plan only in the operator's Windows Downloads directory; replace the repository snapshot with a brief contributor handoff and use short-lived milestone branches with pushed checkpoints and verified merges to main.
 
 ### Fixed
+- 2026-10-13: Derive external tool annotations from operator mutation policy; stream bounded recovery admission and operation lookups, record policy fingerprints, and keep read-only calls responsive during deadline-limited mutation journal contention.
+- 2026-10-13: Execute recovery acknowledgement, reconciliation, and external quota admission inside a full interprocess file-lock read-check-append transaction, and preserve `known_result='returned_error'` alongside `external_outcome='not_dispatched'` for pre-dispatch failures.
 - 2026-10-13: Reject diagnostic all and unknown execution profiles at the shared extension guard, and retain legacy connection exposure limits in router recommendations.
 - 2026-10-13: Validate real HTTP catalog changes by relisting after notifications until the requested state, tolerating earlier startup notifications within the same bounded deadline; separately prove SDK cache invalidation with a public positive-TTL fixture while preserving production TTL0.
 - 2026-10-13: Honor positive finite startup/handshake/discovery/call deadlines and operator/Core ceilings in direct extension calls as well as public calls, including admission queue time.

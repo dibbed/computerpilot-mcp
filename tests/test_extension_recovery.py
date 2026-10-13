@@ -408,9 +408,9 @@ def test_m10_2_manager_durable_dispatch_barrier_and_outcome_taxonomy(
         return int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
 
     async def run_scenarios() -> None:
-        # Verify default manager keeps mutation gate closed before M10.4
+        # Verify M10.4 activates the default mutation gate (while still requiring recovery availability)
         default_mgr = ExtensionLifecycleManager()
-        assert default_mgr.is_mutation_gate_closed is True
+        assert default_mgr.is_mutation_gate_closed is False
 
         # Scenario 1: Journal disabled -> deny before dispatch (marker == 0)
         ws1 = tmp_path / "ws1"
@@ -885,3 +885,728 @@ def test_m10_3_interprocess_atomic_admission_and_cas_ack_reconcile_conflict(
     assert total_admitted == 6
     assert total_denied == 4
     assert seed_journal.unresolved_external_count() == 6
+
+
+def test_m10_4_two_runtime_restart_proof_and_recovery_tool_parity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    import anyio
+    from mcp import Client
+    from mcp.server import MCPServer
+
+    from core import recovery as recovery_mod
+    from core.extensions.bridge import ExtensionMCPServer
+    from core.extensions.manager import ExtensionLifecycleManager
+    from core.extensions.models import (
+        ExtensionDefinition,
+        ExtensionState,
+        MutationClass,
+        ToolPolicy,
+        TrustClass,
+    )
+    from core.lifecycle import RUNTIME_LIFECYCLE
+    from tools.recovery import registry as recovery_tools_registry
+
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "fake_mcp_server.py"
+    ws = tmp_path / "ws_restart"
+    ws.mkdir()
+    journal_path = tmp_path / "operations.jsonl"
+
+    defn = ExtensionDefinition(
+        extension_id="fake",
+        display_name="Fake Provider",
+        provider="Fake MCP",
+        trust_class=TrustClass.TRUSTED,
+        launch_approved=True,
+        enabled=True,
+        command=sys.executable,
+        arguments=(str(fixture_path), "--workspace", str(ws), "--mode", "uncertain_mutation"),
+        working_directory=str(ws),
+        platforms=("windows", "linux", "macos"),
+        tools={
+            "increment_value": ToolPolicy(
+                remote_name="increment_value",
+                domain="process",
+                allow_call=True,
+                mutation_class=MutationClass.REMOTE_MUTATION,
+                profiles=("full",),
+            ),
+        },
+    )
+
+    def read_dispatch_count() -> int:
+        counter = ws / "counter.json"
+        return int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+
+    async def run_restart_proof() -> None:
+        RUNTIME_LIFECYCLE.configure(None, None)
+        journal1 = OperationRecoveryJournal()
+        journal1.configure(journal_path, "runtime-r1")
+        monkeypatch.setattr(recovery_mod, "OPERATION_RECOVERY", journal1)
+
+        # Runtime 1: default ExtensionLifecycleManager (M10.4 gate open)
+        mgr1 = ExtensionLifecycleManager(recovery_journal=journal1)
+        assert mgr1.is_mutation_gate_closed is False
+        mgr1.register_extension(defn)
+
+        keep1 = anyio.Event()
+        op_id = ""
+        async with anyio.create_task_group() as tg1:
+            await mgr1.start_all_background(tg1, keep_alive_event=keep1)
+            for _ in range(200):
+                if mgr1.get_state("fake") == ExtensionState.HEALTHY:
+                    break
+                await anyio.sleep(0.02)
+            assert mgr1.get_state("fake") == ExtensionState.HEALTHY
+
+            server1 = ExtensionMCPServer("test-r1", tool_profile="full")
+            server1.extension_manager = mgr1
+            recovery_tools_registry.register(server1)
+
+            async with Client(server1) as client1:
+                tools1 = await client1.list_tools()
+                tool_names1 = {t.name for t in tools1.tools}
+                assert "external.fake.increment_value" in tool_names1
+
+                call_res = await client1.call_tool(
+                    "external.fake.increment_value",
+                    {"amount": 7},
+                )
+                assert call_res.structured_content is not None
+                sc = call_res.structured_content
+                assert sc["ok"] is False
+                assert sc["outcome"] == "uncertain", sc
+                assert sc["error"] == "uncertain_side_effect"
+                assert isinstance(sc["operation_id"], str)
+                op_id = sc["operation_id"]
+
+            # Durable marker proves provider executed the side effect exactly once
+            assert read_dispatch_count() == 1
+
+            # Disable, catalog retirement, and transport loss NEVER resolve an uncertain op
+            owner1 = mgr1.get_owner("fake")
+            assert owner1 is not None
+            owner1.handle_transport_loss("transport_eof", mgr1.registry)
+            assert journal1.inspect(op_id)["state"] == "uncertain"
+            mgr1.registry.retire_extension_catalog("fake")
+            assert journal1.inspect(op_id)["state"] == "uncertain"
+            await mgr1.disable_extension("fake")
+            assert journal1.inspect(op_id)["state"] == "uncertain"
+
+            await mgr1.drain_and_stop()
+
+        # Runtime 2: fresh journal and manager on the same operations.jsonl
+        RUNTIME_LIFECYCLE.configure(None, None)
+        journal2 = OperationRecoveryJournal()
+        journal2.configure(journal_path, "runtime-r2")
+        monkeypatch.setattr(recovery_mod, "OPERATION_RECOVERY", journal2)
+
+        mgr2 = ExtensionLifecycleManager(recovery_journal=journal2)
+        mgr2.register_extension(defn)
+        keep2 = anyio.Event()
+        async with anyio.create_task_group() as tg2:
+            await mgr2.start_all_background(tg2, keep_alive_event=keep2)
+            for _ in range(200):
+                if mgr2.get_state("fake") == ExtensionState.HEALTHY:
+                    break
+                await anyio.sleep(0.02)
+            assert mgr2.get_state("fake") == ExtensionState.HEALTHY
+
+            # Verify no automatic replay happened on Runtime 2 startup/recovery
+            assert read_dispatch_count() == 1
+
+            server2 = MCPServer("test-r2")
+            recovery_tools_registry.register(server2)
+            async with Client(server2) as client2:
+                listed = await client2.call_tool("list_uncertain_operations", {})
+                assert listed.structured_content is not None
+                assert listed.structured_content["count"] == 1
+                item = listed.structured_content["items"][0]
+                assert item["operation_id"] == op_id
+                assert item["state"] == "uncertain"
+                assert item["external_outcome"] == "uncertain"
+                assert item["external"]["extension_id"] == "fake"
+                assert item["external"]["public_name"] == "external.fake.increment_value"
+                assert item["external"]["dispatch_stage"] == "may_dispatch"
+
+                inspected = await client2.call_tool(
+                    "inspect_uncertain_operation",
+                    {"operation_id": op_id},
+                )
+                assert inspected.structured_content is not None
+                assert inspected.structured_content["state"] == "uncertain"
+                assert inspected.structured_content["external"]["external_outcome"] == "uncertain"
+                raw_json = json.dumps(inspected.structured_content)
+                assert "amount" not in raw_json
+
+                hist = await client2.call_tool(
+                    "get_operation_history",
+                    {"operation_id": op_id},
+                )
+                assert hist.structured_content is not None
+                assert hist.structured_content["count"] >= 3
+
+                acked = await client2.call_tool(
+                    "acknowledge_uncertain_operation",
+                    {
+                        "operation_id": op_id,
+                        "outcome": "acknowledged",
+                        "note": "Verified external counter state manually after restart.",
+                    },
+                )
+                assert acked.structured_content is not None
+                assert acked.structured_content["state"] == "acknowledged"
+                assert acked.structured_content["external_outcome"] == "acknowledged"
+
+                listed_after = await client2.call_tool("list_uncertain_operations", {})
+                assert listed_after.structured_content is not None
+                assert listed_after.structured_content["count"] == 0
+
+            # Still zero replay after inspection and acknowledgement
+            assert read_dispatch_count() == 1
+            await mgr2.drain_and_stop()
+
+    anyio.run(run_restart_proof)
+
+
+def test_external_dispatch_reads_bounded_legacy_history_and_torn_tail(tmp_path: Path) -> None:
+    import tracemalloc
+
+    path = tmp_path / "large-journal.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "current")
+    with path.open("wb") as stream:
+        for idx in range(3000):
+            stream.write((json.dumps({"schema_version": 1, "type": "begin", "operation_id": f"native-{idx}",
+                                     "runtime_id": "current", "target": "x" * 1000}) + "\n").encode())
+            stream.write((json.dumps({"schema_version": 1, "type": "acknowledged", "operation_id": f"native-{idx}",
+                                     "state": "acknowledged"}) + "\n").encode())
+        stream.write(b"{" + b"x" * (4 * 1024 * 1024))  # Torn final append, without newline.
+
+    tracemalloc.start()
+    try:
+        assert journal.has_external_mutation_capacity()
+        handle = journal.begin("external.fake.increment_value", external_metadata=_sample_external_metadata())
+        assert handle is not None
+        journal.checkpoint_external_dispatch(handle)
+        journal.finish(handle, known_result="ok", external_outcome="succeeded")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 2 * 1024 * 1024, peak
+    assert journal.inspect(handle.operation_id)["state"] == "succeeded"
+    assert journal.inspect("native-2999")["state"] == "acknowledged"
+
+
+def test_two_core_processes_recover_crash_after_effect_without_replay(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[1]
+    fixture = repo / "tests" / "fixtures" / "fake_mcp_server.py"
+    definition = tmp_path / "definition.json"
+    definition.write_text(json.dumps({
+        "extension_id": "fake", "display_name": "Fixture", "provider": "fixture", "enabled": True,
+        "launch_approved": True, "trust_class": "trusted", "command": sys.executable,
+        "arguments": [str(fixture), "--workspace", str(tmp_path), "--mode", "uncertain_mutation"],
+        "working_directory": str(tmp_path), "platforms": ["windows", "linux", "macos"],
+        "tools": {"increment_value": {
+            "remote_name": "increment_value", "domain": "process", "mutation_class": "remote_mutation",
+            "allow_call": True, "profiles": ["full"],
+        }},
+    }), encoding="utf-8")
+    script = '''
+import json, os, sys
+from pathlib import Path
+import anyio
+from mcp import Client
+from core import recovery
+from core.recovery import OperationRecoveryJournal
+from core.extensions.bridge import ExtensionMCPServer
+from core.extensions.manager import ExtensionLifecycleManager
+from core.extensions.models import ExtensionDefinition, ExtensionState
+from tools.recovery.registry import register
+workspace, mode = Path(sys.argv[1]), sys.argv[2]
+class CrashJournal(OperationRecoveryJournal):
+    def mark_uncertain(self, handle, reason_code, **kwargs):
+        os._exit(41)  # Crash after durable provider effect, before uncertainty is persisted.
+async def scenario():
+    journal = (CrashJournal if mode == "crash" else OperationRecoveryJournal)()
+    journal.configure(workspace / "operations.jsonl", mode)
+    recovery.OPERATION_RECOVERY = journal
+    manager = ExtensionLifecycleManager(recovery_journal=journal)
+    manager.register_extension(ExtensionDefinition.model_validate_json((workspace / "definition.json").read_text()))
+    async with anyio.create_task_group() as tasks:
+        await manager.start_all_background(tasks, keep_alive_event=anyio.Event())
+        with anyio.fail_after(10):
+            while manager.get_state("fake") != ExtensionState.HEALTHY:
+                await anyio.sleep(0.01)
+        server = ExtensionMCPServer("core-restart-test")
+        server.extension_manager = manager
+        register(server)
+        async with Client(server) as client:
+            if mode == "crash":
+                eligibility = manager.tool_eligibility("external.fake.increment_value")
+                assert eligibility.eligible, eligibility
+                assert "external.fake.increment_value" in {tool.name for tool in (await client.list_tools()).tools}
+                result = await client.call_tool("external.fake.increment_value", {"amount": 2})
+                raise AssertionError(result.structured_content)
+            listing = (await client.call_tool("list_uncertain_operations", {})).structured_content
+            assert listing["count"] == 1
+            operation = listing["items"][0]
+            assert operation["external"]["dispatch_stage"] == "may_dispatch"
+            assert operation["external_outcome"] == "uncertain"
+            assert len(operation["external"]["policy_revision"]) == 64
+            assert (workspace / "counter.json").read_text() == "1"
+            ack = (await client.call_tool("acknowledge_uncertain_operation", {
+                "operation_id": operation["operation_id"], "outcome": "acknowledged", "note": "Counter verified once",
+            })).structured_content
+            assert ack["state"] == "acknowledged"
+            assert (await client.call_tool("list_uncertain_operations", {})).structured_content["count"] == 0
+            assert (workspace / "counter.json").read_text() == "1"
+        await manager.drain_and_stop()
+anyio.run(scenario)
+'''
+    crashed = subprocess.run([sys.executable, "-c", script, str(tmp_path), "crash"],
+                             cwd=repo, capture_output=True, text=True, timeout=30)
+    assert crashed.returncode == 41, crashed.stderr[-2000:]
+    records = _records(tmp_path / "operations.jsonl")
+    assert [item["type"] for item in records] == ["begin", "checkpoint"]
+    assert (tmp_path / "counter.json").read_text(encoding="utf-8") == "1"
+    restarted = subprocess.run([sys.executable, "-c", script, str(tmp_path), "restart"],
+                               cwd=repo, capture_output=True, text=True, timeout=30)
+    assert restarted.returncode == 0, restarted.stderr[-2000:]
+    assert (tmp_path / "counter.json").read_text(encoding="utf-8") == "1"
+
+
+@pytest.mark.parametrize("mode", ["provider_error", "invalid_output", "malformed", "oversize", "call_timeout", "cancel"])
+def test_possible_dispatch_failures_stay_uncertain_without_retry(tmp_path: Path, mode: str) -> None:
+    import sys
+
+    import anyio
+
+    from core.extensions.manager import ExtensionLifecycleManager
+    from core.extensions.models import ExtensionDefinition, ExtensionState
+
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.py"
+    definition = ExtensionDefinition.model_validate_json(json.dumps({
+        "extension_id": "fake", "display_name": "Fixture", "provider": "fixture", "enabled": True,
+        "launch_approved": True, "trust_class": "trusted", "command": sys.executable,
+        "arguments": [str(fixture.resolve()), "--workspace", str(tmp_path), "--mode", "call_timeout" if mode == "cancel" else mode],
+        "working_directory": str(tmp_path), "platforms": ["windows", "linux", "macos"],
+        "tools": {"increment_value": {"remote_name": "increment_value", "domain": "process",
+                 "mutation_class": "remote_mutation", "allow_call": True, "profiles": ["full"]}},
+    }))
+    journal = OperationRecoveryJournal()
+    journal.configure(tmp_path / "operations.jsonl", "taxonomy")
+    manager = ExtensionLifecycleManager(recovery_journal=journal)
+    manager.register_extension(definition)
+
+    async def scenario() -> None:
+        async with anyio.create_task_group() as tasks:
+            await manager.start_all_background(tasks, keep_alive_event=anyio.Event())
+            with anyio.fail_after(10):
+                while manager.get_state("fake") != ExtensionState.HEALTHY:
+                    await anyio.sleep(0.01)
+            lease = manager.registry.create_lease("external.fake.increment_value")
+            assert lease is not None
+            if mode == "cancel":
+                with anyio.move_on_after(0.2) as cancel:
+                    await manager.execute_guarded_call(lease, {"amount": 2})
+                assert cancel.cancel_called
+            else:
+                result = await manager.execute_guarded_call(lease, {"amount": 2}, timeout_sec=0.5)
+                assert result["outcome"] == "uncertain", result
+            operations = journal.list_operations(state=OperationState.UNCERTAIN)
+            assert operations["count"] == 1
+            assert operations["items"][0]["external"]["dispatch_stage"] == "may_dispatch"
+            assert (tmp_path / "counter.json").read_text(encoding="utf-8") == "1"
+            await manager.drain_and_stop()
+            assert (tmp_path / "counter.json").read_text(encoding="utf-8") == "1"
+
+    anyio.run(scenario)
+
+
+def test_contended_journal_respects_dispatch_deadline_and_readonly_is_responsive(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+    import time
+    from dataclasses import replace
+
+    import anyio
+    from mcp import types
+    from test_extension_security import admitted_call
+
+    from core.extensions.models import MutationClass
+
+    manager, _, session = admitted_call({"type": "object"}, types.CallToolResult(content=[]))
+    journal = OperationRecoveryJournal()
+    path = tmp_path / "operations.jsonl"
+    journal.configure(path, "contended")
+    manager._recovery_journal = journal
+    descriptor = manager.list_tools()[0]
+    descriptor = replace(descriptor, catalog_generation=descriptor.catalog_generation + 1,
+                         policy=descriptor.policy.model_copy(update={"mutation_class": MutationClass.LOCAL_MUTATION}))
+    manager.registry.publish_extension_catalog(descriptor.extension_id, descriptor.catalog_generation, (descriptor,))
+    lease = manager.registry.create_lease(descriptor.public_name)
+    assert lease is not None
+    readonly, read_lease, read_session = admitted_call({"type": "object"}, types.CallToolResult(content=[]))
+    readonly._recovery_journal = journal
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    code = '''
+import sys, time
+from pathlib import Path
+from core.file_lock import exclusive_file_lock
+workspace = Path(sys.argv[1])
+with exclusive_file_lock(workspace / ".operations.jsonl.lock", timeout_sec=5):
+    (workspace / "ready").touch()
+    while not (workspace / "release").exists():
+        time.sleep(0.01)
+'''
+    locker = subprocess.Popen([sys.executable, "-c", code, str(tmp_path)], cwd=Path(__file__).resolve().parents[1])
+    try:
+        until = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < until:
+            time.sleep(0.01)
+        assert ready.exists()
+
+        async def scenario() -> None:
+            errors: list[str] = []
+
+            async def mutate() -> None:
+                started = time.monotonic()
+                with pytest.raises(ToolError) as caught:
+                    await manager.execute_guarded_call(lease, {}, timeout_sec=0.2)
+                errors.append(caught.value.code)
+                assert time.monotonic() - started < 1.0
+
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(mutate)
+                await anyio.sleep(0.02)
+                with anyio.fail_after(0.2):
+                    assert (await readonly.execute_guarded_call(read_lease, {}))["ok"]
+            assert errors[0] in {"operation_journal_unavailable", "admission_limit_exceeded"}
+            session.send_request.assert_not_awaited()
+            read_session.send_request.assert_awaited_once()
+            assert journal.list_operations()["count"] == 0
+
+        anyio.run(scenario)
+    finally:
+        release.touch()
+        try:
+            locker.wait(timeout=5)
+        finally:
+            if locker.poll() is None:
+                locker.kill()
+                locker.wait(timeout=5)
+
+
+@pytest.mark.parametrize("revocation", ["catalog", "trust", "unchanged"])
+def test_authority_revoked_during_durable_checkpoint_never_dispatches(tmp_path: Path, revocation: str) -> None:
+    import threading
+    from dataclasses import replace
+
+    import anyio
+    from mcp import types
+    from test_extension_security import admitted_call
+
+    from core.extensions.models import MutationClass, TrustClass
+
+    entered, release = threading.Event(), threading.Event()
+
+    class PausedCheckpoint(OperationRecoveryJournal):
+        def checkpoint_external_dispatch(self, handle: Any) -> None:
+            super().checkpoint_external_dispatch(handle)
+            entered.set()
+            assert release.wait(timeout=5)
+
+    journal = PausedCheckpoint(max_unresolved_external=1)
+    journal.configure(tmp_path / "operations.jsonl", "race")
+    manager, _, session = admitted_call({"type": "object"}, types.CallToolResult(content=[]))
+    manager._recovery_journal = journal
+    descriptor = manager.list_tools()[0]
+    descriptor = replace(descriptor, catalog_generation=descriptor.catalog_generation + 1,
+                         policy=descriptor.policy.model_copy(update={"mutation_class": MutationClass.LOCAL_MUTATION}))
+    manager.registry.publish_extension_catalog(descriptor.extension_id, descriptor.catalog_generation, (descriptor,))
+    lease = manager.registry.create_lease(descriptor.public_name)
+    assert lease is not None
+    results: list[dict[str, Any]] = []
+
+    async def call() -> None:
+        results.append(await manager.execute_guarded_call(lease, {}))
+
+    async def scenario() -> None:
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(call)
+            assert await anyio.to_thread.run_sync(entered.wait, 5)
+            try:
+                if revocation == "catalog":
+                    manager.registry.retire_extension_catalog(descriptor.extension_id)
+                elif revocation == "trust":
+                    owner = manager.get_owner(descriptor.extension_id)
+                    assert owner is not None
+                    owner.definition = owner.definition.model_copy(update={"trust_class": TrustClass.UNTRUSTED})
+            finally:
+                release.set()
+        if revocation == "unchanged":
+            session.send_request.assert_awaited_once()
+            assert results[0]["outcome"] == "succeeded"
+            assert journal.unresolved_external_count() == 0
+        else:
+            session.send_request.assert_not_awaited()
+            assert results[0]["outcome"] == "uncertain"
+            assert journal.list_operations(state=OperationState.UNCERTAIN)["count"] == 1
+
+    anyio.run(scenario)
+
+
+def test_m10_4_direct_wire_router_mutation_eligibility_and_denial_parity(
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    import anyio
+    from mcp import Client
+
+    from core.execution_models import ExecutionIntent, RecoverabilityClass, RouteClass
+    from core.execution_router import ExecutionRouter
+    from core.extensions.bridge import ExtensionMCPServer
+    from core.extensions.manager import ExtensionLifecycleManager
+    from core.extensions.models import (
+        ExtensionDefinition,
+        ExtensionState,
+        MutationClass,
+        ToolPolicy,
+        TrustClass,
+    )
+    from core.lifecycle import RUNTIME_LIFECYCLE
+    from core.platform import detect_capabilities
+
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "fake_mcp_server.py"
+
+    def make_defn(
+        ws: Path,
+        *,
+        trust_class: TrustClass = TrustClass.TRUSTED,
+        mutation_class: MutationClass = MutationClass.DESTRUCTIVE_REMOTE_MUTATION,
+        allow_call: bool = True,
+        profiles: tuple[str, ...] = ("full", "minimal"),
+    ) -> ExtensionDefinition:
+        return ExtensionDefinition(
+            extension_id="fake",
+            display_name="Fake Provider",
+            provider="Fake MCP",
+            trust_class=trust_class,
+            launch_approved=True,
+            enabled=True,
+            command=sys.executable,
+            arguments=(str(fixture_path), "--workspace", str(ws), "--mode", "mutation_success"),
+            working_directory=str(ws),
+            platforms=("windows", "linux", "macos"),
+            tools={
+                "increment_value": ToolPolicy(
+                    remote_name="increment_value",
+                    domain="process",
+                    intents=("external.mutate.counter",),
+                    allow_call=allow_call,
+                    mutation_class=mutation_class,
+                    determinism=4,
+                    recoverability=RecoverabilityClass.MEDIUM,
+                    profiles=profiles,
+                ),
+            },
+        )
+
+    def read_dispatch_count(ws: Path) -> int:
+        counter = ws / "counter.json"
+        return int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+
+    async def run_parity_checks() -> None:
+        RUNTIME_LIFECYCLE.configure(None, None)
+
+        # 1. Eligible across direct, MCP wire, and ExecutionRouter when all M10.4 conditions hold
+        ws_ok = tmp_path / "ws_ok"
+        ws_ok.mkdir()
+        journal_ok = OperationRecoveryJournal(max_unresolved_external=2)
+        journal_ok.configure(tmp_path / "ok.jsonl", "runtime-ok")
+        mgr_ok = ExtensionLifecycleManager(recovery_journal=journal_ok)
+        mgr_ok.register_extension(
+            make_defn(
+                ws_ok,
+                trust_class=TrustClass.TRUSTED,
+                mutation_class=MutationClass.DESTRUCTIVE_REMOTE_MUTATION,
+                allow_call=True,
+            )
+        )
+        keep_ok = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            await mgr_ok.start_all_background(tg, keep_alive_event=keep_ok)
+            for _ in range(200):
+                if mgr_ok.get_state("fake") == ExtensionState.HEALTHY:
+                    break
+                await anyio.sleep(0.02)
+            assert mgr_ok.get_state("fake") == ExtensionState.HEALTHY
+
+            # Eligible in registry / manager
+            el_full = mgr_ok.tool_eligibility("external.fake.increment_value", active_profile="full")
+            assert el_full.eligible is True
+
+            # Eligible in ExecutionRouter (with allow_destructive=True for destructive_remote_mutation)
+            router = ExecutionRouter(
+                registered_tools={tool.public_name for tool in mgr_ok.list_tools()},
+                capabilities=detect_capabilities(), extension_manager=mgr_ok,
+            )
+            sel = router.recommend(ExecutionIntent("external.mutate.counter", destructive=True))
+            assert sel["ok"] is True, sel
+            assert sel["selected_route"] == RouteClass.EXTERNAL_MCP.value
+            assert sel["representative_tool"] == "external.fake.increment_value"
+
+            # Direct call succeeds and increments counter to 1
+            lease = mgr_ok.registry.create_lease("external.fake.increment_value")
+            assert lease is not None
+            direct_res = await mgr_ok.execute_guarded_call(lease, {"amount": 2})
+            assert direct_res["ok"] is True
+            assert direct_res["outcome"] == "succeeded"
+            assert read_dispatch_count(ws_ok) == 1
+
+            # MCP wire call succeeds and increments counter to 2
+            bridge_full = ExtensionMCPServer("bridge-full", tool_profile="full")
+            bridge_full.extension_manager = mgr_ok
+            async with Client(bridge_full) as client_full:
+                tools_full = await client_full.list_tools()
+                assert "external.fake.increment_value" in {t.name for t in tools_full.tools}
+                wire_res = await client_full.call_tool("external.fake.increment_value", {"amount": 3})
+                assert wire_res.structured_content is not None
+                assert wire_res.structured_content["ok"] is True
+                assert wire_res.structured_content["outcome"] == "succeeded"
+            assert read_dispatch_count(ws_ok) == 2
+
+            # Minimal profile denies non-read_only across eligibility, wire list/call, and router
+            el_min = mgr_ok.tool_eligibility("external.fake.increment_value", active_profile="minimal")
+            assert el_min.eligible is False
+            assert el_min.rejection_code == "profile_mismatch"
+
+            router_min = ExecutionRouter(
+                registered_tools={tool.public_name for tool in mgr_ok.list_tools()},
+                capabilities=detect_capabilities(), extension_manager=mgr_ok,
+                active_profile="minimal",
+            )
+            sel_min = router_min.recommend(ExecutionIntent("external.mutate.counter", destructive=True))
+            assert sel_min["ok"] is False
+
+            bridge_min = ExtensionMCPServer("bridge-min", tool_profile="minimal")
+            bridge_min.extension_manager = mgr_ok
+            async with Client(bridge_min) as client_min:
+                tools_min = await client_min.list_tools()
+                assert "external.fake.increment_value" not in {t.name for t in tools_min.tools}
+                wire_min = await client_min.call_tool("external.fake.increment_value", {"amount": 3})
+                assert wire_min.is_error is True
+            assert read_dispatch_count(ws_ok) == 2
+
+            # Exhaust unresolved quota (max_unresolved_external=2) -> denied across eligibility, router, direct, wire
+            ext_meta = _sample_external_metadata()
+            q1 = journal_ok.begin("external.fake.increment_value", "q1", external_metadata=ext_meta)
+            q2 = journal_ok.begin("external.fake.increment_value", "q2", external_metadata=ext_meta)
+            assert q1 is not None and q2 is not None
+            journal_ok.mark_uncertain(q1, "call_timeout")
+            journal_ok.mark_uncertain(q2, "call_timeout")
+
+            el_quota = mgr_ok.tool_eligibility("external.fake.increment_value", active_profile="full")
+            assert el_quota.eligible is False
+            assert el_quota.rejection_code == "operation_limit"
+
+            router_quota = ExecutionRouter(
+                registered_tools={tool.public_name for tool in mgr_ok.list_tools()},
+                capabilities=detect_capabilities(), extension_manager=mgr_ok,
+            )
+            assert (
+                router_quota.recommend(ExecutionIntent("external.mutate.counter", destructive=True))["ok"]
+                is False
+            )
+
+            with pytest.raises(ToolError) as quota_err:
+                await mgr_ok.execute_guarded_call(lease, {"amount": 9})
+            assert quota_err.value.code == "operation_limit"
+            assert read_dispatch_count(ws_ok) == 2
+
+            # Lifecycle draining/stopping -> denied with recovery_unavailable before dispatch
+            journal_ok.acknowledge(
+                q1.operation_id,
+                OperationState.ACKNOWLEDGED,
+                Evidence("operator", {"clear": True}),
+            )
+            control = tmp_path / "control.json"
+            RUNTIME_LIFECYCLE.configure(control, tmp_path / "status.json")
+            control.write_text(json.dumps({"schema_version": 1, "command": "drain", "request_id": "test-drain"}), encoding="utf-8")
+            assert RUNTIME_LIFECYCLE.poll_control() == "DRAINING"
+            try:
+                el_drain = mgr_ok.tool_eligibility("external.fake.increment_value", active_profile="full")
+                assert el_drain.eligible is False
+                assert el_drain.rejection_code == "recovery_unavailable"
+                with pytest.raises(ToolError) as drain_err:
+                    await mgr_ok.execute_guarded_call(lease, {"amount": 9})
+                assert drain_err.value.code == "recovery_unavailable"
+                assert read_dispatch_count(ws_ok) == 2
+            finally:
+                RUNTIME_LIFECYCLE.configure(None, None)
+
+            await mgr_ok.drain_and_stop()
+
+        # 2. RESTRICTED trust and UNKNOWN mutation class denied even when journal is enabled
+        for idx, (trust_cls, mut_cls, expected_el_code, expected_call_code) in enumerate(
+            (
+                (
+                    TrustClass.RESTRICTED,
+                    MutationClass.LOCAL_MUTATION,
+                    "restricted_trust_mutation_forbidden",
+                    "restricted_trust_mutation_forbidden",
+                ),
+                (
+                    TrustClass.TRUSTED,
+                    MutationClass.UNKNOWN,
+                    "unknown_mutation_class_forbidden",
+                    "unknown_mutation_class_forbidden",
+                ),
+            )
+        ):
+            ws_den = tmp_path / f"ws_den_{idx}"
+            ws_den.mkdir()
+            j_den = OperationRecoveryJournal()
+            j_den.configure(tmp_path / f"den_{idx}.jsonl", f"runtime-den-{idx}")
+            mgr_den = ExtensionLifecycleManager(recovery_journal=j_den)
+            mgr_den.register_extension(
+                make_defn(ws_den, trust_class=trust_cls, mutation_class=mut_cls)
+            )
+            keep_den = anyio.Event()
+            async with anyio.create_task_group() as tg:
+                await mgr_den.start_all_background(tg, keep_alive_event=keep_den)
+                for _ in range(200):
+                    if mgr_den.get_state("fake") == ExtensionState.HEALTHY:
+                        break
+                    await anyio.sleep(0.02)
+                assert mgr_den.get_state("fake") == ExtensionState.HEALTHY
+
+                el_den = mgr_den.tool_eligibility("external.fake.increment_value", active_profile="full")
+                assert el_den.eligible is False
+                assert el_den.rejection_code == expected_el_code
+
+                router_den = ExecutionRouter(
+                    registered_tools={tool.public_name for tool in mgr_den.list_tools()},
+                    capabilities=detect_capabilities(), extension_manager=mgr_den,
+                )
+                assert router_den.recommend(ExecutionIntent("external.mutate.counter"))["ok"] is False
+
+                lease_den = mgr_den.registry.create_lease("external.fake.increment_value")
+                assert lease_den is not None
+                with pytest.raises(ToolError) as err_den:
+                    await mgr_den.execute_guarded_call(lease_den, {"amount": 1})
+                assert err_den.value.code == expected_call_code
+                assert read_dispatch_count(ws_den) == 0
+
+                await mgr_den.drain_and_stop()
+
+    anyio.run(run_parity_checks)
