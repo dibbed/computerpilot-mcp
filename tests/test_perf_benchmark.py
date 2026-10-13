@@ -70,6 +70,9 @@ def test_benchmark_profiles_cover_planned_scale_points() -> None:
     assert full["backup_files"] == [2_000]
     assert full["artifact_files"] == [5_000]
     assert full["job_history_rows"] == [2_000]
+    assert full["extension_counts"] == [1, 2, 4]
+    quick = PROFILE_LIMITS["quick"]
+    assert quick["extension_counts"] == [1, 2]
 
 
 def test_browser_pool_details_report_instances_contexts_and_keys() -> None:
@@ -687,3 +690,64 @@ def test_retention_suite_is_available_through_benchmark_runner(monkeypatch: pyte
         "job_history_retention_500_rows",
     }
     assert all(item["status"] == "ok" for item in results.values())
+
+
+def test_extension_benchmark_helpers_cover_scenarios(tmp_path: Path) -> None:
+    from scripts.perf_benchmark import (
+        _extension_1_health_snapshot_once,
+        _extension_baseline_disabled_once,
+        _extension_baseline_empty_config_once,
+        _extension_bounded_resources_once,
+    )
+
+    disabled = _extension_baseline_disabled_once()
+    assert disabled["configured_count"] == 0
+    assert disabled["error_code"] is None
+
+    empty = _extension_baseline_empty_config_once(tmp_path / "empty")
+    assert empty["configured_count"] == 0
+    assert empty["catalog_tools"] == 0
+
+    health = _extension_1_health_snapshot_once(tmp_path / "health")
+    assert health["configured_count"] == 1
+    assert health["health_keys"] > 0
+
+    bounded = _extension_bounded_resources_once(tmp_path / "bounded")
+    assert bounded["stderr_bounded"] is True
+    assert bounded["journal_quota_bounded"] is True
+    assert bounded["unresolved_operations"] == 128
+
+
+def test_extensions_suite_is_available_through_benchmark_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import scripts.perf_benchmark as perf
+    from core.extensions.models import LIMITS
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(perf, "SETTINGS", SimpleNamespace(state_dir=state_dir, backup_dir=tmp_path / "backup", extensions_enabled=False))
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"extensions"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    results = {item["name"]: item for item in report["results"]}
+    expected_names = {
+        "extensions_baseline_disabled",
+        "extensions_baseline_empty_config",
+        "extensions_1_valid_startup_list",
+        "extensions_1_call_roundtrip",
+        "extensions_1_health_snapshot",
+        "extensions_1_parallel_startup",
+        "extensions_2_parallel_startup",
+        "extensions_fault_isolation",
+        "extensions_bounded_resources",
+    }
+    assert expected_names <= set(results)
+    assert all(item["status"] == "ok" for item in results.values())
+    assert "extension_caps" in report
+    assert report["extension_caps"]["configured"] == LIMITS.configured
+    assert report["extension_caps"]["enabled"] == LIMITS.enabled
+    assert report["extension_caps"]["total_tools"] == LIMITS.total_tools
+    assert report["extension_caps"]["unresolved_operations"] == LIMITS.unresolved_operations

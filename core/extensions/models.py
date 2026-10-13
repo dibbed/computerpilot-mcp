@@ -20,7 +20,7 @@ from core.tool_profiles import ALL_DOMAINS, PROFILE_DOMAINS
 
 @dataclass(frozen=True, slots=True)
 class ExtensionLimits:
-    """Provisional Core ceilings, measured/frozen by roadmap M14 rather than providers."""
+    """Core resource ceilings and quotas, measured and frozen by milestone M14."""
 
     configured: int = 16
     enabled: int = 8

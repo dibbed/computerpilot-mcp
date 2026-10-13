@@ -22,7 +22,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -35,6 +35,7 @@ from core.audit import AuditPolicy, AuditWriter
 from core.backups import BackupPolicy, backup_created_at, cleanup_backups
 from core.config import PROJECT_ROOT, SETTINGS
 from core.executor import run_bounded
+from core.extensions.models import LIMITS
 from core.file_lock import exclusive_file_lock
 from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
@@ -68,6 +69,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "backup_files": [500],
         "artifact_files": [1_000],
         "job_history_rows": [500],
+        "extension_counts": [1, 2],
     },
     "full": {
         "output_sizes": [1_024, MiB, 100 * MiB],
@@ -79,9 +81,24 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "backup_files": [2_000],
         "artifact_files": [5_000],
         "job_history_rows": [2_000],
+        "extension_counts": [1, 2, 4],
     },
 }
-SUITES = ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "backups", "retention", "resilience", "workflow")
+SUITES = (
+    "catalog",
+    "startup",
+    "output",
+    "project",
+    "search",
+    "jobs",
+    "browser",
+    "audit",
+    "backups",
+    "retention",
+    "resilience",
+    "workflow",
+    "extensions",
+)
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
 _GC_STAGING = re.compile(r"^\.gc-[0-9a-f]{32}$")
@@ -1632,6 +1649,233 @@ def _cleanup_stale_temp_roots(
     return removed
 
 
+def _extension_baseline_disabled_once() -> dict[str, Any]:
+    from dataclasses import is_dataclass, replace
+
+    from core.extensions.config import load_extension_config
+    if is_dataclass(SETTINGS):
+        settings = replace(SETTINGS, extensions_enabled=False)
+    else:
+        from core.config import Settings
+        settings = Settings(extensions_enabled=False)
+    res = load_extension_config(settings)
+    return {"configured_count": len(res.config.extensions), "error_code": res.error_code}
+
+
+def _extension_baseline_empty_config_once(root: Path) -> dict[str, Any]:
+    from dataclasses import is_dataclass, replace
+
+    from core.extensions.config import load_extension_config
+    from core.extensions.manager import ExtensionLifecycleManager
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "empty_ext.json"
+    if not path.exists():
+        path.write_text('{"schema_version": 1, "extensions": []}', encoding="utf-8")
+    if is_dataclass(SETTINGS):
+        settings = replace(SETTINGS, extensions_enabled=True, extensions_config=str(path))
+    else:
+        from core.config import Settings
+        settings = Settings(extensions_enabled=True, extensions_config=str(path))
+    res = load_extension_config(settings)
+    manager = ExtensionLifecycleManager(config=res.config)
+    return {"configured_count": len(res.config.extensions), "catalog_tools": len(manager.list_tools())}
+
+
+def _build_bench_extension_definition(root: Path, ext_id: str = "fixture", mode: str = "readonly") -> Any:
+    from core.extensions.models import ExtensionDefinition
+    from core.platform import normalize_system
+    fixture_path = PROJECT_ROOT / "tests" / "fixtures" / "fake_mcp_server.py"
+    sub_root = root / ext_id
+    sub_root.mkdir(parents=True, exist_ok=True)
+    return ExtensionDefinition.model_validate_json(
+        json.dumps({
+            "extension_id": ext_id,
+            "display_name": f"Bench {ext_id}",
+            "provider": "fixture",
+            "enabled": True,
+            "launch_approved": True,
+            "trust_class": "trusted",
+            "platforms": [normalize_system()],
+            "command": sys.executable,
+            "arguments": [str(fixture_path.resolve()), "--workspace", str(sub_root), f"--mode={mode}"],
+            "working_directory": str(sub_root),
+            "tools": {
+                "read_value": {
+                    "remote_name": "read_value",
+                    "domain": "system",
+                    "mutation_class": "read_only",
+                    "allow_call": True,
+                    "profiles": ["full"],
+                }
+            },
+        })
+    )
+
+
+def _extension_1_valid_startup_list_once(root: Path) -> dict[str, Any]:
+    import anyio
+
+    from core.extensions.manager import ExtensionLifecycleManager, ExtensionState
+    defn = _build_bench_extension_definition(root, "fixture", "readonly")
+    manager = ExtensionLifecycleManager()
+    owner = manager.register_extension(defn)
+
+    async def _run() -> int:
+        discovered = 0
+        keep = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            await manager.start_all_background(tg, keep_alive_event=keep)
+            with anyio.fail_after(10):
+                while owner.state != ExtensionState.HEALTHY:
+                    await anyio.sleep(0.01)
+            discovered = len(manager.list_tools())
+            keep.set()
+            await manager.drain_and_stop()
+        return discovered
+
+    discovered = anyio.run(_run)
+    return {"discovered_tools": discovered, "extension_id": defn.extension_id}
+
+
+def _extension_1_call_roundtrip_once(root: Path) -> dict[str, Any]:
+    import anyio
+
+    from core.extensions.manager import ExtensionLifecycleManager, ExtensionState
+    defn = _build_bench_extension_definition(root, "fixture_call", "readonly")
+    manager = ExtensionLifecycleManager()
+    owner = manager.register_extension(defn)
+
+    async def _run() -> str:
+        outcome = "failed"
+        keep = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            await manager.start_all_background(tg, keep_alive_event=keep)
+            with anyio.fail_after(10):
+                while owner.state != ExtensionState.HEALTHY:
+                    await anyio.sleep(0.01)
+            lease = manager.registry.create_lease(f"external.{defn.extension_id}.read_value")
+            if lease is None:
+                raise ValueError("could not create lease")
+            result = await manager.execute_guarded_call(
+                lease,
+                {"value": "bench_test"},
+            )
+            outcome = str(result.get("outcome", "failed"))
+            keep.set()
+            await manager.drain_and_stop()
+        return outcome
+
+    outcome = anyio.run(_run)
+    return {"outcome": outcome, "tool": f"external.{defn.extension_id}.read_value"}
+
+
+def _extension_1_health_snapshot_once(root: Path) -> dict[str, Any]:
+    from core.extensions.manager import ExtensionLifecycleManager
+    defn = _build_bench_extension_definition(root, "fixture_health", "readonly")
+    manager = ExtensionLifecycleManager()
+    manager.register_extension(defn)
+    snap = manager.health_snapshot("full")
+    return {"configured_count": snap["configured_count"], "health_keys": len(snap)}
+
+
+def _extension_n_parallel_startup_once(root: Path, count: int) -> dict[str, Any]:
+    import anyio
+
+    from core.extensions.manager import ExtensionLifecycleManager, ExtensionState
+    from core.extensions.models import LIMITS
+    manager = ExtensionLifecycleManager(parallel_startup=LIMITS.parallel_startup)
+    for i in range(count):
+        manager.register_extension(_build_bench_extension_definition(root, f"ext_{i}", "readonly"))
+
+    async def _run() -> int:
+        discovered = 0
+        keep = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            await manager.start_all_background(tg, keep_alive_event=keep)
+            for own in manager._owners.values():
+                with anyio.fail_after(15):
+                    while own.state != ExtensionState.HEALTHY:
+                        await anyio.sleep(0.01)
+            discovered = len(manager.list_tools())
+            keep.set()
+            await manager.drain_and_stop()
+        return discovered
+
+    discovered = anyio.run(_run)
+    return {"configured_count": count, "discovered_tools": discovered}
+
+
+def _extension_fault_isolation_once(root: Path) -> dict[str, Any]:
+    import anyio
+
+    from core.extensions.manager import ExtensionLifecycleManager, ExtensionState
+    defn_a = _build_bench_extension_definition(root, "hanging_ext", "startup_delayed")
+    defn_b = _build_bench_extension_definition(root, "fast_ext", "readonly")
+    manager = ExtensionLifecycleManager()
+    manager.register_extension(defn_a)
+    owner_b = manager.register_extension(defn_b)
+
+    async def _run() -> bool:
+        succeeded = False
+        keep = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            await manager.start_all_background(tg, keep_alive_event=keep)
+            with anyio.fail_after(10):
+                while owner_b.state != ExtensionState.HEALTHY:
+                    await anyio.sleep(0.01)
+            lease_b = manager.registry.create_lease(f"external.{defn_b.extension_id}.read_value")
+            if lease_b is None:
+                raise ValueError("could not create lease")
+            res_b = await manager.execute_guarded_call(
+                lease_b, {"value": "quick"},
+            )
+            succeeded = str(res_b.get("outcome")) == "succeeded"
+            keep.set()
+            await manager.drain_and_stop()
+        return succeeded
+
+    isolated = anyio.run(_run)
+    return {"fault_isolated": isolated, "b_succeeded": isolated}
+
+
+def _extension_bounded_resources_once(root: Path) -> dict[str, Any]:
+    from core.extensions.models import LIMITS
+    from core.extensions.transport import BoundedStderrDrain
+    drain = BoundedStderrDrain(max_bytes=LIMITS.stderr_bytes)
+    drain.feed_chunk(b"E" * (LIMITS.stderr_bytes * 10))
+    tail = drain.get_tail()
+    tail_len = len(tail.encode("utf-8"))
+    if tail_len > LIMITS.stderr_bytes:
+        raise ValueError("stderr tail exceeds limit")
+
+    from core.recovery import OperationRecoveryJournal
+    from core.recovery_models import ExternalOperationMetadata
+    journal = OperationRecoveryJournal()
+    journal.configure(root / "quota_ops.jsonl", "bench_runtime")
+    for i in range(LIMITS.unresolved_operations):
+        meta = ExternalOperationMetadata(
+            extension_id="bench_quota",
+            provider="p",
+            public_name="external.bench_quota.act",
+            remote_name="act",
+            catalog_generation=1,
+            schema_fingerprint="0" * 64,
+            mutation_class="remote_mutation",
+            dispatch_stage="prepared",
+        )
+        h = journal.begin("external.bench_quota.act", f"id_{i}", external_metadata=meta)
+        if h is not None:
+            journal.checkpoint_external_dispatch(h)
+            journal.mark_uncertain(h, "timeout")
+    count = journal.unresolved_external_count()
+    return {
+        "stderr_bounded": tail_len <= LIMITS.stderr_bytes,
+        "stderr_tail_bytes": tail_len,
+        "journal_quota_bounded": count == LIMITS.unresolved_operations,
+        "unresolved_operations": count,
+    }
+
+
 @contextmanager
 def _temporary_root(name: str) -> Iterator[str]:
     parent = SETTINGS.state_dir / "benchmarks" / "tmp"
@@ -1874,6 +2118,25 @@ def run_benchmarks(
                 results.append(measure("browser_idle_eviction", _browser_idle_eviction_once, runs))
                 results.append(measure("browser_5_chromium_5_firefox", _browser_mixed_once, runs))
 
+    if "extensions" in suites:
+        with _temporary_root("extensions") as temporary:
+            root = Path(temporary)
+            results.append(measure("extensions_baseline_disabled", _extension_baseline_disabled_once, runs))
+            results.append(measure("extensions_baseline_empty_config", partial(_extension_baseline_empty_config_once, root), runs))
+            results.append(measure("extensions_1_valid_startup_list", partial(_extension_1_valid_startup_list_once, root), runs))
+            results.append(measure("extensions_1_call_roundtrip", partial(_extension_1_call_roundtrip_once, root), runs))
+            results.append(measure("extensions_1_health_snapshot", partial(_extension_1_health_snapshot_once, root), runs))
+            for count in limits.get("extension_counts", [1]):
+                results.append(
+                    measure(
+                        f"extensions_{count}_parallel_startup",
+                        partial(_extension_n_parallel_startup_once, root, count),
+                        runs,
+                    )
+                )
+            results.append(measure("extensions_fault_isolation", partial(_extension_fault_isolation_once, root), runs))
+            results.append(measure("extensions_bounded_resources", partial(_extension_bounded_resources_once, root), runs))
+
     process = psutil.Process()
     return {
         "schema_version": 1,
@@ -1890,6 +2153,7 @@ def run_benchmarks(
             "benchmark_process_rss_mb": round(process.memory_info().rss / MiB, 3),
         },
         "limits": limits,
+        "extension_caps": asdict(LIMITS),
         "results": results,
     }
 
