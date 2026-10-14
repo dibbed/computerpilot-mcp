@@ -252,20 +252,26 @@ def test_direct_call_cannot_raise_the_operator_deadline() -> None:
     descriptor = manager.list_tools()[0]
     owner = manager.get_owner(descriptor.extension_id)
     assert owner is not None
+    # Ordering is what makes this assertion meaningful: the operator deadline must stay
+    # strictly below the provider's response time, which must stay strictly below the
+    # caller timeout. If the caller could raise the operator deadline the call would
+    # succeed instead of timing out. The 10 ms budget used before left the admission
+    # path no headroom on loaded runners, so the call was denied before dispatch and
+    # the dispatch count failed for timing reasons rather than a policy regression.
     owner.definition = owner.definition.model_copy(update={
-        "timeouts": owner.definition.timeouts.model_copy(update={"call_sec": 0.01}),
+        "timeouts": owner.definition.timeouts.model_copy(update={"call_sec": 0.15}),
     })
     lease = manager.registry.create_lease(descriptor.public_name)
     assert lease is not None
 
     async def provider(*args: Any, **kwargs: Any) -> types.CallToolResult:
-        await anyio.sleep(0.05)
+        await anyio.sleep(0.4)
         return types.CallToolResult(content=[], structured_content={"value": "too late"})
     session.send_request.side_effect = provider
 
     async def scenario() -> None:
         with pytest.raises(ToolError, match="timed out"):
-            await manager.execute_guarded_call(lease, timeout_sec=0.2)
+            await manager.execute_guarded_call(lease, timeout_sec=0.8)
         session.send_request.assert_awaited_once()
 
     anyio.run(scenario)
