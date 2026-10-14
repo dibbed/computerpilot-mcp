@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -252,3 +253,35 @@ class ExecutionRouter:
             elapsed_ms=(time.perf_counter() - started) * 1_000.0,
         )
         return result
+
+
+def build_route_planner(
+    *,
+    registered_tools: set[str] | frozenset[str],
+    capabilities: PlatformCapabilities,
+    policy_version: str = ROUTER_POLICY_VERSION,
+    enabled: bool = True,
+    explain: bool = True,
+    extension_manager: ExtensionLifecycleManager | None = None,
+    active_profile: str = "full",
+) -> Callable[[ExecutionIntent], dict[str, Any]]:
+    """Build the advisory route planner that workflow execution calls.
+
+    Workflow execution must persist a selected route before any side effect, so
+    the MCP tool path and the standalone queue worker build their planner through
+    this single factory instead of each configuring a router of their own. The
+    planner stays advisory: it recommends a route and never executes a tool.
+    """
+    router = ExecutionRouter(
+        registered_tools=registered_tools,
+        capabilities=capabilities,
+        policy_version=policy_version,
+        enabled=enabled,
+        extension_manager=extension_manager,
+        active_profile=active_profile,
+    )
+
+    def plan(intent: ExecutionIntent) -> dict[str, Any]:
+        return router.recommend(intent, explain=explain)
+
+    return plan

@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from core.audit import audit_action
 from core.config import SETTINGS
 from core.errors import ToolError
-from core.execution_router import ExecutionRouter
+from core.execution_router import build_route_planner
 from core.platform import detect_capabilities
 from core.tooling import MUTATING, READ_ONLY, compact_errors
 from core.workflow_actions import get_action_descriptor, validate_workflow_definition
@@ -159,17 +159,13 @@ def register(mcp: MCPServer) -> None:
                 "estimated_max_runtime_sec": summary["estimated_max_runtime_sec"],
             }
         registered_tools = frozenset(tool.name for tool in await mcp.list_tools())
-        router = ExecutionRouter(
+        route_planner = build_route_planner(
             registered_tools=registered_tools,
             capabilities=detect_capabilities(),
             policy_version=SETTINGS.execution_router_policy,
             enabled=SETTINGS.execution_router_enabled,
+            explain=SETTINGS.execution_router_explain,
         )
-        def route_planner(intent: Any) -> dict[str, Any]:
-            return router.recommend(
-                intent,
-                explain=SETTINGS.execution_router_explain,
-            )
 
         executor = WorkflowExecutor(store, route_planner=route_planner)
         result = await asyncio.to_thread(
