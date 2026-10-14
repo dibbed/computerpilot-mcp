@@ -377,7 +377,13 @@ asyncio.run(main())
     try:
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            if target.read_text(encoding="utf-8") == "value = 2\n":
+            try:
+                current = target.read_text(encoding="utf-8")
+            except OSError:
+                # safe_refactor rewrites the file atomically; on Windows a reader can
+                # observe a transient sharing violation during the replace window.
+                current = None
+            if current == "value = 2\n":
                 break
             if process.poll() is not None:
                 stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""

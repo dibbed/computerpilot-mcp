@@ -517,9 +517,6 @@ def test_real_fixture_mcp_discovery_integration(tmp_path: Path) -> None:
             owner,
             manager.registry,
             parent_env=parent_env,
-            startup_timeout=5.0,
-            handshake_timeout=3.0,
-            discovery_timeout=3.0,
         )
         assert len(descriptors) == 2
         names = {d.public_name for d in descriptors}

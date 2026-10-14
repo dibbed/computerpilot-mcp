@@ -27,10 +27,15 @@ This directory contains the public technical documentation and release evidence 
 
 Current release evidence:
 
+- [v0.8.0 release notes](V0.8.0-RELEASE-NOTES.md)
+- [v0.8.0 validation](V0.8.0-VALIDATION.md)
+
+Historical release evidence:
+
 - [v0.7.1 release notes](V0.7.1-RELEASE-NOTES.md)
 - [v0.7.1 validation](V0.7.1-VALIDATION.md)
 
-Versioned files such as `V0.7.1-RELEASE-NOTES.md` and `V0.7.1-VALIDATION.md` are immutable evidence for a specific release. They may contain version-specific counts or platform claims that should not be copied forward without re-validation.
+Versioned files such as `V0.8.0-RELEASE-NOTES.md` and `V0.8.0-VALIDATION.md` are immutable evidence for a specific release. They may contain version-specific counts or platform claims that should not be copied forward without re-validation.
 
 ## Internal development material
 

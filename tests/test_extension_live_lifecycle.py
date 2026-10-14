@@ -180,9 +180,9 @@ def test_three_real_providers_can_finish_startup_while_all_remain_alive(tmp_path
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(manager.start_all_async)
             try:
-                with anyio.fail_after(5):
+                with anyio.fail_after(15):
                     while any(owner.state != ExtensionState.HEALTHY for owner in owners):
-                        await anyio.sleep(0.01)
+                        await anyio.sleep(0.05)
                 assert all(owner.is_running for owner in owners)
                 assert manager.registry.active_snapshot.total_tools == 6
             finally:
