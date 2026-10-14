@@ -112,8 +112,8 @@ A deeper component map is in [Architecture](docs/architecture.md).
 | Windows amd64 | Supported | Python 3.10 + 3.12 | Yes | Full portable core plus Windows desktop capabilities |
 | Linux amd64 | Preview | Python 3.10 + 3.12 | No | Portable filesystem/documents/terminal/browser/Git/testing/jobs/recovery/workflows |
 | macOS arm64 | Preview | Python 3.10 + 3.12 | No | Portable core; browser is the UI automation path |
-| Linux arm64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed for v0.4.0 |
-| macOS amd64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed for v0.4.0 |
+| Linux arm64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed in v0.8.0 |
+| macOS amd64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed in v0.8.0 |
 
 The release workflow builds five target archives from the same tracked source. Platform claims and limitations are documented in [Platform support](docs/platform-support.md).
 
@@ -314,7 +314,7 @@ Release preparation also has:
 - **Release Packaging Smoke** that builds all five archives and validates `SHA256SUMS.txt`;
 - exact-SHA publication gates for release commits.
 
-Release-specific evidence is stored under `docs/V*-VALIDATION.md`. For v0.4.0, see [release validation](docs/V0.4.0-VALIDATION.md).
+Release-specific evidence is stored under `docs/V*-VALIDATION.md`. The current release evidence is [v0.8.0 validation](docs/V0.8.0-VALIDATION.md); earlier releases remain in the same directory and [docs/README.md](docs/README.md) lists them.
 
 Run the common checks locally:
 
