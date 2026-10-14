@@ -6,7 +6,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-10-13
+## [0.8.0] - 2026-10-14
 
 ### Added
 - 2026-10-13: Record finite per-owner 64-call outcome and latency windows, separating uncertain mutations from failures, and publish metadata-only external-call audit records through the existing bounded writer.
