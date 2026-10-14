@@ -1,6 +1,6 @@
 # Native MCP tool authoring
 
-This guide describes the current native implementation at the stable v0.7.1 boundary. The [agent contract](../../AGENTS.md) owns execution rules; [architecture](../architecture.md) owns runtime boundaries, and [release process](../release-process.md) owns publication.
+This guide describes the current native implementation at the stable v0.8.0 boundary. The [agent contract](../../AGENTS.md) owns execution rules; [architecture](../architecture.md) owns runtime boundaries, and [release process](../release-process.md) owns publication.
 
 ## Registration and caller contract
 

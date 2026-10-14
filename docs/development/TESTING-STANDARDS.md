@@ -15,7 +15,7 @@ Keep configuration, journals, artifacts, marker files and owned subprocesses dis
 ## Behavioral evidence
 
 - Input/authorization: invalid or denied calls prove the body/dispatch did not run and no effect marker exists.
-- Registration/profiles: public catalog/schema, strict unknown arguments, unique names, expected platform gates and all nine profiles. Windows/full has 150 native tools at stable v0.7.1; POSIX counts differ.
+- Registration/profiles: public catalog/schema, strict unknown arguments, unique names, expected platform gates and all nine profiles. Windows/full has 150 native tools at stable v0.8.0; POSIX counts differ.
 - Mutations: duplicate, timeout, cancellation, storage failure, partial success and restart paths prove exact effect counts and durable outcomes. Lost response after effect stays uncertain; no replay/reroute.
 - Persistence: legacy fixtures, repeated migration, rollback/crash, concurrent CAS/admission and compaction preserve data and unresolved operations.
 - Process ownership: real child/grandchild trees, root exit, failed ownership before execution, forced stop, and no surviving reader threads/tasks/processes.
