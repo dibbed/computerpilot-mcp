@@ -924,7 +924,10 @@ attempts.write_text(str(number))
 if number == 1:
     with RUNTIME_LIFECYCLE.mutation("safe_refactor"):
         target.write_text("started", encoding="utf-8")
-        time.sleep(0.45)
+        # Keep the in-flight mutation long enough that the drain still has well over
+        # the asserted 250ms remaining after the parent observes "started" and sets
+        # restart; a 0.45s window left only ~30ms of margin on loaded CI runners.
+        time.sleep(1.0)
         target.write_text("complete", encoding="utf-8")
 while True:
     time.sleep(1)
