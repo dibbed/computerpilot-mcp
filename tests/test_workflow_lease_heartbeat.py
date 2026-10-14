@@ -9,7 +9,7 @@ import pytest
 import core.workflow_executor as executor_module
 from core.errors import ToolError
 from core.workflow_actions import ACTION_HANDLERS, TransientActionError
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
 def _workflow(store: WorkflowStore) -> dict[str, object]:
@@ -46,7 +46,7 @@ def test_executor_renews_lease_while_action_is_running(tmp_path: Path, monkeypat
     monkeypatch.setattr(executor_module, "LEASE_HEARTBEAT_MAX_SEC", 0.04)
     monkeypatch.setitem(ACTION_HANDLERS, "check_file", slow_action)
 
-    result = WorkflowExecutor(store).execute(
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(
         str(workflow["workflow_id"]),
         owner_id="heartbeat-owner",
         lease_ttl_sec=5,
@@ -86,7 +86,7 @@ def test_retry_backoff_does_not_expire_short_lease(tmp_path: Path, monkeypatch: 
     monkeypatch.setattr(executor_module, "LEASE_HEARTBEAT_MIN_SEC", 0.01)
     monkeypatch.setattr(executor_module, "LEASE_HEARTBEAT_MAX_SEC", 0.02)
     monkeypatch.setattr(executor_module, "_retry_backoff_seconds", lambda attempt: 0.08)
-    result = WorkflowExecutor(store).execute(
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(
         workflow["workflow_id"],
         owner_id="retry-owner",
         lease_ttl_sec=5,
@@ -138,7 +138,7 @@ def test_executor_reports_lease_loss_without_releasing_new_owner(
     monkeypatch.setitem(ACTION_HANDLERS, "check_file", steal_lease)
 
     with pytest.raises(ToolError) as raised:
-        WorkflowExecutor(store).execute(workflow_id, owner_id="owner-a", lease_ttl_sec=30)
+        WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(workflow_id, owner_id="owner-a", lease_ttl_sec=30)
 
     assert raised.value.code == "workflow_lease_lost"
     assert replacement_token

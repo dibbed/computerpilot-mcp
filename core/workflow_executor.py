@@ -78,15 +78,47 @@ class _LeaseHeartbeat:
             raise _LeaseLostDuringAction("Workflow lease was lost while the action was running.") from exc
 
 
+RoutePlanner = Callable[[ExecutionIntent], dict[str, Any]]
+
+
+class NativeOnlyRouting:
+    """Declaration that a caller never submits a step with an execution intent.
+
+    Required instead of an omitted argument so a new entrypoint cannot silently
+    construct an executor that fails every routed step with
+    `workflow_route_planner_missing`. A caller that does route must pass a planner.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "NATIVE_ONLY_ROUTING"
+
+
+NATIVE_ONLY_ROUTING = NativeOnlyRouting()
+
+
 class WorkflowExecutor:
     def __init__(
         self,
         store: WorkflowStore,
         *,
-        route_planner: Callable[[ExecutionIntent], dict[str, Any]] | None = None,
+        route_planner: RoutePlanner | NativeOnlyRouting,
     ) -> None:
+        """Require every caller to declare how its workflow steps are routed.
+
+        `route_planner` deliberately has no default: a caller that can execute a
+        step declaring an execution intent must supply a plan callable, and a
+        caller that never routes must pass `NATIVE_ONLY_ROUTING` explicitly.
+        Omitting the argument is a TypeError instead of a run-time failure.
+        """
+        if isinstance(route_planner, NativeOnlyRouting):
+            self.route_planner: RoutePlanner | None = None
+        elif callable(route_planner):
+            self.route_planner = route_planner
+        else:
+            raise TypeError("route_planner must be a plan callable or NATIVE_ONLY_ROUTING")
         self.store = store
-        self.route_planner = route_planner
 
     def _plan_route(
         self,
@@ -99,7 +131,8 @@ class WorkflowExecutor:
         if self.route_planner is None:
             raise ToolError(
                 "workflow_route_planner_missing",
-                "This workflow step declares an execution intent but no route planner is available.",
+                "This workflow step declares an execution intent but the executor was "
+                "constructed with native-only routing and no route planner.",
             )
         intent = ExecutionIntent(**step.execution_intent)
         decision = self.route_planner(intent)

@@ -8,7 +8,7 @@ import pytest
 
 from core.workflow_actions import ACTION_HANDLERS
 from core.workflow_store import canonical_execution_definition
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
 def test_execution_payload_is_not_redacted_or_truncated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -46,7 +46,7 @@ def test_execution_payload_is_not_redacted_or_truncated(tmp_path: Path, monkeypa
     assert public_arg == long_arg[:2_000]
     assert workflow["definition"]["steps"][0]["arguments"]["idempotency_key"] == request_key
 
-    result = WorkflowExecutor(store).execute(workflow["workflow_id"], owner_id="payload-test")
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(workflow["workflow_id"], owner_id="payload-test")
 
     assert result["state"] == "completed"
     assert captured["idempotency_key"] == request_key
@@ -97,7 +97,9 @@ def test_large_apply_patch_payload_survives_public_projection(
     assert durable_hash == submitted_hash
 
     reloaded = WorkflowStore(store.path)
-    result = WorkflowExecutor(reloaded).execute(str(workflow["workflow_id"]), owner_id="patch-payload-test")
+    result = WorkflowExecutor(reloaded, route_planner=NATIVE_ONLY_ROUTING).execute(
+        str(workflow["workflow_id"]), owner_id="patch-payload-test"
+    )
 
     assert result["state"] == "completed"
     assert len(patch) > 2_000
@@ -135,6 +137,8 @@ def test_independent_durable_job_keys_remain_distinct_after_reload(
 
     reloaded = WorkflowStore(tmp_path / "workflows.db")
     for workflow in workflows:
-        WorkflowExecutor(reloaded).execute(workflow["workflow_id"], owner_id=f"worker-{workflow['workflow_id']}")
+        WorkflowExecutor(reloaded, route_planner=NATIVE_ONLY_ROUTING).execute(
+            workflow["workflow_id"], owner_id=f"worker-{workflow['workflow_id']}"
+        )
 
     assert seen == ["request-a", "request-b"]
