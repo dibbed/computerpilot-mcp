@@ -274,10 +274,17 @@ def test_wal_is_configured_at_startup_and_not_repeated_on_each_read(
             return super().execute(sql, parameters)
 
     def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if not args or args[0] != path:
+            return original_connect(*args, **kwargs)
         return original_connect(*args, factory=TrackedConnection, **kwargs)
 
     monkeypatch.setattr(workflow_store.sqlite3, "connect", connect)
     store = WorkflowStore(path)
+    unrelated = sqlite3.connect(tmp_path / "unrelated.db")
+    try:
+        unrelated.execute("PRAGMA journal_mode=WAL")
+    finally:
+        unrelated.close()
     for _ in range(5):
         store.health_summary()
     assert wal_setups == 1
