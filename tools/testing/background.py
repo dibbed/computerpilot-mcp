@@ -31,7 +31,7 @@ class VerificationRequest(BaseModel):
 
     repo: PathText
     changed_paths: Annotated[list[PathText] | None, Field(max_length=1_000)] = None
-    base: Annotated[str | None, Field(min_length=1, max_length=500)] = None
+    base: Annotated[str | None, Field(min_length=1, max_length=500, pattern=r"^[a-zA-Z0-9_.\-/@^~:]+$")] = None
     checks: Annotated[list[Check] | None, Field(max_length=4)] = None
     affected_only: bool = True
     fallback_policy: Literal["report", "select_full_suite"] = "select_full_suite"
@@ -48,6 +48,10 @@ class VerificationRequest(BaseModel):
     def validate_modes(self) -> VerificationRequest:
         if self.max_parallel_checks > 1 and (self.fail_fast or self.ruff_fix):
             raise ValueError("parallel verification requires fail_fast=false and ruff_fix=false")
+        if self.ruff_fix:
+            raise ValueError("background verification cannot mutate files; run ruff fix first, then verify")
+        if self.base is not None and self.base.startswith("-"):
+            raise ValueError("base git ref cannot start with '-'")
         return self
 
     def options(self) -> dict[str, Any]:
@@ -62,6 +66,13 @@ def request_root(request: VerificationRequest) -> Path:
         if Path(path).is_absolute() or not (root / path).resolve().is_relative_to(root):
             raise ValueError("Changed paths must stay inside the repository")
     return root
+
+
+def _is_symlink_or_junction(path: Path) -> bool:
+    try:
+        return path.is_symlink() or getattr(path, "is_junction", lambda: False)()
+    except OSError:
+        return False
 
 
 def source_fingerprint(repo: Path) -> str:
@@ -80,15 +91,18 @@ def source_fingerprint(repo: Path) -> str:
             name for name in dirs
             if name not in EXCLUDED_DIRS and not name.startswith((".pytest-tmp", ".codebase-memory"))
         )
-        if any((Path(directory) / name).is_symlink() for name in dirs):
+        if any(_is_symlink_or_junction(Path(directory) / name) for name in dirs):
             raise ValueError("Verification inputs cannot contain directory symlinks")
         for name in sorted(names):
-            if name == ".git" or name.endswith((".pyc", ".pyo")):
+            if name == ".git" or name.endswith((".pyc", ".pyo")) or name.startswith(".coverage"):
                 continue
             path = Path(directory) / name
-            if path.is_symlink() or not path.resolve().is_relative_to(root):
+            if _is_symlink_or_junction(path) or not path.resolve().is_relative_to(root):
                 raise ValueError("Verification inputs must remain inside the repository")
-            before = path.stat()
+            try:
+                before = path.stat()
+            except OSError as exc:
+                raise ValueError("Verification input changed during snapshot") from exc
             if not stat.S_ISREG(before.st_mode):
                 raise ValueError("Verification inputs must be regular files")
             count += 1
@@ -101,7 +115,10 @@ def source_fingerprint(repo: Path) -> str:
                     digest.update(chunk)
                     if stream.tell() > before.st_size or time.monotonic() > deadline:
                         raise ValueError("Verification input changed or exceeded its time budget")
-            after = path.stat()
+            try:
+                after = path.stat()
+            except OSError as exc:
+                raise ValueError("Verification input changed during snapshot") from exc
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 raise ValueError("Verification input changed during snapshot")
             digest.update(b"\0")
@@ -120,10 +137,13 @@ def submit_verification(
         root, changed_paths=request.changed_paths, base=request.base,
         affected_only=request.affected_only, fallback_policy=request.fallback_policy,
     )
-    request = request.model_copy(update={
-        "repo": str(root), "changed_paths": sorted(set(plan["changed_paths"])),
+    updated_data = request.model_dump()
+    updated_data.update({
+        "repo": str(root),
+        "changed_paths": sorted(set(plan["changed_paths"])),
         "source_fingerprint": source_fingerprint(root),
     })
+    request = VerificationRequest.model_validate(updated_data)
     payload = request.model_dump_json()
     command = [sys.executable, "-m", "scripts.verification_worker", "--request-json", payload]
     if len(payload.encode("utf-8")) > MAX_REQUEST_BYTES or (

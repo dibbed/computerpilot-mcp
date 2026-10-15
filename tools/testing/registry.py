@@ -21,7 +21,7 @@ from tools.testing.background import VerificationRequest, submit_verification
 from tools.testing.diagnostics import merge_diagnostics
 from tools.testing.impact import select_affected_tests
 from tools.testing.runners import run_mypy_summary, run_pytest_summary, run_ruff_summary
-from tools.testing.verification import Check, verify_changed_repository
+from tools.testing.verification import _CHECKS, Check, verify_changed_repository
 
 # Kept as compatibility aliases for existing local consumers.
 _junit_summary = _runners._junit_summary
@@ -68,7 +68,7 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
                 maxfail=maxfail, stage_timeout_sec=stage_timeout_sec, total_timeout_sec=total_timeout_sec,
                 ruff_fix=ruff_fix, diagnostic_cap=diagnostic_cap, max_parallel_checks=max_parallel_checks,
             )
-            audit_action("start_verification", target=working, details={"check_count": len(checks or [])})
+            audit_action("start_verification", target=working, details={"check_count": len(checks) if checks is not None else len(_CHECKS)})
             return submit_verification(watch_store, request, idempotency_key, queue_timeout_sec)
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)

@@ -35,7 +35,7 @@ def _bounded(value: Any, depth: int = 0) -> Any:
 def run_request(payload: str) -> int:
     sent = 0
 
-    def emit(event: str, data: dict[str, Any]) -> None:
+    def emit(event: str, data: dict[str, Any], *, force: bool = False) -> None:
         nonlocal sent
         row = {"schema_version": 1, "event": event, **_bounded(data)}
         line = json.dumps(row, ensure_ascii=False, allow_nan=False)
@@ -50,7 +50,7 @@ def run_request(payload: str) -> int:
             row["output_truncated"] = True
             line = json.dumps(row, ensure_ascii=False, allow_nan=False)
         size = len(line.encode("utf-8")) + 1
-        if size > MAX_EVENT_BYTES or sent + size > MAX_STREAM_BYTES:
+        if not force and (size > MAX_EVENT_BYTES or sent + size > MAX_STREAM_BYTES):
             raise ValueError("Verification event quota exceeded")
         print(line, flush=True)
         sent += size
@@ -65,7 +65,7 @@ def run_request(payload: str) -> int:
         if before != request.source_fingerprint:
             emit("result", {"ok": False, "required_unknown": True, "freshness": "stale", "stages": []})
             return 1
-        with tempfile.TemporaryDirectory(prefix="computerpilot-verification-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="computerpilot-verification-", ignore_cleanup_errors=True) as temporary:
             result = verify_changed_repository(
                 repo, **request.options(),
                 stage_callback=lambda event, data: emit(event, data),
@@ -83,7 +83,14 @@ def run_request(payload: str) -> int:
         return 0 if result["ok"] and fresh else 1
     except Exception as exc:
         # Native worker errors must not echo request contents or arbitrary analyzer payloads.
-        emit("result", {"ok": False, "required_unknown": True, "freshness": "unknown", "error": type(exc).__name__})
+        try:
+            emit("result", {"ok": False, "required_unknown": True, "freshness": "unknown", "error": type(exc).__name__}, force=True)
+        except Exception:
+            fallback = (
+                '{"schema_version":1,"event":"result","ok":false,"required_unknown":true,'
+                '"freshness":"unknown","error":"FatalWorkerError"}'
+            )
+            print(fallback, flush=True)
         return 1
 
 

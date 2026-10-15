@@ -31,7 +31,7 @@ def build_verification_plan(
     impact = select_affected_tests(resolved, changed_paths=paths, base=base, fallback_policy=fallback_policy)
     full = not affected_only or impact["decision"] in {"full_suite", "focused_plus_full_recommended"}
     mode = "full" if full else ("focused" if impact.get("tests") else "checks_only")
-    python_targets = [path for path in paths if Path(path).suffix in {".py", ".pyi"} and (resolved / path).is_file()]
+    python_targets = [path for path in paths if Path(path).suffix.casefold() in {".py", ".pyi"} and (resolved / path).is_file()]
     return {"changed_paths": paths, "affected": impact, "full": full, "mode": mode, "python_targets": python_targets}
 
 
@@ -63,7 +63,7 @@ def _syntax(repo: Path, targets: list[str], diagnostic_cap: int) -> dict[str, An
     diagnostics: list[dict[str, Any]] = []
     for target in targets:
         path = repo / target
-        if path.suffix not in {".py", ".pyi"} or not path.is_file():
+        if path.suffix.casefold() not in {".py", ".pyi"} or not path.is_file():
             continue
         try:
             compile(path.read_text(encoding="utf-8-sig"), str(path), "exec")
@@ -120,7 +120,10 @@ def verify_changed_repository(
                 stage_callback(event, data)
 
     def analyze(check: Check, targets: list[str]) -> dict[str, Any]:
-        timeout = max(0.001, min(stage_timeout_sec, total_timeout_sec - (time.perf_counter() - overall_started)))
+        remaining = total_timeout_sec - (time.perf_counter() - overall_started)
+        if remaining <= 0:
+            return {"ok": False, "exit_code": None, "timed_out": True, "summary": "stage timed out", "diagnostics": []}
+        timeout = max(0.001, min(stage_timeout_sec, remaining))
         if check == "syntax":
             return _syntax(resolved, targets, diagnostic_cap)
         if check == "ruff":
@@ -137,11 +140,13 @@ def verify_changed_repository(
         if check not in selected_checks:
             continue
         name = ("pytest_full" if full else "pytest_focused") if check == "pytest" else check
-        targets = (
-            ([] if full else [item["path"] for item in impact.get("tests", [])])
-            if check == "pytest" else (python_targets or (["."] if full and check != "syntax" else []))
-        )
-        runnable = bool(targets) or check == "syntax" or (check == "pytest" and full)
+        if check == "pytest":
+            targets = [] if full else [item["path"] if isinstance(item, dict) else str(item) for item in impact.get("tests", [])]
+        elif full and check != "syntax":
+            targets = ["."]
+        else:
+            targets = python_targets
+        runnable = bool(targets) or (check == "pytest" and full)
         tasks.append((name, targets, partial(analyze, check, targets) if runnable else None))
 
     def run(task: tuple[str, list[str], Callable[[], dict[str, Any]] | None]) -> dict[str, Any]:
@@ -157,6 +162,8 @@ def verify_changed_repository(
             result = operation()
         except (ModuleNotFoundError, FileNotFoundError) as exc:
             result = {"ok": False, "exit_code": None, "unavailable": True, "summary": str(exc), "diagnostics": []}
+        except Exception as exc:
+            result = {"ok": False, "exit_code": None, "unavailable": True, "summary": f"{type(exc).__name__}: {exc}", "diagnostics": []}
         stage = _stage(name, _status(result), started, targets=targets, result=result)
         notify("stage_finished", stage)
         return stage

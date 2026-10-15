@@ -4,14 +4,16 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from mcp import Client
 from mcp.server import MCPServer
+from pydantic import ValidationError
 
 from core.jobs import JobStore
 from tools.jobs import registry as jobs_registry
-from tools.testing import registry
+from tools.testing import background, registry
 from tools.testing.background import VerificationRequest, source_fingerprint, submit_verification
 
 
@@ -270,3 +272,75 @@ def test_fingerprint_rejects_directory_symlink(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(Path, "is_symlink", lambda self: True if self.name == "sub" else original_is_symlink(self))
     with pytest.raises(ValueError, match="symlink"):
         source_fingerprint(tmp_path)
+
+
+def test_fingerprint_rejects_directory_junction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "app.py").write_text("ok", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+    monkeypatch.setattr(Path, "is_junction", lambda self: True if self.name == "sub" else False, raising=False)
+    with pytest.raises(ValueError, match="symlink"):
+        source_fingerprint(tmp_path)
+
+
+def test_request_rejects_base_flag_injection() -> None:
+    with pytest.raises(ValueError, match="base git ref"):
+        VerificationRequest(repo=".", base="-main")
+    with pytest.raises(ValueError, match="pattern"):
+        VerificationRequest(repo=".", base="main; rm -rf /")
+
+
+def test_request_rejects_ruff_fix() -> None:
+    with pytest.raises(ValueError, match="background verification cannot mutate"):
+        VerificationRequest(repo=".", ruff_fix=True)
+
+
+def test_submit_verification_revalidates_changed_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    store = JobStore(tmp_path / "state" / "jobs.sqlite3")
+    request = VerificationRequest(repo=str(repo), changed_paths=["app.py"])
+
+    # Simulate impact analysis finding over 1,000 files
+    monkeypatch.setattr(
+        background,
+        "build_verification_plan",
+        lambda *a, **kw: {
+            "changed_paths": [f"file_{i}.py" for i in range(1005)],
+            "affected": {"decision": "none", "tests": []},
+            "full": False,
+            "mode": "checks_only",
+            "python_targets": [],
+        },
+    )
+    with pytest.raises(ValidationError):
+        submit_verification(store, request, "large-paths-key")
+
+
+def test_worker_emits_result_when_stream_quota_exceeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from scripts import verification_worker
+
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    request = VerificationRequest(repo=str(tmp_path), source_fingerprint=source_fingerprint(tmp_path))
+
+    def exceed_stream_callback(*args: object, **kwargs: object) -> dict[str, Any]:
+        cb = kwargs.get("stage_callback")
+        if callable(cb):
+            for i in range(100):
+                cb("stage_finished", {"name": f"stage_{i}", "data": "y" * 1000})
+        return {"ok": True, "mode": "full", "stages": [], "duration_ms": 1, "required_unknown": False}
+
+    monkeypatch.setattr(verification_worker, "verify_changed_repository", exceed_stream_callback)
+    monkeypatch.setattr(verification_worker, "MAX_STREAM_BYTES", 500)
+    exit_code = verification_worker.run_request(request.model_dump_json())
+    assert exit_code == 1
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) >= 1
+    last = json.loads(lines[-1])
+    assert last["event"] == "result"
+    assert last["ok"] is False
+    assert last["required_unknown"] is True
