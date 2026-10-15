@@ -10,6 +10,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-15: Require every `WorkflowExecutor` caller to pass an advisory route planner or explicitly declare `NATIVE_ONLY_ROUTING`; reject omission and `None` at construction. Native-only callers still reject routed steps before dispatch, and external MCP workflow actions remain unsupported.
 - 2026-10-15: Synchronize the real-process lifecycle drain test with a release marker and cover a slow observer, preserving active-mutation assertions on loaded runners.
 - 2026-10-15: Correct stale extension-authoring references to the implemented authenticated panel view, frozen budget evidence and existing local fake provider.
+- 2026-10-15: Cancel the possible-dispatch recovery test only after its durable fixture effect marker, and cover delayed dispatch without weakening uncertainty or no-retry assertions.
 
 ## [0.8.0] - 2026-10-14
 

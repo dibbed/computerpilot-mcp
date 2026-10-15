@@ -1225,8 +1225,16 @@ def test_possible_dispatch_failures_stay_uncertain_without_retry(tmp_path: Path,
                 lease = manager.registry.create_lease("external.fake.increment_value")
                 assert lease is not None
                 if mode == "cancel":
-                    with anyio.move_on_after(0.2) as cancel:
-                        await manager.execute_guarded_call(lease, {"amount": 2})
+                    async def cancel_after_effect(scope: anyio.CancelScope) -> None:
+                        with anyio.fail_after(10):
+                            while not (tmp_path / "effect_committed").exists():
+                                await anyio.sleep(0.01)
+                        scope.cancel()
+
+                    with anyio.CancelScope() as cancel:
+                        async with anyio.create_task_group() as cancellation_tasks:
+                            cancellation_tasks.start_soon(cancel_after_effect, cancel)
+                            await manager.execute_guarded_call(lease, {"amount": 2})
                     assert cancel.cancel_called
                 else:
                     result = await manager.execute_guarded_call(lease, {"amount": 2}, timeout_sec=0.5)
@@ -1243,6 +1251,23 @@ def test_possible_dispatch_failures_stay_uncertain_without_retry(tmp_path: Path,
                 assert (tmp_path / "counter.json").read_text(encoding="utf-8") == "1"
 
     anyio.run(scenario)
+
+
+def test_delayed_dispatch_cancellation_stays_uncertain_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import anyio
+
+    from core.extensions.manager import ExtensionOwner
+
+    original = ExtensionOwner._call_tool
+
+    async def delayed(owner: ExtensionOwner, *args: Any, **kwargs: Any) -> Any:
+        await anyio.sleep(0.3)
+        return await original(owner, *args, **kwargs)
+
+    monkeypatch.setattr(ExtensionOwner, "_call_tool", delayed)
+    test_possible_dispatch_failures_stay_uncertain_without_retry(tmp_path, "cancel")
 
 
 def test_contended_journal_respects_dispatch_deadline_and_readonly_is_responsive(tmp_path: Path) -> None:
