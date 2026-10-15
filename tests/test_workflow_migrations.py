@@ -232,14 +232,28 @@ def test_transient_wal_lock_during_open_is_retried_without_leaking_connection(
             return super().execute(sql, parameters)
 
     def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if not args or args[0] != path:
+            return original_connect(*args, **kwargs)
         connection = original_connect(*args, factory=ContendedConnection, **kwargs)
         connections.append(connection)
         return connection
 
     monkeypatch.setattr(workflow_store.sqlite3, "connect", connect)
+
+    def unrelated_background_connection() -> None:
+        connection = sqlite3.connect(tmp_path / "unrelated.db")
+        try:
+            assert type(connection) is sqlite3.Connection
+            assert connection.execute("SELECT 1").fetchone() == (1,)
+        finally:
+            connection.close()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(unrelated_background_connection).result(timeout=5)
     store = WorkflowStore(path)
     assert store.get("legacy-workflow")["state"] == "completed"
     assert attempts >= 2
+    assert connections
     for connection in connections:
         with pytest.raises(sqlite3.ProgrammingError, match="closed"):
             connection.execute("SELECT 1")
@@ -260,10 +274,17 @@ def test_wal_is_configured_at_startup_and_not_repeated_on_each_read(
             return super().execute(sql, parameters)
 
     def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if not args or args[0] != path:
+            return original_connect(*args, **kwargs)
         return original_connect(*args, factory=TrackedConnection, **kwargs)
 
     monkeypatch.setattr(workflow_store.sqlite3, "connect", connect)
     store = WorkflowStore(path)
+    unrelated = sqlite3.connect(tmp_path / "unrelated.db")
+    try:
+        unrelated.execute("PRAGMA journal_mode=WAL")
+    finally:
+        unrelated.close()
     for _ in range(5):
         store.health_summary()
     assert wal_setups == 1
