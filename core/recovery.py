@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -11,7 +12,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator, Mapping
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,7 @@ from core.recovery_models import (
     Evidence,
     ExternalOperationMetadata,
     ExternalRequestCorrelation,
+    NativeUIATarget,
     OperationState,
     Postcondition,
 )
@@ -73,6 +75,7 @@ _ALLOWED_MUTATION_CLASSES = frozenset({
     "destructive_remote_mutation",
 })
 _ALLOWED_DISPATCH_STAGES = frozenset({"prepared", "may_dispatch"})
+_NATIVE_UIA_OPERATIONS = frozenset({"ui_invoke", "ui_set_value", "ui_select"})
 _ALLOWED_EXTERNAL_OUTCOMES = frozenset({
     "succeeded",
     "not_dispatched",
@@ -293,19 +296,36 @@ class OperationHandle:
     started_at: str
 
 
-_CURRENT_OPERATION_HANDLE: ContextVar[OperationHandle | None] = ContextVar(
-    "current_operation_recovery_handle",
+@dataclass(slots=True)
+class _OperationRecoveryScope:
+    handle: OperationHandle | None
+    owner: tuple[int, int | None]
+    active: bool = True
+
+
+def _execution_owner() -> tuple[int, int | None]:
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return threading.get_ident(), id(task) if task is not None else None
+
+
+_CURRENT_OPERATION_SCOPE: ContextVar[_OperationRecoveryScope | None] = ContextVar(
+    "current_operation_recovery_scope",
     default=None,
 )
 
 
 @contextmanager
 def operation_recovery_context(handle: OperationHandle | None) -> Iterator[None]:
-    token = _CURRENT_OPERATION_HANDLE.set(handle)
+    scope = _OperationRecoveryScope(handle, _execution_owner())
+    token = _CURRENT_OPERATION_SCOPE.set(scope)
     try:
         yield
     finally:
-        _CURRENT_OPERATION_HANDLE.reset(token)
+        scope.active = False
+        _CURRENT_OPERATION_SCOPE.reset(token)
 
 
 def _parse_iso_utc(value: Any) -> datetime | None:
@@ -318,6 +338,42 @@ def _parse_iso_utc(value: Any) -> datetime | None:
         return parsed.astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+def _native_uia_metadata(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {
+        "native_metadata_version", "kind", "dispatch_stage", "target",
+    }:
+        return None
+    if (
+        type(value["native_metadata_version"]) is not int or value["native_metadata_version"] != 1
+        or value["kind"] != "windows_uia" or value["dispatch_stage"] not in ("prepared", "may_dispatch")
+    ):
+        return None
+    raw = value["target"]
+    if not isinstance(raw, dict) or set(raw) != {
+        "pid", "process_created", "window_handle", "element_handle", "element_runtime_id", "identity_status",
+    } or not isinstance(raw["element_runtime_id"], list):
+        return None
+    try:
+        target = NativeUIATarget(
+            pid=raw["pid"], process_created=raw["process_created"],
+            window_handle=raw["window_handle"], element_handle=raw["element_handle"],
+            element_runtime_id=tuple(raw["element_runtime_id"]),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return {**value, "target": target.as_dict()}
+
+
+def _native_uia_view(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    native = _native_uia_metadata(checkpoint.get("native"))
+    if native is None:
+        return {}
+    identity = dict(native["target"])
+    identity.pop("identity_status")
+    identity["element_runtime_id"] = tuple(identity["element_runtime_id"])
+    return {"native": native, "target": NativeUIATarget(**identity).label()}
 
 
 class OperationRecoveryJournal:
@@ -804,6 +860,7 @@ class OperationRecoveryJournal:
             "runtime_id": begin.get("runtime_id"),
             "evidence": evidence,
         }
+        view.update(_native_uia_view(checkpoint or {}))
         if checkpoint is not None and isinstance(checkpoint.get("postcondition"), dict):
             view["postcondition"] = checkpoint["postcondition"]
         if result is not None and isinstance(result.get("postcondition"), dict):
@@ -1169,6 +1226,54 @@ class OperationRecoveryJournal:
                 self._append_unlocked_file(record)
             self._maybe_compact_locked()
 
+    def checkpoint_native_uia(
+        self, handle: OperationHandle | None, target: NativeUIATarget, *,
+        stage: Literal["prepared", "may_dispatch"],
+    ) -> None:
+        if handle is None:
+            return
+        if not isinstance(target, NativeUIATarget) or stage not in ("prepared", "may_dispatch"):
+            raise ToolError("invalid_native_recovery_metadata", "Invalid native UIA recovery metadata.")
+        native = {
+            "native_metadata_version": 1, "kind": "windows_uia", "dispatch_stage": stage,
+            "target": target.as_dict(),
+        }
+        with self._lock:
+            if not self._enabled:
+                raise ToolError("operation_journal_unavailable", "Native recovery journal became unavailable.")
+            with self._journal_transaction(operation_id=handle.operation_id) as records:
+                current = self._state(records).get(handle.operation_id)
+                begin = current.get("begin") if current else None
+                if (
+                    not begin or handle.runtime_id != self._runtime_id
+                    or begin.get("runtime_id") != handle.runtime_id
+                    or begin.get("operation_type") != handle.operation_type
+                    or handle.operation_type not in _NATIVE_UIA_OPERATIONS or begin.get("external") is not None
+                ):
+                    raise ToolError("invalid_operation_handle", "Native UIA recovery requires its active operation.")
+                assert current is not None
+                if any(current.get(key) is not None for key in ("result", "uncertain", "acknowledged", "reconciliation")):
+                    raise ToolError("operation_already_completed", "Operation already has a known or uncertain outcome.")
+                previous = current.get("checkpoint") or {}
+                old_native = _native_uia_metadata(previous.get("native"))
+                if "native" in previous and (
+                    old_native is None or old_native["target"] != native["target"]
+                    or (old_native["dispatch_stage"] == "may_dispatch" and stage == "prepared")
+                ):
+                    raise ToolError("operation_checkpoint_conflict", "Native UIA checkpoint identity or stage changed.")
+                if old_native == native:
+                    return
+                if old_native is None and stage != "prepared":
+                    raise ToolError("operation_checkpoint_conflict", "Prepare native UIA identity before dispatch.")
+                self._append_unlocked_file({
+                    **previous,
+                    "schema_version": JOURNAL_SCHEMA_VERSION, "type": "checkpoint", "status": "in_progress",
+                    "operation_id": handle.operation_id, "runtime_id": handle.runtime_id,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "target": target.label(), "native": native,
+                })
+            self._maybe_compact_locked()
+
     def checkpoint_postcondition(
         self,
         handle: OperationHandle | None,
@@ -1192,7 +1297,7 @@ class OperationRecoveryJournal:
                 if current.get("result") is not None:
                     raise ToolError("operation_already_completed", "Operation already has a known runtime result.")
                 existing = current.get("checkpoint")
-                if existing is not None:
+                if existing is not None and existing.get("postcondition") is not None:
                     if existing.get("postcondition") == bounded:
                         return
                     raise ToolError(
@@ -1200,6 +1305,7 @@ class OperationRecoveryJournal:
                         "Operation already has a different recovery checkpoint.",
                     )
                 self._append_unlocked_file({
+                    **(existing or {}),
                     "schema_version": JOURNAL_SCHEMA_VERSION,
                     "type": "checkpoint",
                     "status": "in_progress",
@@ -1235,6 +1341,19 @@ class OperationRecoveryJournal:
                         "operation_already_uncertain",
                         "Cannot mark an uncertain operation as completed without reconciliation or acknowledgment.",
                     )
+                checkpoint = (current or {}).get("checkpoint") or {}
+                native = _native_uia_metadata(checkpoint.get("native"))
+                if (
+                    native is not None and native["dispatch_stage"] == "may_dispatch"
+                    and known_result in {"raised", "returned_error"}
+                ):
+                    self._append_unlocked_file({
+                        "schema_version": JOURNAL_SCHEMA_VERSION, "type": "uncertain", "status": "uncertain",
+                        "operation_id": handle.operation_id, "runtime_id": handle.runtime_id,
+                        "marked_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                        "reason": "native_uia_dispatch_without_known_result",
+                    })
+                    return
                 record: dict[str, Any] = {
                     "schema_version": JOURNAL_SCHEMA_VERSION,
                     "type": "result",
@@ -1266,11 +1385,23 @@ class OperationRecoveryJournal:
             known_result = "ok" if result["ok"] else "returned_error"
         else:
             known_result = "returned"
-        self.finish(
-            handle,
-            known_result=known_result,
-            postcondition=_bounded_result_postcondition(result),
-        )
+        try:
+            self.finish(
+                handle,
+                known_result=known_result,
+                postcondition=_bounded_result_postcondition(result),
+            )
+        except Exception:
+            if handle is None or handle.operation_type not in _NATIVE_UIA_OPERATIONS:
+                raise
+            try:
+                self.finish(handle, known_result="raised")
+            except Exception:
+                pass  # The durable may_dispatch checkpoint survives even when storage stays unavailable.
+            raise ToolError(
+                "operation_outcome_uncertain", "The UIA effect may have completed; do not replay it.",
+                hint=f"Inspect recovery operation {handle.operation_id}.",
+            ) from None
 
     def summary(self, *, max_items: int = 5) -> dict[str, Any]:
         with self._lock:
@@ -1302,6 +1433,8 @@ class OperationRecoveryJournal:
                     "marked_at": marker.get("marked_at"),
                     "reason": marker.get("reason"),
                 }
+                checkpoint = item.get("checkpoint") or {}
+                entry.update(_native_uia_view(checkpoint))
                 external = self._merged_external_metadata(item)
                 if external is not None:
                     entry["external"] = external
@@ -1318,7 +1451,48 @@ class OperationRecoveryJournal:
 OPERATION_RECOVERY = OperationRecoveryJournal()
 
 
+@contextmanager
+def native_uia_mutation(operation: str, target: NativeUIATarget) -> Iterator[None]:
+    """Guard direct UIA calls, reusing the enclosing MCP mutation when present."""
+    from core.lifecycle import RUNTIME_LIFECYCLE
+
+    if operation not in _NATIVE_UIA_OPERATIONS:
+        raise ToolError("invalid_native_recovery_metadata", "Unsupported native UIA mutation.")
+    scope = _CURRENT_OPERATION_SCOPE.get()
+    # Copied child-task/thread contexts are not the parent's live admission.
+    owned = scope is None or not scope.active or scope.owner != _execution_owner()
+    handle = scope.handle if scope is not None and not owned else None
+    admission = RUNTIME_LIFECYCLE.mutation(operation) if owned else nullcontext()
+    with admission:
+        if owned:
+            handle = OPERATION_RECOVERY.begin(operation, target.label())
+        with operation_recovery_context(handle):
+            dispatched = False
+            try:
+                OPERATION_RECOVERY.checkpoint_native_uia(handle, target, stage="prepared")
+                OPERATION_RECOVERY.checkpoint_native_uia(handle, target, stage="may_dispatch")
+                dispatched = True
+                yield
+                if owned:
+                    OPERATION_RECOVERY.finish(handle, known_result="returned")
+            except BaseException as exc:
+                if owned or dispatched:
+                    try:
+                        OPERATION_RECOVERY.finish(handle, known_result="raised")
+                    except Exception:
+                        pass  # A durable may_dispatch checkpoint remains unresolved if storage fails.
+                if dispatched and handle is not None and isinstance(exc, Exception):
+                    raise ToolError(
+                        "operation_outcome_uncertain", "The UIA effect may have completed; do not replay it.",
+                        hint=f"Inspect recovery operation {handle.operation_id}.",
+                    ) from None
+                raise
+
+
 def checkpoint_current_postcondition(postcondition: dict[str, Any]) -> None:
     """Durably checkpoint the current mutation's file hash before its side effect."""
 
-    OPERATION_RECOVERY.checkpoint_postcondition(_CURRENT_OPERATION_HANDLE.get(), postcondition)
+    scope = _CURRENT_OPERATION_SCOPE.get()
+    if scope is not None and not scope.active:
+        raise ToolError("invalid_operation_handle", "The enclosing recovery operation has finished.")
+    OPERATION_RECOVERY.checkpoint_postcondition(scope.handle if scope is not None else None, postcondition)
