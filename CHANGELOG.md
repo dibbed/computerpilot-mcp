@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Fixed
+- 2026-10-16: Isolate the migration WAL-lock test's SQLite spy to its own database and exercise an unrelated background connection, preserving leak checks across Python versions.
 - 2026-10-16: Retry a failed lifecycle status publication on the existing managed-runtime watcher even before a control request, keeping active mutation counts observable after transient Windows sharing violations without idle status writes.
 - 2026-10-15: Guard direct semantic UIA mutations, checkpoint private-safe numeric target identity before dispatch, and preserve uncertain outcomes after possible effects without replay. Keep legacy/file/external recovery compatible and omit locator contents from mutation audit records.
 - 2026-10-15: Require every `WorkflowExecutor` caller to pass an advisory route planner or explicitly declare `NATIVE_ONLY_ROUTING`; reject omission and `None` at construction. Native-only callers still reject routed steps before dispatch, and external MCP workflow actions remain unsupported.
