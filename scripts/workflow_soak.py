@@ -20,7 +20,7 @@ from core.jobs import JobStore
 from core.workflow_models import OperationState
 from core.workflow_reconciliation import reconcile_operation
 from core.workflow_retention import WorkflowHistoryPolicy, cleanup_workflow_history
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _TERMINAL_JOBS = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
@@ -220,7 +220,7 @@ def run_soak(
             idempotency_key=f"soak-success-{index}",
             initial_state=WorkflowState.QUEUED,
         )
-        result = WorkflowExecutor(store).execute(
+        result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(
             str(created["workflow_id"]),
             owner_id=f"soak-success-{index}",
         )
@@ -237,7 +237,7 @@ def run_soak(
             idempotency_key=f"soak-failure-{index}",
             initial_state=WorkflowState.QUEUED,
         )
-        result = WorkflowExecutor(store).execute(
+        result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(
             str(created["workflow_id"]),
             owner_id=f"soak-failure-{index}",
         )

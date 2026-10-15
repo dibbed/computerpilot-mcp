@@ -8,7 +8,7 @@ import pytest
 from core.errors import ToolError
 from core.workflow_actions import ACTION_HANDLERS, SideEffectUncertain
 from core.workflow_reconciliation import acknowledge_operation, reconcile_operation
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
 def _uncertain(
@@ -27,7 +27,7 @@ def _uncertain(
         WorkflowDefinition("uncertain", (StepDefinition("effect", "check_file", {"path": "unused"}, postcondition=postcondition),)),
         initial_state=WorkflowState.QUEUED,
     )
-    WorkflowExecutor(store).execute(created["workflow_id"], owner_id="test")
+    WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(created["workflow_id"], owner_id="test")
     return store, store.list_operations(created["workflow_id"])["items"][0]
 
 

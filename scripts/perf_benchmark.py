@@ -42,7 +42,7 @@ from core.jobs import JobStore, same_process
 from core.recovery import OperationRecoveryJournal
 from core.registry import create_server
 from core.state_paths import unlinked_directory_tree, unlinked_regular_file
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 from tools.desktop.uia import ElementLocator, UIAutomationService, WindowLocator
 from tools.filesystem.patches import PatchLimits, apply_patch_transaction
 from tools.filesystem.search_snapshots import SearchSnapshotStore, search_fingerprint
@@ -569,7 +569,7 @@ def _workflow_execute_read_once(store: WorkflowStore, target: Path) -> dict[str,
         ),
         initial_state=WorkflowState.QUEUED,
     )
-    result = WorkflowExecutor(store).execute(
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(
         str(workflow["workflow_id"]),
         owner_id=f"benchmark-{workflow['workflow_id']}",
     )

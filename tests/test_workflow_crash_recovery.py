@@ -6,7 +6,7 @@ import pytest
 
 from core.workflow_actions import ACTION_HANDLERS
 from core.workflow_models import OperationState
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
 def test_executor_checkpoints_operation_before_action(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -24,7 +24,7 @@ def test_executor_checkpoints_operation_before_action(tmp_path: Path, monkeypatc
         initial_state=WorkflowState.QUEUED,
     )
 
-    result = WorkflowExecutor(store).execute(workflow["workflow_id"], owner_id="test-owner")
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(workflow["workflow_id"], owner_id="test-owner")
 
     assert seen == ["running"]
     assert result["state"] == "completed"
@@ -208,7 +208,7 @@ def test_completed_operation_is_not_replayed(tmp_path: Path, monkeypatch: pytest
         WorkflowDefinition("once", (StepDefinition("check", "check_file", {"path": "unused"}),)),
         initial_state=WorkflowState.QUEUED,
     )
-    executor = WorkflowExecutor(store)
+    executor = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING)
     executor.execute(workflow["workflow_id"], owner_id="test-owner")
 
     result = executor.execute(workflow["workflow_id"], owner_id="test-owner")

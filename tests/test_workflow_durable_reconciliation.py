@@ -10,7 +10,7 @@ from core.reconcilers import evaluate_postcondition
 from core.recovery_models import Postcondition
 from core.workflow_actions import ACTION_HANDLERS, ActionContext, SideEffectUncertain, prepare_action_intent
 from core.workflow_reconciliation import reconcile_operation
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -65,7 +65,7 @@ def test_lost_git_stage_result_reconciles_without_replay(
         initial_state=WorkflowState.QUEUED,
     )
 
-    result = WorkflowExecutor(store).execute(str(workflow["workflow_id"]), owner_id="worker-a")
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(str(workflow["workflow_id"]), owner_id="worker-a")
     assert result["state"] == "uncertain"
     assert calls == 1
     assert _git(repo, "diff", "--cached", "--name-only") == "value.txt"
@@ -177,7 +177,7 @@ new file mode 100644
         initial_state=WorkflowState.QUEUED,
     )
 
-    result = WorkflowExecutor(store).execute(str(workflow["workflow_id"]), owner_id="worker-a")
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(str(workflow["workflow_id"]), owner_id="worker-a")
     assert result["state"] == "uncertain"
     assert calls == 1
     operation = store.get_operation_for_reconciliation(
@@ -230,7 +230,7 @@ def test_lost_durable_job_result_reconciles_by_request_key(
         raise SideEffectUncertain("result lost after submit")
 
     monkeypatch.setitem(ACTION_HANDLERS, "run_durable_job", result_lost)
-    result = WorkflowExecutor(store).execute(str(workflow["workflow_id"]), owner_id="worker-a")
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(str(workflow["workflow_id"]), owner_id="worker-a")
     assert result["state"] == "uncertain"
 
     operation = store.get_operation_for_reconciliation(

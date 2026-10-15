@@ -18,7 +18,7 @@ import pytest
 from core import reconcilers
 from core.jobs import JobStore
 from core.workflow_actions import ActionContext, execute_action
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
 @pytest.mark.parametrize("status", ["queued", "running", "orphaned", "succeeded", "failed"])
@@ -76,7 +76,7 @@ def test_durable_job_workflow_completes_with_public_job_id_contract(
         initial_state=WorkflowState.QUEUED,
     )
 
-    result = WorkflowExecutor(workflow_store).execute(
+    result = WorkflowExecutor(workflow_store, route_planner=NATIVE_ONLY_ROUTING).execute(
         str(workflow["workflow_id"]),
         owner_id="job-id-regression",
     )

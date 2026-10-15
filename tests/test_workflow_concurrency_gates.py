@@ -12,7 +12,7 @@ from core.errors import ToolError
 from core.workflow_actions import ACTION_HANDLERS, SideEffectUncertain
 from core.workflow_reconciliation import acknowledge_operation, reconcile_operation
 from core.workflow_retention import WorkflowHistoryPolicy, cleanup_workflow_history
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
 def _definition(name: str = "concurrency") -> WorkflowDefinition:
@@ -45,9 +45,13 @@ def test_two_executors_cannot_run_same_workflow_twice(
     monkeypatch.setitem(ACTION_HANDLERS, "check_file", blocked)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(WorkflowExecutor(store).execute, workflow_id, owner_id="worker-a")
+        first = pool.submit(WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute, workflow_id, owner_id="worker-a")
         assert entered.wait(timeout=5)
-        second = pool.submit(WorkflowExecutor(WorkflowStore(store.path)).execute, workflow_id, owner_id="worker-b")
+        second = pool.submit(
+            WorkflowExecutor(WorkflowStore(store.path), route_planner=NATIVE_ONLY_ROUTING).execute,
+            workflow_id,
+            owner_id="worker-b",
+        )
         second_error = second.exception(timeout=5)
         release.set()
         completed = first.result(timeout=10)
@@ -84,7 +88,7 @@ def test_reconcile_and_manual_acknowledgement_are_cas_serialized(
         ),
         initial_state=WorkflowState.QUEUED,
     )
-    WorkflowExecutor(store).execute(str(workflow["workflow_id"]), owner_id="worker-a")
+    WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(str(workflow["workflow_id"]), owner_id="worker-a")
     operation = store.list_operations(str(workflow["workflow_id"]))["items"][0]
     version = int(operation["version"])
     operation_id = str(operation["operation_id"])

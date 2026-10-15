@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from core.workflow_actions import ACTION_HANDLERS, ActionCancelled, ActionContext, execute_action
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
 def test_running_workflow_enters_cancelling_then_stops_after_completed_effect(
@@ -38,7 +38,7 @@ def test_running_workflow_enters_cancelling_then_stops_after_completed_effect(
         return {"ok": True}
 
     monkeypatch.setitem(ACTION_HANDLERS, "check_file", deferred)
-    executor = WorkflowExecutor(store)
+    executor = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING)
     workflow_id = str(workflow["workflow_id"])
 
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -93,7 +93,7 @@ def test_cancel_during_long_read_only_verification_preserves_result_then_stops(
     workflow_id = str(workflow["workflow_id"])
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(WorkflowExecutor(store).execute, workflow_id, owner_id="worker-verify")
+        future = pool.submit(WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute, workflow_id, owner_id="worker-verify")
         assert started.wait(timeout=5)
         current = store.get(workflow_id)
         requested = store.request_cancel(workflow_id, int(current["version"]), reason="stop verification")
@@ -140,7 +140,7 @@ def test_action_context_propagates_cooperative_cancellation(
     workflow_id = str(workflow["workflow_id"])
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(WorkflowExecutor(store).execute, workflow_id, owner_id="worker-a")
+        future = pool.submit(WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute, workflow_id, owner_id="worker-a")
         assert entered.wait(timeout=5)
         current = store.get(workflow_id)
         assert store.request_cancel(workflow_id, current["version"])["state"] == "cancelling"

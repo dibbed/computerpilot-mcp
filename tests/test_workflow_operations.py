@@ -9,7 +9,7 @@ import pytest
 from core.errors import ToolError
 from core.workflow_models import OperationState
 from core.workflow_reconciliation import reconcile_operation
-from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
+from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
 def _definition() -> WorkflowDefinition:
@@ -45,7 +45,7 @@ def test_direct_store_operations_beyond_first_page_are_retrievable_and_executabl
     last = store.list_operations(workflow_id, offset=100, limit=1)["items"][0]
 
     assert store.get_operation(last["operation_id"])["step_index"] == 100
-    result = WorkflowExecutor(store).execute(workflow_id, owner_id="many-steps-test")
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).execute(workflow_id, owner_id="many-steps-test")
     assert result["state"] == "completed"
     assert result["current_step"] == 101
 
@@ -169,7 +169,7 @@ def test_execution_rejects_corrupt_materialized_operation_after_backfill(
 
     reopened = WorkflowStore(path)
     with pytest.raises(ToolError, match="definition"):
-        WorkflowExecutor(reopened).execute(workflow_id, owner_id="integrity-test")
+        WorkflowExecutor(reopened, route_planner=NATIVE_ONLY_ROUTING).execute(workflow_id, owner_id="integrity-test")
     assert reopened.get(workflow_id)["state"] == "queued"
 
 
