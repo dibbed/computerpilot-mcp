@@ -166,6 +166,10 @@ def test_executor_requires_an_explicit_routing_declaration() -> None:
 def test_executor_rejects_a_missing_planner_instead_of_defaulting(tmp_path: Path) -> None:
     store = WorkflowStore(tmp_path / "workflows.db")
 
+    construct = cast("Any", WorkflowExecutor)
+    with pytest.raises(TypeError, match="route_planner"):
+        construct(store)
+
     with pytest.raises(TypeError):
         WorkflowExecutor(store, route_planner=cast("Any", None))
 
