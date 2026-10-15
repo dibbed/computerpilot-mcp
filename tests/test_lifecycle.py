@@ -189,11 +189,13 @@ def test_mcp_drain_rejects_mutations_but_allows_reads(tmp_path: Path, monkeypatc
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("observer_delay", [0.01, 0.8])
 def test_real_mutating_tool_stays_active_until_command_finishes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observer_delay: float,
 ) -> None:
     control = tmp_path / "control.json"
     status = tmp_path / "status.json"
+    release = tmp_path / "command-release"
     existing = tmp_path / "existing.txt"
     existing.write_text("safe", encoding="utf-8")
     monkeypatch.setenv("MCP_LIFECYCLE_CONTROL_FILE", str(control))
@@ -206,46 +208,62 @@ def test_real_mutating_tool_stays_active_until_command_finishes(
                     "run_process",
                     {
                         "executable": sys.executable,
-                        "args": ["-c", "import time; time.sleep(0.35); print('done')"],
+                        "args": ["-c", (
+                            "import sys, time\n"
+                            "from pathlib import Path\n"
+                            "release = Path(sys.argv[1])\n"
+                            "deadline = time.monotonic() + 15\n"
+                            "while not release.exists():\n"
+                            "    if time.monotonic() >= deadline: raise TimeoutError('release marker timeout')\n"
+                            "    time.sleep(0.01)\n"
+                            "print('done')\n"
+                        ), str(release)],
                         "cwd": str(tmp_path),
-                        "timeout_sec": 5,
+                        "timeout_sec": 20,
                     },
                 )
             )
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                if status.exists():
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if status.exists():
+                        payload = json.loads(status.read_text(encoding="utf-8"))
+                        if payload.get("active_mutations") == 1:
+                            break
+                    await asyncio.sleep(observer_delay)
+                else:
+                    raise AssertionError(status.read_text(encoding="utf-8") if status.exists() else "missing status")
+
+                request_id = "active-command-drain"
+                _write_control(control, "drain", request_id, time.time() + 10)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
                     payload = json.loads(status.read_text(encoding="utf-8"))
-                    if payload.get("active_mutations") == 1:
+                    if payload.get("request_id") == request_id and payload.get("state") == "DRAINING":
                         break
-                await asyncio.sleep(0.01)
-            else:
-                raise AssertionError(status.read_text(encoding="utf-8") if status.exists() else "missing status")
+                    await asyncio.sleep(observer_delay)
+                else:
+                    raise AssertionError(status.read_text(encoding="utf-8"))
+                assert payload["active_mutations"] == 1
+                assert not running.done()
 
-            request_id = "active-command-drain"
-            _write_control(control, "drain", request_id, time.time() + 3)
-            while time.monotonic() < deadline:
-                payload = json.loads(status.read_text(encoding="utf-8"))
-                if payload.get("request_id") == request_id and payload.get("state") == "DRAINING":
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                raise AssertionError(status.read_text(encoding="utf-8"))
-            assert payload["active_mutations"] == 1
+                rejected = await client.call_tool(
+                    "write_file",
+                    {"path": str(existing), "content": "unsafe", "backup": False},
+                )
+                assert rejected.structured_content
+                assert rejected.structured_content["error"] == "runtime_draining"
+                readable = await client.call_tool("read_file", {"path": str(existing)})
+                assert readable.structured_content and readable.structured_content["content"] == "safe"
+            finally:
+                # Keep the real process active until the observer finishes its drain checks.
+                release.write_text("go", encoding="ascii")
+                completed = await running
 
-            rejected = await client.call_tool(
-                "write_file",
-                {"path": str(existing), "content": "unsafe", "backup": False},
-            )
-            assert rejected.structured_content
-            assert rejected.structured_content["error"] == "runtime_draining"
-            readable = await client.call_tool("read_file", {"path": str(existing)})
-            assert readable.structured_content and readable.structured_content["content"] == "safe"
-
-            completed = await running
             assert completed.structured_content
             assert completed.structured_content["ok"] is True
             assert "done" in completed.structured_content["stdout"]["text"]
+            deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 payload = json.loads(status.read_text(encoding="utf-8"))
                 if payload.get("active_mutations") == 0:
