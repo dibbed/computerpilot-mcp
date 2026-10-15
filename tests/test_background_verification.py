@@ -242,3 +242,31 @@ def test_fingerprint_fails_closed_on_input_quota(tmp_path: Path, monkeypatch: py
     monkeypatch.setattr(background, "MAX_INPUT_BYTES", 1)
     with pytest.raises(ValueError, match="budget"):
         source_fingerprint(tmp_path)
+
+
+def test_idempotency_conflict_when_key_reused_after_source_change(tmp_path: Path) -> None:
+    from core.errors import ToolError
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    store = JobStore(tmp_path / "state" / "jobs.sqlite3")
+    request1 = VerificationRequest(repo=str(repo), changed_paths=["app.py"])
+    first = submit_verification(store, request1, "key-1")
+    assert first["accepted"] and not first["deduplicated"]
+
+    (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+    request2 = VerificationRequest(repo=str(repo), changed_paths=["app.py"])
+    with pytest.raises(ToolError) as exc_info:
+        submit_verification(store, request2, "key-1")
+    assert exc_info.value.code == "idempotency_conflict"
+
+
+def test_fingerprint_rejects_directory_symlink(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "app.py").write_text("ok", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda self: True if self.name == "sub" else original_is_symlink(self))
+    with pytest.raises(ValueError, match="symlink"):
+        source_fingerprint(tmp_path)
