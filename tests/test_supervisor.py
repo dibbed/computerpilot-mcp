@@ -314,12 +314,11 @@ def test_supervisor_survives_transient_children_oserror(tmp_path: Path, monkeypa
 
     def flaky_children(self: object, recursive: bool = False) -> list[object]:
         nonlocal failures
-        if failures == 0:
+        if threading.current_thread() is thread and failures == 0:
             failures += 1
             raise OSError(1455, "The paging file is too small for this operation to complete")
         return original_children(self, recursive=recursive)
 
-    monkeypatch.setattr(module.psutil.Process, "children", flaky_children)
     code = (
         "import os,time;from pathlib import Path;"
         "h=Path(os.environ['MCP_HEARTBEAT_FILE']);"
@@ -328,16 +327,17 @@ def test_supervisor_survives_transient_children_oserror(tmp_path: Path, monkeypa
     )
     supervisor = Supervisor([sys.executable, "-c", code], readiness_url=None, state_dir=tmp_path, grace=2, interval=0.03)
     thread = threading.Thread(target=supervisor.run)
+    monkeypatch.setattr(module.psutil.Process, "children", flaky_children)
     thread.start()
     try:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            snapshot = supervisor.snapshot()
+            snapshot = supervisor.state_snapshot()
             if snapshot["state"] == "running":
                 break
             time.sleep(0.03)
         else:
-            raise AssertionError(supervisor.snapshot())
+            raise AssertionError(supervisor.state_snapshot())
         assert failures == 1
         assert snapshot["restart_count"] == 0
         assert any("Could not enumerate runtime children" in line for line in snapshot["logs"])
