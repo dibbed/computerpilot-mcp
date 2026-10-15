@@ -79,6 +79,8 @@ def create_server() -> MCPServer:
             "For browser screenshots, pass the returned path to read_file with delivery=auto for "
             "catalog-compatible ChatGPT vision; view_image is equivalent after tool refresh. "
             "Mutating operations are metadata-audited locally."
+            " For long verification use start_verification when available, continue independent work, then collect job_wait/job_output. "
+            "Acceptance is not test success; require a successful job and a current final result before dependent decisions."
         ),
         version=SETTINGS.version,
         log_level="WARNING",
@@ -88,7 +90,10 @@ def create_server() -> MCPServer:
     for domain in active_domains:
         registrar = REGISTRARS.get(domain)
         if registrar is not None:
-            registrar(server)
+            if domain == "testing":
+                register_testing(server, background_enabled="jobs" in active_domains)
+            else:
+                registrar(server)
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("discover_tool_domains")

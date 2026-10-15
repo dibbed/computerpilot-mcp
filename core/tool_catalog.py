@@ -85,6 +85,7 @@ TOOL_EXECUTION_METADATA: dict[str, ToolExecutionMetadata] = {
     "apply_code_action": _meta("apply_code_action", "language", RouteClass.NATIVE_CODE, 5, RiskClass.MEDIUM, RecoverabilityClass.STRONG),
     "affected_tests": _meta("affected_tests", "testing", RouteClass.NATIVE_CODE, 5, RiskClass.LOW, RecoverabilityClass.STRONG),
     "verify_changes": _meta("verify_changes", "testing", RouteClass.NATIVE_CODE, 5, RiskClass.LOW, RecoverabilityClass.STRONG),
+    "start_verification": _meta("start_verification", "testing", RouteClass.NATIVE_CODE, 5, RiskClass.MEDIUM, RecoverabilityClass.STRONG),
     # Git
     "git_status": _meta("git_status", "git", RouteClass.NATIVE_GIT, 5, RiskClass.LOW, RecoverabilityClass.STRONG),
     "git_diff": _meta("git_diff", "git", RouteClass.NATIVE_GIT, 5, RiskClass.LOW, RecoverabilityClass.STRONG),

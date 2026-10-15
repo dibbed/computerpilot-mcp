@@ -56,6 +56,7 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "run_ruff",
         "run_mypy",
         "verify_changes",
+        "start_verification",
         "collect_diagnostics",
         "start_validation_watch",
         "rename_symbol",
