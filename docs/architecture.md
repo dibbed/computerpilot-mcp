@@ -128,6 +128,8 @@ Standalone mutations use the operation recovery journal. Durable workflows maint
 
 If a runtime disappears after a side effect may have occurred but before the final outcome is known, the operation can remain `uncertain`. Document publication checkpoints its validated final file hash before the atomic replacement, so that crash window retains a reconciler-compatible postcondition.
 
+Semantic UIA mutations checkpoint bounded numeric target identity before backend dispatch, using the same native journal for direct service and MCP calls. Their `prepared` / `may_dispatch` metadata survives restart and compaction without storing titles, control text or values. Once dispatch may have happened, a backend exception is an uncertain outcome rather than proof that no effect occurred. Identity metadata supports investigation; it does not automatically reconcile a private UI value. Existing native recovery opt-out remains explicit and still respects lifecycle drain.
+
 Resolution paths are:
 
 1. inspect durable evidence;

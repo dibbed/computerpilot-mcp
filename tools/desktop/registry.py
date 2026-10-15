@@ -82,7 +82,7 @@ def register(mcp: MCPServer) -> None:
     def ui_invoke(window: WindowLocatorInput, element: ElementLocatorInput) -> dict[str, Any]:
         """Re-resolve exactly one element and invoke its native UI Automation pattern."""
 
-        audit_action("ui_invoke", target="semantic_element", details={"locator": element.model_dump(exclude_none=True)})
+        audit_action("ui_invoke", target="semantic_element", details={"locator_fields": sorted(element.model_dump(exclude_none=True))})
         return UI_AUTOMATION.invoke(window.locator(), element.locator())
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
@@ -97,7 +97,7 @@ def register(mcp: MCPServer) -> None:
         audit_action(
             "ui_set_value",
             target="semantic_element",
-            details={"locator": element.model_dump(exclude_none=True), "value_chars": len(value)},
+            details={"locator_fields": sorted(element.model_dump(exclude_none=True)), "value_chars": len(value)},
         )
         return UI_AUTOMATION.set_value(window.locator(), element.locator(), value)
 
@@ -106,7 +106,7 @@ def register(mcp: MCPServer) -> None:
     def ui_select(window: WindowLocatorInput, element: ElementLocatorInput) -> dict[str, Any]:
         """Re-resolve one element and select it through SelectionItem."""
 
-        audit_action("ui_select", target="semantic_element", details={"locator": element.model_dump(exclude_none=True)})
+        audit_action("ui_select", target="semantic_element", details={"locator_fields": sorted(element.model_dump(exclude_none=True))})
         return UI_AUTOMATION.select(window.locator(), element.locator())
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)

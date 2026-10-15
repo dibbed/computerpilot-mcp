@@ -23,6 +23,10 @@ Reuse `READ_ONLY`, `MUTATING`, `DESTRUCTIVE`, or the existing open-world variant
 
 The wrapper tracks tool activity and timing. For allowlisted native mutations it enters `RUNTIME_LIFECYCLE.mutation`, begins the existing operation journal, runs the body under `operation_recovery_context`, and records the returned result or raised outcome. Managed drain rejects new mutations while permitting reads; standalone native behavior remains supported. Preserve resource locks and postcondition checkpoints owned by the tool.
 
+UIA mutations also guard direct `UIAutomationService` calls at the backend boundary. They reuse an enclosing MCP admission and recovery handle, including the explicit native-recovery-disabled case. With recovery enabled, a typed numeric target (process creation time, window/element handles and bounded UIA runtime ID) is durably checkpointed as `prepared` and then `may_dispatch` before the effect. A backend exception or lost result after that barrier remains `uncertain`; it does not prove rollback. Inspect or acknowledge the existing operation before considering another action.
+
+UIA recovery metadata is additive within the existing schema-1 checkpoint and preserves file postconditions and legacy records. It stores neither control text, window titles, locator contents nor values/value hashes. Mutation audit records include locator field names only. Missing process identity is explicitly partial; numeric identity is investigation evidence, not a conclusive value postcondition. Automatic UIA value reconciliation is not supported, and disabling native recovery does not disable lifecycle admission.
+
 The native wrapper's raised/returned-error terminal semantics do not establish whether a remote effect happened. External tools require their separate durable dispatch/uncertainty boundary; do not insert dynamic external names into the native allowlist. A timeout or cancellation is not proof of rollback. Preserve unresolved evidence and never blindly replay it.
 
 ## Validation and safe persistence
