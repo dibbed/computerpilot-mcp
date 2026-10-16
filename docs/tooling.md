@@ -35,6 +35,14 @@ Supported initial structured intents are:
 
 `filesystem.read`, `filesystem.write`, `code.rename`, `git.read`, `git.write`, `process.run`, `system.inspect`, `document.excel.read`, `document.excel.write`, `document.docx.read`, `document.docx.write`, `document.pdf.read`, `document.pdf.create`, `browser.interact`, `desktop.semantic.interact`, and `desktop.raw.interact`.
 
+The planning client maps a request such as "write cells in Excel" to a canonical intent before calling `execution_recommend`:
+
+```json
+{"intent":"document.excel.write","allow_raw_desktop":false}
+```
+
+When available in the active profile, this recommends `native.excel` and `excel_write_range`; the client then calls that typed tool with its validated arguments. The recommendation performs no write and grants no execution permission. Free-form requests are not canonical intents: an unsupported intent returns `unknown_execution_intent` with the existing supported-name hint. Profile choice is described in the [profile guide](../README.md#tool-profiles).
+
 The initial route classes are `native.filesystem`, `native.code`, `native.git`, `native.process`, `native.system`, `native.excel`, `native.docx`, `native.pdf`, `semantic.browser`, `semantic.windows_uia`, reserved `visual.desktop`, and `raw.desktop`.
 
 `deterministic-v1` is rule/metadata based; it does not use an opaque model score. Exact structured routes are preferred over semantic UI routes and raw coordinates when all are valid. Unsupported profile/platform routes are removed before ranking.
@@ -45,9 +53,9 @@ Hard safety rules include:
 - stale semantic references cannot fall back to coordinates;
 - destructive ambiguous semantic targets fail closed;
 - macro-preservation requirements exclude routes that cannot prove fidelity;
-- `visual.desktop` is unavailable in v0.7.
+- `visual.desktop` is unavailable in v0.8.
 
-There is intentionally no `execution_run` tool in v0.7. The selected route still resolves to existing typed tools and their existing validation, lifecycle, audit, recovery, and permission behavior.
+There is intentionally no `execution_run` tool in v0.8. The selected route still resolves to existing typed tools and their existing validation, lifecycle, audit, recovery, and permission behavior.
 
 ## Filesystem and editing
 
@@ -72,6 +80,8 @@ Project tools provide:
 - dependency graphs;
 - consolidated `code_context`;
 - version-aware cached Python metadata.
+
+Recursive project discovery skips generated child directories `.worktrees`, `.playwright-cli`, `.pytest-tmp`, and `.pytest-tmp-*`, alongside the established exclusions. Explicitly targeting an excluded directory or file still allows inspection. `project_summary.files_scanned` describes the filtered scan; `top_level` remains a bounded raw inventory and may include excluded names. Raw filesystem listing retains its own behavior. An explicitly changed Python file that exists outside the scanned index makes `affected_tests` report `changed_python_outside_scan`, `complete=false`, and a full-suite fallback; it is not silently dropped.
 
 Language tools add LSP-based:
 

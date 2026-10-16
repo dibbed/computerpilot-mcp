@@ -47,6 +47,45 @@ def test_affected_tests_selects_direct_and_reverse_importers_with_evidence(tmp_p
     assert result["complete"] is True
 
 
+@pytest.mark.parametrize("name", [".worktrees", ".playwright-cli", ".pytest-tmp", ".pytest-tmp-r4"])
+@pytest.mark.parametrize("suffix", [".py", ".pyi"])
+def test_affected_tests_requires_full_suite_for_changed_python_outside_scan(tmp_path: Path, name: str, suffix: str) -> None:
+    from tools.testing.impact import select_affected_tests
+
+    _write_project(tmp_path)
+    changed = f"{name}/copy/app/service{suffix}"
+    target = tmp_path / changed
+    target.parent.mkdir(parents=True)
+    target.write_text("def create() -> int:\n    return 2\n", encoding="utf-8")
+
+    result = select_affected_tests(tmp_path, changed_paths=[changed])
+
+    assert result["changed_paths"] == [changed]
+    assert [(item["path"], item["evidence"]) for item in result["tests"]] == [
+        ("tests/test_service.py", ["naming_convention"])
+    ]
+    assert result["decision"] == "full_suite"
+    assert "changed_python_outside_scan" in result["full_suite_reasons"]
+    assert result["complete"] is False
+
+
+def test_affected_tests_requires_full_suite_after_rename_into_generated_directory(tmp_path: Path) -> None:
+    from tools.testing.impact import select_affected_tests
+
+    _write_project(tmp_path)
+    _init_git(tmp_path)
+    changed = ".worktrees/copy/app/service.py"
+    (tmp_path / changed).parent.mkdir(parents=True)
+    _git(tmp_path, "mv", "app/service.py", changed)
+
+    result = select_affected_tests(tmp_path)
+
+    assert result["changed_paths"] == [changed]
+    assert result["decision"] == "full_suite"
+    assert "changed_python_outside_scan" in result["full_suite_reasons"]
+    assert result["complete"] is False
+
+
 @pytest.mark.parametrize("changed", ["conftest.py", "pyproject.toml", "requirements.txt", "tests/plugins.py"])
 def test_affected_tests_requires_full_suite_for_repository_wide_risk(tmp_path: Path, changed: str) -> None:
     from tools.testing.impact import select_affected_tests
@@ -115,5 +154,7 @@ def test_affected_tests_maps_deleted_module_from_imports(tmp_path: Path) -> None
     result = select_affected_tests(tmp_path, changed_paths=["app/service.py"])
 
     assert result["decision"] == "focused"
+    assert result["complete"] is True
+    assert "changed_python_outside_scan" not in result["full_suite_reasons"]
     selected = next(item for item in result["tests"] if item["path"] == "tests/test_service.py")
     assert "direct_import" in selected["evidence"]
