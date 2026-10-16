@@ -11,7 +11,9 @@ from typing import Any, cast
 import pytest
 
 from tools.project import registry, service
+from tools.project.context import lookup_code_context
 from tools.project.index import PythonFileMetadata, PythonMetadataCache, build_python_metadata
+from tools.testing.impact import select_affected_tests
 
 ToolFunction = Callable[..., dict[str, Any]]
 
@@ -36,6 +38,96 @@ def counting_cache(*, max_files: int = 16, max_bytes: int = 4 * 1024 * 1024) -> 
         return build_python_metadata(path)
 
     return PythonMetadataCache(max_files=max_files, max_bytes=max_bytes, loader=load), calls
+
+
+def test_project_discovery_excludes_generated_directories_across_consumers(tmp_path: Path) -> None:
+    source = "def create() -> int:\n    return 1\n"
+    test_source = "from app.service import create\n\ndef test_create() -> None:\n    assert create() == 1\n"
+    for relative, content in (("app/service.py", source), ("tests/test_service.py", test_source)):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    generated_names = {".worktrees", ".playwright-cli", ".pytest-tmp", ".pytest-tmp-r4"}
+    for parent in (tmp_path, tmp_path / "app"):
+        for name in generated_names:
+            generated = parent / name / "copy"
+            for relative, content in (
+                ("app/service.py", source),
+                ("tests/test_service.py", test_source),
+                ("broken.py", "def broken(:\n"),
+            ):
+                target = generated / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+
+    server = ToolCapture()
+    registry.register(cast(Any, server))
+
+    summary = server.functions["project_summary"](str(tmp_path))
+    assert summary["files_scanned"] == 2
+    assert summary["languages"] == [{"name": "Python", "files": 2}]
+    assert summary["scan_truncated"] is False
+    assert generated_names <= {item["name"] for item in summary["top_level"]}
+
+    functions = server.functions["find_function"](str(tmp_path), "create")
+    assert functions["total_count"] == 1
+    assert functions["items"][0]["file"] == "app/service.py"
+    assert functions["parse_errors"] == []
+
+    context = lookup_code_context(tmp_path, "create")
+    assert context["ambiguous"] is False
+    assert [(item["file"], item["qualified_name"]) for item in context["definitions"]] == [
+        ("app/service.py", "app.service.create")
+    ]
+    assert [item["file"] for item in context["tests"]] == ["tests/test_service.py"]
+    assert context["parse_errors"] == []
+    assert context["complete"] is True
+
+    affected = select_affected_tests(tmp_path, changed_paths=["app/service.py"])
+    assert [item["path"] for item in affected["tests"]] == ["tests/test_service.py"]
+    assert affected["files_scanned"] == 2
+    assert affected["parse_errors"] == []
+    assert affected["decision"] == "focused"
+    assert affected["complete"] is True
+
+
+def test_project_discovery_preserves_similar_directory_names(tmp_path: Path) -> None:
+    names = {"worktrees", ".worktrees-source", ".playwright-cli-source", ".pytest-tmp2", ".pytest-tmp_saved", ".hidden"}
+    for name in names:
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / "source.py").write_text("def create():\n    pass\n", encoding="utf-8")
+
+    files, truncated = service.iter_files(tmp_path, 100)
+
+    assert {path.relative_to(tmp_path).as_posix() for path in files} == {f"{name}/source.py" for name in names}
+    assert truncated is False
+
+
+@pytest.mark.parametrize("name", [".worktrees", ".playwright-cli", ".pytest-tmp", ".pytest-tmp-r4"])
+def test_project_discovery_allows_explicit_generated_root_and_file(tmp_path: Path, name: str) -> None:
+    root = tmp_path / name
+    root.mkdir()
+    target = root / "service.py"
+    target.write_text("def create():\n    pass\n", encoding="utf-8")
+    server = ToolCapture()
+    registry.register(cast(Any, server))
+
+    assert service.project_summary(root, 100)["files_scanned"] == 1
+    for path in (root, target):
+        functions = server.functions["find_function"](str(path), "create")
+        assert functions["total_count"] == 1
+        assert functions["items"][0]["file"] == "service.py"
+        assert functions["parse_errors"] == []
+
+
+def test_project_discovery_marks_real_source_at_file_limit_truncated(tmp_path: Path) -> None:
+    target = tmp_path / "source.py"
+    target.write_text("def create():\n    pass\n", encoding="utf-8")
+
+    assert service.iter_files(tmp_path, 1) == ([target], True)
+    assert service.iter_files(tmp_path, 2) == ([target], False)
 
 
 def test_same_file_version_is_parsed_once(tmp_path: Path) -> None:

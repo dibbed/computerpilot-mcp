@@ -206,6 +206,9 @@ def select_affected_tests(
 
     changed_modules.update(module_by_path[path] for path in normalized_changed if path in module_by_path)
     executable_changes = [path for path in normalized_changed if Path(path).suffix.casefold() in {".py", ".pyi"}]
+    changed_outside_scan = any(path not in module_by_path and (root / path).is_file() for path in executable_changes)
+    if changed_outside_scan:
+        reasons.append("changed_python_outside_scan")
     unmappable = any(module is None for module in (_module_from_path(path) for path in executable_changes))
     if unmappable:
         reasons.append("unmappable_python_change")
@@ -253,7 +256,7 @@ def select_affected_tests(
     ]
     results_truncated = len(rows) > max_results
     rows = rows[:max_results]
-    complete = not scan_truncated and not results_truncated and not parse_errors
+    complete = not scan_truncated and not results_truncated and not parse_errors and not changed_outside_scan
     if reasons:
         decision: Decision = "full_suite"
     elif scan_truncated or results_truncated or parse_errors:

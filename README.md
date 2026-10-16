@@ -185,16 +185,20 @@ Set a profile with:
 MCP_TOOL_PROFILE=coding
 ```
 
+Set the variable before startup and restart the runtime to change profiles. `coding` omits browser, desktop/UIA, and native document tools. Keep `full` for mixed coding, desktop, and document work; `documents` includes filesystem, native documents, recovery, and workflows. A smaller catalog saves serialized discovery bytes by removing capabilities; it does not establish a model-token or task-quality improvement.
+
+Profiles filter registration. They do not grant execution permission or implicitly enable extensions; typed tools and external operator policy retain their existing execution checks.
+
 ## Adaptive Execution Routing
 
-The v0.7 routing layer is a **decision layer**, not a universal dispatcher. It receives a structured intent, generates candidates only from tools registered in the active MCP profile, filters platform/capability and safety constraints, and applies the versioned deterministic policy `deterministic-v1`.
+The routing layer introduced in v0.7 is a **decision layer**, not a universal dispatcher. It receives a structured intent, generates candidates only from tools registered in the active MCP profile, filters platform/capability and safety constraints, and applies the versioned deterministic policy `deterministic-v1`.
 
 Initial route classes are:
 
 - native: filesystem, code/LSP, Git, process, system, Excel, DOCX, and PDF;
 - semantic: browser and Windows UI Automation;
 - `raw.desktop`, only when the request explicitly permits raw desktop fallback and the action is not destructive;
-- `visual.desktop`, reserved for a later visual-grounding phase and unavailable in v0.7.
+- `visual.desktop`, reserved for a later visual-grounding phase and unavailable in v0.8.
 
 The public diagnostics are read-only:
 
