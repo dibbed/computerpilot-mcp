@@ -70,6 +70,55 @@ def test_posix_termination_reaps_descendants_in_separate_sessions(
     assert not result["alive_pids"]
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_posix_group_signal_retains_a_live_group_member_until_dispatch(
+    monkeypatch: pytest.MonkeyPatch, force: bool,
+) -> None:
+    class Process:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.alive = True
+
+        def children(self, *, recursive: bool) -> list[Process]:
+            assert recursive
+            return [detached]
+
+        def kill(self) -> None:
+            self.alive = False
+
+        def terminate(self) -> None:
+            self.alive = False
+
+    member, detached = Process(100), Process(200)
+    monkeypatch.setattr(process_ownership, "_group_processes", lambda pgid: [member])
+    group_signals: list[bool] = []
+
+    def signal_group(pgid: int, sig: int) -> bool:
+        # Darwin killpg excludes zombies and reports EPERM when no live member remains.
+        had_live_member = member.alive
+        group_signals.append(had_live_member)
+        member.alive = False
+        return had_live_member
+
+    def wait_procs(processes: list[Process], *, timeout: float) -> tuple[list[Process], list[Process]]:
+        return [process for process in processes if not process.alive], [process for process in processes if process.alive]
+
+    class Popen:
+        pid = member.pid
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    monkeypatch.setattr(process_ownership, "_signal_group", signal_group)
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
+    owned = process_ownership.PosixOwnedProcess(cast(subprocess.Popen[bytes], Popen()), member.pid)
+    result = owned.terminate_tree(force=force)
+    assert not member.alive and not detached.alive
+    assert group_signals == [True]
+    assert result["terminated_pids"] == [member.pid, detached.pid]
+    assert not result["alive_pids"]
+
+
 @pytest.mark.parametrize("denied_phase", ["inspection", "kill", "terminate", "group", "unknown_class"])
 def test_posix_cleanup_attempts_remaining_targets_before_reporting_denial(
     monkeypatch: pytest.MonkeyPatch, denied_phase: str,

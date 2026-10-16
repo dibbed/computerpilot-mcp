@@ -179,20 +179,23 @@ class PosixOwnedProcess:
 
         if force:
             sigkill = int(getattr(signal, "SIGKILL", signal.SIGTERM))
-            signal_processes(processes, force=True)
+            # Signal the owned group while a captured member still proves it exists.
+            # Darwin may report failure once individually reaped members leave no live
+            # process for killpg(), even though cleanup already succeeded.
             if not _signal_group(self.pgid, sigkill):
                 record_error("group")
+            signal_processes(processes, force=True)
             gone, alive = psutil.wait_procs(processes, timeout=3.0)
         else:
-            signal_processes(processes, force=False)
             if not _signal_group(self.pgid, int(signal.SIGTERM)):
                 record_error("group")
+            signal_processes(processes, force=False)
             gone, alive = psutil.wait_procs(processes, timeout=3.0)
             if alive:
                 sigkill = int(getattr(signal, "SIGKILL", signal.SIGTERM))
-                signal_processes(alive, force=True)
                 if not _signal_group(self.pgid, sigkill):
                     record_error("group")
+                signal_processes(alive, force=True)
                 gone_after, alive = psutil.wait_procs(alive, timeout=2.0)
                 gone.extend(gone_after)
         try:
