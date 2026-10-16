@@ -11,7 +11,11 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from core.lifecycle import RUNTIME_LIFECYCLE
-from core.recovery import OPERATION_RECOVERY, operation_recovery_context
+from core.recovery import (
+    OPERATION_RECOVERY,
+    operation_recovery_context,
+    uses_native_uia_dispatch_protocol,
+)
 from core.response import failure
 from core.timings import tool_timing
 from core.tool_activity import TOOL_ACTIVITY
@@ -141,7 +145,11 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                         if operation in MUTATING_TOOL_OPERATIONS:
                             target = _mutation_target(signature, args, kwargs)
                             with RUNTIME_LIFECYCLE.mutation(operation):
-                                handle = OPERATION_RECOVERY.begin(operation, target)
+                                handle = OPERATION_RECOVERY.begin(
+                                    operation,
+                                    target,
+                                    native_uia_protocol=uses_native_uia_dispatch_protocol(operation),
+                                )
                                 try:
                                     with operation_recovery_context(handle):
                                         result = await fn(*args, **kwargs)
@@ -166,7 +174,11 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                     if operation in MUTATING_TOOL_OPERATIONS:
                         target = _mutation_target(signature, args, kwargs)
                         with RUNTIME_LIFECYCLE.mutation(operation):
-                            handle = OPERATION_RECOVERY.begin(operation, target)
+                            handle = OPERATION_RECOVERY.begin(
+                                operation,
+                                target,
+                                native_uia_protocol=uses_native_uia_dispatch_protocol(operation),
+                            )
                             try:
                                 with operation_recovery_context(handle):
                                     result = fn(*args, **kwargs)

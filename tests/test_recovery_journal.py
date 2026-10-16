@@ -145,13 +145,75 @@ with recovery.native_uia_mutation('ui_set_value',NativeUIATarget(window_handle=1
     assert result.returncode == 23
     recovered = OperationRecoveryJournal()
     recovered.configure(path, "parent")
-    recovered.compact()
+    if crash_at == "after_effect":
+        recovered.compact()
     operation = recovered.list_operations()["items"][0]
-    assert operation["state"] == "uncertain"
+    assert operation["state"] == ("failed" if crash_at == "prepared" else "uncertain")
     assert operation["native"]["dispatch_stage"] == ("prepared" if crash_at == "prepared" else "may_dispatch")
     recovered.configure(path, "another-restart")
-    assert recovered.summary()["uncertain_count"] == 1
+    assert recovered.summary()["uncertain_count"] == (0 if crash_at == "prepared" else 1)
     assert (effect.read_text(encoding="utf-8") if effect.exists() else "") == ("1" if crash_at == "after_effect" else "")
+
+
+def test_native_uia_begin_only_crash_is_not_dispatched_instead_of_uncertain(tmp_path: Path) -> None:
+    path = tmp_path / "native.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "before")
+    handle = journal.begin("ui_set_value", native_uia_protocol=True)
+    assert handle is not None
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+
+    operation = recovered.inspect(handle.operation_id)
+    assert operation["state"] == "failed"
+    assert operation["target"] is None
+    assert recovered.summary()["uncertain_count"] == 0
+    assert recovered.summary()["pending_count"] == 0
+
+
+def test_wrapped_native_uia_crash_before_checkpoint_recovers_as_failed(tmp_path: Path) -> None:
+    path = tmp_path / "wrapped-native.jsonl"
+    script = """
+import os,sys
+from pathlib import Path
+from core import recovery
+from core.tooling import compact_errors
+recovery.OPERATION_RECOVERY.configure(Path(sys.argv[1]),'child')
+@compact_errors('ui_set_value')
+def crash_before_native_checkpoint():
+    os._exit(23)
+crash_before_native_checkpoint()
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(path)], timeout=15)
+    assert result.returncode == 23
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+
+    operation = recovered.list_operations()["items"][0]
+    assert operation["state"] == "failed"
+    assert operation["target"] is None
+    assert recovered.summary()["uncertain_count"] == 0
+    records = _records(path)
+    native_recovery = records[0].get("native_recovery")
+    assert isinstance(native_recovery, dict)
+    assert native_recovery["dispatch_rule"] == "may_dispatch_checkpoint_before_effect"
+    assert records[-1]["reason"] == "runtime_ended_before_native_uia_dispatch"
+
+
+def test_legacy_native_uia_begin_without_dispatch_protocol_remains_uncertain(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-native.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "before")
+    handle = journal.begin("ui_set_value")
+    assert handle is not None
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+
+    assert recovered.inspect(handle.operation_id)["state"] == "uncertain"
+    assert recovered.summary()["uncertain_count"] == 1
 
 
 def test_previous_runtime_pending_operation_becomes_uncertain(tmp_path: Path) -> None:

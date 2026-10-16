@@ -76,6 +76,8 @@ _ALLOWED_MUTATION_CLASSES = frozenset({
 })
 _ALLOWED_DISPATCH_STAGES = frozenset({"prepared", "may_dispatch"})
 _NATIVE_UIA_OPERATIONS = frozenset({"ui_invoke", "ui_set_value", "ui_select"})
+_NATIVE_UIA_DISPATCH_PROTOCOL_VERSION = 1
+_NATIVE_UIA_DISPATCH_RULE = "may_dispatch_checkpoint_before_effect"
 _ALLOWED_EXTERNAL_OUTCOMES = frozenset({
     "succeeded",
     "not_dispatched",
@@ -89,6 +91,12 @@ _SECRET_LIKE_PATTERN = re.compile(
     r"akia[0-9a-z]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|eyj[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"
     r"(?:token|secret|password|api[_-]?key|authorization)\s*[:=]\s*\S+)"
 )
+
+
+def uses_native_uia_dispatch_protocol(operation: str) -> bool:
+    """Return whether a tool must checkpoint native UIA identity before any effect."""
+
+    return operation in _NATIVE_UIA_OPERATIONS
 
 
 def _has_forbidden_text(value: str, *, max_len: int) -> bool:
@@ -686,6 +694,40 @@ class OperationRecoveryJournal:
                 continue
             if begin.get("runtime_id") == runtime_id:
                 continue
+            native_protocol = begin.get("native_recovery")
+            if (
+                begin.get("operation_type") in _NATIVE_UIA_OPERATIONS
+                and native_protocol == {
+                    "version": _NATIVE_UIA_DISPATCH_PROTOCOL_VERSION,
+                    "kind": "windows_uia",
+                    "dispatch_rule": _NATIVE_UIA_DISPATCH_RULE,
+                }
+            ):
+                checkpoint = item.get("checkpoint")
+                native_raw_present = isinstance(checkpoint, dict) and "native" in checkpoint
+                native = (
+                    _native_uia_metadata(checkpoint.get("native"))
+                    if isinstance(checkpoint, dict)
+                    else None
+                )
+                before_dispatch = (
+                    checkpoint is None
+                    or (not native_raw_present and isinstance(checkpoint, dict))
+                    or (native is not None and native["dispatch_stage"] == "prepared")
+                )
+                if before_dispatch:
+                    self._append_unlocked_file({
+                        "schema_version": JOURNAL_SCHEMA_VERSION,
+                        "type": "result",
+                        "status": "completed",
+                        "operation_id": operation_id,
+                        "runtime_id": begin.get("runtime_id"),
+                        "recovered_by_runtime_id": runtime_id,
+                        "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                        "known_result": "returned_error",
+                        "reason": "runtime_ended_before_native_uia_dispatch",
+                    })
+                    continue
             uncertain_record: dict[str, Any] = {
                 "schema_version": JOURNAL_SCHEMA_VERSION,
                 "type": "uncertain",
@@ -1033,7 +1075,13 @@ class OperationRecoveryJournal:
         target: str | None = None,
         *,
         external_metadata: ExternalOperationMetadata | Mapping[str, Any] | None = None,
+        native_uia_protocol: bool = False,
     ) -> OperationHandle | None:
+        if native_uia_protocol and not uses_native_uia_dispatch_protocol(operation_type):
+            raise ToolError(
+                "invalid_native_recovery_metadata",
+                "Native UIA dispatch protocol can only be enabled for native UIA mutations.",
+            )
         normalized_external = (
             _normalize_external_metadata(external_metadata)
             if external_metadata is not None
@@ -1068,6 +1116,12 @@ class OperationRecoveryJournal:
                 "started_at": handle.started_at,
                 "pid": os.getpid(),
             }
+            if native_uia_protocol:
+                record["native_recovery"] = {
+                    "version": _NATIVE_UIA_DISPATCH_PROTOCOL_VERSION,
+                    "kind": "windows_uia",
+                    "dispatch_rule": _NATIVE_UIA_DISPATCH_RULE,
+                }
             if normalized_external is not None:
                 record["external"] = normalized_external
                 with self._journal_transaction(external_admission=True) as records:
@@ -1465,7 +1519,11 @@ def native_uia_mutation(operation: str, target: NativeUIATarget) -> Iterator[Non
     admission = RUNTIME_LIFECYCLE.mutation(operation) if owned else nullcontext()
     with admission:
         if owned:
-            handle = OPERATION_RECOVERY.begin(operation, target.label())
+            handle = OPERATION_RECOVERY.begin(
+                operation,
+                target.label(),
+                native_uia_protocol=True,
+            )
         with operation_recovery_context(handle):
             dispatched = False
             try:
