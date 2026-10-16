@@ -147,7 +147,15 @@ class PosixOwnedProcess:
 
     def _terminate_group(self, *, force: bool) -> dict[str, Any]:
         members = _group_processes(self.pgid)
-        errors = 0
+        errors: dict[str, int] = {}
+
+        def record_error(stage: str, error: Exception | None = None) -> None:
+            kind = "Unspecified" if error is None else "OtherError"
+            if type(error) in {psutil.AccessDenied, psutil.Error, OSError, PermissionError, ProcessLookupError}:
+                kind = type(error).__name__
+            key = f"{stage}:{kind}"
+            errors[key] = errors.get(key, 0) + 1
+
         by_pid = {process.pid: process for process in members}
         # Nested owned commands start new sessions; capture them before killing their parents.
         for process in members:
@@ -155,34 +163,36 @@ class PosixOwnedProcess:
                 by_pid.update((child.pid, child) for child in process.children(recursive=True))
             except psutil.NoSuchProcess:
                 pass
-            except (psutil.Error, OSError):
-                errors += 1
+            except (psutil.Error, OSError) as error:
+                record_error("inspection", error)
         processes = list(by_pid.values())
         targeted = sorted({process.pid for process in processes} | {self.pid})
 
         def signal_processes(targets: list[psutil.Process], *, force: bool) -> None:
-            nonlocal errors
             for process in reversed(targets):
                 try:
                     process.kill() if force else process.terminate()
                 except psutil.NoSuchProcess:
                     pass
-                except (psutil.Error, OSError):
-                    errors += 1
+                except (psutil.Error, OSError) as error:
+                    record_error("signal", error)
 
         if force:
             sigkill = int(getattr(signal, "SIGKILL", signal.SIGTERM))
             signal_processes(processes, force=True)
-            errors += not _signal_group(self.pgid, sigkill)
+            if not _signal_group(self.pgid, sigkill):
+                record_error("group")
             gone, alive = psutil.wait_procs(processes, timeout=3.0)
         else:
             signal_processes(processes, force=False)
-            errors += not _signal_group(self.pgid, int(signal.SIGTERM))
+            if not _signal_group(self.pgid, int(signal.SIGTERM)):
+                record_error("group")
             gone, alive = psutil.wait_procs(processes, timeout=3.0)
             if alive:
                 sigkill = int(getattr(signal, "SIGKILL", signal.SIGTERM))
                 signal_processes(alive, force=True)
-                errors += not _signal_group(self.pgid, sigkill)
+                if not _signal_group(self.pgid, sigkill):
+                    record_error("group")
                 gone_after, alive = psutil.wait_procs(alive, timeout=2.0)
                 gone.extend(gone_after)
         try:
@@ -190,9 +200,11 @@ class PosixOwnedProcess:
         except (subprocess.TimeoutExpired, OSError):
             pass
         if errors or alive:
+            classifications = ", ".join(f"{key}={count}" for key, count in sorted(errors.items())) or "none"
             raise ToolError(
                 "process_cleanup_incomplete",
-                f"Process-tree cleanup incomplete: {len(alive)} process(es) remain and {errors} cleanup error(s).",
+                f"Process-tree cleanup incomplete: {len(alive)} process(es) remain and {sum(errors.values())} cleanup error(s)"
+                f" ({classifications}).",
             )
         return {
             "targeted_pids": targeted,

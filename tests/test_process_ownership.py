@@ -70,11 +70,14 @@ def test_posix_termination_reaps_descendants_in_separate_sessions(
     assert not result["alive_pids"]
 
 
-@pytest.mark.parametrize("denied_phase", ["inspection", "kill", "terminate", "group"])
+@pytest.mark.parametrize("denied_phase", ["inspection", "kill", "terminate", "group", "unknown_class"])
 def test_posix_cleanup_attempts_remaining_targets_before_reporting_denial(
     monkeypatch: pytest.MonkeyPatch, denied_phase: str,
 ) -> None:
     events: list[str] = []
+
+    class CredentialCanaryError(OSError):
+        pass
 
     class Process:
         def __init__(self, pid: int) -> None:
@@ -85,6 +88,8 @@ def test_posix_cleanup_attempts_remaining_targets_before_reporting_denial(
             events.append(f"inspect:{self.pid}")
             if self is first and denied_phase == "inspection":
                 raise psutil.AccessDenied(pid=self.pid)
+            if self is first and denied_phase == "unknown_class":
+                raise CredentialCanaryError("credential-canary-error-body")
             return [child]
 
         def kill(self) -> None:
@@ -122,6 +127,15 @@ def test_posix_cleanup_attempts_remaining_targets_before_reporting_denial(
     with pytest.raises(ToolError) as failure:
         owned.terminate_tree(force=denied_phase != "terminate")
     assert failure.value.code == "process_cleanup_incomplete"
+    classification = {
+        "inspection": "inspection:AccessDenied=1",
+        "kill": "signal:AccessDenied=1",
+        "terminate": "signal:AccessDenied=1",
+        "group": "group:Unspecified=1",
+        "unknown_class": "inspection:OtherError=1",
+    }[denied_phase]
+    assert classification in failure.value.message
+    assert "CredentialCanary" not in failure.value.message and "credential-canary" not in failure.value.message
     assert "inspect:101" in events and "signal_group" in events
     assert any(event in events for event in ("kill:101", "terminate:101"))
     assert not first.alive and not second.alive
