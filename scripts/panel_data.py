@@ -502,6 +502,7 @@ def config_snapshot() -> dict[str, Any]:
         "artifact_max_age_hours",
         "artifact_max_count",
         "backup_max_bytes",
+        "backup_max_count",
         "backup_max_age_days",
         "job_history_max_age_days",
         "job_history_max_count",

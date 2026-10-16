@@ -80,6 +80,7 @@ class Settings:
     audit_max_file_bytes: int = _env_int("MCP_AUDIT_MAX_FILE_BYTES", 8 * 1_024 * 1_024, 65_536, 1_073_741_824)
     audit_keep_files: int = _env_int("MCP_AUDIT_KEEP_FILES", 5, 1, 100)
     backup_max_bytes: int = _env_int("MCP_BACKUP_MAX_BYTES", 256 * 1_024 * 1_024, 0, 100 * 1_024 * 1_024 * 1_024)
+    backup_max_count: int = _env_int("MCP_BACKUP_MAX_COUNT", 0, 0, 1_000_000)
     backup_max_age_days: int = _env_int("MCP_BACKUP_MAX_AGE_DAYS", 30, 0, 3_650)
     backup_cleanup_interval_sec: int = _env_int("MCP_BACKUP_CLEANUP_INTERVAL_SEC", 5, 1, 3_600)
     artifact_max_bytes: int = _env_int("MCP_ARTIFACT_MAX_BYTES", 512 * 1_024 * 1_024, 0, 100 * 1_024 * 1_024 * 1_024)
@@ -153,6 +154,7 @@ class Settings:
             "artifact_max_bytes": self.artifact_max_bytes,
             "artifact_max_age_hours": self.artifact_max_age_hours,
             "backup_max_bytes": self.backup_max_bytes,
+            "backup_max_count": self.backup_max_count,
             "backup_max_age_days": self.backup_max_age_days,
             "job_history_max_count": self.job_history_max_count,
             "job_history_max_bytes": self.job_history_max_bytes,

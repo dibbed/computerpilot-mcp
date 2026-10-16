@@ -3,13 +3,49 @@ from __future__ import annotations
 import os
 import subprocess
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from core import resource_health
+from core.config import Settings
 from core.jobs import JobStore
+
+
+@pytest.mark.parametrize("maximum, ratio, pressure", [(0, None, "normal"), (4, 1.0, "critical"), (5, 0.8, "warning")])
+def test_backup_count_budget_reuses_usage_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maximum: int, ratio: float | None, pressure: str,
+) -> None:
+    settings = replace(Settings(), state_dir=tmp_path, backup_max_count=maximum, backup_max_bytes=0)
+    settings.backup_dir.mkdir()
+    for index in range(4):
+        (settings.backup_dir / f"{index}.bak").write_bytes(b"")
+    (settings.backup_dir / "ignored.txt").write_bytes(b"ignored")
+    monkeypatch.setattr(resource_health, "SETTINGS", settings)
+    monkeypatch.setattr(resource_health.PYTHON_METADATA_CACHE, "stats", lambda: {"entries": 0, "bytes": 0})
+    monkeypatch.setattr(resource_health.SEARCH_SNAPSHOTS, "stats", lambda: {"count": 0, "bytes": 0})
+    monkeypatch.setattr(resource_health, "background_stats", lambda: {"running": 0, "tracked": 0})
+    scans = 0
+    iterdir = Path.iterdir
+
+    def counted_iterdir(path: Path) -> Iterator[Path]:
+        nonlocal scans
+        if path == settings.backup_dir:
+            scans += 1
+        return iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", counted_iterdir)
+
+    metrics = resource_health.collect_resource_metrics(
+        {"active_sessions": 0, "pending_sessions": 0, "active_pools": 0, "active_contexts": 0}
+    )
+
+    assert metrics["backup_count"] == 4
+    assert metrics["budgets"]["backup_count"] == {"value": 4, "max": maximum, "unit": "files", "usage_ratio": ratio}
+    assert metrics["resource_pressure"] == pressure
+    assert scans == 1
 
 
 def test_job_metrics_account_for_terminal_output_in_one_tree_walk(

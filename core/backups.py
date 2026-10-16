@@ -24,6 +24,7 @@ class BackupPolicy:
     max_age_sec: float
     cleanup_interval_sec: float
     recent_grace_sec: float = BACKUP_RECENT_GRACE_SEC
+    max_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,7 @@ class BackupCleanupResult:
     quota_satisfied: bool
     safety_floor_preserved: bool
     errors: int
+    removed_for_count: int = 0
 
     def to_dict(self) -> dict[str, int | bool]:
         return asdict(self)
@@ -56,6 +58,7 @@ def policy_from_settings(settings: Settings = SETTINGS) -> BackupPolicy:
         max_bytes=settings.backup_max_bytes,
         max_age_sec=float(settings.backup_max_age_days * 86_400),
         cleanup_interval_sec=float(settings.backup_cleanup_interval_sec),
+        max_count=settings.backup_max_count,
     )
 
 
@@ -108,7 +111,7 @@ def cleanup_backups(
     now: float | None = None,
     protected_paths: set[Path] | None = None,
 ) -> BackupCleanupResult:
-    """Apply age and byte quotas while preserving at least the newest backup."""
+    """Apply age/count/byte quotas while preserving at least the newest backup."""
 
     if not unlinked_directory_tree(directory, allow_missing=True):
         return BackupCleanupResult(0, 0, 0, 0, 0, 0, 0, 0, True, False, 1)
@@ -139,6 +142,7 @@ def cleanup_backups(
     removed_bytes = 0
     removed_for_age = 0
     removed_for_quota = 0
+    removed_for_count = 0
 
     cutoff = current - policy.max_age_sec if policy.max_age_sec > 0 else None
     for entry in entries:
@@ -158,11 +162,16 @@ def cleanup_backups(
         removed_for_age += 1
 
     remaining_bytes = sum(entry.size for entry in survivors)
-    if policy.max_bytes > 0 and remaining_bytes > policy.max_bytes:
+    remaining_files = len(survivors)
+    if (policy.max_bytes > 0 and remaining_bytes > policy.max_bytes) or (
+        policy.max_count > 0 and remaining_files > policy.max_count
+    ):
         kept: list[BackupEntry] = []
         for entry in survivors:
             resolved = entry.path.resolve(strict=False)
-            if remaining_bytes <= policy.max_bytes or resolved in protected:
+            over_bytes = policy.max_bytes > 0 and remaining_bytes > policy.max_bytes
+            over_count = policy.max_count > 0 and remaining_files > policy.max_count
+            if not (over_bytes or over_count) or resolved in protected:
                 kept.append(entry)
                 continue
             try:
@@ -172,23 +181,33 @@ def cleanup_backups(
                 kept.append(entry)
                 continue
             remaining_bytes -= entry.size
+            remaining_files -= 1
             removed_files += 1
             removed_bytes += entry.size
-            removed_for_quota += 1
+            if over_bytes:
+                removed_for_quota += 1
+            else:
+                removed_for_count += 1
         survivors = kept
 
-    # Concurrent cleanup may have removed files after our scan; recompute from
-    # files that still exist so reported storage never intentionally overstates.
+    # Exclude confirmed deletions, but retain scanned usage when a survivor
+    # cannot be inspected so an I/O failure cannot hide quota pressure.
     remaining_files = 0
     actual_remaining_bytes = 0
     for entry in survivors:
         try:
             file_info = entry.path.stat()
-        except OSError:
+        except FileNotFoundError:
             continue
+        except OSError:
+            errors += 1
+            actual_remaining_bytes += entry.size
+        else:
+            actual_remaining_bytes += file_info.st_size
         remaining_files += 1
-        actual_remaining_bytes += file_info.st_size
-    quota_satisfied = policy.max_bytes <= 0 or actual_remaining_bytes <= policy.max_bytes
+    quota_satisfied = (policy.max_bytes <= 0 or actual_remaining_bytes <= policy.max_bytes) and (
+        policy.max_count <= 0 or remaining_files <= policy.max_count
+    )
 
     return BackupCleanupResult(
         scanned_files=scanned_files,
@@ -202,6 +221,7 @@ def cleanup_backups(
         quota_satisfied=quota_satisfied,
         safety_floor_preserved=safety_floor_preserved,
         errors=errors,
+        removed_for_count=removed_for_count,
     )
 
 

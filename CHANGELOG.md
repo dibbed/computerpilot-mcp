@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Fixed
+- 2026-10-16: Add an opt-in backup file-count quota alongside age and byte retention, expose its budget in health and panel configuration, and preserve protected restore points and conservative usage counts when a survivor cannot be restatted.
 - 2026-10-16: Exclude generated worktree, Playwright CLI, and pytest temporary directories from recursive project discovery while preserving explicit-path inspection and raw inventories. Keep test selection conservative for existing changed Python files outside the scan, and clarify profile selection and canonical advisory intents without changing tool registration or routing policy.
 - 2026-10-16: Keep supervisor child-enumeration fault injection on the runtime owner thread and observe state without consuming the simulated failure in process diagnostics.
 - 2026-10-16: Isolate migration WAL tests' SQLite spies to their own database and exercise unrelated connections, preserving leak and startup-count checks across Python versions.
