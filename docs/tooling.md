@@ -164,6 +164,7 @@ request or input revision. Deduplication lasts only as long as the existing job 
 Do not edit tested inputs while their job runs. Changes before or during execution invalidate the result; unrelated input
 changes may conservatively do so too. Start/end hashes cannot detect a transient change that is reverted during a run.
 Use `cancel_job` to cancel the owned process tree. Disconnecting a client does not cancel a durable job.
+If ownership cleanup cannot be confirmed, the job reports failure with a bounded cleanup error instead of successful cancellation.
 
 For opt-in parallel checks, set `max_parallel_checks=2` or `3` and `fail_fast=false`, with `ruff_fix=false`.
 Syntax is a preflight; Ruff checks, mypy and pytest may then overlap, with deterministic result ordering and one total

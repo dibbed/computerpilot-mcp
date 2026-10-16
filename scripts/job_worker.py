@@ -16,6 +16,7 @@ import psutil
 
 from core.audit import audit_action
 from core.config import SETTINGS
+from core.errors import ToolError
 from core.executor import _creation_flags
 from core.jobs import JobStore
 from core.process_ownership import OwnedProcess, spawn_owned_process
@@ -144,22 +145,28 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 process.close_ownership()
             _update(db, job_id, status=status, exit_code=code)
         except BaseException as exc:
-            if process is not None and process.poll() is None:
-                audit_action(
-                    "job_terminate_process_tree",
-                    target=str(process.pid),
-                    details={"job_id": job_id, "reason": "worker_error"},
-                )
-                process.terminate_tree(force=True)
+            error = exc.message if isinstance(exc, ToolError) else type(exc).__name__
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        audit_action(
+                            "job_terminate_process_tree",
+                            target=str(process.pid),
+                            details={"job_id": job_id, "reason": "worker_error"},
+                        )
+                        process.terminate_tree(force=True)
+                except Exception as cleanup_error:
+                    error += f"; termination cleanup failed ({type(cleanup_error).__name__})"
+                try:
+                    process.close_ownership()
+                except Exception as cleanup_error:
+                    error += f"; ownership cleanup failed ({type(cleanup_error).__name__})"
             try:
-                _update(db, job_id, status="failed", error=str(exc))
+                _update(db, job_id, status="failed", error=error)
             except sqlite3.Error:
                 # Recovery path only: a broken worker connection must still make
                 # the terminal state visible if the database itself is reachable.
-                store.update(job_id, status="failed", error=str(exc))
-        finally:
-            if process is not None:
-                process.close_ownership()
+                store.update(job_id, status="failed", error=error)
     _kick_successor(store)
 
 

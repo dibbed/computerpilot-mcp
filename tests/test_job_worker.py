@@ -228,3 +228,47 @@ def test_worker_sees_external_cancel_on_persistent_connection(tmp_path: Path, mo
     row = external.raw(job_id)
     assert row["status"] == "cancelled"
     assert terminated == [5432]
+
+
+@pytest.mark.parametrize("failure_phase", ["terminate", "close"])
+def test_worker_records_failure_when_secondary_ownership_cleanup_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_phase: str,
+) -> None:
+    path = tmp_path / "jobs.sqlite3"
+    store = JobStore(path)
+    job_id = "2" * 32
+    _seed(store, job_id, tmp_path)
+    events: list[str] = []
+
+    class Process:
+        pid = 5432
+
+        def poll(self) -> int | None:
+            return None if failure_phase == "terminate" else 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            if failure_phase == "terminate":
+                store.update(job_id, cancel_requested=1)
+                raise subprocess.TimeoutExpired("fake", timeout or 0)
+            return 0
+
+        def terminate_tree(self, *, force: bool = True) -> dict[str, object]:
+            events.append("terminate")
+            raise PermissionError("credential-canary-terminate")
+
+        def close_ownership(self) -> None:
+            events.append("close")
+            raise RuntimeError("credential-canary-close")
+
+    monkeypatch.setattr(job_worker, "spawn_owned_process", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(job_worker.psutil, "Process", lambda *args: SimpleNamespace(create_time=lambda: 1.0))
+    monkeypatch.setattr(job_worker, "audit_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(job_worker, "_kick_successor", lambda *args: events.append("successor"))
+    job_worker.run(path, job_id)
+    row = store.raw(job_id)
+    assert row["status"] == "failed"
+    assert "credential-canary" not in row["error"]
+    assert "cleanup" in row["error"].casefold()
+    assert "close" in events and events[-1] == "successor"
+    if failure_phase == "terminate":
+        assert events.count("terminate") == 2

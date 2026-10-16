@@ -10,7 +10,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-15: Add `start_verification` in profiles containing testing and jobs. Native verification reuses durable job admission, cancellation and output, reports bounded stage events and stale inputs, and supports opt-in parallel read-only checks without changing foreground defaults.
 
 ### Fixed
-- 2026-10-16: Reap recursively owned descendants during POSIX process-group cleanup so cancelling a background verification also terminates pytest processes that started a separate session.
+- 2026-10-16: Reap recursively owned descendants during POSIX process-group cleanup so cancelling verification also terminates pytest in a separate session. Continue cleanup after individual denials, report incomplete cleanup explicitly, and persist failed jobs even when secondary cleanup fails.
 - 2026-10-16: Prevent background verification from reporting success without running full analyzers when syntax has no Python targets; bind explicitly requested excluded inputs to unambiguously framed snapshots and enforce snapshot deadlines during empty-directory traversal.
 - 2026-10-16: Add an opt-in backup file-count quota alongside age and byte retention, expose its budget in health and panel configuration, and preserve protected restore points and conservative usage counts when a survivor cannot be restatted.
 - 2026-10-16: Exclude generated worktree, Playwright CLI, and pytest temporary directories from recursive project discovery while preserving explicit-path inspection and raw inventories. Keep test selection conservative for existing changed Python files outside the scan, and clarify profile selection and canonical advisory intents without changing tool registration or routing policy.

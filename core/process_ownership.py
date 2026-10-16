@@ -18,6 +18,7 @@ from typing import IO, Any, Protocol
 import psutil
 
 from core import windows_job
+from core.errors import ToolError
 from core.windows_job import NativeOwnershipRequiredError
 
 
@@ -109,6 +110,7 @@ class PosixOwnedProcess:
         self.pgid = pgid
         self.ownership_backend = backend
         self._closed = False
+        self._close_failed = False
         self._lock = threading.Lock()
 
     @property
@@ -145,6 +147,7 @@ class PosixOwnedProcess:
 
     def _terminate_group(self, *, force: bool) -> dict[str, Any]:
         members = _group_processes(self.pgid)
+        errors = 0
         by_pid = {process.pid: process for process in members}
         # Nested owned commands start new sessions; capture them before killing their parents.
         for process in members:
@@ -152,35 +155,45 @@ class PosixOwnedProcess:
                 by_pid.update((child.pid, child) for child in process.children(recursive=True))
             except psutil.NoSuchProcess:
                 pass
+            except (psutil.Error, OSError):
+                errors += 1
         processes = list(by_pid.values())
         targeted = sorted({process.pid for process in processes} | {self.pid})
 
         def signal_processes(targets: list[psutil.Process], *, force: bool) -> None:
+            nonlocal errors
             for process in reversed(targets):
                 try:
                     process.kill() if force else process.terminate()
                 except psutil.NoSuchProcess:
                     pass
+                except (psutil.Error, OSError):
+                    errors += 1
 
         if force:
             sigkill = int(getattr(signal, "SIGKILL", signal.SIGTERM))
             signal_processes(processes, force=True)
-            _signal_group(self.pgid, sigkill)
+            errors += not _signal_group(self.pgid, sigkill)
             gone, alive = psutil.wait_procs(processes, timeout=3.0)
         else:
             signal_processes(processes, force=False)
-            _signal_group(self.pgid, int(signal.SIGTERM))
+            errors += not _signal_group(self.pgid, int(signal.SIGTERM))
             gone, alive = psutil.wait_procs(processes, timeout=3.0)
             if alive:
                 sigkill = int(getattr(signal, "SIGKILL", signal.SIGTERM))
                 signal_processes(alive, force=True)
-                _signal_group(self.pgid, sigkill)
+                errors += not _signal_group(self.pgid, sigkill)
                 gone_after, alive = psutil.wait_procs(alive, timeout=2.0)
                 gone.extend(gone_after)
         try:
             self.process.wait(timeout=0.1)
         except (subprocess.TimeoutExpired, OSError):
             pass
+        if errors or alive:
+            raise ToolError(
+                "process_cleanup_incomplete",
+                f"Process-tree cleanup incomplete: {len(alive)} process(es) remain and {errors} cleanup error(s).",
+            )
         return {
             "targeted_pids": targeted,
             "terminated_pids": sorted({process.pid for process in gone}),
@@ -194,11 +207,16 @@ class PosixOwnedProcess:
     def close_ownership(self) -> None:
         with self._lock:
             if self._closed:
+                if self._close_failed:
+                    raise ToolError("process_cleanup_incomplete", "Process-tree ownership cleanup remains incomplete.")
                 return
             self._closed = True
-        # Mirrors JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: descendants may outlive the
-        # root, so releasing ownership must reap the dedicated process group.
-        self._terminate_group(force=False)
+            # Failed close stays failed; never resignal a potentially reused process group.
+            try:
+                self._terminate_group(force=False)
+            except BaseException:
+                self._close_failed = True
+                raise
 
 
 class PsutilOwnedProcess:

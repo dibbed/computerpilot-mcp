@@ -10,6 +10,7 @@ import psutil
 import pytest
 
 from core import process_ownership, windows_job
+from core.errors import ToolError
 from core.process_ownership import NativeOwnershipRequiredError, spawn_owned_process
 
 
@@ -67,6 +68,93 @@ def test_posix_termination_reaps_descendants_in_separate_sessions(
     assert set(result["targeted_pids"]) == {parent.pid, member.pid, child.pid, grandchild.pid}
     assert set(result["terminated_pids"]) == {member.pid, child.pid, grandchild.pid}
     assert not result["alive_pids"]
+
+
+@pytest.mark.parametrize("denied_phase", ["inspection", "kill", "terminate", "group"])
+def test_posix_cleanup_attempts_remaining_targets_before_reporting_denial(
+    monkeypatch: pytest.MonkeyPatch, denied_phase: str,
+) -> None:
+    events: list[str] = []
+
+    class Process:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.alive = True
+
+        def children(self, *, recursive: bool) -> list[Process]:
+            events.append(f"inspect:{self.pid}")
+            if self is first and denied_phase == "inspection":
+                raise psutil.AccessDenied(pid=self.pid)
+            return [child]
+
+        def kill(self) -> None:
+            events.append(f"kill:{self.pid}")
+            if self is child and denied_phase == "kill":
+                raise psutil.AccessDenied(pid=self.pid)
+            self.alive = False
+
+        def terminate(self) -> None:
+            events.append(f"terminate:{self.pid}")
+            if self is child and denied_phase == "terminate":
+                raise psutil.AccessDenied(pid=self.pid)
+            self.alive = False
+
+    first, second, child = Process(100), Process(101), Process(200)
+    monkeypatch.setattr(process_ownership, "_group_processes", lambda pgid: [first, second])
+
+    def signal_group(pgid: int, sig: int) -> bool:
+        events.append("signal_group")
+        first.alive = second.alive = False
+        return denied_phase != "group"
+
+    def wait_procs(processes: list[Process], *, timeout: float) -> tuple[list[Process], list[Process]]:
+        return [process for process in processes if not process.alive], [process for process in processes if process.alive]
+
+    class Popen:
+        pid = first.pid
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    monkeypatch.setattr(process_ownership, "_signal_group", signal_group)
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
+    owned = process_ownership.PosixOwnedProcess(cast(subprocess.Popen[bytes], Popen()), first.pid)
+    with pytest.raises(ToolError) as failure:
+        owned.terminate_tree(force=denied_phase != "terminate")
+    assert failure.value.code == "process_cleanup_incomplete"
+    assert "inspect:101" in events and "signal_group" in events
+    assert any(event in events for event in ("kill:101", "terminate:101"))
+    assert not first.alive and not second.alive
+
+
+@pytest.mark.parametrize("failure", ["none", "error", "interrupt"])
+def test_posix_close_preserves_failed_cleanup_without_repeating_signals(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    owned = process_ownership.PosixOwnedProcess(cast(subprocess.Popen[bytes], object()), 100)
+    attempts = 0
+
+    def cleanup(*, force: bool) -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        if failure == "interrupt":
+            raise KeyboardInterrupt
+        if failure == "error":
+            raise ToolError("process_cleanup_incomplete", "Process cleanup incomplete.")
+        return {}
+
+    monkeypatch.setattr(owned, "_terminate_group", cleanup)
+    for attempt in range(2):
+        if failure == "interrupt" and attempt == 0:
+            with pytest.raises(KeyboardInterrupt):
+                owned.close_ownership()
+        elif failure != "none":
+            with pytest.raises(ToolError) as error:
+                owned.close_ownership()
+            assert error.value.code == "process_cleanup_incomplete"
+        else:
+            owned.close_ownership()
+    assert attempts == 1
 
 
 def test_require_native_parameter_defaults_to_false() -> None:
