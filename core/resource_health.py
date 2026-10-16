@@ -189,6 +189,7 @@ def collect_resource_metrics(browser: dict[str, int | float]) -> dict[str, Any]:
         "artifacts": _budget(artifact_count, SETTINGS.artifact_max_count, unit="files"),
         "artifact_bytes": _budget(artifact_bytes, SETTINGS.artifact_max_bytes, unit="bytes"),
         "backup_bytes": _budget(backup_bytes, SETTINGS.backup_max_bytes, unit="bytes"),
+        "backup_count": _budget(backup_count, SETTINGS.backup_max_count, unit="files"),
         "job_history": _budget(jobs["terminal_jobs"], SETTINGS.job_history_max_count, unit="jobs"),
         "job_history_bytes": _budget(jobs["job_history_output_bytes"], SETTINGS.job_history_max_bytes, unit="bytes"),
         "audit_bytes": _budget(audit_bytes, audit_max_bytes, unit="bytes"),

@@ -32,6 +32,7 @@ class RuntimeLifecycle:
         self._status_path: Path | None = None
         self._pid = os.getpid()
         self._managed = False
+        self._status_dirty = False
 
     def configure(self, control_path: Path | None, status_path: Path | None) -> None:
         """Reset lifecycle state for one freshly launched MCP runtime."""
@@ -74,13 +75,16 @@ class RuntimeLifecycle:
     def _publish_locked(self) -> None:
         path = self._status_path
         if path is None:
+            self._status_dirty = False
             return
         payload = json.dumps(self._snapshot_locked(), separators=(",", ":"), sort_keys=True)
         temporary = path.with_name(f".{path.name}.{self._pid}.tmp")
         try:
             temporary.write_text(payload, encoding="utf-8")
             os.replace(temporary, path)
+            self._status_dirty = False
         except OSError:
+            self._status_dirty = True
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
@@ -102,6 +106,10 @@ class RuntimeLifecycle:
 
     def poll_control(self) -> LifecycleState:
         """Apply the latest private control request and publish an acknowledgement."""
+        with self._lock:
+            # Retry transient Windows sharing failures even without a valid control request.
+            if self._status_dirty:
+                self._publish_locked()
         request = self._read_control()
         if request is None:
             with self._lock:

@@ -38,6 +38,122 @@ def test_mutation_target_includes_workflow_and_operation_identity() -> None:
     assert target == "workflow_id=workflow-123;operation_id=operation-456"
 
 
+def test_uia_checkpoint_preserves_file_evidence_across_restart_and_compaction(tmp_path: Path) -> None:
+    from core.recovery_models import NativeUIATarget
+
+    path = tmp_path / "native.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "before")
+    handle = journal.begin("ui_set_value")
+    assert handle is not None
+    target = NativeUIATarget(pid=123, process_created=123.0, window_handle=10, element_runtime_id=(42, 9))
+    postcondition = {"kind": "file_sha256", "expected": {"path": str(tmp_path / "target"), "sha256": "a" * 64}}
+    journal.checkpoint_postcondition(handle, postcondition)
+    journal.checkpoint_native_uia(handle, target, stage="prepared")
+    journal.checkpoint_native_uia(handle, target, stage="may_dispatch")
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+    recovered.compact()
+    operation = recovered.inspect(handle.operation_id)
+    assert operation["state"] == "uncertain"
+    assert operation["postcondition"] == postcondition
+    assert operation["native"]["target"]["element_runtime_id"] == [42, 9]
+    assert operation["target"] is not None
+    assert recovered.summary()["uncertain_count"] == 1
+
+
+@pytest.mark.parametrize("dispatched", [False, True])
+def test_native_exception_does_not_claim_rollback_after_dispatch(tmp_path: Path, dispatched: bool) -> None:
+    from core.recovery_models import NativeUIATarget
+
+    journal = OperationRecoveryJournal()
+    journal.configure(tmp_path / "native.jsonl", "runtime")
+    handle = journal.begin("ui_set_value")
+    assert handle is not None
+    journal.checkpoint_native_uia(handle, NativeUIATarget(window_handle=10), stage="prepared")
+    if dispatched:
+        journal.checkpoint_native_uia(handle, NativeUIATarget(window_handle=10), stage="may_dispatch")
+    journal.finish(handle, known_result="raised")
+    assert journal.inspect(handle.operation_id)["state"] == ("uncertain" if dispatched else "failed")
+
+
+def test_uia_identity_is_bounded_and_checkpoint_cannot_change_target_or_runtime(tmp_path: Path) -> None:
+    from core.recovery_models import NativeUIATarget
+
+    for values in ({"pid": True}, {"element_runtime_id": (1,) * 33}, {"process_created": float("nan")}):
+        with pytest.raises(ValueError):
+            NativeUIATarget(**values)
+    journal = OperationRecoveryJournal()
+    path = tmp_path / "native.jsonl"
+    journal.configure(path, "before")
+    handle = journal.begin("ui_set_value")
+    assert handle is not None
+    target = NativeUIATarget(window_handle=10)
+    journal.checkpoint_native_uia(handle, target, stage="prepared")
+    with pytest.raises(ToolError, match="identity or stage changed"):
+        journal.checkpoint_native_uia(handle, NativeUIATarget(window_handle=20), stage="may_dispatch")
+    journal.checkpoint_native_uia(handle, target, stage="may_dispatch")
+    with pytest.raises(ToolError):
+        journal.checkpoint_native_uia(handle, target, stage="prepared")
+    journal.configure(path, "after")
+    with pytest.raises(ToolError):
+        journal.checkpoint_native_uia(handle, target, stage="may_dispatch")
+
+
+def test_uia_view_does_not_trust_unvalidated_persisted_target_label(tmp_path: Path) -> None:
+    from core.recovery_models import NativeUIATarget
+
+    path = tmp_path / "native.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "before")
+    handle = journal.begin("ui_set_value")
+    assert handle is not None
+    journal.checkpoint_native_uia(handle, NativeUIATarget(window_handle=10), stage="prepared")
+    records = _records(path)
+    records[-1]["target"] = "private-forged-label-canary"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+    assert "private-forged-label-canary" not in json.dumps(recovered.inspect(handle.operation_id))
+    assert "private-forged-label-canary" not in json.dumps(recovered.summary())
+
+
+@pytest.mark.parametrize("crash_at", ["prepared", "after_effect"])
+def test_native_uia_real_process_crash_preserves_evidence_without_replay(tmp_path: Path, crash_at: str) -> None:
+    path, effect = tmp_path / "native.jsonl", tmp_path / "effect.txt"
+    script = """
+import os,sys
+from pathlib import Path
+from core import recovery
+from core.recovery_models import NativeUIATarget
+path,effect,crash_at=sys.argv[1:]
+recovery.OPERATION_RECOVERY.configure(Path(path),'child')
+append=recovery.OPERATION_RECOVERY._append_unlocked_file
+def record(payload):
+    append(payload)
+    if crash_at=='prepared' and payload.get('native',{}).get('dispatch_stage')=='prepared':
+        os._exit(23)
+recovery.OPERATION_RECOVERY._append_unlocked_file=record
+with recovery.native_uia_mutation('ui_set_value',NativeUIATarget(window_handle=10,element_runtime_id=(42,9))):
+    with open(effect,'a',encoding='utf-8') as marker:
+        marker.write('1')
+        marker.flush()
+        os.fsync(marker.fileno())
+    os._exit(23)
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(path), str(effect), crash_at], timeout=15)
+    assert result.returncode == 23
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "parent")
+    recovered.compact()
+    operation = recovered.list_operations()["items"][0]
+    assert operation["state"] == "uncertain"
+    assert operation["native"]["dispatch_stage"] == ("prepared" if crash_at == "prepared" else "may_dispatch")
+    recovered.configure(path, "another-restart")
+    assert recovered.summary()["uncertain_count"] == 1
+    assert (effect.read_text(encoding="utf-8") if effect.exists() else "") == ("1" if crash_at == "after_effect" else "")
+
+
 def test_previous_runtime_pending_operation_becomes_uncertain(tmp_path: Path) -> None:
     path = tmp_path / "operations.jsonl"
     journal = OperationRecoveryJournal()

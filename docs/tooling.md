@@ -35,6 +35,14 @@ Supported initial structured intents are:
 
 `filesystem.read`, `filesystem.write`, `code.rename`, `git.read`, `git.write`, `process.run`, `system.inspect`, `document.excel.read`, `document.excel.write`, `document.docx.read`, `document.docx.write`, `document.pdf.read`, `document.pdf.create`, `browser.interact`, `desktop.semantic.interact`, and `desktop.raw.interact`.
 
+The planning client maps a request such as "write cells in Excel" to a canonical intent before calling `execution_recommend`:
+
+```json
+{"intent":"document.excel.write","allow_raw_desktop":false}
+```
+
+When available in the active profile, this recommends `native.excel` and `excel_write_range`; the client then calls that typed tool with its validated arguments. The recommendation performs no write and grants no execution permission. Free-form requests are not canonical intents: an unsupported intent returns `unknown_execution_intent` with the existing supported-name hint. Profile choice is described in the [profile guide](../README.md#tool-profiles).
+
 The initial route classes are `native.filesystem`, `native.code`, `native.git`, `native.process`, `native.system`, `native.excel`, `native.docx`, `native.pdf`, `semantic.browser`, `semantic.windows_uia`, reserved `visual.desktop`, and `raw.desktop`.
 
 `deterministic-v1` is rule/metadata based; it does not use an opaque model score. Exact structured routes are preferred over semantic UI routes and raw coordinates when all are valid. Unsupported profile/platform routes are removed before ranking.
@@ -45,9 +53,9 @@ Hard safety rules include:
 - stale semantic references cannot fall back to coordinates;
 - destructive ambiguous semantic targets fail closed;
 - macro-preservation requirements exclude routes that cannot prove fidelity;
-- `visual.desktop` is unavailable in v0.7.
+- `visual.desktop` is unavailable in v0.8.
 
-There is intentionally no `execution_run` tool in v0.7. The selected route still resolves to existing typed tools and their existing validation, lifecycle, audit, recovery, and permission behavior.
+There is intentionally no `execution_run` tool in v0.8. The selected route still resolves to existing typed tools and their existing validation, lifecycle, audit, recovery, and permission behavior.
 
 ## Filesystem and editing
 
@@ -72,6 +80,8 @@ Project tools provide:
 - dependency graphs;
 - consolidated `code_context`;
 - version-aware cached Python metadata.
+
+Recursive project discovery skips generated child directories `.worktrees`, `.playwright-cli`, `.pytest-tmp`, and `.pytest-tmp-*`, alongside the established exclusions. Explicitly targeting an excluded directory or file still allows inspection. `project_summary.files_scanned` describes the filtered scan; `top_level` remains a bounded raw inventory and may include excluded names. Raw filesystem listing retains its own behavior. An explicitly changed Python file that exists outside the scanned index makes `affected_tests` report `changed_python_outside_scan`, `complete=false`, and a full-suite fallback; it is not silently dropped.
 
 Language tools add LSP-based:
 
@@ -147,7 +157,7 @@ Output uses schema version 1 events: `started`, `stage_started`, `stage_finished
 interpreter; analyzers select the target project's interpreter. Test caches and temporary directories are isolated per run.
 
 Input snapshots hash a conservative tree excluding standard dependency/runtime/cache directories, bounded to 10,000 files,
-64 MiB and 10 seconds per snapshot. Inaccessible inputs, symlinks, changing files and exhausted bounds fail closed.
+64 MiB and 10 seconds per snapshot. Explicit changed files are included even inside an excluded directory; missing explicit paths are also bound so creating them invalidates the snapshot. The same limits apply to these inputs. Inaccessible inputs, symlinks, changing files and exhausted bounds fail closed.
 Requests are limited to 64 KiB and the native Windows command-line limit. Use a new idempotency key after changing the
 request or input revision. Deduplication lasts only as long as the existing job record is retained.
 
@@ -157,7 +167,7 @@ Use `cancel_job` to cancel the owned process tree. Disconnecting a client does n
 
 For opt-in parallel checks, set `max_parallel_checks=2` or `3` and `fail_fast=false`, with `ruff_fix=false`.
 Syntax is a preflight; Ruff checks, mypy and pytest may then overlap, with deterministic result ordering and one total
-deadline. Fix mode and fail-fast are serial only. Four active jobs with three checks each can run up to twelve analyzers;
+deadline. Background verification rejects `ruff_fix=true`; fix source with the foreground tool first, then submit verification. Fail-fast remains serial only. A syntax stage skipped because there are no Python targets does not suppress full-suite analyzers. Four active jobs with three checks each can run up to twelve analyzers;
 the job limit is not a limit on all descendant processes or threads.
 
 ## Terminal and processes

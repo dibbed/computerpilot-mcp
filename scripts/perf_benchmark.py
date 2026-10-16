@@ -326,6 +326,9 @@ class _BenchmarkUIABackend:
     def properties(self, element: Any) -> dict[str, Any]:
         return {"name": element.name, "control_type": "WindowControl" if element is self.root else "TextControl", "pid": 1, "handle": 1}
 
+    def runtime_id(self, element: Any) -> list[int]:
+        return [42, 0 if element is self.root else self.root.children.index(element) + 1]
+
     def invoke(self, element: Any) -> None:
         del element
 

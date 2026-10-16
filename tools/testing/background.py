@@ -75,18 +75,57 @@ def _is_symlink_or_junction(path: Path) -> bool:
         return False
 
 
-def source_fingerprint(repo: Path) -> str:
-    """Hash a conservative bounded input tree; never persist file contents."""
+def source_fingerprint(repo: Path, *, changed_paths: list[str] | None = None) -> str:
+    """Hash a bounded tree plus explicit files, including recursively excluded paths."""
     root = repo.resolve(strict=True)
     if not root.is_dir():
         raise ValueError("Verification repository must be a directory")
     digest = hashlib.sha256()
     count = total = 0
     deadline = time.monotonic() + 10
+    seen: set[Path] = set()
+
     def walk_error(error: OSError) -> None:
         raise error
 
+    def check_budget() -> None:
+        if count > MAX_INPUT_FILES or total > MAX_INPUT_BYTES or time.monotonic() > deadline:
+            raise ValueError("Verification input snapshot exceeds its count, byte or time budget")
+
+    def hash_file(path: Path) -> None:
+        nonlocal count, total
+        check_budget()
+        if _is_symlink_or_junction(path) or not path.resolve().is_relative_to(root):
+            raise ValueError("Verification inputs must remain inside the repository")
+        path = path.resolve()
+        if path in seen:
+            return
+        seen.add(path)
+        try:
+            before = path.stat()
+        except OSError as exc:
+            raise ValueError("Verification input changed during snapshot") from exc
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("Verification inputs must be regular files")
+        count += 1
+        total += before.st_size
+        check_budget()
+        content = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(64 * 1024):
+                content.update(chunk)
+                if stream.tell() > before.st_size or time.monotonic() > deadline:
+                    raise ValueError("Verification input changed or exceeded its time budget")
+        try:
+            after = path.stat()
+        except OSError as exc:
+            raise ValueError("Verification input changed during snapshot") from exc
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise ValueError("Verification input changed during snapshot")
+        digest.update(b"F" + path.relative_to(root).as_posix().encode("utf-8") + b"\0" + content.digest())
+
     for directory, dirs, names in os.walk(root, onerror=walk_error):
+        check_budget()
         dirs[:] = sorted(
             name for name in dirs
             if name not in EXCLUDED_DIRS and not name.startswith((".pytest-tmp", ".codebase-memory"))
@@ -96,32 +135,21 @@ def source_fingerprint(repo: Path) -> str:
         for name in sorted(names):
             if name == ".git" or name.endswith((".pyc", ".pyo")) or name.startswith(".coverage"):
                 continue
-            path = Path(directory) / name
-            if _is_symlink_or_junction(path) or not path.resolve().is_relative_to(root):
-                raise ValueError("Verification inputs must remain inside the repository")
-            try:
-                before = path.stat()
-            except OSError as exc:
-                raise ValueError("Verification input changed during snapshot") from exc
-            if not stat.S_ISREG(before.st_mode):
-                raise ValueError("Verification inputs must be regular files")
-            count += 1
-            total += before.st_size
-            if count > MAX_INPUT_FILES or total > MAX_INPUT_BYTES or time.monotonic() > deadline:
-                raise ValueError("Verification input snapshot exceeds its count, byte or time budget")
-            digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
-            with path.open("rb") as stream:
-                while chunk := stream.read(64 * 1024):
-                    digest.update(chunk)
-                    if stream.tell() > before.st_size or time.monotonic() > deadline:
-                        raise ValueError("Verification input changed or exceeded its time budget")
-            try:
-                after = path.stat()
-            except OSError as exc:
-                raise ValueError("Verification input changed during snapshot") from exc
-            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                raise ValueError("Verification input changed during snapshot")
-            digest.update(b"\0")
+            hash_file(Path(directory) / name)
+    for relative in sorted(set(changed_paths or [])):
+        check_budget()
+        path = root / relative
+        if Path(relative).is_absolute() or not path.resolve().is_relative_to(root):
+            raise ValueError("Changed paths must stay inside the repository")
+        if any(_is_symlink_or_junction(parent) for parent in (path, *path.parents) if parent != root and parent.is_relative_to(root)):
+            raise ValueError("Verification inputs cannot contain directory symlinks")
+        try:
+            path.stat()
+        except FileNotFoundError:
+            digest.update(b"M" + path.resolve().relative_to(root).as_posix().encode("utf-8") + b"\0")
+        else:
+            hash_file(path)
+    check_budget()
     return digest.hexdigest()
 
 
@@ -141,7 +169,7 @@ def submit_verification(
     updated_data.update({
         "repo": str(root),
         "changed_paths": sorted(set(plan["changed_paths"])),
-        "source_fingerprint": source_fingerprint(root),
+        "source_fingerprint": source_fingerprint(root, changed_paths=plan["changed_paths"]),
     })
     request = VerificationRequest.model_validate(updated_data)
     payload = request.model_dump_json()

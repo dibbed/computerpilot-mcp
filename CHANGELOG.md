@@ -10,6 +10,13 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-15: Add `start_verification` in profiles containing testing and jobs. Native verification reuses durable job admission, cancellation and output, reports bounded stage events and stale inputs, and supports opt-in parallel read-only checks without changing foreground defaults.
 
 ### Fixed
+- 2026-10-16: Prevent background verification from reporting success without running full analyzers when syntax has no Python targets; bind explicitly requested excluded inputs to unambiguously framed snapshots and enforce snapshot deadlines during empty-directory traversal.
+- 2026-10-16: Add an opt-in backup file-count quota alongside age and byte retention, expose its budget in health and panel configuration, and preserve protected restore points and conservative usage counts when a survivor cannot be restatted.
+- 2026-10-16: Exclude generated worktree, Playwright CLI, and pytest temporary directories from recursive project discovery while preserving explicit-path inspection and raw inventories. Keep test selection conservative for existing changed Python files outside the scan, and clarify profile selection and canonical advisory intents without changing tool registration or routing policy.
+- 2026-10-16: Keep supervisor child-enumeration fault injection on the runtime owner thread and observe state without consuming the simulated failure in process diagnostics.
+- 2026-10-16: Isolate migration WAL tests' SQLite spies to their own database and exercise unrelated connections, preserving leak and startup-count checks across Python versions.
+- 2026-10-16: Retry a failed lifecycle status publication on the existing managed-runtime watcher even before a control request, keeping active mutation counts observable after transient Windows sharing violations without idle status writes.
+- 2026-10-15: Guard direct semantic UIA mutations, checkpoint private-safe numeric target identity before dispatch, and preserve uncertain outcomes after possible effects without replay. Keep legacy/file/external recovery compatible and omit locator contents from mutation audit records.
 - 2026-10-15: Extract affected-test paths from the structured selector records before invoking pytest in change-aware verification.
 - 2026-10-15: Require every `WorkflowExecutor` caller to pass an advisory route planner or explicitly declare `NATIVE_ONLY_ROUTING`; reject omission and `None` at construction. Native-only callers still reject routed steps before dispatch, and external MCP workflow actions remain unsupported.
 - 2026-10-15: Synchronize the real-process lifecycle drain test with a release marker and cover a slow observer, preserving active-mutation assertions on loaded runners.

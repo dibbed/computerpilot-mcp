@@ -100,6 +100,28 @@ def test_syntax_skipped_when_no_python_targets(tmp_path: Path) -> None:
         assert stage["reason"] == "no_python_targets"
 
 
+def test_parallel_full_checks_run_when_syntax_has_no_targets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "README.md").write_text("# Doc\n", encoding="utf-8")
+    dispatched: dict[str, list[str]] = {}
+
+    def runner(name: str) -> Any:
+        def run(*args: object, targets: list[str], **kwargs: object) -> dict[str, Any]:
+            dispatched[name] = targets
+            return {"ok": True, "exit_code": 0, "summary": "passed"}
+        return run
+
+    for name in ("ruff", "mypy", "pytest"):
+        monkeypatch.setattr(verification, f"run_{name}_summary", runner(name))
+    result = verification.verify_changed_repository(
+        tmp_path, changed_paths=["README.md"], affected_only=False, max_parallel_checks=2, fail_fast=False,
+    )
+    assert result["ok"] and result["mode"] == "full"
+    assert dispatched == {"ruff": ["."], "mypy": ["."], "pytest": []}
+    assert result["stages"][0]["status"] == "skipped"
+    assert result["stages"][0]["reason"] == "no_python_targets"
+    assert all(stage["status"] == "passed" for stage in result["stages"][1:])
+
+
 def test_parallel_catches_unhandled_exception(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
     def boom(*args: object, **kwargs: object) -> dict[str, Any]:

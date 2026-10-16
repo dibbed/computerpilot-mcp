@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+from scripts import panel_data
 from scripts.panel_data import (
     doctor_snapshot,
     redact_diagnostics,
     storage_breakdown,
     summarize_transport_history,
 )
+
+
+def test_config_snapshot_exposes_backup_count_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(panel_data, "SETTINGS", replace(panel_data.SETTINGS, backup_max_count=123))
+
+    assert panel_data.config_snapshot()["backup_max_count"] == 123
 
 
 def test_storage_breakdown_groups_operational_state(tmp_path: Path) -> None:

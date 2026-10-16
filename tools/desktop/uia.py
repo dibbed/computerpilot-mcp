@@ -8,13 +8,18 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import psutil
+
 from core.errors import ToolError
+from core.recovery import native_uia_mutation
+from core.recovery_models import NativeUIATarget
 
 
 class UIABackend(Protocol):
     def windows(self) -> list[Any]: ...
     def children(self, element: Any) -> list[Any]: ...
     def properties(self, element: Any) -> dict[str, Any]: ...
+    def runtime_id(self, element: Any) -> list[int]: ...
     def invoke(self, element: Any) -> None: ...
     def set_value(self, element: Any, value: str) -> None: ...
     def select(self, element: Any) -> None: ...
@@ -78,6 +83,12 @@ class NativeUIABackend:
             element.GetInvokePattern().Invoke()
         except Exception as exc:
             raise ToolError("uia_pattern_unsupported", "Element does not support the Invoke pattern.") from exc
+
+    def runtime_id(self, element: Any) -> list[int]:
+        try:
+            return list(element.GetRuntimeId())
+        except Exception as exc:
+            raise ToolError("uia_identity_unavailable", "Could not read the UIA element identity.") from exc
 
     def set_value(self, element: Any, value: str) -> None:
         try:
@@ -160,6 +171,7 @@ class UIAutomationService:
         max_nodes: int = 5_000,
     ) -> list[tuple[Any, dict[str, Any]]]:
         root = self._resolve_window(window)
+        window_values = self.backend.properties(root)
         queue: deque[tuple[Any, int]] = deque([(root, 0)])
         matches: list[tuple[Any, dict[str, Any]]] = []
         visited = 0
@@ -168,9 +180,11 @@ class UIAutomationService:
             visited += 1
             if visited > max_nodes:
                 raise ToolError("uia_traversal_limit", f"UI traversal exceeded {max_nodes} nodes.")
-            values = self.backend.properties(element)
+            values = window_values if depth == 0 else self.backend.properties(element)
             if depth > 0 and self._matches(values, locator):
-                matches.append((element, values))
+                matches.append((element, {
+                    **values, "_window_pid": window_values.get("pid"), "_window_handle": window_values.get("handle"),
+                }))
             if depth < max_depth:
                 queue.extend((child, depth + 1) for child in self.backend.children(element))
         return matches
@@ -210,18 +224,39 @@ class UIAutomationService:
 
     def invoke(self, window: WindowLocator, locator: ElementLocator) -> dict[str, Any]:
         element, values = self._resolve_element(window, locator)
-        self.backend.invoke(element)
+        with native_uia_mutation("ui_invoke", self._recovery_target(element, values)):
+            self.backend.invoke(element)
         return {"ok": True, "element": self._snapshot(values), "action": "invoke"}
 
     def set_value(self, window: WindowLocator, locator: ElementLocator, value: str) -> dict[str, Any]:
         element, values = self._resolve_element(window, locator)
-        self.backend.set_value(element, value)
+        with native_uia_mutation("ui_set_value", self._recovery_target(element, values)):
+            self.backend.set_value(element, value)
         return {"ok": True, "element": self._snapshot(values), "action": "set_value", "value_chars": len(value)}
 
     def select(self, window: WindowLocator, locator: ElementLocator) -> dict[str, Any]:
         element, values = self._resolve_element(window, locator)
-        self.backend.select(element)
+        with native_uia_mutation("ui_select", self._recovery_target(element, values)):
+            self.backend.select(element)
         return {"ok": True, "element": self._snapshot(values), "action": "select"}
+
+    def _recovery_target(self, element: Any, values: dict[str, Any]) -> NativeUIATarget:
+        pid = values.get("_window_pid") or None
+        created = None
+        if type(pid) is int and pid > 0:
+            try:
+                created = psutil.Process(pid).create_time()
+            except psutil.Error:
+                pass
+        try:
+            return NativeUIATarget(
+                pid=pid, process_created=created,
+                window_handle=values.get("_window_handle") or None,
+                element_handle=values.get("handle") or None,
+                element_runtime_id=tuple(self.backend.runtime_id(element)),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ToolError("invalid_native_recovery_metadata", "UIA target identity is unavailable or invalid.") from exc
 
     def wait_for_element(
         self,

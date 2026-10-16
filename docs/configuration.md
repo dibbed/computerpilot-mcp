@@ -101,6 +101,19 @@ The runtime also exposes age/count/byte policies for:
 
 Set a retention dimension to `0` only where the configuration explicitly documents `0` as disabling that dimension.
 
+### Recoverable backups
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `MCP_BACKUP_MAX_BYTES` | aggregate backup byte limit; `0` disables it | `256 MiB` |
+| `MCP_BACKUP_MAX_COUNT` | backup file count limit, including empty files; `0` disables it | `0` (disabled) |
+| `MCP_BACKUP_MAX_AGE_DAYS` | backup age limit; `0` disables it | `30` days |
+| `MCP_BACKUP_CLEANUP_INTERVAL_SEC` | minimum interval between coalesced background cleanup scans | `5` seconds |
+
+Cleanup removes eligible expired backups first, then the oldest eligible backups until both enabled byte and count limits are met. A removal under byte pressure increments `removed_for_quota`; a count-only removal increments `removed_for_count`, so the reason counters do not overlap. The newest restore point, explicitly protected paths, and backups within the 60-second recent-write grace period remain protected even when limits are exceeded. In that case cleanup reports `quota_satisfied=false` if either enabled limit remains exceeded.
+
+The count setting accepts `0` through `1000000` (out-of-range integers are clamped; invalid values use `0`) and takes effect at runtime restart. It adds no scheduler or index: cleanup retains the existing flat directory scan and sort, so a configured count limit does not bound scan acquisition time. Health and panel snapshots expose the configured count limit; health uses its existing backup count observation without a second scan. No count-based retention runs by default.
+
 ## Output delivery
 
 Compatible output tools can choose inline, file-backed, or automatic bounded delivery.

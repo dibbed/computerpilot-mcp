@@ -36,6 +36,131 @@ def test_fingerprint_tracks_inputs_and_ignores_test_cache(tmp_path: Path) -> Non
     assert source_fingerprint(tmp_path) != before
 
 
+def test_fingerprint_frames_file_contents_unambiguously(tmp_path: Path) -> None:
+    first = tmp_path / "a"
+    first.write_bytes(b"first\0b\0second")
+    before = source_fingerprint(tmp_path)
+    first.write_bytes(b"first")
+    (tmp_path / "b").write_bytes(b"second")
+    assert source_fingerprint(tmp_path) != before
+
+
+@pytest.mark.parametrize("directory", [".worktrees", ".playwright-cli", ".pytest-tmp-session", ".codebase-memory-test"])
+@pytest.mark.parametrize("change_when", ["before", "during", "deleted", "created", "unchanged"])
+def test_explicit_excluded_input_is_bound_to_submitted_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    directory: str, change_when: str,
+) -> None:
+    from scripts import verification_worker
+
+    repo = tmp_path / "repo"
+    source = repo / directory / "app.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("x=1\n", encoding="utf-8")
+    if change_when == "created":
+        source.unlink()
+    store = JobStore(tmp_path / "state" / "jobs.sqlite3")
+    commands: list[list[str]] = []
+
+    def submit(command: list[str], *args: object, **kwargs: object) -> dict[str, str]:
+        commands.append(command)
+        return {"job_id": "snapshot-test"}
+
+    monkeypatch.setattr(store, "submit", submit)
+    submit_verification(store, VerificationRequest(
+        repo=str(repo), changed_paths=[f"{directory}/app.py"], checks=["syntax"],
+    ), "snapshot-test")
+    payload = commands[0][-1]
+    dispatched = False
+
+    def check(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal dispatched
+        dispatched = True
+        if change_when == "during":
+            source.write_text("x=2\n", encoding="utf-8")
+        return {"ok": True, "required_unknown": False, "stages": [], "mode": "focused", "duration_ms": 1}
+
+    monkeypatch.setattr(verification_worker, "verify_changed_repository", check)
+    if change_when in {"before", "created"}:
+        source.write_text("x=2\n", encoding="utf-8")
+    elif change_when == "deleted":
+        source.unlink()
+    assert verification_worker.run_request(payload) == (0 if change_when == "unchanged" else 1)
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert result["freshness"] == ("current" if change_when == "unchanged" else "stale")
+    assert result["ok"] is (change_when == "unchanged")
+    assert dispatched is (change_when in {"during", "unchanged"})
+
+
+@pytest.mark.parametrize("expire_after_last_directory", [False, True])
+def test_fingerprint_enforces_deadline_when_only_directories_are_visited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, expire_after_last_directory: bool,
+) -> None:
+    now = [0.0]
+
+    def walk(*args: object, **kwargs: object) -> Any:
+        yield str(tmp_path), [], []
+        now[0] = 11.0
+        if not expire_after_last_directory:
+            yield str(tmp_path / "empty"), [], []
+
+    monkeypatch.setattr(background.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(background.os, "walk", walk)
+    with pytest.raises(ValueError, match="budget"):
+        source_fingerprint(tmp_path)
+
+
+@pytest.mark.parametrize("limit", ["MAX_INPUT_FILES", "MAX_INPUT_BYTES"])
+def test_explicit_excluded_inputs_share_snapshot_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: str,
+) -> None:
+    (tmp_path / "app.py").write_bytes(b"xx")
+    extra = tmp_path / ".worktrees" / "extra.py"
+    extra.parent.mkdir()
+    extra.write_bytes(b"xx")
+    monkeypatch.setattr(background, limit, 1 if limit == "MAX_INPUT_FILES" else 3)
+    with pytest.raises(ValueError, match="budget"):
+        source_fingerprint(tmp_path, changed_paths=[".worktrees/extra.py"])
+
+
+def test_explicit_scanned_inputs_are_not_counted_twice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "app.py").write_bytes(b"xx")
+    monkeypatch.setattr(background, "MAX_INPUT_FILES", 1)
+    before = source_fingerprint(tmp_path)
+    assert source_fingerprint(tmp_path, changed_paths=["app.py", "./app.py"]) == before
+
+
+def test_explicit_excluded_input_stat_error_is_not_treated_as_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extra = tmp_path / ".worktrees" / "extra.py"
+    extra.parent.mkdir()
+    extra.write_text("x=1\n", encoding="utf-8")
+    original = Path.stat
+
+    def denied(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == extra:
+            raise PermissionError("unreadable explicit input")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied)
+    with pytest.raises(PermissionError):
+        source_fingerprint(tmp_path, changed_paths=[".worktrees/extra.py"])
+
+
+@pytest.mark.parametrize("link_method", ["is_symlink", "is_junction"])
+def test_explicit_excluded_inputs_reject_linked_ancestors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_method: str,
+) -> None:
+    extra = tmp_path / ".worktrees" / "extra.py"
+    extra.parent.mkdir()
+    extra.write_text("x=1\n", encoding="utf-8")
+    original = getattr(Path, link_method, lambda self: False)
+    monkeypatch.setattr(Path, link_method, lambda self: self == extra.parent or original(self), raising=False)
+    with pytest.raises(ValueError, match="symlink"):
+        source_fingerprint(tmp_path, changed_paths=[".worktrees/extra.py"])
+
+
 def test_rejected_request_never_submits(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "state" / "jobs.sqlite3")
     repo = tmp_path / "repo"

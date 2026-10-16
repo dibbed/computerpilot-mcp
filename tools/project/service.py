@@ -17,12 +17,15 @@ from tools.project.index import PYTHON_METADATA_CACHE, PythonFileMetadata
 
 EXCLUDED_DIRS = {
     ".git",
+    ".worktrees",
     ".venv",
     "venv",
     "node_modules",
     "__pycache__",
     ".agent_state",
+    ".playwright-cli",
     ".pytest_cache",
+    ".pytest-tmp",
     ".mypy_cache",
     ".ruff_cache",
     "graphify-out",
@@ -88,7 +91,7 @@ def iter_files(root: Path, max_files: int) -> tuple[list[Path], bool]:
         return [root], False
     files: list[Path] = []
     for current, directories, names in os.walk(root):
-        directories[:] = [name for name in directories if name not in EXCLUDED_DIRS]
+        directories[:] = [name for name in directories if name not in EXCLUDED_DIRS and not name.startswith(".pytest-tmp-")]
         for name in names:
             files.append(Path(current) / name)
             if len(files) >= max_files:

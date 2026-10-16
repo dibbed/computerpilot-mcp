@@ -114,6 +114,42 @@ def test_unmanaged_lifecycle_preserves_standalone_behavior() -> None:
     assert lifecycle.snapshot()["active_mutations"] == 0
 
 
+@pytest.mark.parametrize("transition", ["enter", "exit"])
+@pytest.mark.parametrize("invalid_control", [None, {"command": "invalid", "request_id": "bad"}, {"command": "drain"}])
+def test_mutation_status_retries_without_control_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transition: str, invalid_control: dict[str, str] | None,
+) -> None:
+    status = tmp_path / "status.json"
+    control = tmp_path / "control.json"
+    lifecycle = RuntimeLifecycle()
+    lifecycle.configure(control, status)
+    if invalid_control is not None:
+        control.write_text(json.dumps({"schema_version": 1, **invalid_control}), encoding="utf-8")
+    if transition == "exit":
+        lifecycle.enter_mutation("run_process")
+    original_replace = lifecycle_module.os.replace
+    calls = 0
+
+    def flaky_replace(source: str | bytes | Path, destination: str | bytes | Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("transient sharing violation")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(lifecycle_module.os, "replace", flaky_replace)
+    if transition == "enter":
+        lifecycle.enter_mutation("run_process")
+    else:
+        lifecycle.exit_mutation()
+    for _ in range(2):
+        assert lifecycle.poll_control() == "RUNNING"
+    payload = json.loads(status.read_text(encoding="utf-8"))
+    assert payload["active_mutations"] == (1 if transition == "enter" else 0)
+    assert payload["active_mutations"] == lifecycle.snapshot()["active_mutations"]
+    assert calls == 2  # A successful retry stops further publication without new state.
+
+
 def test_unmanaged_server_does_not_wake_for_supervisor_control(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

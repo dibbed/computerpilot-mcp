@@ -60,7 +60,7 @@ def run_request(payload: str) -> int:
             raise ValueError("Request quota exceeded")
         request = VerificationRequest.model_validate_json(payload)
         repo = request_root(request)
-        before = source_fingerprint(repo)
+        before = source_fingerprint(repo, changed_paths=request.changed_paths)
         emit("started", {"source_fingerprint": request.source_fingerprint})
         if before != request.source_fingerprint:
             emit("result", {"ok": False, "required_unknown": True, "freshness": "stale", "stages": []})
@@ -72,7 +72,7 @@ def run_request(payload: str) -> int:
                 max_parallel_checks=request.max_parallel_checks,
                 pytest_extra_args=["--basetemp", str(Path(temporary) / "pytest"), "-o", f"cache_dir={temporary}/cache"],
             )
-        after = source_fingerprint(repo)
+        after = source_fingerprint(repo, changed_paths=request.changed_paths)
         fresh = before == after
         emit("result", {
             "ok": bool(result["ok"] and fresh), "required_unknown": bool(result["required_unknown"] or not fresh),

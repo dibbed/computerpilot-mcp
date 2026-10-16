@@ -172,7 +172,7 @@ def verify_changed_repository(
     if max_parallel_checks > 1:
         if tasks and tasks[0][0] == "syntax":
             stages.append(run(tasks.pop(0)))
-            if stages[0]["status"] != "passed":
+            if stages[0]["status"] not in {"passed", "skipped"}:
                 stages.extend(_stage(name, "skipped", time.perf_counter(), targets=targets, reason="syntax_failed")
                               for name, targets, _ in tasks)
                 tasks = []
