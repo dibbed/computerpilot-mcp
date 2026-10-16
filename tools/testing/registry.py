@@ -17,10 +17,11 @@ from core.job_scheduler import ensure_job_scheduler
 from core.jobs import JobStore
 from core.tooling import OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 from tools.testing import runners as _runners
+from tools.testing.background import VerificationRequest, submit_verification
 from tools.testing.diagnostics import merge_diagnostics
 from tools.testing.impact import select_affected_tests
 from tools.testing.runners import run_mypy_summary, run_pytest_summary, run_ruff_summary
-from tools.testing.verification import Check, verify_changed_repository
+from tools.testing.verification import _CHECKS, Check, verify_changed_repository
 
 # Kept as compatibility aliases for existing local consumers.
 _junit_summary = _runners._junit_summary
@@ -31,9 +32,44 @@ def _cwd(value: str | None) -> Path:
     return resolve_path(value) if value else PROJECT_ROOT
 
 
-def register(mcp: MCPServer) -> None:
+def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
     watch_store = JobStore()
     ensure_job_scheduler(watch_store)
+
+    if background_enabled:
+
+        @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
+        @compact_errors("start_verification")
+        def start_verification(
+            idempotency_key: Annotated[str, Field(min_length=1, max_length=200)],
+            repo: Annotated[str | None, Field(max_length=32_767)] = None,
+            changed_paths: Annotated[list[str] | None, Field(max_length=1_000)] = None,
+            base: Annotated[str | None, Field(min_length=1, max_length=500)] = None,
+            checks: Annotated[list[Check] | None, Field(max_length=4)] = None,
+            affected_only: bool = True,
+            fallback_policy: Literal["report", "select_full_suite"] = "select_full_suite",
+            fail_fast: bool = True,
+            maxfail: Annotated[int, Field(ge=1, le=100)] = 1,
+            stage_timeout_sec: Annotated[float, Field(gt=0, le=3_600)] = 600,
+            total_timeout_sec: Annotated[float, Field(gt=0, le=7_200)] = 1_800,
+            ruff_fix: bool = False,
+            diagnostic_cap: Annotated[int, Field(ge=1, le=200)] = 30,
+            max_parallel_checks: Annotated[int, Field(ge=1, le=3)] = 1,
+            queue_timeout_sec: Annotated[float | None, Field(gt=0, le=86_400)] = None,
+        ) -> dict[str, Any]:
+            """Start durable verification; return a job ID, not test success.
+
+            Continue independent work, then collect job_wait/job_output.
+            """
+            working = _cwd(repo)
+            request = VerificationRequest(
+                repo=str(working), changed_paths=changed_paths, base=base, checks=checks,
+                affected_only=affected_only, fallback_policy=fallback_policy, fail_fast=fail_fast,
+                maxfail=maxfail, stage_timeout_sec=stage_timeout_sec, total_timeout_sec=total_timeout_sec,
+                ruff_fix=ruff_fix, diagnostic_cap=diagnostic_cap, max_parallel_checks=max_parallel_checks,
+            )
+            audit_action("start_verification", target=working, details={"check_count": len(checks) if checks is not None else len(_CHECKS)})
+            return submit_verification(watch_store, request, idempotency_key, queue_timeout_sec)
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("start_validation_watch")

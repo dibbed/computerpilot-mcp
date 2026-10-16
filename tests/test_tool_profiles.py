@@ -26,7 +26,7 @@ def test_full_is_default_and_preserves_complete_catalog() -> None:
     assert resolve_profile(None).name == "full"
     names = _names("full")
     if os.name == "nt":
-        assert len(names) == 150
+        assert len(names) == 151
     else:
         assert "run_shell" in names
         assert "run_cmd" not in names

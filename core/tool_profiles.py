@@ -48,6 +48,7 @@ PREFERRED_USE: dict[str, str] = {
     "submit_job": "Use for durable execution that must survive MCP runtime restarts.",
     "affected_tests": "Use to identify a conservative focused test set for changed code.",
     "verify_changes": "Use for change-aware syntax, Ruff, mypy, and pytest verification.",
+    "start_verification": "Start long verification, continue independent work, then collect the fresh result with job_wait/job_output.",
     "ui_invoke": "Use a semantic locator for UI buttons instead of screen coordinates.",
     "mouse_click": "Use coordinates only when semantic UI Automation is unavailable.",
 }

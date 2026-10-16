@@ -24,7 +24,7 @@ def test_focused_plan_runs_changed_checks_and_selected_tests(tmp_path: Path, mon
     monkeypatch.setattr(
         verification,
         "select_affected_tests",
-        lambda *args, **kwargs: {"decision": "focused", "tests": ["tests/test_app.py"], "recommendation": "focused"},
+        lambda *args, **kwargs: {"decision": "focused", "tests": [{"path": "tests/test_app.py"}], "recommendation": "focused"},
     )
     calls: list[tuple[str, list[str]]] = []
 
@@ -75,7 +75,7 @@ def test_fail_fast_skips_later_required_stages(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(
         verification,
         "select_affected_tests",
-        lambda *args, **kwargs: {"decision": "focused", "tests": ["tests/test_x.py"], "recommendation": "focused"},
+        lambda *args, **kwargs: {"decision": "focused", "tests": [{"path": "tests/test_x.py"}], "recommendation": "focused"},
     )
 
     result = verification.verify_changed_repository(tmp_path, changed_paths=["broken.py"], fail_fast=True)

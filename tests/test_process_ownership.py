@@ -4,12 +4,220 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import psutil
 import pytest
 
 from core import process_ownership, windows_job
+from core.errors import ToolError
 from core.process_ownership import NativeOwnershipRequiredError, spawn_owned_process
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("root_present", [False, True])
+def test_posix_termination_reaps_descendants_in_separate_sessions(
+    monkeypatch: pytest.MonkeyPatch, force: bool, root_present: bool,
+) -> None:
+    events: list[str] = []
+
+    class Process:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.alive = True
+
+        def children(self, *, recursive: bool) -> list[Process]:
+            assert recursive
+            events.append("snapshot")
+            return [child, grandchild]
+
+        def terminate(self) -> None:
+            events.append(f"terminate:{self.pid}")
+            if self is not grandchild:
+                self.alive = False
+
+        def kill(self) -> None:
+            events.append(f"kill:{self.pid}")
+            self.alive = False
+
+    parent, child, grandchild = Process(100), Process(200), Process(300)
+    member = parent if root_present else Process(101)
+    # The child and grandchild each started a new session and are absent from group 100.
+    monkeypatch.setattr(process_ownership, "_group_processes", lambda pgid: [member])
+
+    def signal_group(pgid: int, sig: int) -> bool:
+        events.append("signal_group")
+        member.alive = False
+        return True
+
+    def wait_procs(processes: list[Process], *, timeout: float) -> tuple[list[Process], list[Process]]:
+        return [process for process in processes if not process.alive], [process for process in processes if process.alive]
+
+    class Popen:
+        pid = parent.pid
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    monkeypatch.setattr(process_ownership, "_signal_group", signal_group)
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
+    owned = process_ownership.PosixOwnedProcess(cast(subprocess.Popen[bytes], Popen()), parent.pid)
+    result = owned.terminate_tree(force=force)
+    assert not child.alive and not grandchild.alive
+    assert events.index("snapshot") < events.index("signal_group")
+    assert set(result["targeted_pids"]) == {parent.pid, member.pid, child.pid, grandchild.pid}
+    assert set(result["terminated_pids"]) == {member.pid, child.pid, grandchild.pid}
+    assert not result["alive_pids"]
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_posix_group_signal_retains_a_live_group_member_until_dispatch(
+    monkeypatch: pytest.MonkeyPatch, force: bool,
+) -> None:
+    class Process:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.alive = True
+
+        def children(self, *, recursive: bool) -> list[Process]:
+            assert recursive
+            return [detached]
+
+        def kill(self) -> None:
+            self.alive = False
+
+        def terminate(self) -> None:
+            self.alive = False
+
+    member, detached = Process(100), Process(200)
+    monkeypatch.setattr(process_ownership, "_group_processes", lambda pgid: [member])
+    group_signals: list[bool] = []
+
+    def signal_group(pgid: int, sig: int) -> bool:
+        # Darwin killpg excludes zombies and reports EPERM when no live member remains.
+        had_live_member = member.alive
+        group_signals.append(had_live_member)
+        member.alive = False
+        return had_live_member
+
+    def wait_procs(processes: list[Process], *, timeout: float) -> tuple[list[Process], list[Process]]:
+        return [process for process in processes if not process.alive], [process for process in processes if process.alive]
+
+    class Popen:
+        pid = member.pid
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    monkeypatch.setattr(process_ownership, "_signal_group", signal_group)
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
+    owned = process_ownership.PosixOwnedProcess(cast(subprocess.Popen[bytes], Popen()), member.pid)
+    result = owned.terminate_tree(force=force)
+    assert not member.alive and not detached.alive
+    assert group_signals == [True]
+    assert result["terminated_pids"] == [member.pid, detached.pid]
+    assert not result["alive_pids"]
+
+
+@pytest.mark.parametrize("denied_phase", ["inspection", "kill", "terminate", "group", "unknown_class"])
+def test_posix_cleanup_attempts_remaining_targets_before_reporting_denial(
+    monkeypatch: pytest.MonkeyPatch, denied_phase: str,
+) -> None:
+    events: list[str] = []
+
+    class CredentialCanaryError(OSError):
+        pass
+
+    class Process:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.alive = True
+
+        def children(self, *, recursive: bool) -> list[Process]:
+            events.append(f"inspect:{self.pid}")
+            if self is first and denied_phase == "inspection":
+                raise psutil.AccessDenied(pid=self.pid)
+            if self is first and denied_phase == "unknown_class":
+                raise CredentialCanaryError("credential-canary-error-body")
+            return [child]
+
+        def kill(self) -> None:
+            events.append(f"kill:{self.pid}")
+            if self is child and denied_phase == "kill":
+                raise psutil.AccessDenied(pid=self.pid)
+            self.alive = False
+
+        def terminate(self) -> None:
+            events.append(f"terminate:{self.pid}")
+            if self is child and denied_phase == "terminate":
+                raise psutil.AccessDenied(pid=self.pid)
+            self.alive = False
+
+    first, second, child = Process(100), Process(101), Process(200)
+    monkeypatch.setattr(process_ownership, "_group_processes", lambda pgid: [first, second])
+
+    def signal_group(pgid: int, sig: int) -> bool:
+        events.append("signal_group")
+        first.alive = second.alive = False
+        return denied_phase != "group"
+
+    def wait_procs(processes: list[Process], *, timeout: float) -> tuple[list[Process], list[Process]]:
+        return [process for process in processes if not process.alive], [process for process in processes if process.alive]
+
+    class Popen:
+        pid = first.pid
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    monkeypatch.setattr(process_ownership, "_signal_group", signal_group)
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
+    owned = process_ownership.PosixOwnedProcess(cast(subprocess.Popen[bytes], Popen()), first.pid)
+    with pytest.raises(ToolError) as failure:
+        owned.terminate_tree(force=denied_phase != "terminate")
+    assert failure.value.code == "process_cleanup_incomplete"
+    classification = {
+        "inspection": "inspection:AccessDenied=1",
+        "kill": "signal:AccessDenied=1",
+        "terminate": "signal:AccessDenied=1",
+        "group": "group:Unspecified=1",
+        "unknown_class": "inspection:OtherError=1",
+    }[denied_phase]
+    assert classification in failure.value.message
+    assert "CredentialCanary" not in failure.value.message and "credential-canary" not in failure.value.message
+    assert "inspect:101" in events and "signal_group" in events
+    assert any(event in events for event in ("kill:101", "terminate:101"))
+    assert not first.alive and not second.alive
+
+
+@pytest.mark.parametrize("failure", ["none", "error", "interrupt"])
+def test_posix_close_preserves_failed_cleanup_without_repeating_signals(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    owned = process_ownership.PosixOwnedProcess(cast(subprocess.Popen[bytes], object()), 100)
+    attempts = 0
+
+    def cleanup(*, force: bool) -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        if failure == "interrupt":
+            raise KeyboardInterrupt
+        if failure == "error":
+            raise ToolError("process_cleanup_incomplete", "Process cleanup incomplete.")
+        return {}
+
+    monkeypatch.setattr(owned, "_terminate_group", cleanup)
+    for attempt in range(2):
+        if failure == "interrupt" and attempt == 0:
+            with pytest.raises(KeyboardInterrupt):
+                owned.close_ownership()
+        elif failure != "none":
+            with pytest.raises(ToolError) as error:
+                owned.close_ownership()
+            assert error.value.code == "process_cleanup_incomplete"
+        else:
+            owned.close_ownership()
+    assert attempts == 1
 
 
 def test_require_native_parameter_defaults_to_false() -> None:

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -27,7 +31,7 @@ def build_verification_plan(
     impact = select_affected_tests(resolved, changed_paths=paths, base=base, fallback_policy=fallback_policy)
     full = not affected_only or impact["decision"] in {"full_suite", "focused_plus_full_recommended"}
     mode = "full" if full else ("focused" if impact.get("tests") else "checks_only")
-    python_targets = [path for path in paths if Path(path).suffix in {".py", ".pyi"} and (resolved / path).is_file()]
+    python_targets = [path for path in paths if Path(path).suffix.casefold() in {".py", ".pyi"} and (resolved / path).is_file()]
     return {"changed_paths": paths, "affected": impact, "full": full, "mode": mode, "python_targets": python_targets}
 
 
@@ -59,7 +63,7 @@ def _syntax(repo: Path, targets: list[str], diagnostic_cap: int) -> dict[str, An
     diagnostics: list[dict[str, Any]] = []
     for target in targets:
         path = repo / target
-        if path.suffix not in {".py", ".pyi"} or not path.is_file():
+        if path.suffix.casefold() not in {".py", ".pyi"} or not path.is_file():
             continue
         try:
             compile(path.read_text(encoding="utf-8-sig"), str(path), "exec")
@@ -90,112 +94,102 @@ def verify_changed_repository(
     total_timeout_sec: float = 1800,
     ruff_fix: bool = False,
     diagnostic_cap: int = 30,
+    stage_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    pytest_extra_args: list[str] | None = None,
+    max_parallel_checks: int = 1,
 ) -> dict[str, Any]:
     selected_checks = list(_CHECKS if checks is None else checks)
     unknown = sorted(set(selected_checks) - set(_CHECKS))
     if unknown:
         raise ValueError(f"Unknown verification check(s): {', '.join(unknown)}")
+    if not 1 <= max_parallel_checks <= 3 or (max_parallel_checks > 1 and (fail_fast or ruff_fix)):
+        raise ValueError("parallel verification requires capacity 1..3, fail_fast=false and ruff_fix=false")
     resolved = repo.resolve(strict=False)
     plan = build_verification_plan(
-        resolved,
-        changed_paths=changed_paths,
-        base=base,
-        affected_only=affected_only,
-        fallback_policy=fallback_policy,
+        resolved, changed_paths=changed_paths, base=base,
+        affected_only=affected_only, fallback_policy=fallback_policy,
     )
-    paths = plan["changed_paths"]
-    impact = plan["affected"]
-    full = plan["full"]
-    mode = plan["mode"]
+    paths, impact, full = plan["changed_paths"], plan["affected"], plan["full"]
     python_targets = plan["python_targets"]
-    stages: list[dict[str, Any]] = []
-    halted = False
-    required_unknown = False
     overall_started = time.perf_counter()
+    callback_lock = threading.Lock()
 
-    def bounded_stage_timeout() -> float:
+    def notify(event: str, data: dict[str, Any]) -> None:
+        if stage_callback:
+            with callback_lock:
+                stage_callback(event, data)
+
+    def analyze(check: Check, targets: list[str]) -> dict[str, Any]:
         remaining = total_timeout_sec - (time.perf_counter() - overall_started)
-        return max(0.001, min(stage_timeout_sec, remaining))
+        if remaining <= 0:
+            return {"ok": False, "exit_code": None, "timed_out": True, "summary": "stage timed out", "diagnostics": []}
+        timeout = max(0.001, min(stage_timeout_sec, remaining))
+        if check == "syntax":
+            return _syntax(resolved, targets, diagnostic_cap)
+        if check == "ruff":
+            return run_ruff_summary(resolved, targets=targets, fix=ruff_fix, timeout_sec=timeout, diagnostic_cap=diagnostic_cap)
+        if check == "mypy":
+            return run_mypy_summary(resolved, targets=targets, timeout_sec=timeout, diagnostic_cap=diagnostic_cap)
+        return run_pytest_summary(
+            resolved, targets=targets, maxfail=maxfail, timeout_sec=timeout,
+            diagnostic_cap=diagnostic_cap, extra_args=pytest_extra_args,
+        )
 
-    def execute(name: str, targets: list[str], operation: Any) -> None:
-        nonlocal halted, required_unknown
+    tasks: list[tuple[str, list[str], Callable[[], dict[str, Any]] | None]] = []
+    for check in _CHECKS:
+        if check not in selected_checks:
+            continue
+        name = ("pytest_full" if full else "pytest_focused") if check == "pytest" else check
+        if check == "pytest":
+            targets = [] if full else [item["path"] if isinstance(item, dict) else str(item) for item in impact.get("tests", [])]
+        elif full and check != "syntax":
+            targets = ["."]
+        else:
+            targets = python_targets
+        runnable = bool(targets) or (check == "pytest" and full)
+        tasks.append((name, targets, partial(analyze, check, targets) if runnable else None))
+
+    def run(task: tuple[str, list[str], Callable[[], dict[str, Any]] | None]) -> dict[str, Any]:
+        name, targets, operation = task
         started = time.perf_counter()
-        if halted:
-            stages.append(_stage(name, "skipped", started, targets=targets, reason="fail_fast"))
-            return
+        if operation is None:
+            reason = "no_affected_tests" if name.startswith("pytest") else "no_python_targets"
+            return _stage(name, "skipped", started, targets=targets, reason=reason)
         if time.perf_counter() - overall_started >= total_timeout_sec:
-            stages.append(_stage(name, "timed_out", started, targets=targets, reason="total_timeout"))
-            halted = True
-            required_unknown = True
-            return
+            return _stage(name, "timed_out", started, targets=targets, reason="total_timeout")
+        notify("stage_started", {"name": name})
         try:
             result = operation()
         except (ModuleNotFoundError, FileNotFoundError) as exc:
             result = {"ok": False, "exit_code": None, "unavailable": True, "summary": str(exc), "diagnostics": []}
-        status = _status(result)
-        stages.append(_stage(name, status, started, targets=targets, result=result))
-        required_unknown = required_unknown or status in {"timed_out", "unavailable"}
-        if status != "passed" and fail_fast:
-            halted = True
+        except Exception as exc:
+            result = {"ok": False, "exit_code": None, "unavailable": True, "summary": f"{type(exc).__name__}: {exc}", "diagnostics": []}
+        stage = _stage(name, _status(result), started, targets=targets, result=result)
+        notify("stage_finished", stage)
+        return stage
 
-    if "syntax" in selected_checks:
-        execute("syntax", python_targets, lambda: _syntax(resolved, python_targets, diagnostic_cap))
-    if "ruff" in selected_checks:
-        ruff_targets = python_targets or (["."] if full else [])
-        if ruff_targets:
-            execute(
-                "ruff",
-                ruff_targets,
-                lambda: run_ruff_summary(
-                    resolved,
-                    targets=ruff_targets,
-                    fix=ruff_fix,
-                    timeout_sec=bounded_stage_timeout(),
-                    diagnostic_cap=diagnostic_cap,
-                ),
-            )
-        else:
-            stages.append(_stage("ruff", "skipped", time.perf_counter(), targets=[], reason="no_python_targets"))
-    if "mypy" in selected_checks:
-        mypy_targets = python_targets or (["."] if full else [])
-        if mypy_targets:
-            execute(
-                "mypy",
-                mypy_targets,
-                lambda: run_mypy_summary(
-                    resolved,
-                    targets=mypy_targets,
-                    timeout_sec=bounded_stage_timeout(),
-                    diagnostic_cap=diagnostic_cap,
-                ),
-            )
-        else:
-            stages.append(_stage("mypy", "skipped", time.perf_counter(), targets=[], reason="no_python_targets"))
-    if "pytest" in selected_checks:
-        test_targets = [] if full else list(impact.get("tests", []))
-        name = "pytest_full" if full else "pytest_focused"
-        if not full and not test_targets:
-            started = time.perf_counter()
-            stages.append(_stage(name, "skipped", started, targets=[], reason="no_affected_tests"))
-        else:
-            execute(
-                name,
-                test_targets,
-                lambda: run_pytest_summary(
-                    resolved,
-                    targets=test_targets,
-                    maxfail=maxfail,
-                    timeout_sec=bounded_stage_timeout(),
-                    diagnostic_cap=diagnostic_cap,
-                ),
-            )
-    ok = all(stage["status"] in {"passed", "skipped"} for stage in stages) and not required_unknown
+    stages: list[dict[str, Any]] = []
+    if max_parallel_checks > 1:
+        if tasks and tasks[0][0] == "syntax":
+            stages.append(run(tasks.pop(0)))
+            if stages[0]["status"] not in {"passed", "skipped"}:
+                stages.extend(_stage(name, "skipped", time.perf_counter(), targets=targets, reason="syntax_failed")
+                              for name, targets, _ in tasks)
+                tasks = []
+        with ThreadPoolExecutor(max_workers=max_parallel_checks, thread_name_prefix="verification") as pool:
+            stages.extend(pool.map(run, tasks))
+    else:
+        halted = False
+        for task in tasks:
+            if halted:
+                stages.append(_stage(task[0], "skipped", time.perf_counter(), targets=task[1], reason="fail_fast"))
+            else:
+                stages.append(run(task))
+                halted = fail_fast and stages[-1]["status"] not in {"passed", "skipped"}
+    required_unknown = any(stage["status"] in {"timed_out", "unavailable"} for stage in stages)
     return {
-        "ok": ok,
-        "mode": mode,
-        "changed_paths": paths,
-        "affected": impact,
-        "stages": stages,
+        "ok": all(stage["status"] in {"passed", "skipped"} for stage in stages) and not required_unknown,
+        "mode": plan["mode"], "changed_paths": paths, "affected": impact, "stages": stages,
         "required_unknown": required_unknown,
         "duration_ms": round((time.perf_counter() - overall_started) * 1000, 3),
     }

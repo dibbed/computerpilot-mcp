@@ -143,6 +143,34 @@ verify_changes
 
 `verify_changes` can run syntax, Ruff, mypy, and the narrowest sound pytest scope. Shared/repository-wide changes can fall back to the full suite.
 
+For long checks, `start_verification` accepts the verification inputs plus a required `idempotency_key`, optional
+`queue_timeout_sec`, and `max_parallel_checks` (1–3, default 1). It is available when both testing and jobs domains are
+active, including `coding` and `full`; existing profiles and foreground response contracts are unchanged.
+
+Start the job, retain its ID, and continue independent work. Collect `job_wait`/`job_output` when the result is needed.
+`accepted=true` means submission succeeded. Require job status `succeeded`, exit code zero, and a final JSONL `result`
+with `ok=true`, `required_unknown=false`, and `freshness=current` before a dependent decision. Keep partial JSONL lines
+between progress chunks. Missing or incomplete final records are unknown, even if output was received.
+
+Output uses schema version 1 events: `started`, `stage_started`, `stage_finished`, `result`. Each record is bounded to
+64 KiB, the controlled stream to 4 MiB, and diagnostics explicitly report truncation. The worker runs under ComputerPilot's
+interpreter; analyzers select the target project's interpreter. Test caches and temporary directories are isolated per run.
+
+Input snapshots hash a conservative tree excluding standard dependency/runtime/cache directories, bounded to 10,000 files,
+64 MiB and 10 seconds per snapshot. Explicit changed files are included even inside an excluded directory; missing explicit paths are also bound so creating them invalidates the snapshot. The same limits apply to these inputs. Inaccessible inputs, symlinks, changing files and exhausted bounds fail closed.
+Requests are limited to 64 KiB and the native Windows command-line limit. Use a new idempotency key after changing the
+request or input revision. Deduplication lasts only as long as the existing job record is retained.
+
+Do not edit tested inputs while their job runs. Changes before or during execution invalidate the result; unrelated input
+changes may conservatively do so too. Start/end hashes cannot detect a transient change that is reverted during a run.
+Use `cancel_job` to cancel the owned process tree. Disconnecting a client does not cancel a durable job.
+If ownership cleanup cannot be confirmed, the job reports failure with a bounded cleanup error instead of successful cancellation.
+
+For opt-in parallel checks, set `max_parallel_checks=2` or `3` and `fail_fast=false`, with `ruff_fix=false`.
+Syntax is a preflight; Ruff checks, mypy and pytest may then overlap, with deterministic result ordering and one total
+deadline. Background verification rejects `ruff_fix=true`; fix source with the foreground tool first, then submit verification. Fail-fast remains serial only. A syntax stage skipped because there are no Python targets does not suppress full-suite analyzers. Four active jobs with three checks each can run up to twelve analyzers;
+the job limit is not a limit on all descendant processes or threads.
+
 ## Terminal and processes
 
 Choose execution based on intent:
