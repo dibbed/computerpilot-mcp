@@ -4,12 +4,69 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import psutil
 import pytest
 
 from core import process_ownership, windows_job
 from core.process_ownership import NativeOwnershipRequiredError, spawn_owned_process
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("root_present", [False, True])
+def test_posix_termination_reaps_descendants_in_separate_sessions(
+    monkeypatch: pytest.MonkeyPatch, force: bool, root_present: bool,
+) -> None:
+    events: list[str] = []
+
+    class Process:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.alive = True
+
+        def children(self, *, recursive: bool) -> list[Process]:
+            assert recursive
+            events.append("snapshot")
+            return [child, grandchild]
+
+        def terminate(self) -> None:
+            events.append(f"terminate:{self.pid}")
+            if self is not grandchild:
+                self.alive = False
+
+        def kill(self) -> None:
+            events.append(f"kill:{self.pid}")
+            self.alive = False
+
+    parent, child, grandchild = Process(100), Process(200), Process(300)
+    member = parent if root_present else Process(101)
+    # The child and grandchild each started a new session and are absent from group 100.
+    monkeypatch.setattr(process_ownership, "_group_processes", lambda pgid: [member])
+
+    def signal_group(pgid: int, sig: int) -> bool:
+        events.append("signal_group")
+        member.alive = False
+        return True
+
+    def wait_procs(processes: list[Process], *, timeout: float) -> tuple[list[Process], list[Process]]:
+        return [process for process in processes if not process.alive], [process for process in processes if process.alive]
+
+    class Popen:
+        pid = parent.pid
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    monkeypatch.setattr(process_ownership, "_signal_group", signal_group)
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
+    owned = process_ownership.PosixOwnedProcess(cast(subprocess.Popen[bytes], Popen()), parent.pid)
+    result = owned.terminate_tree(force=force)
+    assert not child.alive and not grandchild.alive
+    assert events.index("snapshot") < events.index("signal_group")
+    assert set(result["targeted_pids"]) == {parent.pid, member.pid, child.pid, grandchild.pid}
+    assert set(result["terminated_pids"]) == {member.pid, child.pid, grandchild.pid}
+    assert not result["alive_pids"]
 
 
 def test_require_native_parameter_defaults_to_false() -> None:

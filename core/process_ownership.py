@@ -144,17 +144,36 @@ class PosixOwnedProcess:
         self.process.terminate()
 
     def _terminate_group(self, *, force: bool) -> dict[str, Any]:
-        processes = _group_processes(self.pgid)
+        members = _group_processes(self.pgid)
+        by_pid = {process.pid: process for process in members}
+        # Nested owned commands start new sessions; capture them before killing their parents.
+        for process in members:
+            try:
+                by_pid.update((child.pid, child) for child in process.children(recursive=True))
+            except psutil.NoSuchProcess:
+                pass
+        processes = list(by_pid.values())
         targeted = sorted({process.pid for process in processes} | {self.pid})
+
+        def signal_processes(targets: list[psutil.Process], *, force: bool) -> None:
+            for process in reversed(targets):
+                try:
+                    process.kill() if force else process.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+
         if force:
             sigkill = int(getattr(signal, "SIGKILL", signal.SIGTERM))
+            signal_processes(processes, force=True)
             _signal_group(self.pgid, sigkill)
             gone, alive = psutil.wait_procs(processes, timeout=3.0)
         else:
+            signal_processes(processes, force=False)
             _signal_group(self.pgid, int(signal.SIGTERM))
             gone, alive = psutil.wait_procs(processes, timeout=3.0)
             if alive:
                 sigkill = int(getattr(signal, "SIGKILL", signal.SIGTERM))
+                signal_processes(alive, force=True)
                 _signal_group(self.pgid, sigkill)
                 gone_after, alive = psutil.wait_procs(alive, timeout=2.0)
                 gone.extend(gone_after)
