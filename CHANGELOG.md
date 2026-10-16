@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Fixed
+- 2026-10-16: Add an opt-in backup file-count quota alongside age and byte retention, expose its budget in health and panel configuration, and preserve protected restore points and conservative usage counts when a survivor cannot be restatted.
 - 2026-10-16: Keep supervisor child-enumeration fault injection on the runtime owner thread and observe state without consuming the simulated failure in process diagnostics.
 - 2026-10-16: Isolate migration WAL tests' SQLite spies to their own database and exercise unrelated connections, preserving leak and startup-count checks across Python versions.
 - 2026-10-16: Retry a failed lifecycle status publication on the existing managed-runtime watcher even before a control request, keeping active mutation counts observable after transient Windows sharing violations without idle status writes.

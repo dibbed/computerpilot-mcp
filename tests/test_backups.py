@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -26,13 +29,261 @@ def _policy(
     max_age_sec: float = 0,
     interval: float = 0,
     recent_grace_sec: float = 0,
+    max_count: int = 0,
 ) -> BackupPolicy:
     return BackupPolicy(
         max_bytes=max_bytes,
         max_age_sec=max_age_sec,
         cleanup_interval_sec=interval,
         recent_grace_sec=recent_grace_sec,
+        max_count=max_count,
     )
+
+
+@pytest.mark.parametrize("size", [0, 100])
+def test_count_quota_removes_oldest_backups_including_empty_files(tmp_path: Path, size: int) -> None:
+    for index in range(4):
+        _backup(tmp_path / f"{index}.bak", size, 100 + index)
+
+    result = cleanup_backups(tmp_path, _policy(max_count=2), now=1_000)
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["2.bak", "3.bak"]
+    assert result.scanned_files == 4
+    assert result.scanned_bytes == 4 * size
+    assert result.removed_files == result.removed_for_count == 2
+    assert result.removed_for_age == result.removed_for_quota == 0
+    assert result.removed_bytes == result.remaining_bytes == 2 * size
+    assert result.remaining_files == 2
+    assert result.quota_satisfied is True
+
+
+def test_disabled_count_quota_preserves_positional_policy_and_result_contracts(tmp_path: Path) -> None:
+    policy = BackupPolicy(0, 0, 0, 0)
+    assert policy.recent_grace_sec == policy.max_count == 0
+    legacy_result = BackupCleanupResult(1, 10, 0, 0, 0, 0, 1, 10, True, True, 0)
+    assert legacy_result.removed_for_count == 0
+    assert legacy_result.to_dict()["removed_for_count"] == 0
+    assert cleanup_backups(tmp_path, policy).to_dict()["removed_for_count"] == 0
+    for index in range(3):
+        _backup(tmp_path / f"{index}.bak", 0, index)
+
+    result = cleanup_backups(tmp_path, policy, now=1_000)
+
+    assert result.remaining_files == 3
+    assert result.removed_files == result.removed_for_count == 0
+    assert result.quota_satisfied is True
+
+
+def test_age_retention_precedes_count_quota(tmp_path: Path) -> None:
+    for index, created_at in enumerate((100, 200, 920, 930, 940)):
+        _backup(tmp_path / f"{index}.bak", 10, created_at)
+
+    result = cleanup_backups(tmp_path, _policy(max_age_sec=100, max_count=2), now=1_000)
+
+    assert result.removed_for_age == 2
+    assert result.removed_for_count == 1
+    assert result.removed_for_quota == 0
+    assert result.removed_files == 3
+    assert result.remaining_files == 2
+    assert result.remaining_bytes == 20
+    assert result.quota_satisfied is True
+
+
+def test_byte_pressure_takes_priority_over_count_reason_until_byte_limit_is_met(tmp_path: Path) -> None:
+    for index, size in enumerate((100, 0, 100, 100)):
+        _backup(tmp_path / f"{index}.bak", size, 100 + index)
+
+    result = cleanup_backups(tmp_path, _policy(max_bytes=200, max_count=1), now=1_000)
+
+    assert result.removed_for_quota == 1
+    assert result.removed_for_count == 2
+    assert result.removed_files == result.removed_for_age + result.removed_for_quota + result.removed_for_count == 3
+    assert result.remaining_files == 1
+    assert result.remaining_bytes == 100
+    assert result.quota_satisfied is True
+
+
+@pytest.mark.parametrize("recent", [False, True])
+def test_count_quota_reports_overflow_when_protected_or_recent_backups_survive(tmp_path: Path, recent: bool) -> None:
+    protected = tmp_path / "protected.bak"
+    newest = tmp_path / "newest.bak"
+    _backup(protected, 0, 990 if recent else 100)
+    _backup(newest, 0, 999)
+
+    result = cleanup_backups(
+        tmp_path,
+        _policy(max_count=1, recent_grace_sec=60 if recent else 0),
+        now=1_000,
+        protected_paths=set() if recent else {protected},
+    )
+
+    assert protected.is_file() and newest.is_file()
+    assert result.remaining_files == 2
+    assert result.remaining_bytes == result.removed_for_count == 0
+    assert result.quota_satisfied is False
+    assert result.safety_floor_preserved is True
+
+
+def test_newest_survives_when_byte_and_count_limits_cannot_both_be_met(tmp_path: Path) -> None:
+    _backup(tmp_path / "old.bak", 0, 100)
+    newest = tmp_path / "newest.bak"
+    _backup(newest, 100, 200)
+
+    result = cleanup_backups(tmp_path, _policy(max_count=1, max_bytes=1), now=1_000)
+
+    assert newest.is_file()
+    assert result.remaining_files == 1
+    assert result.remaining_bytes == 100
+    assert result.removed_for_quota == 1
+    assert result.removed_for_count == 0
+    assert result.quota_satisfied is False
+    assert result.safety_floor_preserved is True
+
+
+@pytest.mark.parametrize("blocked_names", [{"0.bak"}, {"0.bak", "1.bak"}])
+def test_count_decreases_only_after_successful_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_names: set[str],
+) -> None:
+    for index in range(4):
+        _backup(tmp_path / f"{index}.bak", index + 1, 100 + index)
+    unlink = Path.unlink
+
+    def denied_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        if path.name in blocked_names:
+            raise PermissionError("backup still in use")
+        unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", denied_unlink)
+
+    result = cleanup_backups(tmp_path, _policy(max_count=2), now=1_000)
+
+    survivors = list(tmp_path.iterdir())
+    assert result.errors == len(blocked_names)
+    assert result.remaining_files == len(survivors) == len(blocked_names) + 1
+    assert result.remaining_bytes == sum(path.stat().st_size for path in survivors)
+    assert result.removed_files == result.removed_for_count == 3 - len(blocked_names)
+    assert result.quota_satisfied is (len(survivors) <= 2)
+    assert (tmp_path / "3.bak").is_file()
+
+
+@pytest.mark.parametrize("size, max_bytes, max_count", [(0, 0, 1), (100, 150, 0)])
+def test_final_stat_failure_preserves_scanned_survivor_usage_and_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size: int, max_bytes: int, max_count: int,
+) -> None:
+    protected = tmp_path / "protected.bak"
+    newest = tmp_path / "newest.bak"
+    _backup(protected, size, 100)
+    _backup(newest, size, 200)
+    stat = Path.stat
+
+    def denied_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == protected and follow_symlinks:
+            raise PermissionError("cannot inspect surviving backup")
+        return stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", denied_stat)
+
+    result = cleanup_backups(
+        tmp_path, _policy(max_bytes=max_bytes, max_count=max_count),
+        now=1_000, protected_paths={protected},
+    )
+
+    assert result.scanned_files == result.remaining_files == 2
+    assert result.scanned_bytes == result.remaining_bytes == 2 * size
+    assert result.removed_files == 0
+    assert result.quota_satisfied is False
+    assert result.errors == 1
+
+
+def test_count_quota_uses_actual_survivors_after_concurrent_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(4):
+        _backup(tmp_path / f"{index}.bak", index + 1, 100 + index)
+    unlink = Path.unlink
+
+    def concurrent_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        unlink(path, missing_ok=missing_ok)
+        if path == tmp_path / "2.bak":
+            unlink(tmp_path / "0.bak")
+
+    monkeypatch.setattr(Path, "unlink", concurrent_unlink)
+
+    result = cleanup_backups(
+        tmp_path, _policy(max_count=2), now=1_000,
+        protected_paths={tmp_path / "0.bak", tmp_path / "1.bak"},
+    )
+
+    assert result.removed_files == result.removed_for_count == 1
+    assert result.removed_bytes == 3
+    assert result.remaining_files == 2
+    assert result.remaining_bytes == 6
+    assert result.quota_satisfied is True
+
+
+def test_count_retention_coalesces_concurrent_atomic_backup_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    for index in range(2):
+        _backup(directory / f"{index}.bak", 1, 100 + index)
+    source = tmp_path / "source.txt"
+    source.write_text("recoverable", encoding="utf-8")
+    entered = threading.Event()
+    release = threading.Event()
+    scan = backups._scan_backups
+    calls = 0
+
+    def blocked_scan(path: Path) -> tuple[list[backups.BackupEntry], int]:
+        nonlocal calls
+        entries = scan(path)
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(2)
+        return entries
+
+    monkeypatch.setattr(backups, "_scan_backups", blocked_scan)
+    monkeypatch.setattr(service, "SETTINGS", SimpleNamespace(backup_dir=directory))
+    monkeypatch.setattr(service, "ensure_runtime_dirs", lambda: None)
+    manager = BackupRetentionManager(directory, _policy(max_count=1, recent_grace_sec=60))
+    manager.schedule()
+    assert entered.wait(2)
+    try:
+        published = Path(service._backup_file(source, "a" * 64))
+        manager.schedule(published)
+    finally:
+        release.set()
+    assert manager.flush(3)
+
+    assert published.read_text(encoding="utf-8") == "recoverable"
+    assert list(directory.iterdir()) == [published]
+    assert calls == 2
+    result = manager.snapshot()["last_result"]
+    assert isinstance(result, dict)
+    assert result["remaining_files"] == 1
+    assert result["removed_for_count"] == 1
+    assert result["quota_satisfied"] is True
+
+
+@pytest.mark.parametrize("configured, expected", [(None, 0), ("13", 13), ("-1", 0), ("2000000", 1_000_000), ("bad", 0)])
+def test_backup_count_setting_defaults_bounds_and_policy(
+    monkeypatch: pytest.MonkeyPatch, configured: str | None, expected: int,
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("MCP_BACKUP_MAX_COUNT", raising=False)
+    else:
+        monkeypatch.setenv("MCP_BACKUP_MAX_COUNT", configured)
+    result = subprocess.run(
+        [sys.executable, "-c", "import json; from core.config import Settings; "
+         "from core.backups import policy_from_settings; s = Settings(); "
+         "print(json.dumps([s.backup_max_count, s.resource_budgets()['backup_max_count'], policy_from_settings(s).max_count]))"],
+        cwd=Path(__file__).resolve().parent.parent,
+        check=True, capture_output=True, text=True, timeout=10,
+    )
+
+    assert json.loads(result.stdout) == [expected, expected, expected]
 
 
 def test_age_retention_removes_expired_backups_but_preserves_newest(tmp_path: Path) -> None:

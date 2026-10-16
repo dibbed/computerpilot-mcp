@@ -158,6 +158,9 @@ def test_server_health_exposes_resource_usage_and_budgets() -> None:
             assert budgets["browser_idle_sec"] == SETTINGS.browser_idle_sec
             assert budgets["artifact_max_bytes"] == SETTINGS.artifact_max_bytes
             assert budgets["artifact_max_age_hours"] == SETTINGS.artifact_max_age_hours
+            assert budgets["backup_max_count"] == SETTINGS.backup_max_count
+            assert usage["backup_count"]["max"] == SETTINGS.backup_max_count
+            assert usage["backup_count"]["value"] == health["backup_count"]
             assert usage["artifact_bytes"]["max"] == SETTINGS.artifact_max_bytes
             assert usage["audit_bytes"]["max"] == SETTINGS.audit_max_file_bytes * (SETTINGS.audit_keep_files + 1)
 
