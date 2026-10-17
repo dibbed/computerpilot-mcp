@@ -8,7 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,16 @@ from core.errors import ToolError
 from core.executor import _creation_flags
 from core.jobs import JobStore
 from core.process_ownership import OwnedProcess, spawn_owned_process
+from core.resource_claims import (
+    RESOURCE_CAPABILITY_ENV,
+    coordination_claim,
+    managed_resource_claims,
+    path_claim,
+    resource_capability,
+    resource_requires_native_ownership,
+    validate_resource_capability,
+)
+from core.windows_job import NativeOwnershipRequiredError
 
 
 def _poll_interval(elapsed: float) -> float:
@@ -34,6 +44,24 @@ def _poll_interval(elapsed: float) -> float:
 def _admission_poll_interval(attempt: int) -> float:
     """Back off queued workers cheaply while keeping slot handoff responsive."""
     return min(0.1 * (2 ** min(attempt, 3)), 1.0)
+
+
+def _capacity_process_identities(pid: int, created: float | None) -> list[tuple[int, float]]:
+    if created is None:
+        return []
+    identities = [(pid, created)]
+    try:
+        parent = psutil.Process(pid)
+        if abs(parent.create_time() - created) >= 0.01:
+            return []
+        for child in parent.children(recursive=True):
+            try:
+                identities.append((child.pid, child.create_time()))
+            except psutil.Error:
+                continue
+    except (psutil.Error, OSError):
+        pass
+    return identities
 
 
 def _kick_successor(store: JobStore) -> None:
@@ -86,6 +114,7 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 return
             time.sleep(_admission_poll_interval(admission_attempt))
             admission_attempt += 1
+        resource_stack: ExitStack | None = None
         try:
             row = _row(db, job_id)
             if row["cancel_requested"]:
@@ -93,9 +122,29 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 _kick_successor(store)
                 return
             spec = json.loads(row["spec"])
+            resource_stack = ExitStack()
+            inherited_capability = spec.get("_resource_capability")
+            if inherited_capability is not None:
+                if not isinstance(inherited_capability, str) or not inherited_capability:
+                    raise ToolError("resource_capability_invalid", "Internal resource capability is malformed.")
+                resource_stack.enter_context(resource_capability(inherited_capability))
+            capability = resource_stack.enter_context(
+                managed_resource_claims(
+                    [
+                        coordination_claim(exclusive=True),
+                        path_claim(str(spec["cwd"]), "write", scope="subtree"),
+                    ],
+                    category="native.job",
+                    timeout_sec=float(spec["timeout_sec"]),
+                    db_path=path.parent / "workflows.sqlite3",
+                    quarantine_on_error=True,
+                )
+            )
+            resource_authority = validate_resource_capability(capability, ())
             directory = store.output_dir / job_id
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = spec["encoding"]
+            env[RESOURCE_CAPABILITY_ENV] = capability
             with (directory / "stdout.bin").open("ab") as stdout, (directory / "stderr.bin").open("ab") as stderr:
                 process = spawn_owned_process(
                     spec["command"],
@@ -105,6 +154,7 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                     stdout=stdout,
                     stderr=stderr,
                     creationflags=_creation_flags(),
+                    require_native=resource_requires_native_ownership(capability, resource_authority),
                 )
                 try:
                     created = psutil.Process(process.pid).create_time()
@@ -118,6 +168,7 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 started = time.monotonic()
                 deadline = started + spec["timeout_sec"]
                 status = "succeeded"
+                capacity_identities = [(process.pid, created)] if created is not None else []
                 code: int | None = None
                 while code is None:
                     now = time.monotonic()
@@ -132,7 +183,10 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                             target=str(process.pid),
                             details={"job_id": job_id, "reason": status},
                         )
-                        process.terminate_tree(force=True)
+                        capacity_identities = _capacity_process_identities(process.pid, created)
+                        cleanup = process.terminate_tree(force=True)
+                        if cleanup.get("alive_pids"):
+                            raise ToolError("process_cleanup_incomplete", "Process-tree cleanup did not stop every child.")
                         code = process.wait(timeout=5)
                         break
                     wait_for = min(_poll_interval(now - started), max(deadline - now, 0.001))
@@ -143,9 +197,20 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 if status == "succeeded" and code != 0:
                     status = "failed"
                 process.close_ownership()
+                for capacity_pid, capacity_created in capacity_identities:
+                    resource_authority.release_process_capacity(capacity_pid, capacity_created)
             _update(db, job_id, status=status, exit_code=code)
         except BaseException as exc:
             error = exc.message if isinstance(exc, ToolError) else type(exc).__name__
+            if resource_stack is not None:
+                stack, resource_stack = resource_stack, None
+                try:
+                    if process is None and isinstance(exc, NativeOwnershipRequiredError):
+                        stack.close()
+                    else:
+                        stack.__exit__(type(exc), exc, exc.__traceback__)
+                except Exception as resource_error:
+                    error += f"; resource quarantine failed ({type(resource_error).__name__})"
             if process is not None:
                 try:
                     if process.poll() is None:
@@ -167,6 +232,9 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 # Recovery path only: a broken worker connection must still make
                 # the terminal state visible if the database itself is reachable.
                 store.update(job_id, status="failed", error=error)
+        finally:
+            if resource_stack is not None:
+                resource_stack.close()
     _kick_successor(store)
 
 

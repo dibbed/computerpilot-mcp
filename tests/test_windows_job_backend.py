@@ -66,7 +66,8 @@ def test_nested_job_object_kill_on_close_reaps_parent_and_grandchild(
         assert _alive(owned.pid)
         assert _alive(grandchild_pid)
         owned.close_ownership()
-        _wait_dead(owned.pid, grandchild_pid)
+        assert not _alive(owned.pid)
+        assert not _alive(grandchild_pid)
     finally:
         owned.close_ownership()
         if _alive(owned.pid):

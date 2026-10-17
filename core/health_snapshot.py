@@ -155,6 +155,10 @@ async def collect_server_health(
         degraded_reasons.append("operation_recovery_pending")
     if int(workflow_health["unresolved_operation_count"]) > 0:
         degraded_reasons.append("unresolved_uncertain_operations")
+    if int(workflow_health.get("quarantined_resource_request_count", 0)) > 0 or any(
+        count > 0 for state, count in workflow_health.get("runtime_capacity_counts", {}).items() if state.endswith(":quarantined")
+    ):
+        degraded_reasons.append("resource_ownership_unresolved")
     if int(workflow_health["workflow_db_bytes"]) >= settings.workflow_db_warn_bytes:
         degraded_reasons.append("workflow_db_pressure")
     resource_pressure = resources.get("resource_pressure")

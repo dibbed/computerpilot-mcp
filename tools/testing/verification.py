@@ -6,10 +6,12 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
+from core.runtime_capacity import acquire_runtime_capacity
 from tools.testing.impact import discover_changed_paths, select_affected_tests
 from tools.testing.runners import run_mypy_summary, run_pytest_summary, run_ruff_summary
 
@@ -97,6 +99,8 @@ def verify_changed_repository(
     stage_callback: Callable[[str, dict[str, Any]], None] | None = None,
     pytest_extra_args: list[str] | None = None,
     max_parallel_checks: int = 1,
+    analyzer_capacity_db: Path | None = None,
+    analyzer_capacity_limit: int = 3,
 ) -> dict[str, Any]:
     selected_checks = list(_CHECKS if checks is None else checks)
     unknown = sorted(set(selected_checks) - set(_CHECKS))
@@ -104,6 +108,8 @@ def verify_changed_repository(
         raise ValueError(f"Unknown verification check(s): {', '.join(unknown)}")
     if not 1 <= max_parallel_checks <= 3 or (max_parallel_checks > 1 and (fail_fast or ruff_fix)):
         raise ValueError("parallel verification requires capacity 1..3, fail_fast=false and ruff_fix=false")
+    if analyzer_capacity_db is not None and analyzer_capacity_limit < 1:
+        raise ValueError("analyzer_capacity_limit must be positive when durable capacity is enabled")
     resolved = repo.resolve(strict=False)
     plan = build_verification_plan(
         resolved, changed_paths=changed_paths, base=base,
@@ -157,9 +163,23 @@ def verify_changed_repository(
             return _stage(name, "skipped", started, targets=targets, reason=reason)
         if time.perf_counter() - overall_started >= total_timeout_sec:
             return _stage(name, "timed_out", started, targets=targets, reason="total_timeout")
+        permit = None
+        if analyzer_capacity_db is not None and name != "syntax":
+            permit = acquire_runtime_capacity(
+                analyzer_capacity_db,
+                category="analyzer",
+                limit=analyzer_capacity_limit,
+                deadline=overall_started + total_timeout_sec,
+            )
+            if permit is None:
+                return _stage(name, "timed_out", started, targets=targets, reason="analyzer_capacity_timeout")
         notify("stage_started", {"name": name})
         try:
-            result = operation()
+            if permit is None:
+                result = operation()
+            else:
+                with permit:
+                    result = operation()
         except (ModuleNotFoundError, FileNotFoundError) as exc:
             result = {"ok": False, "exit_code": None, "unavailable": True, "summary": str(exc), "diagnostics": []}
         except Exception as exc:
@@ -177,7 +197,8 @@ def verify_changed_repository(
                               for name, targets, _ in tasks)
                 tasks = []
         with ThreadPoolExecutor(max_workers=max_parallel_checks, thread_name_prefix="verification") as pool:
-            stages.extend(pool.map(run, tasks))
+            futures = [pool.submit(copy_context().run, run, task) for task in tasks]
+            stages.extend(future.result() for future in futures)
     else:
         halted = False
         for task in tasks:

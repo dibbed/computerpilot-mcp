@@ -343,6 +343,10 @@ def test_cancel_running_verification_reaps_test_process(tmp_path: Path) -> None:
     from core.jobs import same_process
 
     assert not same_process(process.pid, created)
+    from core.workflow_store import WorkflowStore
+
+    capacity = WorkflowStore(store.path.parent / "workflows.sqlite3", recover=False)
+    assert capacity.health_summary()["active_analyzer_capacity_weight"] == 0
 
 
 def test_worker_bounds_diagnostics_but_preserves_stage_status(

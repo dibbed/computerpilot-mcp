@@ -45,6 +45,8 @@ class StepInput(BaseModel):
     max_retries: int = Field(default=0, ge=0, le=10)
     postcondition: dict[str, Any] | None = None
     execution_intent: ExecutionIntentInput | None = None
+    step_id: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
+    depends_on: tuple[str, ...] = Field(default_factory=tuple, max_length=99)
 
 
 class WorkflowInput(BaseModel):
@@ -52,12 +54,18 @@ class WorkflowInput(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=2_000)
     steps: list[StepInput] = Field(min_length=1, max_length=100)
+    execution_mode: Literal["sequential", "dag"] = "sequential"
+    max_parallel_steps: int = Field(default=1, ge=1, le=16)
+    total_timeout_sec: float | None = Field(default=None, gt=0, le=86_400)
 
     def definition(self) -> WorkflowDefinition:
         return WorkflowDefinition(
             self.name,
             tuple(StepDefinition(**step.model_dump()) for step in self.steps),
             self.description,
+            self.execution_mode,
+            self.max_parallel_steps,
+            self.total_timeout_sec,
         )
 
 

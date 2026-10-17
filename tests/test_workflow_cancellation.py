@@ -158,8 +158,12 @@ def test_durable_job_handler_requests_underlying_job_cancellation(monkeypatch: p
     class FakeJobStore:
         cancelled = False
 
-        def submit(self, command: list[str], cwd: Path, timeout: float, request_key: str, encoding: str) -> dict[str, Any]:
+        def submit(
+            self, command: list[str], cwd: Path, timeout: float, request_key: str, encoding: str,
+            *, _resource_capability: str | None = None,
+        ) -> dict[str, Any]:
             del command, cwd, timeout, request_key, encoding
+            assert _resource_capability is None
             return {"job_id": "a" * 32, "status": "running", "version": 1, "exit_code": None}
 
         def get(self, job_id: str) -> dict[str, Any]:

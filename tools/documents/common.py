@@ -16,6 +16,7 @@ from core.config import SETTINGS, ensure_runtime_dirs, resolve_path
 from core.errors import ToolError
 from core.file_lock import exclusive_file_lock
 from core.recovery import checkpoint_current_postcondition
+from core.resource_claims import managed_path_claims
 from core.resource_locks import RESOURCE_LOCKS, canonical_path
 from tools.filesystem import service as filesystem_service
 
@@ -48,9 +49,9 @@ def _lock_path(path: Path) -> Path:
 
 @contextmanager
 def document_write_lock(path: str | Path, *, timeout_sec: float = 30.0) -> Iterator[Path]:
-    target = resolve_path(path)
-    with RESOURCE_LOCKS.sync(target):
-        with exclusive_file_lock(
+    with managed_path_claims(path, category="native.document", timeout_sec=timeout_sec):
+        target = resolve_path(path)
+        with RESOURCE_LOCKS.sync(target), exclusive_file_lock(
             _lock_path(target),
             timeout_sec=timeout_sec,
             label=f"document {target}",
