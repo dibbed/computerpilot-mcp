@@ -42,6 +42,30 @@ def test_poll_interval_backs_off_for_long_jobs() -> None:
     assert job_worker._poll_interval(30.0) == 1.0
 
 
+def test_cancel_winning_during_resource_wait_prevents_child_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id = "7" * 32
+    _seed(store, job_id, tmp_path)
+    original = job_worker.validate_resource_capability
+    dispatched = []
+
+    def cancel_before_dispatch(*args: object, **kwargs: object) -> WorkflowStore:
+        authority = original(*args, **kwargs)  # type: ignore[arg-type]
+        store.cancel(job_id)
+        return authority
+
+    def spawn(*args: object, **kwargs: object) -> None:
+        dispatched.append(True)
+        raise AssertionError("Cancelled job dispatched")
+
+    monkeypatch.setattr(job_worker, "validate_resource_capability", cancel_before_dispatch)
+    monkeypatch.setattr(job_worker, "spawn_owned_process", spawn)
+    job_worker.run(store.path, job_id)
+    assert dispatched == []
+    assert store.raw(job_id)["status"] == "cancelled"
+    assert WorkflowStore(tmp_path / "workflows.sqlite3", recover=False).health_summary()["quarantined_resource_request_count"] == 0
+
+
 def test_worker_releases_fresh_claim_when_native_ownership_denies_before_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

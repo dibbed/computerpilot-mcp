@@ -144,6 +144,11 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = spec["encoding"]
             env[RESOURCE_CAPABILITY_ENV] = capability
+            if not store.mark_may_dispatch(job_id, worker_pid=os.getpid(), worker_created=worker_created, db=db):
+                resource_stack.close()
+                resource_stack = None
+                _kick_successor(store)
+                return
             with (directory / "stdout.bin").open("ab") as stdout, (directory / "stderr.bin").open("ab") as stderr:
                 process = spawn_owned_process(
                     spec["command"],

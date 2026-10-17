@@ -1307,7 +1307,7 @@ class WorkflowStore:
                 raise ToolError("workflow_operation_not_uncertain", "Only an uncertain operation can be resolved.")
             workflow_id, step_index = str(operation["workflow_id"]), int(operation["step_index"])
             workflow = connection.execute(
-                "SELECT state, current_step FROM workflows WHERE workflow_id = ?", (workflow_id,),
+                "SELECT state, current_step, execution_mode FROM workflows WHERE workflow_id = ?", (workflow_id,),
             ).fetchone()
             if workflow is None or str(workflow["state"]) != WorkflowState.UNCERTAIN.value:
                 raise ToolError("workflow_not_uncertain", "The operation aggregate is not in uncertain state.")
@@ -1364,6 +1364,18 @@ class WorkflowStore:
                 (workflow_state.value, current_step, 1 if workflow_state is WorkflowState.UNCERTAIN else 2,
                  now, workflow_state.value, workflow_id),
             )
+            if str(workflow["execution_mode"]) == "dag":
+                if final_state is not OperationState.UNCERTAIN:
+                    connection.execute(
+                        "DELETE FROM workflow_execution_admissions WHERE operation_id=? AND NOT EXISTS "
+                        "(SELECT 1 FROM workflow_resource_requests WHERE operation_id=? AND state!='released')",
+                        (operation_id, operation_id),
+                    )
+                aggregate, next_index, aggregate_error, _ = self._aggregate_state(connection, workflow_id)
+                connection.execute(
+                    "UPDATE workflows SET state=?,current_step=?,last_error=? WHERE workflow_id=?",
+                    (aggregate.value, next_index, aggregate_error, workflow_id),
+                )
             connection.execute(
                 """
                 INSERT INTO workflow_events(workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at)
@@ -2349,6 +2361,49 @@ class WorkflowStore:
         assert row is not None
         return self.get_operation(operation_id)
 
+    @staticmethod
+    def _aggregate_state(
+        connection: sqlite3.Connection, workflow_id: str, *, keep_running: bool = False,
+    ) -> tuple[WorkflowState, int, str | None, int]:
+        workflow = connection.execute(
+            "SELECT cancel_requested_at FROM workflows WHERE workflow_id=?", (workflow_id,),
+        ).fetchone()
+        operations = connection.execute(
+            "SELECT step_index,state,error FROM workflow_operations WHERE workflow_id=? AND operation_index=0 ORDER BY step_index",
+            (workflow_id,),
+        ).fetchall()
+        active = int(connection.execute(
+            "SELECT COUNT(*) FROM workflow_execution_admissions a JOIN workflow_operations o USING(operation_id) "
+            "WHERE a.workflow_id=? AND o.state IN ('created','running','waiting')", (workflow_id,),
+        ).fetchone()[0])
+        states = {str(operation["state"]) for operation in operations}
+        success = {"succeeded", "acknowledged"}
+        unfinished = [int(operation["step_index"]) for operation in operations if str(operation["state"]) not in success]
+        current_step = min(unfinished) if unfinished else len(operations)
+        unresolved = bool(states & {"uncertain", "reconciling"}) or connection.execute(
+            "SELECT 1 FROM workflow_resource_requests WHERE workflow_id=? AND state IN ('active','quarantined') LIMIT 1",
+            (workflow_id,),
+        ).fetchone() is not None
+        failed = bool(states & {"failed", "unresolvable"})
+        cancelled = bool(workflow["cancel_requested_at"]) or "cancelled" in states
+        error = None
+        if active:
+            target = WorkflowState.CANCELLING if cancelled else WorkflowState.RUNNING
+        elif unresolved:
+            target = WorkflowState.UNCERTAIN
+            error = "workflow has unresolved operation or resource ownership"
+        elif failed:
+            target = WorkflowState.FAILED
+            error = next(str(op["error"] or "workflow operation failed")[:2_000]
+                         for op in operations if str(op["state"]) in {"failed", "unresolvable"})
+        elif cancelled:
+            target = WorkflowState.CANCELLED
+        elif operations and states <= success:
+            target = WorkflowState.COMPLETED
+        else:
+            target = WorkflowState.RUNNING if keep_running else WorkflowState.PAUSED
+        return target, current_step, error, active
+
     def recompute_workflow_aggregate(
         self,
         workflow_id: str,
@@ -2368,63 +2423,10 @@ class WorkflowStore:
             if workflow is None:
                 raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
             self._require_current_lease_row(connection, workflow_id, lease_token, now)
-            operations = connection.execute(
-                """
-                SELECT step_index, state, error FROM workflow_operations
-                WHERE workflow_id = ? AND operation_index = 0
-                ORDER BY step_index
-                """,
-                (workflow_id,),
-            ).fetchall()
-            active_count = int(connection.execute(
-                "SELECT COUNT(*) FROM workflow_execution_admissions WHERE workflow_id = ?",
-                (workflow_id,),
-            ).fetchone()[0])
-            states = [str(operation["state"]) for operation in operations]
-            unresolved = any(state in {OperationState.UNCERTAIN.value, OperationState.RECONCILING.value} for state in states)
-            failed = any(state in {OperationState.FAILED.value, OperationState.UNRESOLVABLE.value} for state in states)
-            cancelled = bool(workflow["cancel_requested_at"]) or any(state == OperationState.CANCELLED.value for state in states)
-            all_success = bool(operations) and all(
-                state in {OperationState.SUCCEEDED.value, OperationState.ACKNOWLEDGED.value} for state in states
+            target, current_step, primary_error, active_count = self._aggregate_state(
+                connection, workflow_id, keep_running=keep_running,
             )
-            unfinished_indices = [
-                int(operation["step_index"])
-                for operation in operations
-                if str(operation["state"]) not in {OperationState.SUCCEEDED.value, OperationState.ACKNOWLEDGED.value}
-            ]
-            current_step = min(unfinished_indices) if unfinished_indices else len(operations)
-
-            if active_count > 0:
-                target = WorkflowState.CANCELLING if cancelled else WorkflowState.RUNNING
-            elif unresolved:
-                target = WorkflowState.UNCERTAIN
-            elif failed:
-                target = WorkflowState.FAILED
-            elif cancelled:
-                target = WorkflowState.CANCELLED
-            elif all_success:
-                target = WorkflowState.COMPLETED
-            elif keep_running:
-                target = WorkflowState.RUNNING
-            else:
-                target = WorkflowState.PAUSED
-
-            primary_error = None
-            if failed:
-                primary = next(
-                    (
-                        operation
-                        for operation in operations
-                        if str(operation["state"]) in {OperationState.FAILED.value, OperationState.UNRESOLVABLE.value}
-                    ),
-                    None,
-                )
-                if primary is not None:
-                    primary_error = str(primary["error"] or "workflow operation failed")[:2_000]
-            elif unresolved:
-                primary_error = "workflow has unresolved operation outcome"
-            elif stop_admission_reason:
-                primary_error = stop_admission_reason[:2_000]
+            primary_error = primary_error or stop_admission_reason
 
             connection.execute(
                 """
@@ -2694,6 +2696,8 @@ class WorkflowStore:
                 if str(lease["expires_at"]) <= _now():
                     raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
             validate_workflow_transition(WorkflowState(str(current["state"])), state)
+            if state is WorkflowState.QUEUED:
+                self._require_safe_resume(connection, workflow_id)
             assignments = ["state = ?", "version = version + 1", "updated_at = ?", "last_error = ?"]
             parameters: list[Any] = [state.value, _now(), last_error[:2_000] if last_error else None]
             if current_step is not None:
@@ -2707,6 +2711,27 @@ class WorkflowStore:
                 raise ToolError("workflow_version_conflict", "Workflow changed; reload status before retrying.")
             connection.commit()
         return self.get(workflow_id)
+
+    @staticmethod
+    def _require_safe_resume(connection: sqlite3.Connection, workflow_id: str) -> None:
+        from core.workflow_actions import get_action_descriptor
+
+        if connection.execute(
+            "SELECT 1 FROM workflow_operations WHERE workflow_id=? AND state IN ('running','waiting','uncertain','reconciling') "
+            "UNION ALL SELECT 1 FROM workflow_resource_requests WHERE workflow_id=? AND state!='released' "
+            "UNION ALL SELECT 1 FROM workflow_execution_admissions WHERE workflow_id=? LIMIT 1",
+            (workflow_id, workflow_id, workflow_id),
+        ).fetchone() is not None:
+            raise ToolError("workflow_resume_unresolved", "All branches, child ownership and resource claims must settle before resume.")
+        for operation in connection.execute(
+            "SELECT action,evidence_json,external_ref_json FROM workflow_operations "
+            "WHERE workflow_id=? AND state IN ('failed','unresolvable')", (workflow_id,),
+        ):
+            descriptor = get_action_descriptor(str(operation["action"]))
+            if descriptor.mutates or descriptor.name == "verify_changes":
+                evidence = json.loads(operation["evidence_json"] or "{}")
+                if evidence.get("dispatch_phase") not in {"reserved", "prepared"} or operation["external_ref_json"]:
+                    raise ToolError("workflow_resume_unsafe_replay", "A failed effectful branch needs proof of no dispatch before retry.")
 
     def advance_running(
         self,
@@ -2795,6 +2820,70 @@ class WorkflowStore:
                 raise ToolError("workflow_step_not_found", "Workflow step was not found.")
             connection.commit()
 
+    def _recover_dag_execution(self, connection: sqlite3.Connection, workflow_id: str, now: str) -> None:
+        operations = connection.execute(
+            "SELECT * FROM workflow_operations WHERE workflow_id=? ORDER BY step_index,operation_index", (workflow_id,),
+        ).fetchall()
+        for operation in operations:
+            operation_id = str(operation["operation_id"])
+            state = str(operation["state"])
+            phase = str(operation["dispatch_phase"] or "")
+            has_child = bool(operation["external_ref_json"]) or connection.execute(
+                "SELECT 1 FROM runtime_capacity_requests c JOIN workflow_resource_requests r "
+                "ON r.request_id=c.resource_request_id WHERE r.operation_id=? AND c.state!='released' LIMIT 1",
+                (operation_id,),
+            ).fetchone() is not None
+            safe = state == "created" and not has_child and (
+                phase in {"reserved", "prepared"} or
+                (not phase and not operation["started_at"] and int(operation["attempts"]) == 0)
+            )
+            if state in {"running", "waiting", "reconciling"} or (state == "created" and not safe):
+                state = "uncertain"
+            connection.execute(
+                "UPDATE workflow_operations SET state=?, version=version+1, updated_at=?, "
+                "dispatch_phase=CASE WHEN ? THEN NULL ELSE dispatch_phase END, "
+                "error=CASE WHEN ?='uncertain' THEN 'runtime_ended_without_checkpoint' ELSE error END "
+                "WHERE operation_id=?", (state, now, int(safe), state, operation_id),
+            )
+            step_state = {"succeeded": "completed", "acknowledged": "completed", "unresolvable": "failed"}.get(state, state)
+            connection.execute(
+                "UPDATE workflow_steps SET state=?, evidence_json=?, error=?, "
+                "finished_at=CASE WHEN ?='created' THEN NULL ELSE COALESCE(finished_at,?) END "
+                "WHERE workflow_id=? AND step_index=?",
+                (step_state, operation["evidence_json"], "runtime_ended_without_checkpoint" if state == "uncertain" else operation["error"],
+                 state, now, workflow_id, operation["step_index"]),
+            )
+            connection.execute(
+                "UPDATE workflow_resource_requests SET state=CASE WHEN state='pending' OR ? THEN 'released' "
+                "ELSE 'quarantined' END,reason='workflow_lease_lost_before_resource_reconciliation',updated_at=? "
+                "WHERE operation_id=? AND state IN ('active','pending')",
+                (int(safe or (state in {"succeeded", "acknowledged", "failed", "unresolvable", "cancelled"} and not has_child)),
+                 now, operation_id),
+            )
+            if safe or state in {"succeeded", "acknowledged", "failed", "unresolvable", "cancelled"}:
+                connection.execute(
+                    "DELETE FROM workflow_execution_admissions WHERE operation_id=? AND NOT EXISTS "
+                    "(SELECT 1 FROM workflow_resource_requests WHERE operation_id=? AND state!='released')",
+                    (operation_id, operation_id),
+                )
+        # Unbound reservations cannot authorize dispatch; an active unbound owner still needs evidence.
+        connection.execute(
+            "UPDATE workflow_resource_requests SET state=CASE WHEN state='pending' THEN 'released' ELSE 'quarantined' END, "
+            "reason='workflow_lease_lost_before_resource_reconciliation',updated_at=? "
+            "WHERE workflow_id=? AND operation_id IS NULL AND state IN ('active','pending')", (now, workflow_id),
+        )
+        target, current_step, error, _ = self._aggregate_state(connection, workflow_id)
+        connection.execute(
+            "UPDATE workflows SET state=?,current_step=?,version=version+1,updated_at=?,last_error=? WHERE workflow_id=?",
+            (target.value, current_step, now, error, workflow_id),
+        )
+        connection.execute("DELETE FROM workflow_leases WHERE workflow_id=?", (workflow_id,))
+        connection.execute(
+            "INSERT INTO workflow_events(workflow_id,event_type,state,metadata_json,created_at) "
+            "VALUES (?,'workflow_restart_recovered',?,?,?)",
+            (workflow_id, target.value, _canonical({"operation_count": len(operations)}), now),
+        )
+
     def recover_interrupted(self) -> int:
         now = _now()
         with closing(self._connect()) as connection:
@@ -2824,7 +2913,7 @@ class WorkflowStore:
                 ).rowcount
             rows = connection.execute(
                 """
-                SELECT workflows.workflow_id, workflows.current_step, workflows.state,
+                SELECT workflows.workflow_id, workflows.current_step, workflows.state, workflows.execution_mode,
                        workflows.cancel_requested_at
                 FROM workflows
                 LEFT JOIN workflow_leases ON workflow_leases.workflow_id = workflows.workflow_id
@@ -2837,6 +2926,9 @@ class WorkflowStore:
                 workflow_id = str(row["workflow_id"])
                 step_index = int(row["current_step"])
                 workflow_state = str(row["state"])
+                if str(row["execution_mode"]) == "dag":
+                    self._recover_dag_execution(connection, workflow_id, now)
+                    continue
                 connection.execute(
                     """
                     UPDATE workflow_resource_requests

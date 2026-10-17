@@ -49,7 +49,7 @@ def _patch_safe_actions(monkeypatch: pytest.MonkeyPatch, *, fail_step: str | Non
     monkeypatch.setattr(
         workflow_executor,
         "prepare_action_intent",
-        lambda action, arguments, postcondition: (postcondition, {"prepared": True}),
+        lambda action, arguments, postcondition, **kwargs: (postcondition, {"prepared": True}),
     )
 
     def fake_execute(action: str, arguments: dict[str, object], timeout_sec: float, context: object) -> dict[str, object]:

@@ -174,7 +174,7 @@ class WorkflowExecutor:
             )
 
     @staticmethod
-    def _postcondition(step: StepDefinition, result: dict[str, Any]) -> dict[str, Any]:
+    def _postcondition(step: StepDefinition, result: dict[str, Any], *, timeout_sec: float | None = None) -> dict[str, Any]:
         descriptor = get_action_descriptor(step.action)
         if not descriptor.mutates:
             return {"conclusive": True, "satisfied": True, "source": "action_result"}
@@ -192,7 +192,7 @@ class WorkflowExecutor:
                 "job_id": result.get("job_id"),
                 "request_key": expected.get("request_key"),
             }
-        evidence = evaluate_postcondition(Postcondition(kind, expected))
+        evidence = evaluate_postcondition(Postcondition(kind, expected), timeout_sec=timeout_sec)
         return {"source": evidence.source, **evidence.data}
 
     def _run_step_with_heartbeat(
@@ -294,6 +294,8 @@ class WorkflowExecutor:
         reserved: dict[str, Any],
         resource_request_id: str,
         resource_owner_token: str,
+        workflow_deadline: float,
+        stop_signal: threading.Event,
     ) -> dict[str, Any]:
         """Execute one already-admitted DAG attempt behind resource and dispatch barriers."""
 
@@ -301,6 +303,16 @@ class WorkflowExecutor:
         if not attempt_token:
             raise ToolError("workflow_attempt_missing", "Reserved workflow operation has no attempt token.")
         descriptor = get_action_descriptor(step.action)
+        effectful = descriptor.mutates or step.action == "verify_changes"
+        deadline = min(workflow_deadline, time.monotonic() + step.timeout_sec)
+        retry_safe = False
+
+        def remaining() -> float:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("Workflow attempt deadline expired.")
+            return budget
+
         crossed_dispatch_barrier = False
         canonical_postcondition: dict[str, Any] | None = None
 
@@ -340,19 +352,23 @@ class WorkflowExecutor:
         context = ActionContext(
             workflow_id=workflow_id,
             operation_id=operation_id,
-            is_cancel_requested=lambda: self.store.cancel_requested(workflow_id),
+            is_cancel_requested=lambda: stop_signal.is_set() or self.store.cancel_requested(workflow_id),
             persist_external_ref=persist_external_ref,
             persist_intent_evidence=persist_intent_evidence,
         )
         capability = make_resource_capability(resource_request_id, resource_owner_token, self.store.path)
         try:
             with resource_capability(capability):
+                remaining()
+                if stop_signal.is_set():
+                    raise ActionCancelled("Workflow stopped before dispatch.")
                 self._plan_route(step, operation_id, lease_token)
                 latest = self.store.get_operation(operation_id)
                 canonical_postcondition, intent_evidence = prepare_action_intent(
                     step.action,
                     step.arguments,
                     step.postcondition,
+                    timeout_sec=remaining(),
                 )
                 prepared = self.store.prepare_operation_attempt(
                     operation_id,
@@ -362,6 +378,9 @@ class WorkflowExecutor:
                     intent_evidence=intent_evidence,
                     postcondition=canonical_postcondition,
                 )
+                remaining()
+                if stop_signal.is_set():
+                    raise ActionCancelled("Workflow stopped before dispatch.")
                 self.store.mark_operation_may_dispatch(
                     operation_id,
                     expected_version=int(prepared["version"]),
@@ -380,8 +399,8 @@ class WorkflowExecutor:
                     step_id=step.step_id,
                     depends_on=step.depends_on,
                 )
-                result = execute_action(step.action, step.arguments, step.timeout_sec, context)
-                evidence = self._postcondition(execution_step, result)
+                result = execute_action(step.action, step.arguments, remaining(), context)
+                evidence = self._postcondition(execution_step, result, timeout_sec=remaining())
                 if evidence.get("conclusive") is not True:
                     raise SideEffectUncertain("Postcondition could not be evaluated conclusively.")
                 if evidence.get("satisfied") is not True:
@@ -406,13 +425,17 @@ class WorkflowExecutor:
             )
             raise
         except ActionCancelled as exc:
-            final_state = OperationState.CANCELLED
+            final_state = OperationState.UNCERTAIN if crossed_dispatch_barrier and effectful else OperationState.CANCELLED
+            error = str(exc)
+        except TransientActionError as exc:
+            retry_safe = not effectful and descriptor.retry_policy == "transient"
+            final_state = OperationState.FAILED if not effectful else OperationState.UNCERTAIN
             error = str(exc)
         except SideEffectUncertain as exc:
             final_state = OperationState.UNCERTAIN
             error = str(exc)
         except Exception as exc:
-            final_state = OperationState.UNCERTAIN if crossed_dispatch_barrier and descriptor.mutates else OperationState.FAILED
+            final_state = OperationState.UNCERTAIN if crossed_dispatch_barrier and effectful else OperationState.FAILED
             error = str(exc)
 
         latest = self.store.get_operation(operation_id)
@@ -427,6 +450,7 @@ class WorkflowExecutor:
                     "source": "workflow_attempt",
                     "conclusive": final_state is not OperationState.UNCERTAIN,
                     "satisfied": False,
+                    "retry_safe": retry_safe,
                     "dispatch_phase": "may_dispatch" if crossed_dispatch_barrier else str(latest.get("dispatch_phase") or "reserved"),
                 },
                 error=error,
@@ -477,6 +501,14 @@ class WorkflowExecutor:
         futures: dict[Future[Any], int] = {}
         resource_waits: dict[int, tuple[str, str]] = {}
         stop_admission_reason: str | None = None
+        stop_signal = threading.Event()
+        retry_after: dict[int, tuple[int, float]] = {}
+
+        def retryable(operation: dict[str, Any], index: int) -> bool:
+            descriptor = get_action_descriptor(definition.steps[index].action)
+            return (operation["state"] == "failed" and descriptor.retry_policy == "transient" and
+                    not descriptor.mutates and (operation.get("evidence") or {}).get("retry_safe") is True and
+                    int(operation["attempts"]) <= definition.steps[index].max_retries)
 
         def operations() -> list[dict[str, Any]]:
             items: list[dict[str, Any]] = []
@@ -514,20 +546,29 @@ class WorkflowExecutor:
                             OperationState.UNCERTAIN.value,
                             OperationState.UNRESOLVABLE.value,
                         }
-                        for operation in snapshot
+                        for index, operation in enumerate(snapshot) if not retryable(operation, index)
                     ):
                         stop_admission_reason = stop_admission_reason or "workflow branch failed or became uncertain"
 
+                    if stop_admission_reason is not None:
+                        stop_signal.set()
                     claimed_any = False
                     if stop_admission_reason is None:
                         ready_indices = set(self.store.get(workflow_id).get("ready_step_indices", []))
                         for index, operation in enumerate(snapshot):
                             if len(futures) >= effective_cap:
                                 break
-                            if str(operation["state"]) != OperationState.CREATED.value:
+                            retry = retryable(operation, index)
+                            if str(operation["state"]) != OperationState.CREATED.value and not retry:
                                 continue
-                            if index not in ready_indices:
+                            if index not in ready_indices and not retry:
                                 continue
+                            if retry:
+                                count = int(operation["attempts"])
+                                if retry_after.get(index, (-1, 0))[0] != count:
+                                    retry_after[index] = (count, time.monotonic() + _retry_backoff_seconds(count))
+                                if time.monotonic() < retry_after[index][1]:
+                                    continue
                             resource_request_id, resource_owner_token = resource_waits.get(
                                 index,
                                 (f"resource-{uuid.uuid4().hex}", f"resource-owner-{uuid.uuid4().hex}"),
@@ -575,6 +616,8 @@ class WorkflowExecutor:
                                 reserved,
                                 resource_request_id,
                                 resource_owner_token,
+                                deadline,
+                                stop_signal,
                             )
                             futures[future] = index
                             resource_waits.pop(index, None)
@@ -605,6 +648,9 @@ class WorkflowExecutor:
                                 raise ToolError("workflow_lease_lost", stop_admission_reason) from exc
                             raise
 
+                    if any(retryable(operation, index) for index, operation in enumerate(snapshot)):
+                        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                        continue
                     aggregate = self.store.recompute_workflow_aggregate(
                         workflow_id,
                         lease_token=lease.lease_token,
@@ -790,7 +836,7 @@ class WorkflowExecutor:
                             return self._cancel_operation(
                                 workflow_id, index, operation["operation_id"], lease.lease_token, error=str(exc),
                             )
-                        if attempts <= step.max_retries:
+                        if get_action_descriptor(step.action).retry_policy == "transient" and attempts <= step.max_retries:
                             lease = self.store.renew_lease(workflow_id, lease.lease_token, lease_ttl_sec)
                             heartbeat = _LeaseHeartbeat(self.store, workflow_id, lease.lease_token, lease_ttl_sec)
                             heartbeat.start()

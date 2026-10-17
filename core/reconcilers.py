@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,16 @@ from core.errors import ToolError
 from core.jobs import JobStore
 from core.recovery_models import Evidence, Postcondition
 from tools.git.service import command_arguments, command_environment
+
+_DEADLINE: ContextVar[float | None] = ContextVar("workflow_postcondition_deadline", default=None)
+
+
+def _remaining_timeout(default: float = 10) -> float:
+    deadline = _DEADLINE.get()
+    remaining = default if deadline is None else min(default, deadline - time.monotonic())
+    if remaining <= 0:
+        raise TimeoutError("Postcondition deadline expired.")
+    return remaining
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -67,6 +79,7 @@ def _file_sha256(expected: dict[str, Any]) -> Evidence:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1_048_576), b""):
+            _remaining_timeout()
             digest.update(chunk)
     actual = digest.hexdigest()
     return Evidence(
@@ -101,6 +114,7 @@ def _files_all_sha256(expected: dict[str, Any]) -> Evidence:
             hasher = hashlib.sha256()
             with path.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(1_048_576), b""):
+                    _remaining_timeout()
                     hasher.update(chunk)
             digest = hasher.hexdigest()
         except OSError as exc:
@@ -133,7 +147,7 @@ def _git_head(expected: dict[str, Any]) -> Evidence:
         env=command_environment(),
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=_remaining_timeout(),
         check=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
@@ -167,7 +181,7 @@ def _git_commit_effect(expected: dict[str, Any]) -> Evidence:
             env=command_environment(),
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_remaining_timeout(),
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -319,7 +333,7 @@ def _git_index_contains(expected: dict[str, Any]) -> Evidence:
         env=command_environment(),
         capture_output=True,
         text=False,
-        timeout=10,
+        timeout=_remaining_timeout(),
         check=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
@@ -349,7 +363,7 @@ def _http_response(expected: dict[str, Any]) -> Evidence:
     body_limit = 1_048_576
     opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
-        with opener.open(url, timeout=float(expected.get("timeout_sec", 10))) as response:
+        with opener.open(url, timeout=_remaining_timeout(float(expected.get("timeout_sec", 10)))) as response:
             body = response.read(body_limit + 1)
             status = int(response.status)
     except urllib.error.HTTPError as exc:
@@ -463,7 +477,15 @@ def get_postcondition_descriptor(kind: str) -> PostconditionDescriptor:
     return descriptor
 
 
-def evaluate_postcondition(postcondition: Postcondition) -> Evidence:
+def evaluate_postcondition(postcondition: Postcondition, *, timeout_sec: float | None = None) -> Evidence:
     """Evaluate one allowlisted postcondition without replaying its operation."""
 
-    return get_postcondition_descriptor(postcondition.kind).evaluator(postcondition.expected)
+    token = _DEADLINE.set(time.monotonic() + timeout_sec) if timeout_sec is not None else None
+    try:
+        _remaining_timeout()
+        evidence = get_postcondition_descriptor(postcondition.kind).evaluator(postcondition.expected)
+        _remaining_timeout()
+        return evidence
+    finally:
+        if token is not None:
+            _DEADLINE.reset(token)

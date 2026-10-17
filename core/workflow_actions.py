@@ -180,6 +180,8 @@ def _run_git(
     *command: str,
     uncertain_on_timeout: bool = False,
 ) -> dict[str, Any]:
+    if timeout_sec <= 0:
+        raise TimeoutError("Workflow Git deadline expired.")
     repo = resolve_path(str(arguments.get("repo", ".")))
     if uncertain_on_timeout:
         with managed_resource_claims(
@@ -246,14 +248,15 @@ def _verify_changes(arguments: dict[str, Any], timeout_sec: float) -> dict[str, 
 
 
 def _git_status(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
-    result = _run_git(arguments, timeout_sec, "status", "--short", "--branch")
+    deadline = time.monotonic() + timeout_sec
+    result = _run_git(arguments, deadline - time.monotonic(), "status", "--short", "--branch")
     lines = result["stdout"].splitlines()
     dirty = any(line and not line.startswith("##") for line in lines)
     if arguments.get("require_clean") is True and dirty:
         raise ToolError("workflow_git_dirty", "Repository must be clean for this workflow.")
     tag = arguments.get("tag_must_not_exist")
     if isinstance(tag, str) and tag:
-        tag_result = _run_git(arguments, timeout_sec, "tag", "--list", tag)
+        tag_result = _run_git(arguments, deadline - time.monotonic(), "tag", "--list", tag)
         if tag_result["stdout"].strip():
             raise ToolError("workflow_tag_exists", f"Git tag {tag!r} already exists.")
     result["dirty"] = dirty
@@ -264,8 +267,9 @@ def _git_stage(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
     paths = arguments.get("paths")
     if not isinstance(paths, list) or not paths or not all(isinstance(item, str) and item for item in paths):
         raise ToolError("invalid_workflow_action", "git_stage requires a non-empty paths list.")
-    result = _run_git(arguments, timeout_sec, "add", "--", *paths, uncertain_on_timeout=True)
-    staged = _run_git(arguments, timeout_sec, "diff", "--cached", "--name-only")["stdout"].splitlines()
+    deadline = time.monotonic() + timeout_sec
+    result = _run_git(arguments, deadline - time.monotonic(), "add", "--", *paths, uncertain_on_timeout=True)
+    staged = _run_git(arguments, deadline - time.monotonic(), "diff", "--cached", "--name-only")["stdout"].splitlines()
     result["requested_paths"] = paths
     result["staged_paths"] = staged
     return result
@@ -275,8 +279,9 @@ def _git_commit(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]
     message = arguments.get("message")
     if not isinstance(message, str) or not message.strip() or len(message) > 10_000:
         raise ToolError("invalid_workflow_action", "git_commit requires a bounded non-empty message.")
-    result = _run_git(arguments, timeout_sec, "commit", "-m", message, uncertain_on_timeout=True)
-    head = _run_git(arguments, timeout_sec, "rev-parse", "HEAD")["stdout"].strip()
+    deadline = time.monotonic() + timeout_sec
+    result = _run_git(arguments, deadline - time.monotonic(), "commit", "-m", message, uncertain_on_timeout=True)
+    head = _run_git(arguments, deadline - time.monotonic(), "rev-parse", "HEAD")["stdout"].strip()
     result["head"] = head
     return result
 
@@ -326,7 +331,7 @@ def _run_durable_job(
 
 
 def _check_file(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
-    del timeout_sec
+    deadline = time.monotonic() + timeout_sec
     path = resolve_path(str(arguments.get("path", "")))
     exists = path.exists()
     expected = bool(arguments.get("exists", True))
@@ -336,7 +341,25 @@ def _check_file(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]
     if contains is not None:
         if not isinstance(contains, str) or not path.is_file():
             raise ToolError("invalid_workflow_action", "check_file contains requires an existing text file.")
-        if contains not in path.read_text(encoding="utf-8", errors="replace"):
+        if path.stat().st_size > SETTINGS.max_file_write_chars * 4 or len(contains) > SETTINGS.max_file_write_chars:
+            raise ToolError("workflow_file_check_limit", "File content check exceeds the bounded text size limit.")
+        matched = contains == ""
+        tail = ""
+        scanned = 0
+        with path.open(encoding="utf-8", errors="replace", newline=None) as handle:
+            while not matched:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("File content check deadline expired.")
+                chunk = handle.read(65_536)
+                if not chunk:
+                    break
+                scanned += len(chunk)
+                if scanned > SETTINGS.max_file_write_chars * 4:
+                    raise ToolError("workflow_file_check_limit", "File grew beyond the bounded text scan limit.")
+                window = tail + chunk
+                matched = contains in window
+                tail = window[-(len(contains) - 1):] if len(contains) > 1 else ""
+        if not matched:
             raise ToolError("workflow_file_check_failed", "Expected text was not found in the file.")
     return {"path": str(path), "exists": exists, "contains_matched": contains is not None}
 
@@ -373,12 +396,13 @@ def _apply_patch(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any
 
 
 def _affected_tests(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
-    del timeout_sec
+    deadline = time.monotonic() + timeout_sec
     return select_affected_tests(
         resolve_path(str(arguments["cwd"])),
         changed_paths=arguments.get("changed_paths"),
         base=arguments.get("base"),
         fallback_policy=arguments["fallback_policy"],
+        deadline=deadline,
     )
 
 
@@ -570,8 +594,18 @@ def prepare_action_intent(
     name: str,
     arguments: dict[str, Any],
     postcondition: dict[str, Any] | None,
+    *,
+    timeout_sec: float = 60,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Materialize result-independent recovery intent before a side effect begins."""
+
+    deadline = time.monotonic() + timeout_sec
+
+    def remaining() -> float:
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise TimeoutError("Workflow intent deadline expired.")
+        return budget
 
     descriptor, validated = validate_operation(name, arguments, postcondition)
     if not descriptor.mutates:
@@ -584,7 +618,7 @@ def prepare_action_intent(
             dry_run=True,
             expected_sha256=validated.get("expected_sha256"),
             backup=False,
-            timeout_sec=60,
+            timeout_sec=remaining(),
             encoding=str(validated["encoding"]),
         )
         files: list[dict[str, Any]] = []
@@ -619,8 +653,8 @@ def prepare_action_intent(
     if name == "git_commit":
         repo = str(resolve_path(str(validated["repo"])))
         git_args = {"repo": repo}
-        before_head = _run_git(git_args, 10, "rev-parse", "HEAD")["stdout"].strip()
-        staged_tree = _run_git(git_args, 10, "write-tree")["stdout"].strip()
+        before_head = _run_git(git_args, min(10, remaining()), "rev-parse", "HEAD")["stdout"].strip()
+        staged_tree = _run_git(git_args, min(10, remaining()), "write-tree")["stdout"].strip()
         message_hash = hashlib.sha256(str(validated["message"]).strip().encode("utf-8")).hexdigest()
         commit_expected: dict[str, Any] = {
             "repo": repo,
