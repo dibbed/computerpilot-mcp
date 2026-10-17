@@ -121,6 +121,31 @@ def test_failed_quarantine_does_not_release_unknown_effect(
     )["admitted"] is False
 
 
+@pytest.mark.parametrize("writer", ["document", "workspace_edit"])
+def test_document_and_language_writers_enforce_inherited_scope(tmp_path: Path, writer: str) -> None:
+    from tools.documents.common import publish_document
+    from tools.language.edits import PlannedFile, apply_workspace_edit
+
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    target = tmp_path / "target.txt"
+    target.write_bytes(b"before")
+
+    def write_document(staged: Path) -> None:
+        staged.write_bytes(b"after")
+
+    with managed_resource_claims((path_claim(target, "read"),), category="reader", store=store):
+        with pytest.raises(ToolError) as raised:
+            if writer == "document":
+                publish_document(
+                    target, writer=write_document, validator=None,
+                    media_type="text/plain", backup=False,
+                )
+            else:
+                apply_workspace_edit((PlannedFile(target, b"before", b"after"),))
+        assert raised.value.code == "resource_capability_scope_violation"
+    assert target.read_bytes() == b"before"
+
+
 def test_inherited_resource_capability_cannot_expand_parent_scope(tmp_path: Path) -> None:
     store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
     repo = tmp_path / "repo"

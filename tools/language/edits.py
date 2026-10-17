@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from core.errors import ToolError
+from core.resource_claims import managed_path_claims
 from core.resource_locks import RESOURCE_LOCKS
 from tools.filesystem.patches import _write_bytes
 from tools.language.lsp import position_to_offset, uri_to_path
@@ -92,7 +93,8 @@ def prepare_workspace_edit(
 
 
 def apply_workspace_edit(plan: tuple[PlannedFile, ...]) -> dict[str, Any]:
-    with RESOURCE_LOCKS.sync(*(item.path for item in plan)):
+    paths = tuple(item.path for item in plan)
+    with managed_path_claims(*paths, category="native.workspace_edit"), RESOURCE_LOCKS.sync(*paths):
         written = []
         try:
             for item in plan:

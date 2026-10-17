@@ -296,3 +296,19 @@ def managed_resource_claims(
     finally:
         if release_on_exit:
             claim_store.release_resource_request(request_id, owner_token=owner_token)
+
+
+@contextmanager
+def managed_path_claims(
+    *paths: str | Path, category: str, scope: ClaimScope = "exact", timeout_sec: float = 60.0,
+) -> Iterator[str]:
+    """Claim native writer paths before local locks and reject aliases changed while waiting."""
+
+    from core.errors import ToolError
+
+    claims = canonical_claims((coordination_claim(), *(path_claim(path, "write", scope=scope) for path in paths)))
+    with managed_resource_claims(claims, category=category, timeout_sec=timeout_sec) as capability:
+        current = canonical_claims((coordination_claim(), *(path_claim(path, "write", scope=scope) for path in paths)))
+        if current != claims:
+            raise ToolError("resource_path_changed", "Resource path changed while waiting for admission.")
+        yield capability

@@ -17,6 +17,7 @@ from core.audit import audit_action
 from core.config import resolve_path
 from core.errors import ToolError
 from core.media import image_tool_result, inspect_image
+from core.resource_claims import coordination_claim, managed_path_claims, managed_resource_claims, path_claim
 from core.resource_locks import RESOURCE_LOCKS
 from core.response import ok, page
 from core.tooling import DESTRUCTIVE, MUTATING, READ_ONLY, PathArg, compact_errors
@@ -149,7 +150,7 @@ def register(mcp: MCPServer) -> None:
         expected_sha256: Annotated[str | None, Field(pattern=r"^[0-9a-fA-F]{64}$")] = None,
     ) -> dict[str, Any]:
         """Atomically replace an entire file; prefer surgical edit tools for small changes."""
-        with RESOURCE_LOCKS.sync(path):
+        with managed_path_claims(path, category="native.filesystem"), RESOURCE_LOCKS.sync(path):
             target = resolve_path(path)
             if not target.exists() and not create_if_missing:
                 raise FileNotFoundError(f"File not found: {target}")
@@ -178,7 +179,7 @@ def register(mcp: MCPServer) -> None:
         validate_python: bool = True,
     ) -> dict[str, Any]:
         """Create one new file and fail if it already exists."""
-        with RESOURCE_LOCKS.sync(path):
+        with managed_path_claims(path, category="native.filesystem"), RESOURCE_LOCKS.sync(path):
             target = resolve_path(path)
             if target.exists():
                 raise FileExistsError(f"Target already exists: {target}")
@@ -204,7 +205,7 @@ def register(mcp: MCPServer) -> None:
         missing_ok: bool = False,
     ) -> dict[str, Any]:
         """Permanently delete a file or, with recursive=true, a directory tree."""
-        with RESOURCE_LOCKS.sync(path):
+        with managed_path_claims(path, category="native.filesystem", scope="subtree"), RESOURCE_LOCKS.sync(path):
             target = resolve_path(path)
             if not target.exists() and not target.is_symlink():
                 if missing_ok:
@@ -233,7 +234,9 @@ def register(mcp: MCPServer) -> None:
         create_parents: bool = False,
     ) -> dict[str, Any]:
         """Move or rename one file or directory with explicit overwrite semantics."""
-        with RESOURCE_LOCKS.sync(source, destination):
+        with managed_path_claims(
+            source, destination, category="native.filesystem", scope="subtree",
+        ), RESOURCE_LOCKS.sync(source, destination):
             src = resolve_path(source)
             dst = resolve_path(destination)
             if not src.exists() and not src.is_symlink():
@@ -271,7 +274,9 @@ def register(mcp: MCPServer) -> None:
         preserve_metadata: bool = True,
     ) -> dict[str, Any]:
         """Copy one regular file and return structured metadata."""
-        with RESOURCE_LOCKS.sync(source, destination):
+        with managed_path_claims(
+            source, destination, category="native.filesystem", scope="subtree",
+        ), RESOURCE_LOCKS.sync(source, destination):
             src = resolve_path(source)
             dst = resolve_path(destination)
             if not src.is_file():
@@ -547,7 +552,7 @@ def register(mcp: MCPServer) -> None:
         validate_python: bool = True,
     ) -> dict[str, Any]:
         """Replace an exact small fragment only when its match count is known."""
-        with RESOURCE_LOCKS.sync(path):
+        with managed_path_claims(path, category="native.filesystem"), RESOURCE_LOCKS.sync(path):
             target, before, used_encoding = service.load_text(path, encoding)
             after, count = service.exact_replace(before, old, new, expected_count)
             audit_action("replace_exact", target=target, details={"expected_count": expected_count})
@@ -570,7 +575,7 @@ def register(mcp: MCPServer) -> None:
         validate_python: bool = True,
     ) -> dict[str, Any]:
         """Replace one uniquely anchored region without touching the rest of the file."""
-        with RESOURCE_LOCKS.sync(path):
+        with managed_path_claims(path, category="native.filesystem"), RESOURCE_LOCKS.sync(path):
             target, before, used_encoding = service.load_text(path, encoding)
             after = service.anchor_replace(before, start_marker, end_marker, replacement, include_markers)
             audit_action("replace_between_anchors", target=target, details={"include_markers": include_markers})
@@ -587,7 +592,7 @@ def register(mcp: MCPServer) -> None:
         encoding: str,
         backup: bool,
     ) -> dict[str, Any]:
-        with RESOURCE_LOCKS.sync(path):
+        with managed_path_claims(path, category="native.filesystem"), RESOURCE_LOCKS.sync(path):
             target, before, used_encoding = service.load_text(path, encoding)
             service._validate_python(target, before)
             after = service.replace_symbol_body(before, qualified_name, new_body, kind)
@@ -635,7 +640,10 @@ def register(mcp: MCPServer) -> None:
         timeout_sec: Annotated[float, Field(gt=0, le=600)] = 60,
     ) -> dict[str, Any]:
         """Validate, back up, atomically edit, test, and roll back on validation failure."""
-        with RESOURCE_LOCKS.sync(path):
+        with managed_resource_claims(
+            (coordination_claim(exclusive=bool(validation_command)), path_claim(path, "write")),
+            category="native.safe_refactor", timeout_sec=timeout_sec,
+        ), RESOURCE_LOCKS.sync(path):
             target = resolve_path(path)
             details: dict[str, Any] = {"edit_count": len(edits), "has_validation": bool(validation_command)}
             if validation_command:

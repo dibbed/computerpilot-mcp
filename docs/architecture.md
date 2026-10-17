@@ -247,3 +247,5 @@ ComputerPilot MCP v0.8 adds an extensibility and agent foundation enabling opera
 - **Observability**: Health and loopback panel projections read cached state with zero provider RPC. Bounded telemetry tracks the last 64 call outcomes per owner without per-provider dynamic labels.
 
 For authoring and contract details, see [External MCP extension authoring](development/MCP-EXTENSION-AUTHORING.md) and [Configuration](configuration.md).
+
+Native file writes, surgical edits, copy/move/delete, document publication, and LSP workspace edits join durable resource admission before local locks. Directory removal and moves use subtree claims; command-backed refactors reserve exclusive host coordination. Paths are revalidated after admission so alias changes while waiting fail before mutation. Background processes started outside the durable job/managed foreground interfaces remain outside this cooperative guarantee, as do editors and other external writers.
