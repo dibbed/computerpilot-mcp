@@ -1757,6 +1757,8 @@ class WorkflowStore:
         resolution: Literal["released"],
         evidence: str,
     ) -> dict[str, Any]:
+        if not evidence.strip():
+            raise ToolError("resource_resolution_evidence_required", "Resource resolution requires bounded operator evidence.")
         now = _now()
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1769,6 +1771,11 @@ class WorkflowStore:
                 raise ToolError("resource_owner_mismatch", "Resource request owner token does not match.")
             if str(row["state"]) != "quarantined":
                 raise ToolError("resource_request_not_quarantined", "Resource request is not quarantined.")
+            if connection.execute(
+                "SELECT 1 FROM runtime_capacity_requests WHERE resource_request_id=? AND state!='released' LIMIT 1",
+                (request_id,),
+            ).fetchone() is not None:
+                raise ToolError("resource_children_unresolved", "Child process capacity must settle before resource resolution.")
             connection.execute(
                 """
                 UPDATE workflow_resource_requests
@@ -1938,7 +1945,7 @@ class WorkflowStore:
                 """
                 UPDATE runtime_capacity_requests
                 SET state = 'released', reason = 'owned_process_cleanup_complete', updated_at = ?
-                WHERE owner_token LIKE ? AND state IN ('active', 'pending')
+                WHERE owner_token LIKE ? AND state IN ('active', 'pending', 'quarantined')
                 """,
                 (_now(), owner_prefix),
             ).rowcount

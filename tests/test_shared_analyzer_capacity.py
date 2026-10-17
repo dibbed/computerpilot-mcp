@@ -61,8 +61,23 @@ def test_parent_cannot_release_while_analyzer_permit_is_still_active(tmp_path: P
     assert store.reserve_resource_claims(
         request_id="other", owner_token="other", category="test", claims=(claim,),
     )["admitted"] is False
+    with sqlite3.connect(store.path) as db:
+        request_id, owner = db.execute(
+            "SELECT request_id, owner_token FROM workflow_resource_requests WHERE state='quarantined'",
+        ).fetchone()
+    from core.errors import ToolError
+
+    with pytest.raises(ToolError) as raised:
+        store.resolve_quarantined_resource_request(request_id, owner_token=owner, resolution="released", evidence="operator ack")
+    assert raised.value.code == "resource_children_unresolved"
     permit.release()
     assert store.health_summary()["quarantined_resource_request_count"] == 1
+    store.resolve_quarantined_resource_request(
+        request_id, owner_token=owner, resolution="released", evidence="child permit settled; fixture has no effects",
+    )
+    assert store.reserve_resource_claims(
+        request_id="other", owner_token="other", category="test", claims=(claim,),
+    )["admitted"] is True
 
 
 def test_process_capacity_cleanup_fences_reused_pid(tmp_path: Path) -> None:
@@ -82,6 +97,41 @@ def test_process_capacity_cleanup_fences_reused_pid(tmp_path: Path) -> None:
         assert permit.store.health_summary()["active_analyzer_capacity_weight"] == 1
         assert permit.store.release_process_capacity(os.getpid(), created) == 1
         assert permit.store.release_process_capacity(os.getpid(), created) == 0
+
+
+def test_quarantined_child_capacity_requires_owned_exit_then_operator_resolution(tmp_path: Path) -> None:
+    from core.executor import run_bounded
+    from core.resource_claims import managed_resource_claims, path_claim
+    from core.workflow_store import WorkflowStore
+
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    code = """
+import json,os,psutil,time
+from pathlib import Path
+from core.errors import ToolError
+from core.runtime_capacity import acquire_runtime_capacity
+permit=acquire_runtime_capacity(Path('unused.sqlite3'),category='analyzer',limit=1,deadline=time.monotonic()+2)
+assert permit is not None
+try:
+    with permit:
+        raise ToolError('process_cleanup_incomplete','fixture denied cleanup before owned exit')
+except ToolError:
+    pass
+print(json.dumps({'pid':os.getpid(),'created':psutil.Process().create_time()}))
+"""
+    with managed_resource_claims((path_claim(tmp_path, "write", scope="subtree"),), category="parent", store=store):
+        result = run_bounded([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], timeout_sec=10)
+        assert result["ok"] is True
+        identity = json.loads(result["stdout"]["text"])
+    assert store.health_summary()["runtime_capacity_counts"]["analyzer:quarantined"] == 1
+    assert store.release_process_capacity(identity["pid"], identity["created"]) == 1
+    assert store.health_summary()["quarantined_resource_request_count"] == 1
+    with sqlite3.connect(store.path) as db:
+        request_id, owner = db.execute("SELECT request_id, owner_token FROM workflow_resource_requests").fetchone()
+    store.resolve_quarantined_resource_request(
+        request_id, owner_token=owner, resolution="released", evidence="owned child exited; fixture only changed admission metadata",
+    )
+    assert store.health_summary()["quarantined_resource_request_count"] == 0
 
 
 def test_analyzer_capacity_uses_parent_resource_authority(tmp_path: Path) -> None:

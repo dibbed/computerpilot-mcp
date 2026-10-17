@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
+import psutil
+
 from core.resource_locks import canonical_path
 
 if TYPE_CHECKING:
@@ -223,6 +225,22 @@ def validate_resource_capability(
     return authority
 
 
+def resource_requires_native_ownership(token: str | None = None, store: WorkflowStore | None = None) -> bool:
+    from core.errors import ToolError
+
+    inherited = token if token is not None else current_resource_capability()
+    if inherited is None:
+        return False
+    authority = validate_resource_capability(inherited, (), store)
+    request_id, owner_token, _ = _parse_resource_capability(inherited)
+    resource = authority.resource_request(request_id, expected_owner_token=owner_token)
+    if resource["workflow_id"] is not None:
+        operation = authority.get_operation(str(resource["operation_id"]))
+        if operation.get("dispatch_phase") != "may_dispatch":
+            raise ToolError("workflow_dispatch_barrier_required", "Workflow process dispatch requires its durable barrier.")
+    return True
+
+
 @contextmanager
 def managed_resource_claims(
     claims: Sequence[ResourceClaim],
@@ -258,7 +276,7 @@ def managed_resource_claims(
 
     claim_store = store or WorkflowStore(db_path or SETTINGS.workflow_db, recover=False)
     request_id = f"native-resource-{uuid.uuid4().hex}"
-    owner_token = f"native-owner-{os.getpid()}-{uuid.uuid4().hex}"
+    owner_token = f"native-owner-{os.getpid()}-{psutil.Process().create_time():.6f}-{uuid.uuid4().hex}"
     capability = make_resource_capability(request_id, owner_token, claim_store.path)
     deadline = time.monotonic() + max(0.001, timeout_sec)
     admitted = False

@@ -16,6 +16,7 @@ import pytest
 from core.jobs import JobStore
 from core.process_ownership import PosixOwnedProcess
 from core.resource_claims import coordination_claim, make_resource_capability, path_claim
+from core.windows_job import NativeOwnershipRequiredError
 from core.workflow_store import WorkflowStore
 from scripts import job_worker
 
@@ -39,6 +40,26 @@ def test_poll_interval_backs_off_for_long_jobs() -> None:
     assert job_worker._poll_interval(2.0) == 0.5
     assert job_worker._poll_interval(29.99) == 0.5
     assert job_worker._poll_interval(30.0) == 1.0
+
+
+def test_worker_releases_fresh_claim_when_native_ownership_denies_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "jobs.sqlite3"
+    store = JobStore(path)
+    job_id = "f" * 32
+    _seed(store, job_id, tmp_path)
+
+    def denied(*args: object, **kwargs: object) -> None:
+        raise NativeOwnershipRequiredError("disabled before activation")
+
+    monkeypatch.setattr(job_worker, "spawn_owned_process", denied)
+    job_worker.run(path, job_id)
+
+    assert store.raw(job_id)["status"] == "failed"
+    health = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False).health_summary()
+    assert health["active_resource_request_count"] == 0
+    assert health["quarantined_resource_request_count"] == 0
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group ownership only")

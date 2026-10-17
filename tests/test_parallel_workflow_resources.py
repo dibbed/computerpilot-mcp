@@ -74,8 +74,7 @@ def test_resource_claim_set_has_a_byte_budget_before_persistence(tmp_path: Path)
     assert store.health_summary()["active_resource_request_count"] == 0
 
 
-@pytest.mark.parametrize("stale", ["lease", "attempt", "cancel", "completed"])
-def test_workflow_capability_revalidates_live_attempt_before_nested_dispatch(tmp_path: Path, stale: str) -> None:
+def _workflow_capability(tmp_path: Path) -> tuple[WorkflowStore, str, str, str]:
     store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
     workflow = store.create(
         WorkflowDefinition("owner", (StepDefinition("check", "check_file", {"path": str(tmp_path)}),)),
@@ -95,6 +94,12 @@ def test_workflow_capability_revalidates_live_attempt_before_nested_dispatch(tmp
     )
     store.bind_resource_request_attempt("parent", owner_token="owner", attempt_token=str(attempt["attempt_token"]))
     capability = make_resource_capability("parent", "owner", store.path)
+    return store, workflow_id, capability, lease.lease_token
+
+
+@pytest.mark.parametrize("stale", ["lease", "attempt", "cancel", "completed"])
+def test_workflow_capability_revalidates_live_attempt_before_nested_dispatch(tmp_path: Path, stale: str) -> None:
+    store, _, capability, _ = _workflow_capability(tmp_path)
     validate_resource_capability(capability, (), store)
     with sqlite3.connect(store.path) as db:
         if stale == "lease":
@@ -115,6 +120,54 @@ def test_workflow_capability_revalidates_live_attempt_before_nested_dispatch(tmp
             resource_request_id="parent", resource_owner_token="owner",
         )
     assert capacity_error.value.code == "resource_capability_invalid"
+
+
+@pytest.mark.parametrize("crossed_barrier", [False, True])
+def test_workflow_children_require_dispatch_barrier_and_native_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crossed_barrier: bool,
+) -> None:
+    from core.executor import run_bounded
+    from core.windows_job import NativeOwnershipRequiredError
+
+    store, workflow_id, capability, lease_token = _workflow_capability(tmp_path)
+    if crossed_barrier:
+        operation = store.list_operations(workflow_id)["items"][0]
+        prepared = store.prepare_operation_attempt(
+            operation["operation_id"], expected_version=operation["version"], attempt_token=operation["attempt_token"],
+            lease_token=lease_token, intent_evidence={}, postcondition=None,
+        )
+        store.mark_operation_may_dispatch(
+            operation["operation_id"], expected_version=prepared["version"], attempt_token=operation["attempt_token"],
+            lease_token=lease_token,
+        )
+    monkeypatch.setenv("MCP_WINDOWS_JOB_OBJECTS", "0")
+    monkeypatch.setenv("MCP_POSIX_PROCESS_GROUPS", "0")
+    marker = tmp_path / "effect.txt"
+    expected = NativeOwnershipRequiredError if crossed_barrier else ToolError
+    with resource_capability(capability), pytest.raises(expected):
+        run_bounded(
+            [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).write_text('effect')"],
+            cwd=tmp_path, timeout_sec=2,
+        )
+    assert not marker.exists()
+
+
+def test_managed_native_command_refuses_unowned_fallback_before_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.executor import run_bounded
+    from core.windows_job import NativeOwnershipRequiredError
+
+    monkeypatch.setenv("MCP_WINDOWS_JOB_OBJECTS", "0")
+    monkeypatch.setenv("MCP_POSIX_PROCESS_GROUPS", "0")
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    marker = tmp_path / "effect.txt"
+    with managed_resource_claims((path_claim(tmp_path, "write", scope="subtree"),), category="native", store=store):
+        with pytest.raises(NativeOwnershipRequiredError):
+            run_bounded(
+                [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).write_text('effect')"],
+                cwd=tmp_path, timeout_sec=2,
+            )
+    assert not marker.exists()
+    assert store.health_summary()["active_resource_request_count"] == 0
 
 
 def test_resource_conflict_matrix_handles_exact_and_subtree_paths(tmp_path: Path) -> None:
