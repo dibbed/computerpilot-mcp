@@ -6,8 +6,10 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Any
 
+from core.config import SETTINGS
 from core.errors import ToolError
 from core.execution_models import ExecutionIntent
 from core.reconcilers import evaluate_postcondition
@@ -21,7 +23,7 @@ from core.workflow_actions import (
     get_action_descriptor,
     prepare_action_intent,
 )
-from core.workflow_models import OperationState, StepDefinition, WorkflowState
+from core.workflow_models import OperationState, StepDefinition, WorkflowDefinition, WorkflowState
 from core.workflow_store import WorkflowStore
 
 LEASE_HEARTBEAT_MIN_SEC = 1.0
@@ -104,6 +106,7 @@ class WorkflowExecutor:
         store: WorkflowStore,
         *,
         route_planner: RoutePlanner | NativeOnlyRouting,
+        enable_dag_execution: bool = False,
     ) -> None:
         """Require every caller to declare how its workflow steps are routed.
 
@@ -119,6 +122,7 @@ class WorkflowExecutor:
         else:
             raise TypeError("route_planner must be a plan callable or NATIVE_ONLY_ROUTING")
         self.store = store
+        self.enable_dag_execution = bool(enable_dag_execution)
 
     def _plan_route(
         self,
@@ -279,6 +283,271 @@ class WorkflowExecutor:
             )
         return latest
 
+    def _run_dag_attempt(
+        self,
+        workflow_id: str,
+        operation_id: str,
+        lease_token: str,
+        step: StepDefinition,
+        reserved: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute one already-admitted DAG attempt behind a durable dispatch barrier."""
+
+        attempt_token = str(reserved.get("attempt_token") or "")
+        if not attempt_token:
+            raise ToolError("workflow_attempt_missing", "Reserved workflow operation has no attempt token.")
+        descriptor = get_action_descriptor(step.action)
+        crossed_dispatch_barrier = False
+        canonical_postcondition: dict[str, Any] | None = None
+
+        def persist_external_ref(value: dict[str, Any]) -> None:
+            self.store.update_operation_context(
+                operation_id,
+                lease_token=lease_token,
+                external_ref=value,
+            )
+
+        def persist_intent_evidence(value: dict[str, Any]) -> None:
+            self.store.update_operation_context(
+                operation_id,
+                lease_token=lease_token,
+                intent_evidence=value,
+            )
+
+        context = ActionContext(
+            workflow_id=workflow_id,
+            operation_id=operation_id,
+            is_cancel_requested=lambda: self.store.cancel_requested(workflow_id),
+            persist_external_ref=persist_external_ref,
+            persist_intent_evidence=persist_intent_evidence,
+        )
+        try:
+            self._plan_route(step, operation_id, lease_token)
+            latest = self.store.get_operation(operation_id)
+            canonical_postcondition, intent_evidence = prepare_action_intent(
+                step.action,
+                step.arguments,
+                step.postcondition,
+            )
+            prepared = self.store.prepare_operation_attempt(
+                operation_id,
+                expected_version=int(latest["version"]),
+                attempt_token=attempt_token,
+                lease_token=lease_token,
+                intent_evidence=intent_evidence,
+                postcondition=canonical_postcondition,
+            )
+            self.store.mark_operation_may_dispatch(
+                operation_id,
+                expected_version=int(prepared["version"]),
+                attempt_token=attempt_token,
+                lease_token=lease_token,
+            )
+            crossed_dispatch_barrier = True
+            execution_step = StepDefinition(
+                name=step.name,
+                action=step.action,
+                arguments=step.arguments,
+                timeout_sec=step.timeout_sec,
+                max_retries=step.max_retries,
+                postcondition=canonical_postcondition,
+                execution_intent=step.execution_intent,
+                step_id=step.step_id,
+                depends_on=step.depends_on,
+            )
+            result = execute_action(step.action, step.arguments, step.timeout_sec, context)
+            evidence = self._postcondition(execution_step, result)
+            if evidence.get("conclusive") is not True:
+                raise SideEffectUncertain("Postcondition could not be evaluated conclusively.")
+            if evidence.get("satisfied") is not True:
+                raise ToolError("workflow_postcondition_failed", "Step postcondition was not satisfied.")
+            latest = self.store.get_operation(operation_id)
+            return self.store.complete_operation_attempt(
+                operation_id,
+                expected_version=int(latest["version"]),
+                attempt_token=attempt_token,
+                lease_token=lease_token,
+                final_state=OperationState.SUCCEEDED,
+                result=result,
+                evidence=evidence,
+            )
+        except _LeaseLostDuringAction:
+            raise
+        except ActionCancelled as exc:
+            final_state = OperationState.CANCELLED
+            error = str(exc)
+        except SideEffectUncertain as exc:
+            final_state = OperationState.UNCERTAIN
+            error = str(exc)
+        except Exception as exc:
+            final_state = OperationState.UNCERTAIN if crossed_dispatch_barrier and descriptor.mutates else OperationState.FAILED
+            error = str(exc)
+
+        latest = self.store.get_operation(operation_id)
+        try:
+            return self.store.complete_operation_attempt(
+                operation_id,
+                expected_version=int(latest["version"]),
+                attempt_token=attempt_token,
+                lease_token=lease_token,
+                final_state=final_state,
+                evidence={
+                    "source": "workflow_attempt",
+                    "conclusive": final_state is not OperationState.UNCERTAIN,
+                    "satisfied": False,
+                    "dispatch_phase": "may_dispatch" if crossed_dispatch_barrier else str(latest.get("dispatch_phase") or "reserved"),
+                },
+                error=error,
+            )
+        except ToolError as settle_error:
+            if settle_error.code in {
+                "workflow_lease_expired",
+                "workflow_lease_token_mismatch",
+                "workflow_attempt_conflict",
+            }:
+                raise _LeaseLostDuringAction("Workflow attempt lost durable ownership before settlement.") from settle_error
+            raise
+
+    def _execute_dag(
+        self,
+        workflow_id: str,
+        current: dict[str, Any],
+        definition: WorkflowDefinition,
+        *,
+        owner_id: str,
+        lease_ttl_sec: float,
+    ) -> dict[str, Any]:
+        """Run dependency-ready DAG steps with one lease heartbeat and bounded in-flight work."""
+
+        self.store.materialize_operations(workflow_id, return_operations=False)
+        lease = self.store.acquire_lease(
+            workflow_id,
+            owner_id,
+            lease_ttl_sec,
+            allow_reentry=False,
+        )
+        execution_id = uuid.uuid4().hex
+        heartbeat = _LeaseHeartbeat(self.store, workflow_id, lease.lease_token, lease_ttl_sec)
+        effective_cap = min(
+            int(definition.max_parallel_steps),
+            SETTINGS.workflow_max_parallel_steps,
+            SETTINGS.max_running_workflow_steps,
+        )
+        total_timeout = float(definition.total_timeout_sec or 7_200.0)
+        deadline = time.monotonic() + total_timeout
+        futures: dict[Future[Any], int] = {}
+        stop_admission_reason: str | None = None
+
+        def operations() -> list[dict[str, Any]]:
+            items: list[dict[str, Any]] = []
+            while True:
+                page = self.store.list_operations(workflow_id, offset=len(items), limit=500)
+                items.extend(page["items"])
+                if not page["has_more"]:
+                    return items
+
+        try:
+            current = self.store.transition(
+                workflow_id,
+                int(current["version"]),
+                WorkflowState.RUNNING,
+                lease_token=lease.lease_token,
+            )
+            heartbeat.start()
+            with ThreadPoolExecutor(max_workers=effective_cap, thread_name_prefix="workflow-dag") as pool:
+                while True:
+                    try:
+                        heartbeat.ensure_current()
+                    except _LeaseLostDuringAction as exc:
+                        stop_admission_reason = str(exc)
+
+                    if time.monotonic() >= deadline and stop_admission_reason is None:
+                        stop_admission_reason = "workflow total deadline expired"
+                    if self.store.cancel_requested(workflow_id) and stop_admission_reason is None:
+                        stop_admission_reason = "workflow cancellation requested"
+
+                    snapshot = operations()
+                    if any(
+                        str(operation["state"])
+                        in {
+                            OperationState.FAILED.value,
+                            OperationState.UNCERTAIN.value,
+                            OperationState.UNRESOLVABLE.value,
+                        }
+                        for operation in snapshot
+                    ):
+                        stop_admission_reason = stop_admission_reason or "workflow branch failed or became uncertain"
+
+                    claimed_any = False
+                    if stop_admission_reason is None:
+                        for index, operation in enumerate(snapshot):
+                            if len(futures) >= effective_cap:
+                                break
+                            if str(operation["state"]) != OperationState.CREATED.value:
+                                continue
+                            reserved = self.store.claim_ready_operation(
+                                str(operation["operation_id"]),
+                                lease_token=lease.lease_token,
+                                owner_id=owner_id,
+                                execution_id=execution_id,
+                                global_limit=SETTINGS.max_running_workflow_steps,
+                            )
+                            if reserved is None:
+                                continue
+                            future = pool.submit(
+                                self._run_dag_attempt,
+                                workflow_id,
+                                str(operation["operation_id"]),
+                                lease.lease_token,
+                                definition.steps[index],
+                                reserved,
+                            )
+                            futures[future] = index
+                            claimed_any = True
+
+                    if futures:
+                        remaining = max(0.0, deadline - time.monotonic())
+                        wait_timeout = min(max(0.05, heartbeat.interval_sec), remaining) if remaining else 0.05
+                        done, _ = wait(tuple(futures), timeout=wait_timeout, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            futures.pop(future, None)
+                            try:
+                                future.result()
+                            except _LeaseLostDuringAction as exc:
+                                stop_admission_reason = stop_admission_reason or str(exc)
+                        continue
+
+                    if stop_admission_reason is not None:
+                        try:
+                            return self.store.recompute_workflow_aggregate(
+                                workflow_id,
+                                lease_token=lease.lease_token,
+                                stop_admission_reason=stop_admission_reason,
+                                keep_running=False,
+                            )
+                        except ToolError as exc:
+                            if exc.code in {"workflow_lease_expired", "workflow_lease_token_mismatch"}:
+                                raise ToolError("workflow_lease_lost", stop_admission_reason) from exc
+                            raise
+
+                    aggregate = self.store.recompute_workflow_aggregate(
+                        workflow_id,
+                        lease_token=lease.lease_token,
+                        keep_running=True,
+                    )
+                    if aggregate["state"] in {
+                        WorkflowState.COMPLETED.value,
+                        WorkflowState.FAILED.value,
+                        WorkflowState.UNCERTAIN.value,
+                        WorkflowState.CANCELLED.value,
+                    }:
+                        return aggregate
+                    if not claimed_any:
+                        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        finally:
+            heartbeat.stop()
+            self.store.release_lease_if_current(workflow_id, lease.lease_token)
+
     def execute(
         self,
         workflow_id: str,
@@ -296,9 +565,17 @@ class WorkflowExecutor:
             return {**current, "dry_run": True, "would_execute": current["definition"]["steps"]}
         definition = self.store.execution_definition(workflow_id)
         if definition.execution_mode == "dag":
-            raise ToolError(
-                "workflow_dag_execution_unavailable",
-                "DAG workflow execution is not enabled until scheduler and resource gates are active.",
+            if not self.enable_dag_execution:
+                raise ToolError(
+                    "workflow_dag_execution_unavailable",
+                    "DAG workflow execution is not enabled until scheduler and resource gates are active.",
+                )
+            return self._execute_dag(
+                workflow_id,
+                current,
+                definition,
+                owner_id=owner_id,
+                lease_ttl_sec=lease_ttl_sec,
             )
         self.store.materialize_operations(workflow_id, return_operations=False)
         lease = self.store.acquire_lease(workflow_id, owner_id, lease_ttl_sec)

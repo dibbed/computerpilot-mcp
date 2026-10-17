@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Added
+- 2026-10-17: Add the feature-gated parallel workflow scheduler with bounded dependency-ready dispatch, one executor heartbeat, schema-8 active admission rows, fenced attempt tokens, durable dispatch phases, global/per-workflow step caps and late-result rejection; public DAG activation remains disabled pending shared resource and recovery gates.
 - 2026-10-17: Add the gated workflow DAG foundation with explicit step identities/dependencies, deterministic graph validation, schema-7 dependency persistence and derived readiness while preserving legacy sequential execution bytes and keeping DAG execution disabled until scheduler/resource/recovery gates are complete.
 - 2026-10-17: Add bounded opt-in concurrency to `collect_diagnostics`, preserving serial defaults, request-order stages and deterministic merged diagnostics while supporting an optional total deadline and partial sibling results on backend failures.
 - 2026-10-17: Expose bounded `max_parallel_checks` (1–3, default 1) on foreground `verify_changes`, reusing the existing verification engine and preserving serial fix/fail-fast behavior unless callers explicitly opt into compatible read-only parallel checks.
