@@ -18,6 +18,7 @@ from core.config import resolve_path
 from core.errors import ToolError
 from core.jobs import JobStore
 from core.recovery_models import Evidence, Postcondition
+from tools.git.service import command_arguments, command_environment
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -128,7 +129,8 @@ def _git_head(expected: dict[str, Any]) -> Evidence:
     repo = resolve_path(_required_string(expected, "repo"))
     wanted = _required_string(expected, "commit")
     completed = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        ["git", "-C", str(repo), *command_arguments(["rev-parse", "HEAD"])],
+        env=command_environment(),
         capture_output=True,
         text=True,
         timeout=10,
@@ -161,7 +163,8 @@ def _git_commit_effect(expected: dict[str, Any]) -> Evidence:
 
     def run(*args: str) -> tuple[int, str]:
         completed = subprocess.run(
-            ["git", "-C", str(repo), *args],
+            ["git", "-C", str(repo), *command_arguments(args)],
+            env=command_environment(),
             capture_output=True,
             text=True,
             timeout=10,
@@ -312,7 +315,8 @@ def _git_index_contains(expected: dict[str, Any]) -> Evidence:
     if not isinstance(paths, list) or not all(isinstance(item, str) for item in paths):
         raise ToolError("invalid_postcondition", "git_index_contains requires a paths list.")
     completed = subprocess.run(
-        ["git", "-C", str(repo), "-c", "core.quotepath=false", "diff", "--cached", "--name-only", "-z", "--"],
+        ["git", "-C", str(repo), *command_arguments(["diff", "--cached", "--name-only", "-z", "--"])],
+        env=command_environment(),
         capture_output=True,
         text=False,
         timeout=10,

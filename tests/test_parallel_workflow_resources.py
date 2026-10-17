@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -279,17 +281,22 @@ def test_older_writer_fences_late_readers_without_blocking_independent_work(tmp_
     assert reserve("late-reader", target, "read")["admitted"] is True
 
 
+def _git_repository(repo: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    for key, value in {"user.name": "Fixture", "user.email": "fixture@example.invalid", "commit.gpgsign": "false",
+                       "core.hooksPath": str(repo.parent / "empty-hooks")}.items():
+        subprocess.run(["git", "-C", str(repo), "config", key, value], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "fixture"],
+        check=True, capture_output=True,
+    )
+
+
 def test_git_worktrees_share_the_authoritative_common_directory_claim(tmp_path: Path) -> None:
     from core.workflow_actions import derive_action_resource_claims
 
     repo, sibling = tmp_path / "repo", tmp_path / "sibling"
-    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-         "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={tmp_path / 'empty-hooks'}",
-         "commit", "-q", "--allow-empty", "-m", "fixture"],
-        check=True, capture_output=True,
-    )
+    _git_repository(repo)
     subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(sibling)], check=True, capture_output=True)
     first = derive_action_resource_claims("git_stage", {"repo": str(repo), "paths": ["data"]}, {"kind": "git_stage_intent"})
     second = derive_action_resource_claims("git_stage", {"repo": str(sibling), "paths": ["data"]}, {"kind": "git_stage_intent"})
@@ -297,6 +304,244 @@ def test_git_worktrees_share_the_authoritative_common_directory_claim(tmp_path: 
     store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
     assert store.reserve_resource_claims(request_id="a", owner_token="a", category="test", claims=first)["admitted"] is True
     assert store.reserve_resource_claims(request_id="b", owner_token="b", category="test", claims=second)["admitted"] is False
+
+
+@pytest.mark.parametrize("interface", ["workflow", "native"])
+def test_git_mutations_fence_unknown_hook_and_filter_effects(tmp_path: Path, interface: str) -> None:
+    from core.workflow_actions import derive_action_resource_claims
+    from tools.git.registry import _git_resource_claims
+
+    repo = tmp_path / "repo"
+    _git_repository(repo)
+    claims = (
+        derive_action_resource_claims("git_commit", {"repo": str(repo), "message": "fixture"}, {"kind": "git_commit_intent"})
+        if interface == "workflow" else _git_resource_claims(repo)
+    )
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    assert store.reserve_resource_claims(request_id="git", owner_token="git", category="test", claims=claims)["admitted"] is True
+    assert store.reserve_resource_claims(
+        request_id="reader", owner_token="reader", category="test",
+        claims=(resource_claims.coordination_claim(), path_claim(tmp_path / "outside-repo", "read")),
+    )["admitted"] is False
+
+
+@pytest.mark.parametrize("interface", ["workflow", "native", "intent", "reconcile", "verification"])
+def test_git_reads_do_not_activate_repository_fsmonitor_commands(tmp_path: Path, interface: str) -> None:
+    from core.workflow_actions import _run_git, prepare_action_intent
+    from tools.git.service import run_git
+
+    repo = tmp_path / "repo"
+    _git_repository(repo)
+    (repo / "seed").write_text("fixture", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "seed"], check=True, capture_output=True)
+    marker, monitor = tmp_path / "activated", tmp_path / "monitor"
+    monitor.write_text(
+        "#!/bin/sh\nprintf activated > " + shlex.quote(marker.as_posix()) + "\nprintf 'fixture\\0'\n", encoding="utf-8",
+    )
+    monitor.chmod(0o700)
+    subprocess.run(["git", "-C", str(repo), "config", "core.fsmonitor", monitor.as_posix()], check=True, capture_output=True)
+    control = subprocess.run(["git", "-C", str(repo), "status", "--short"], check=True, capture_output=True, text=True)
+    assert marker.exists(), control.stderr
+    marker.unlink()
+    if interface == "workflow":
+        _run_git({"repo": str(repo)}, 10, "status", "--short")
+    elif interface == "native":
+        run_git(repo, ["status", "--short"])
+    elif interface == "intent":
+        prepare_action_intent("git_commit", {"repo": str(repo), "message": "fixture"}, {"kind": "git_commit_intent"})
+    elif interface == "verification":
+        from tools.testing.impact import _git
+
+        _git(repo, ["status", "--short"])
+    else:
+        from core.reconcilers import evaluate_postcondition
+        from core.recovery_models import Postcondition
+
+        evaluate_postcondition(Postcondition("git_index_contains", {"repo": str(repo), "paths": ["seed"]}))
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("interface", ["workflow", "native", "reconcile"])
+def test_git_metadata_reads_do_not_activate_signature_verifiers(tmp_path: Path, interface: str) -> None:
+    from core.workflow_actions import _run_git
+    from tools.git.service import run_git
+
+    repo = tmp_path / "repo"
+    _git_repository(repo)
+
+    def git(*args: str, content: str | None = None) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args], input=content.encode("utf-8") if content is not None else None,
+            capture_output=True, check=True,
+        )
+        return result.stdout.decode("utf-8").strip()
+
+    before, tree = git("rev-parse", "HEAD"), git("write-tree")
+    commit = git(
+        "hash-object", "-t", "commit", "-w", "--stdin",
+        content=f"tree {tree}\nparent {before}\nauthor Fixture <fixture@example.invalid> 1700000000 +0000\n"
+        "committer Fixture <fixture@example.invalid> 1700000000 +0000\n"
+        "gpgsig -----BEGIN PGP SIGNATURE-----\n fixture\n -----END PGP SIGNATURE-----\n\nfixture\n",
+    )
+    git("update-ref", "HEAD", commit, before)
+    marker, verifier = tmp_path / "activated", tmp_path / "verifier"
+    verifier.write_text("#!/bin/sh\nprintf activated > " + shlex.quote(marker.as_posix()) + "\nexit 1\n", encoding="utf-8")
+    verifier.chmod(0o700)
+    for key, value in {"gpg.format": "openpgp", "gpg.program": verifier.as_posix(),
+                       "gpg.openpgp.program": verifier.as_posix(), "log.showSignature": "true"}.items():
+        git("config", key, value)
+    subprocess.run(["git", "-C", str(repo), "show", "-s", "--format=%H", "HEAD"], capture_output=True, check=False)
+    assert marker.exists()
+    marker.unlink()
+    if interface == "workflow":
+        _run_git({"repo": str(repo)}, 10, "show", "-s", "--format=%H", "HEAD")
+    elif interface == "native":
+        run_git(repo, ["show", "-s", "--format=%H", "HEAD"])
+    else:
+        from core.reconcilers import evaluate_postcondition
+        from core.recovery_models import Postcondition
+
+        evaluate_postcondition(Postcondition("git_commit_effect", {
+            "repo": str(repo), "before_head": before, "staged_tree": tree,
+            "message_sha256": hashlib.sha256(b"fixture").hexdigest(),
+        }))
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("interface", ["workflow", "native", "reconcile", "verification"])
+def test_missing_git_objects_never_activate_implicit_promisor_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interface: str,
+) -> None:
+    from core.workflow_actions import _run_git
+    from tools.git.service import run_git
+
+    repo = tmp_path / "repo"
+    _git_repository(repo)
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    marker, transport = tmp_path / "activated", tmp_path / "transport"
+    transport.write_text("#!/bin/sh\nprintf activated > " + shlex.quote(marker.as_posix()) + "\nexit 1\n", encoding="utf-8")
+    transport.chmod(0o700)
+    for key, value in {"core.repositoryformatversion": "1", "extensions.partialclone": "origin",
+                       "remote.origin.url": "ext::" + transport.as_posix(), "remote.origin.promisor": "true",
+                       "remote.origin.partialclonefilter": "blob:none", "protocol.ext.allow": "always"}.items():
+        subprocess.run(["git", "-C", str(repo), "config", key, value], check=True, capture_output=True)
+    missing = repo / ".git" / "objects" / head[:2] / head[2:]
+    assert missing.resolve().is_relative_to(repo.resolve())
+    missing.chmod(0o600)
+    missing.unlink()
+    monkeypatch.delenv("GIT_ALLOW_PROTOCOL", raising=False)
+    monkeypatch.delenv("GIT_NO_LAZY_FETCH", raising=False)
+    subprocess.run(["git", "-C", str(repo), "show", "-s", "HEAD"], capture_output=True, check=False)
+    assert marker.exists()
+    marker.unlink()
+    if interface == "reconcile":
+        from core.reconcilers import evaluate_postcondition
+        from core.recovery_models import Postcondition
+
+        result = evaluate_postcondition(Postcondition("git_commit_effect", {
+            "repo": str(repo), "before_head": "0" * 40, "staged_tree": "0" * 40, "message_sha256": "0" * 64,
+        }))
+        assert result.data["conclusive"] is False
+    else:
+        with pytest.raises(ToolError):
+            if interface == "workflow":
+                _run_git({"repo": str(repo)}, 10, "show", "-s", "HEAD")
+            elif interface == "native":
+                run_git(repo, ["show", "-s", "HEAD"])
+            else:
+                from tools.testing.impact import _git
+
+                _git(repo, ["show", "-s", "HEAD"])
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("interface", ["workflow", "native"])
+@pytest.mark.parametrize("backend", ["external", "textconv"])
+def test_git_diff_uses_native_text_without_executing_repository_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interface: str, backend: str,
+) -> None:
+    from core.workflow_actions import _run_git
+    from tools.git.service import run_git
+
+    repo = tmp_path / "repo"
+    _git_repository(repo)
+    target = repo / "seed.txt"
+    target.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "seed.txt"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "seed"], check=True, capture_output=True)
+    target.write_text("after\n", encoding="utf-8")
+    marker, helper = tmp_path / "activated", tmp_path / "diff-helper"
+    helper.write_text("#!/bin/sh\nprintf activated > " + shlex.quote(marker.as_posix()) + "\nprintf fixture\n", encoding="utf-8")
+    helper.chmod(0o700)
+    if backend == "external":
+        monkeypatch.setenv("GIT_EXTERNAL_DIFF", helper.as_posix())
+    else:
+        (repo / ".gitattributes").write_text("seed.txt diff=fixture\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "config", "diff.fixture.textconv", helper.as_posix()], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "diff"], check=True, capture_output=True)
+    assert marker.exists()
+    marker.unlink()
+    output = (
+        _run_git({"repo": str(repo)}, 10, "diff")["stdout"]
+        if interface == "workflow" else run_git(repo, ["diff"])["stdout"]["text"]
+    )
+    assert not marker.exists()
+    assert "diff --git" in output
+
+
+def test_workflow_git_mutation_reaps_hook_descendants_before_return(tmp_path: Path) -> None:
+    import psutil
+
+    from core.workflow_actions import _run_git
+
+    repo = tmp_path / "repo"
+    _git_repository(repo)
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    for key, value in {"user.name": "Fixture", "user.email": "fixture@example.invalid", "commit.gpgsign": "false",
+                       "core.hooksPath": str(hooks)}.items():
+        subprocess.run(["git", "-C", str(repo), "config", key, value], check=True, capture_output=True)
+    identity = tmp_path / "child.json"
+    child = (
+        "import json,os,time,psutil;from pathlib import Path;"
+        f"Path({str(identity)!r}).write_text(json.dumps({{'pid':os.getpid(),'created':psutil.Process().create_time()}}));"
+        "time.sleep(60)"
+    )
+    parent = (
+        "import subprocess,sys,time;from pathlib import Path;"
+        f"subprocess.Popen([sys.executable,'-c',{child!r}],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+        "deadline=time.monotonic()+5\n"
+        f"while not Path({str(identity)!r}).exists() and time.monotonic()<deadline: time.sleep(.01)\n"
+        f"assert Path({str(identity)!r}).exists()"
+    )
+    hook = hooks / "post-commit"
+    hook.write_text("#!/bin/sh\n" + shlex.quote(sys.executable.replace("\\", "/")) + " -c " + shlex.quote(parent) + "\n", encoding="utf-8")
+    hook.chmod(0o700)
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    try:
+        with managed_resource_claims(
+            (resource_claims.coordination_claim(exclusive=True), path_claim(repo, "write", scope="subtree")),
+            category="git-test", store=store,
+        ):
+            result = _run_git({"repo": str(repo)}, 15, "commit", "--allow-empty", "-m", "effect", uncertain_on_timeout=True)
+        assert result["exit_code"] == 0
+        record = json.loads(identity.read_text(encoding="utf-8"))
+        try:
+            process = psutil.Process(record["pid"])
+            alive = abs(process.create_time() - record["created"]) < .01 and process.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            alive = False
+        assert not alive
+    finally:
+        if identity.exists():
+            record = json.loads(identity.read_text(encoding="utf-8"))
+            try:
+                process = psutil.Process(record["pid"])
+                if abs(process.create_time() - record["created"]) < .01:
+                    process.kill()
+                    process.wait(timeout=5)
+            except psutil.NoSuchProcess:
+                pass
 
 
 def test_alias_changed_during_claim_wait_is_rejected_before_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 from mcp.server import MCPServer
 from pydantic import Field
@@ -22,14 +22,14 @@ from tools.git.service import validate_revision
 GitRevision = Annotated[str | None, Field(min_length=1, max_length=500, pattern=r"^[^-]")]
 
 
-def _git_resource_claims(repo: Path, *, worktree_mode: Literal["read", "write"]) -> tuple[ResourceClaim, ...]:
+def _git_resource_claims(repo: Path) -> tuple[ResourceClaim, ...]:
     common_raw = _run_git(repo, ["rev-parse", "--git-common-dir"])["stdout"]["text"].strip()
     common_dir = Path(common_raw)
     if not common_dir.is_absolute():
         common_dir = (repo / common_dir).resolve(strict=False)
     return (
-        coordination_claim(),
-        path_claim(repo, worktree_mode, scope="subtree"),
+        coordination_claim(exclusive=True),
+        path_claim(repo, "write", scope="subtree"),
         path_claim(common_dir, "write", scope="subtree", kind="git"),
     )
 
@@ -276,7 +276,7 @@ def register(mcp: MCPServer) -> None:
             raise ToolError("invalid_branch_name", "Invalid Git branch name.")
         repo = _repo(path)
         with managed_resource_claims(
-            _git_resource_claims(repo, worktree_mode="write"),
+            _git_resource_claims(repo),
             category="native.git",
             timeout_sec=120,
         ):
@@ -291,7 +291,7 @@ def register(mcp: MCPServer) -> None:
         repo = _repo(path)
         selected = safe_paths(paths)
         with managed_resource_claims(
-            _git_resource_claims(repo, worktree_mode="read"),
+            _git_resource_claims(repo),
             category="native.git",
             timeout_sec=120,
         ):
@@ -305,7 +305,7 @@ def register(mcp: MCPServer) -> None:
         """Commit the currently staged index without pushing or rewriting history."""
         repo = _repo(path)
         with managed_resource_claims(
-            _git_resource_claims(repo, worktree_mode="read"),
+            _git_resource_claims(repo),
             category="native.git",
             timeout_sec=120,
         ):
@@ -328,7 +328,7 @@ def register(mcp: MCPServer) -> None:
         repo = _repo(path)
         selected = safe_paths(paths)
         with managed_resource_claims(
-            _git_resource_claims(repo, worktree_mode="write"),
+            _git_resource_claims(repo),
             category="native.git",
             timeout_sec=120,
         ):

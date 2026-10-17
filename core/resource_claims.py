@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 import psutil
 
 from core.resource_locks import canonical_path
+from core.windows_job import NativeOwnershipRequiredError
 
 if TYPE_CHECKING:
     from core.workflow_store import WorkflowStore
@@ -284,8 +285,8 @@ def managed_resource_claims(
         authority = validate_resource_capability(inherited, canonical, store)
         try:
             yield inherited
-        except BaseException:
-            if quarantine_on_error:
+        except BaseException as exc:
+            if quarantine_on_error and not isinstance(exc, NativeOwnershipRequiredError):
                 request_id, owner_token, _ = _parse_resource_capability(inherited)
                 authority.quarantine_resource_request(
                     request_id, owner_token=owner_token, reason="managed_effect_or_cleanup_unresolved",
@@ -321,8 +322,8 @@ def managed_resource_claims(
             time.sleep(min(0.05, remaining))
         with resource_capability(capability):
             yield capability
-    except BaseException:
-        if admitted and quarantine_on_error:
+    except BaseException as exc:
+        if admitted and quarantine_on_error and not isinstance(exc, NativeOwnershipRequiredError):
             # Do not release even if persisting quarantine fails: the active claim still fences conflicts.
             release_on_exit = False
             claim_store.quarantine_resource_request(

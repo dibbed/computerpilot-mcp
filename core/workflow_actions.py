@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from core.config import SETTINGS, resolve_path
 from core.errors import ToolError
 from core.execution_models import ExecutionIntent
+from core.executor import run_bounded
 from core.job_scheduler import ensure_job_scheduler
 from core.jobs import JobStore
 from core.resource_claims import (
@@ -26,11 +27,13 @@ from core.resource_claims import (
     coordination_claim,
     current_resource_capability,
     endpoint_claim,
+    managed_resource_claims,
     path_claim,
 )
 from core.tool_catalog import intent_route_rules
 from core.workflow_models import WorkflowDefinition, workflow_topological_order
 from tools.filesystem.patches import apply_patch_transaction
+from tools.git.service import command_arguments, command_environment
 from tools.testing.impact import select_affected_tests
 from tools.testing.verification import verify_changed_repository
 
@@ -178,9 +181,25 @@ def _run_git(
     uncertain_on_timeout: bool = False,
 ) -> dict[str, Any]:
     repo = resolve_path(str(arguments.get("repo", ".")))
+    if uncertain_on_timeout:
+        with managed_resource_claims(
+            (coordination_claim(exclusive=True), path_claim(repo, "write", scope="subtree")),
+            category="workflow.git", timeout_sec=timeout_sec, quarantine_on_error=True,
+        ):
+            owned = run_bounded(
+                ["git", "-C", str(repo), *command_arguments(command)], cwd=repo, timeout_sec=timeout_sec,
+                env=command_environment(),
+                stdout_limit=80_000, stderr_limit=8_000, output_mode="head", encoding="utf-8",
+            )
+            if owned["timed_out"] or not owned.get("capture_complete", True):
+                raise SideEffectUncertain("Git mutation ended without a known result.")
+        if owned["exit_code"] != 0:
+            raise ToolError("workflow_git_failed", owned["stderr"]["text"].strip()[:2_000] or "Git command failed.")
+        return {"repo": str(repo), "stdout": owned["stdout"]["text"][:20_000], "exit_code": owned["exit_code"]}
     try:
         completed = subprocess.run(
-            ["git", "-C", str(repo), *command],
+            ["git", "-C", str(repo), *command_arguments(command)],
+            env=command_environment(),
             capture_output=True,
             text=True,
             timeout=timeout_sec,
@@ -188,8 +207,6 @@ def _run_git(
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired as exc:
-        if uncertain_on_timeout:
-            raise SideEffectUncertain("Git mutation timed out without a known result.") from exc
         raise TransientActionError("Git read timed out.") from exc
     if completed.returncode != 0:
         raise ToolError("workflow_git_failed", completed.stderr.strip()[:2_000] or "Git command failed.")
@@ -496,7 +513,7 @@ def derive_action_resource_claims(
         claims.append(path_claim(str(validated["cwd"]), "write", scope="subtree"))
         return canonical_claims(claims)
 
-    claims.append(coordination_claim())
+    claims.append(coordination_claim(exclusive=name in {"git_stage", "git_commit"}))
     if name == "check_file":
         claims.append(path_claim(str(validated["path"]), "read"))
     elif name == "check_http":
@@ -515,7 +532,7 @@ def derive_action_resource_claims(
         common_dir = Path(common_dir_raw)
         if not common_dir.is_absolute():
             common_dir = (repo / common_dir).resolve(strict=False)
-        claims.append(path_claim(repo, "read", scope="subtree"))
+        claims.append(path_claim(repo, "write" if name in {"git_stage", "git_commit"} else "read", scope="subtree"))
         claims.append(
             path_claim(
                 common_dir,

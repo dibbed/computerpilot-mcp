@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from core.errors import ToolError
 from core.executor import run_bounded
+from tools.git.service import command_arguments, command_environment
 from tools.project import service
 
 Decision = Literal["focused", "focused_plus_full_recommended", "full_suite", "none"]
@@ -46,8 +47,9 @@ def _git(repo: Path, args: list[str]) -> str:
     if executable is None:
         raise ToolError("git_not_found", "Git is not installed or not on PATH.")
     result = run_bounded(
-        [executable, "-c", "core.quotepath=false", *args],
+        [executable, *command_arguments(args)],
         cwd=repo,
+        env=command_environment(),
         timeout_sec=60,
         stdout_limit=None,
         stderr_limit=20_000,

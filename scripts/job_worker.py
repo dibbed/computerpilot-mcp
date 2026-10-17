@@ -29,7 +29,6 @@ from core.resource_claims import (
     resource_requires_native_ownership,
     validate_resource_capability,
 )
-from core.windows_job import NativeOwnershipRequiredError
 
 
 def _poll_interval(elapsed: float) -> float:
@@ -205,10 +204,7 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
             if resource_stack is not None:
                 stack, resource_stack = resource_stack, None
                 try:
-                    if process is None and isinstance(exc, NativeOwnershipRequiredError):
-                        stack.close()
-                    else:
-                        stack.__exit__(type(exc), exc, exc.__traceback__)
+                    stack.__exit__(type(exc), exc, exc.__traceback__)
                 except Exception as resource_error:
                     error += f"; resource quarantine failed ({type(resource_error).__name__})"
             if process is not None:
