@@ -134,6 +134,7 @@ class JobStore:
         encoding: str = "utf-8",
         *,
         queue_timeout_sec: float | None = None,
+        _resource_capability: str | None = None,
         _retention_retry: bool = False,
     ) -> dict[str, Any]:
         if not command or not command[0] or not cwd.is_dir():
@@ -142,6 +143,11 @@ class JobStore:
             raise ValueError("Execution timeout must be positive.")
         if queue_timeout_sec is not None and queue_timeout_sec <= 0:
             raise ValueError("Queue timeout must be positive when provided.")
+        if _resource_capability is not None:
+            from core.resource_claims import RESOURCE_CAPABILITY_MAX_LENGTH
+
+            if not _resource_capability or len(_resource_capability) > RESOURCE_CAPABILITY_MAX_LENGTH:
+                raise ValueError("Internal resource capability exceeds its supported size or is empty.")
         codecs.lookup(encoding)
         spec_data: dict[str, Any] = {
             "command": command,
@@ -151,8 +157,11 @@ class JobStore:
         }
         if queue_timeout_sec is not None:
             spec_data["queue_timeout_sec"] = queue_timeout_sec
+        fingerprint_spec = json.dumps(spec_data, sort_keys=True)
+        fingerprint = hashlib.sha256(fingerprint_spec.encode()).hexdigest()
+        if _resource_capability is not None:
+            spec_data["_resource_capability"] = _resource_capability
         spec = json.dumps(spec_data, sort_keys=True)
-        fingerprint = hashlib.sha256(spec.encode()).hexdigest()
         job_id = uuid.uuid4().hex
         now = time.time()
         queue_deadline = None if queue_timeout_sec is None else now + queue_timeout_sec
@@ -183,6 +192,7 @@ class JobStore:
                     request_key,
                     encoding,
                     queue_timeout_sec=queue_timeout_sec,
+                    _resource_capability=_resource_capability,
                     _retention_retry=True,
                 )
             if result["status"] == "queued":

@@ -10,15 +10,24 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from core.config import resolve_path
+from core.config import SETTINGS, resolve_path
 from core.errors import ToolError
 from core.execution_models import ExecutionIntent
 from core.job_scheduler import ensure_job_scheduler
 from core.jobs import JobStore
+from core.resource_claims import (
+    ResourceClaim,
+    canonical_claims,
+    coordination_claim,
+    current_resource_capability,
+    endpoint_claim,
+    path_claim,
+)
 from core.tool_catalog import intent_route_rules
 from core.workflow_models import WorkflowDefinition, workflow_topological_order
 from tools.filesystem.patches import apply_patch_transaction
@@ -45,6 +54,7 @@ class VerifyChangesInput(_ActionInput):
     total_timeout_sec: float = 1800
     ruff_fix: bool = False
     diagnostic_cap: int = 20
+    max_parallel_checks: int = Field(default=1, ge=1, le=3)
 
 
 class GitStatusInput(_ActionInput):
@@ -203,10 +213,16 @@ def _verify_changes(arguments: dict[str, Any], timeout_sec: float) -> dict[str, 
             "total_timeout_sec",
             "ruff_fix",
             "diagnostic_cap",
+            "max_parallel_checks",
         }
     }
     allowed["total_timeout_sec"] = min(float(allowed.get("total_timeout_sec", timeout_sec)), timeout_sec)
-    result = verify_changed_repository(resolve_path(str(arguments.get("cwd", "."))), **allowed)
+    result = verify_changed_repository(
+        resolve_path(str(arguments.get("cwd", "."))),
+        **allowed,
+        analyzer_capacity_db=SETTINGS.workflow_db,
+        analyzer_capacity_limit=SETTINGS.max_running_analyzers,
+    )
     if not result.get("ok"):
         raise ToolError("workflow_verification_failed", "Change-aware verification did not pass.")
     return result
@@ -266,6 +282,7 @@ def _run_durable_job(
         timeout_sec,
         idempotency_key,
         str(arguments.get("encoding", "utf-8")),
+        _resource_capability=current_resource_capability(),
     )
     job_id = str(job["job_id"])
     if context is not None:
@@ -465,10 +482,62 @@ def validate_operation(
     return descriptor, validated
 
 
+def derive_action_resource_claims(
+    name: str,
+    arguments: dict[str, Any],
+    postcondition: dict[str, Any] | None,
+) -> tuple[ResourceClaim, ...]:
+    """Derive a conservative authoritative footprint for one allowlisted workflow action."""
+
+    _descriptor, validated = validate_operation(name, arguments, postcondition)
+    claims: list[ResourceClaim] = []
+    if name == "run_durable_job":
+        claims.append(coordination_claim(exclusive=True))
+        claims.append(path_claim(str(validated["cwd"]), "write", scope="subtree"))
+        return canonical_claims(claims)
+
+    claims.append(coordination_claim())
+    if name == "check_file":
+        claims.append(path_claim(str(validated["path"]), "read"))
+    elif name == "check_http":
+        claims.append(endpoint_claim(str(validated["url"])))
+    elif name == "affected_tests":
+        claims.append(path_claim(str(validated["cwd"]), "read", scope="subtree"))
+    elif name == "verify_changes":
+        # pytest executes repository code and Ruff fix may mutate; treat the repo as write-coarse
+        # unless a future isolation policy proves a narrower footprint.
+        claims.append(path_claim(str(validated["cwd"]), "write", scope="subtree"))
+    elif name == "apply_patch":
+        claims.append(path_claim(str(validated["cwd"]), "write", scope="subtree"))
+    elif name in {"git_status", "git_stage", "git_commit"}:
+        repo = resolve_path(str(validated["repo"]))
+        common_dir_raw = _run_git({"repo": str(repo)}, 10, "rev-parse", "--git-common-dir")["stdout"].strip()
+        common_dir = Path(common_dir_raw)
+        if not common_dir.is_absolute():
+            common_dir = (repo / common_dir).resolve(strict=False)
+        claims.append(path_claim(repo, "read", scope="subtree"))
+        claims.append(
+            path_claim(
+                common_dir,
+                "write" if name in {"git_stage", "git_commit"} else "read",
+                scope="subtree",
+                kind="git",
+            )
+        )
+    else:  # pragma: no cover - validate_operation rejects unavailable adapters
+        raise ToolError("workflow_resource_footprint_unavailable", f"No resource footprint is defined for {name!r}.")
+    return canonical_claims(claims)
+
+
 def validate_workflow_definition(definition: WorkflowDefinition) -> None:
     workflow_topological_order(definition)
     for step in definition.steps:
-        validate_operation(step.action, step.arguments, step.postcondition)
+        _descriptor, validated = validate_operation(step.action, step.arguments, step.postcondition)
+        if definition.execution_mode == "dag" and step.action == "verify_changes" and validated["ruff_fix"]:
+            raise ToolError(
+                "workflow_parallel_fix_unavailable",
+                "DAG verification cannot apply Ruff fixes without a mutation recovery contract.",
+            )
         if step.execution_intent is not None:
             try:
                 intent = ExecutionIntent(**step.execution_intent)

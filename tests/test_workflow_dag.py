@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,36 @@ def test_invalid_dag_graphs_fail_before_persistence(steps: tuple[StepDefinition,
     with pytest.raises(ToolError) as raised:
         validate_workflow_definition(definition)
     assert raised.value.code == code
+
+
+def test_dag_rejects_verify_changes_with_ruff_fix_before_persistence(tmp_path: Path) -> None:
+    definition = WorkflowDefinition(
+        "unsafe-fix",
+        (
+            StepDefinition(
+                name="verify",
+                action="verify_changes",
+                arguments={"cwd": ".", "ruff_fix": True},
+                step_id="verify",
+            ),
+        ),
+        execution_mode="dag",
+    )
+    with pytest.raises(ToolError) as raised:
+        validate_workflow_definition(definition)
+    assert raised.value.code == "workflow_parallel_fix_unavailable"
+    store = WorkflowStore(tmp_path / "workflows.sqlite3")
+    with pytest.raises(ToolError) as raised:
+        store.create(definition)
+    assert raised.value.code == "workflow_parallel_fix_unavailable"
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM workflows").fetchone()[0] == 0
+
+
+def test_sequential_verification_preserves_ruff_fix() -> None:
+    validate_workflow_definition(WorkflowDefinition("legacy-fix", (
+        StepDefinition(name="verify", action="verify_changes", arguments={"cwd": ".", "ruff_fix": True}),
+    )))
 
 
 def test_sequential_mode_rejects_explicit_dag_metadata() -> None:

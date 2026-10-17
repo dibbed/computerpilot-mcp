@@ -14,11 +14,13 @@ from core.errors import ToolError
 from core.execution_models import ExecutionIntent
 from core.reconcilers import evaluate_postcondition
 from core.recovery_models import Postcondition
+from core.resource_claims import make_resource_capability, resource_capability
 from core.workflow_actions import (
     ActionCancelled,
     ActionContext,
     SideEffectUncertain,
     TransientActionError,
+    derive_action_resource_claims,
     execute_action,
     get_action_descriptor,
     prepare_action_intent,
@@ -290,8 +292,10 @@ class WorkflowExecutor:
         lease_token: str,
         step: StepDefinition,
         reserved: dict[str, Any],
+        resource_request_id: str,
+        resource_owner_token: str,
     ) -> dict[str, Any]:
-        """Execute one already-admitted DAG attempt behind a durable dispatch barrier."""
+        """Execute one already-admitted DAG attempt behind resource and dispatch barriers."""
 
         attempt_token = str(reserved.get("attempt_token") or "")
         if not attempt_token:
@@ -314,6 +318,25 @@ class WorkflowExecutor:
                 intent_evidence=value,
             )
 
+        def settle_resource(final_state: OperationState, *, reason: str = "") -> None:
+            if final_state is OperationState.UNCERTAIN:
+                self.store.quarantine_resource_request(
+                    resource_request_id,
+                    owner_token=resource_owner_token,
+                    reason=reason or "workflow effect outcome is uncertain",
+                )
+                return
+            if not self.store.release_resource_request(
+                resource_request_id,
+                owner_token=resource_owner_token,
+            ):
+                resource = self.store.resource_request(resource_request_id)
+                if resource["state"] not in {"released", "quarantined"}:
+                    raise ToolError(
+                        "resource_release_failed",
+                        "Workflow operation settled but its durable resource claim could not be released.",
+                    )
+
         context = ActionContext(
             workflow_id=workflow_id,
             operation_id=operation_id,
@@ -321,48 +344,50 @@ class WorkflowExecutor:
             persist_external_ref=persist_external_ref,
             persist_intent_evidence=persist_intent_evidence,
         )
+        capability = make_resource_capability(resource_request_id, resource_owner_token, self.store.path)
         try:
-            self._plan_route(step, operation_id, lease_token)
+            with resource_capability(capability):
+                self._plan_route(step, operation_id, lease_token)
+                latest = self.store.get_operation(operation_id)
+                canonical_postcondition, intent_evidence = prepare_action_intent(
+                    step.action,
+                    step.arguments,
+                    step.postcondition,
+                )
+                prepared = self.store.prepare_operation_attempt(
+                    operation_id,
+                    expected_version=int(latest["version"]),
+                    attempt_token=attempt_token,
+                    lease_token=lease_token,
+                    intent_evidence=intent_evidence,
+                    postcondition=canonical_postcondition,
+                )
+                self.store.mark_operation_may_dispatch(
+                    operation_id,
+                    expected_version=int(prepared["version"]),
+                    attempt_token=attempt_token,
+                    lease_token=lease_token,
+                )
+                crossed_dispatch_barrier = True
+                execution_step = StepDefinition(
+                    name=step.name,
+                    action=step.action,
+                    arguments=step.arguments,
+                    timeout_sec=step.timeout_sec,
+                    max_retries=step.max_retries,
+                    postcondition=canonical_postcondition,
+                    execution_intent=step.execution_intent,
+                    step_id=step.step_id,
+                    depends_on=step.depends_on,
+                )
+                result = execute_action(step.action, step.arguments, step.timeout_sec, context)
+                evidence = self._postcondition(execution_step, result)
+                if evidence.get("conclusive") is not True:
+                    raise SideEffectUncertain("Postcondition could not be evaluated conclusively.")
+                if evidence.get("satisfied") is not True:
+                    raise ToolError("workflow_postcondition_failed", "Step postcondition was not satisfied.")
             latest = self.store.get_operation(operation_id)
-            canonical_postcondition, intent_evidence = prepare_action_intent(
-                step.action,
-                step.arguments,
-                step.postcondition,
-            )
-            prepared = self.store.prepare_operation_attempt(
-                operation_id,
-                expected_version=int(latest["version"]),
-                attempt_token=attempt_token,
-                lease_token=lease_token,
-                intent_evidence=intent_evidence,
-                postcondition=canonical_postcondition,
-            )
-            self.store.mark_operation_may_dispatch(
-                operation_id,
-                expected_version=int(prepared["version"]),
-                attempt_token=attempt_token,
-                lease_token=lease_token,
-            )
-            crossed_dispatch_barrier = True
-            execution_step = StepDefinition(
-                name=step.name,
-                action=step.action,
-                arguments=step.arguments,
-                timeout_sec=step.timeout_sec,
-                max_retries=step.max_retries,
-                postcondition=canonical_postcondition,
-                execution_intent=step.execution_intent,
-                step_id=step.step_id,
-                depends_on=step.depends_on,
-            )
-            result = execute_action(step.action, step.arguments, step.timeout_sec, context)
-            evidence = self._postcondition(execution_step, result)
-            if evidence.get("conclusive") is not True:
-                raise SideEffectUncertain("Postcondition could not be evaluated conclusively.")
-            if evidence.get("satisfied") is not True:
-                raise ToolError("workflow_postcondition_failed", "Step postcondition was not satisfied.")
-            latest = self.store.get_operation(operation_id)
-            return self.store.complete_operation_attempt(
+            settled = self.store.complete_operation_attempt(
                 operation_id,
                 expected_version=int(latest["version"]),
                 attempt_token=attempt_token,
@@ -371,7 +396,14 @@ class WorkflowExecutor:
                 result=result,
                 evidence=evidence,
             )
+            settle_resource(OperationState.SUCCEEDED)
+            return settled
         except _LeaseLostDuringAction:
+            self.store.quarantine_resource_request(
+                resource_request_id,
+                owner_token=resource_owner_token,
+                reason="workflow lease ownership was lost during an active attempt",
+            )
             raise
         except ActionCancelled as exc:
             final_state = OperationState.CANCELLED
@@ -385,7 +417,7 @@ class WorkflowExecutor:
 
         latest = self.store.get_operation(operation_id)
         try:
-            return self.store.complete_operation_attempt(
+            settled = self.store.complete_operation_attempt(
                 operation_id,
                 expected_version=int(latest["version"]),
                 attempt_token=attempt_token,
@@ -399,12 +431,19 @@ class WorkflowExecutor:
                 },
                 error=error,
             )
+            settle_resource(final_state, reason=error)
+            return settled
         except ToolError as settle_error:
             if settle_error.code in {
                 "workflow_lease_expired",
                 "workflow_lease_token_mismatch",
                 "workflow_attempt_conflict",
             }:
+                self.store.quarantine_resource_request(
+                    resource_request_id,
+                    owner_token=resource_owner_token,
+                    reason="workflow attempt lost durable ownership before settlement",
+                )
                 raise _LeaseLostDuringAction("Workflow attempt lost durable ownership before settlement.") from settle_error
             raise
 
@@ -436,6 +475,7 @@ class WorkflowExecutor:
         total_timeout = float(definition.total_timeout_sec or 7_200.0)
         deadline = time.monotonic() + total_timeout
         futures: dict[Future[Any], int] = {}
+        resource_waits: dict[int, tuple[str, str]] = {}
         stop_admission_reason: str | None = None
 
         def operations() -> list[dict[str, Any]]:
@@ -480,10 +520,32 @@ class WorkflowExecutor:
 
                     claimed_any = False
                     if stop_admission_reason is None:
+                        ready_indices = set(self.store.get(workflow_id).get("ready_step_indices", []))
                         for index, operation in enumerate(snapshot):
                             if len(futures) >= effective_cap:
                                 break
                             if str(operation["state"]) != OperationState.CREATED.value:
+                                continue
+                            if index not in ready_indices:
+                                continue
+                            resource_request_id, resource_owner_token = resource_waits.get(
+                                index,
+                                (f"resource-{uuid.uuid4().hex}", f"resource-owner-{uuid.uuid4().hex}"),
+                            )
+                            resource_waits[index] = (resource_request_id, resource_owner_token)
+                            resource_admission = self.store.reserve_resource_claims(
+                                request_id=resource_request_id,
+                                owner_token=resource_owner_token,
+                                claims=derive_action_resource_claims(
+                                    definition.steps[index].action,
+                                    definition.steps[index].arguments,
+                                    definition.steps[index].postcondition,
+                                ),
+                                category="workflow_step",
+                                workflow_id=workflow_id,
+                                operation_id=str(operation["operation_id"]),
+                            )
+                            if resource_admission["admitted"] is not True:
                                 continue
                             reserved = self.store.claim_ready_operation(
                                 str(operation["operation_id"]),
@@ -493,7 +555,17 @@ class WorkflowExecutor:
                                 global_limit=SETTINGS.max_running_workflow_steps,
                             )
                             if reserved is None:
+                                self.store.release_resource_request(
+                                    resource_request_id,
+                                    owner_token=resource_owner_token,
+                                )
+                                resource_waits.pop(index, None)
                                 continue
+                            self.store.bind_resource_request_attempt(
+                                resource_request_id,
+                                owner_token=resource_owner_token,
+                                attempt_token=str(reserved["attempt_token"]),
+                            )
                             future = pool.submit(
                                 self._run_dag_attempt,
                                 workflow_id,
@@ -501,8 +573,11 @@ class WorkflowExecutor:
                                 lease.lease_token,
                                 definition.steps[index],
                                 reserved,
+                                resource_request_id,
+                                resource_owner_token,
                             )
                             futures[future] = index
+                            resource_waits.pop(index, None)
                             claimed_any = True
 
                     if futures:
@@ -545,6 +620,11 @@ class WorkflowExecutor:
                     if not claimed_any:
                         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         finally:
+            for resource_request_id, resource_owner_token in tuple(resource_waits.values()):
+                self.store.release_resource_request(
+                    resource_request_id,
+                    owner_token=resource_owner_token,
+                )
             heartbeat.stop()
             self.store.release_lease_if_current(workflow_id, lease.lease_token)
 

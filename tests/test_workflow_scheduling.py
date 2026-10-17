@@ -15,8 +15,12 @@ def test_workflow_durable_job_uses_version_wait_not_fixed_status_polling(
     waits: list[tuple[str, int, float]] = []
 
     class FakeJobStore:
-        def submit(self, command: list[str], cwd: Path, timeout: float, request_key: str, encoding: str) -> dict[str, Any]:
+        def submit(
+            self, command: list[str], cwd: Path, timeout: float, request_key: str, encoding: str,
+            *, _resource_capability: str | None = None,
+        ) -> dict[str, Any]:
             del command, cwd, timeout, request_key, encoding
+            assert _resource_capability is None
             return {"job_id": "a" * 32, "status": "running", "version": 1, "exit_code": None}
 
         def wait(self, job_id: str, after_version: int, timeout: float) -> dict[str, Any]:

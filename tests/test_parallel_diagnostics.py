@@ -4,6 +4,7 @@ import asyncio
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -11,13 +12,51 @@ import pytest
 from mcp import Client
 
 from core.registry import create_server
+from core.resource_claims import coordination_claim, current_resource_capability, managed_resource_claims, path_claim
+from core.workflow_store import WorkflowStore
 from tools.testing import registry as testing_registry
+
+
+@pytest.fixture(autouse=True)
+def isolate_diagnostic_admission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(testing_registry, "SETTINGS", replace(testing_registry.SETTINGS, state_dir=tmp_path / "state"))
 
 
 def _structured(result: Any) -> dict[str, Any]:
     payload = getattr(result, "structured_content", None)
     assert isinstance(payload, dict)
     return payload
+
+
+def test_parallel_diagnostics_reuse_parent_resource_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(testing_registry.SETTINGS, state_dir=tmp_path / "state")
+    monkeypatch.setattr(testing_registry, "SETTINGS", settings)
+    resources = WorkflowStore(settings.workflow_db, recover=False)
+    inherited: list[str | None] = []
+
+    def runner(*args: object, **kwargs: object) -> dict[str, object]:
+        inherited.append(current_resource_capability())
+        return {"ok": True, "exit_code": 0, "diagnostics": []}
+
+    monkeypatch.setattr(testing_registry, "run_ruff_summary", runner)
+    monkeypatch.setattr(testing_registry, "run_mypy_summary", runner)
+
+    async def scenario() -> dict[str, Any]:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            return _structured(await client.call_tool("collect_diagnostics", {
+                "cwd": str(tmp_path), "backends": ["ruff", "mypy"],
+                "max_parallel_checks": 2, "total_timeout_sec": 0.5,
+            }))
+
+    with managed_resource_claims(
+        (coordination_claim(), path_claim(tmp_path, "write", scope="subtree")),
+        category="parent", store=resources,
+    ) as capability:
+        result = asyncio.run(scenario())
+    assert result["ok"] is True
+    assert inherited == [capability] * 2
 
 
 def test_collect_diagnostics_parallelism_is_bounded_and_stage_order_is_stable(

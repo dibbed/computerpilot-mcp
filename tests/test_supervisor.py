@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from html import unescape
 from pathlib import Path
 from typing import Any
 
@@ -429,7 +430,7 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         assert token
         assert '<html lang="en" dir="ltr">' in html
         assert "ComputerPilot MCP Control Panel" in html
-        assert "System & Build Identity" in html
+        assert "System & Build Identity" in unescape(html)
         assert "Resource Budgets" in html
         assert "Transport History" in html
         assert "Recovery Center" in html
@@ -466,7 +467,7 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         assert "chunk.has_more" in html
         assert 'id="storageCategories"' in html
         assert 'id="processDetail" class="meta-grid"' in html
-        assert "Timing & Lifecycle" in html
+        assert "Timing & Lifecycle" in unescape(html)
         assert "Last Exit / Drain" in html
         assert "Recent Events" in html
         assert "Runtime Errors" in html
