@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -117,29 +119,73 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
         targets: Annotated[list[str] | None, Field(max_length=100)] = None,
         timeout_sec: Annotated[float, Field(gt=0, le=3_600)] = 600,
         max_items: Annotated[int, Field(ge=1, le=1_000)] = 200,
+        max_parallel_checks: Annotated[int, Field(ge=1, le=3)] = 1,
+        total_timeout_sec: Annotated[float | None, Field(gt=0, le=10_800)] = None,
     ) -> dict[str, Any]:
         """Run selected analyzers and return one stable, deduplicated diagnostic stream."""
         working = _cwd(cwd)
-        selected = backends or ["ruff", "mypy", "pytest"]
-        stages: list[dict[str, Any]] = []
-        groups: list[list[dict[str, Any]]] = []
-        for backend in selected:
-            if backend == "ruff":
-                result = run_ruff_summary(working, targets=targets, timeout_sec=timeout_sec, diagnostic_cap=max_items)
-            elif backend == "mypy":
-                result = run_mypy_summary(working, targets=targets, timeout_sec=timeout_sec, diagnostic_cap=max_items)
-            else:
-                result = run_pytest_summary(working, targets=targets, timeout_sec=timeout_sec, diagnostic_cap=max_items)
-            groups.append(result.get("diagnostics", []))
-            stages.append(
-                {
-                    "backend": backend,
-                    "ok": bool(result.get("ok")),
-                    "unavailable": bool(result.get("unavailable")),
-                    "timed_out": bool(result.get("timed_out")),
-                    "diagnostic_count": len(result.get("diagnostics", [])),
+        selected: list[Literal["ruff", "mypy", "pytest"]] = list(backends) if backends else ["ruff", "mypy", "pytest"]
+        started = time.perf_counter()
+        deadline = None if total_timeout_sec is None else started + total_timeout_sec
+
+        def run_backend(backend: Literal["ruff", "mypy", "pytest"]) -> tuple[dict[str, Any], dict[str, Any]]:
+            remaining = None if deadline is None else deadline - time.perf_counter()
+            if remaining is not None and remaining <= 0:
+                result: dict[str, Any] = {
+                    "ok": False,
+                    "unavailable": False,
+                    "timed_out": True,
+                    "diagnostics": [],
                 }
-            )
+            else:
+                effective_timeout = timeout_sec if remaining is None else max(0.001, min(timeout_sec, remaining))
+                try:
+                    if backend == "ruff":
+                        result = run_ruff_summary(
+                            working,
+                            targets=targets,
+                            timeout_sec=effective_timeout,
+                            diagnostic_cap=max_items,
+                        )
+                    elif backend == "mypy":
+                        result = run_mypy_summary(
+                            working,
+                            targets=targets,
+                            timeout_sec=effective_timeout,
+                            diagnostic_cap=max_items,
+                        )
+                    else:
+                        result = run_pytest_summary(
+                            working,
+                            targets=targets,
+                            timeout_sec=effective_timeout,
+                            diagnostic_cap=max_items,
+                        )
+                except (ModuleNotFoundError, FileNotFoundError):
+                    result = {"ok": False, "unavailable": True, "timed_out": False, "diagnostics": []}
+                except Exception:
+                    result = {"ok": False, "unavailable": True, "timed_out": False, "diagnostics": []}
+                if deadline is not None and time.perf_counter() >= deadline and not result.get("timed_out"):
+                    result = {**result, "ok": False, "timed_out": True}
+            diagnostics = list(result.get("diagnostics", []))
+            stage = {
+                "backend": backend,
+                "ok": bool(result.get("ok")),
+                "unavailable": bool(result.get("unavailable")),
+                "timed_out": bool(result.get("timed_out")),
+                "diagnostic_count": len(diagnostics),
+            }
+            return result, stage
+
+        if max_parallel_checks == 1 or len(selected) <= 1:
+            completed = [run_backend(backend) for backend in selected]
+        else:
+            capacity = min(max_parallel_checks, len(selected))
+            with ThreadPoolExecutor(max_workers=capacity, thread_name_prefix="diagnostics") as pool:
+                completed = list(pool.map(run_backend, selected))
+
+        groups = [list(result.get("diagnostics", [])) for result, _stage in completed]
+        stages = [stage for _result, stage in completed]
         diagnostics, truncated = merge_diagnostics(groups, cap=max_items)
         required_unknown = any(stage["unavailable"] or stage["timed_out"] for stage in stages)
         return {
