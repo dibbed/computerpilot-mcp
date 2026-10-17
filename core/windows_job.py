@@ -6,6 +6,7 @@ import ctypes
 import os
 import subprocess
 import threading
+import time
 from collections.abc import Sequence
 from ctypes import wintypes
 from pathlib import Path
@@ -13,8 +14,11 @@ from typing import IO, Any
 
 import psutil
 
+from core.errors import ToolError
+
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
 _TH32CS_SNAPTHREAD = 0x00000004
 _THREAD_SUSPEND_RESUME = 0x0002
 _RESUME_FAILED = 0xFFFFFFFF
@@ -52,6 +56,19 @@ class _IO_COUNTERS(ctypes.Structure):
         ("ReadTransferCount", ctypes.c_uint64),
         ("WriteTransferCount", ctypes.c_uint64),
         ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("TotalUserTime", _INT64),
+        ("TotalKernelTime", _INT64),
+        ("ThisPeriodTotalUserTime", _INT64),
+        ("ThisPeriodTotalKernelTime", _INT64),
+        ("TotalPageFaultCount", ctypes.c_uint32),
+        ("TotalProcesses", ctypes.c_uint32),
+        ("ActiveProcesses", ctypes.c_uint32),
+        ("TotalTerminatedProcesses", ctypes.c_uint32),
     ]
 
 
@@ -98,6 +115,7 @@ def _kernel32() -> Any:
         specs: tuple[tuple[str, list[Any], Any], ...] = (
             ("CreateJobObjectW", [ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
             ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, _DWORD], wintypes.BOOL),
+            ("QueryInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, _DWORD, ctypes.c_void_p], wintypes.BOOL),
             ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
             ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
             ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
@@ -195,8 +213,20 @@ class WindowsJob:
             handle = self._handle
             if handle is None:
                 return
+            if not _kernel32().CloseHandle(handle):
+                raise ToolError("process_cleanup_incomplete", "Job Object ownership handle could not be closed.")
             self._handle = None
-        _kernel32().CloseHandle(handle)
+
+    def active_process_count(self) -> int:
+        with self._lock:
+            if self._handle is None:
+                return 0
+            info = _JOBOBJECT_BASIC_ACCOUNTING_INFORMATION()
+            if not _kernel32().QueryInformationJobObject(
+                self._handle, _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION, ctypes.byref(info), ctypes.sizeof(info), None,
+            ):
+                raise ToolError("process_cleanup_incomplete", "Job Object process ownership could not be inspected.")
+            return int(info.ActiveProcesses)
 
 
 def _primary_suspended_thread_id(pid: int) -> int:
@@ -249,6 +279,7 @@ class OwnedProcess:
         self.process = process
         self.job = job
         self.ownership_backend = backend
+        self._cleanup_failed = False
 
     @property
     def pid(self) -> int:
@@ -295,14 +326,7 @@ class OwnedProcess:
             targeted = [process.pid for process in processes]
             job.terminate(1)
             gone, alive = psutil.wait_procs(processes, timeout=5)
-            if alive:
-                for process in alive:
-                    try:
-                        process.kill()
-                    except psutil.NoSuchProcess:
-                        pass
-                gone_after, alive = psutil.wait_procs(alive, timeout=2)
-                gone.extend(gone_after)
+            # A process-table PID may have been reused; only the Job Object may signal this owned tree.
             try:
                 self.process.wait(timeout=0.1)
             except (subprocess.TimeoutExpired, OSError):
@@ -319,10 +343,28 @@ class OwnedProcess:
         return result
 
     def close_ownership(self) -> None:
+        if self._cleanup_failed:
+            raise ToolError("process_cleanup_incomplete", "Job Object ownership cleanup remains unresolved.")
         job = self.job
         if job is not None:
-            job.close()
-            self.job = None
+            try:
+                if not job.closed:
+                    if not job.terminate(1):
+                        raise ToolError("process_cleanup_incomplete", "Job Object termination was denied.")
+                    deadline = time.monotonic() + 5.0
+                    while job.active_process_count():
+                        if time.monotonic() >= deadline:
+                            raise ToolError("process_cleanup_incomplete", "Job Object still owns active processes.")
+                        time.sleep(0.01)
+                    job.close()
+                self.job = None
+            except Exception as exc:
+                self._cleanup_failed = True
+                try:
+                    job.close()
+                except Exception:
+                    pass
+                raise ToolError("process_cleanup_incomplete", "Job Object ownership cleanup could not be confirmed.") from exc
 
 
 def _regular_popen(
