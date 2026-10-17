@@ -253,6 +253,7 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
         total_timeout_sec: Annotated[float, Field(gt=0, le=7_200)] = 1_800,
         ruff_fix: bool = False,
         diagnostic_cap: Annotated[int, Field(ge=1, le=200)] = 30,
+        max_parallel_checks: Annotated[int, Field(ge=1, le=3)] = 1,
         delivery: Literal["inline", "file", "auto"] = "inline",
     ) -> dict[str, Any]:
         """Verify changed Python code with syntax, Ruff, mypy, and the narrowest sound pytest scope."""
@@ -265,6 +266,7 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
                 "check_count": len(checks or []),
                 "affected_only": affected_only,
                 "ruff_fix": ruff_fix,
+                "requested_parallel_checks": max_parallel_checks,
             },
         )
         response = verify_changed_repository(
@@ -280,6 +282,7 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
             total_timeout_sec=total_timeout_sec,
             ruff_fix=ruff_fix,
             diagnostic_cap=diagnostic_cap,
+            max_parallel_checks=max_parallel_checks,
         )
         if delivery != "inline":
             delivered = deliver_text(json.dumps(response, ensure_ascii=False, indent=2), delivery)

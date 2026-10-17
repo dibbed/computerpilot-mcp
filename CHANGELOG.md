@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Added
+- 2026-10-17: Expose bounded `max_parallel_checks` (1–3, default 1) on foreground `verify_changes`, reusing the existing verification engine and preserving serial fix/fail-fast behavior unless callers explicitly opt into compatible read-only parallel checks.
 - 2026-10-15: Add `start_verification` in profiles containing testing and jobs. Native verification reuses durable job admission, cancellation and output, reports bounded stage events and stale inputs, and supports opt-in parallel read-only checks without changing foreground defaults.
 
 ### Fixed

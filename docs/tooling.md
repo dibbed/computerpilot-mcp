@@ -141,7 +141,7 @@ affected_tests
 verify_changes
 ```
 
-`verify_changes` can run syntax, Ruff, mypy, and the narrowest sound pytest scope. Shared/repository-wide changes can fall back to the full suite.
+`verify_changes` can run syntax, Ruff, mypy, and the narrowest sound pytest scope. Shared/repository-wide changes can fall back to the full suite. Foreground verification stays serial by default with `max_parallel_checks=1`. Read-only analyzer work can opt into capacity 2–3 only with `fail_fast=false` and `ruff_fix=false`; incompatible combinations are rejected before planning or analyzer dispatch. Parallel foreground verification is synchronous and non-durable, so client disconnects do not turn it into a background job. `stage_timeout_sec` remains a per-stage ceiling while `total_timeout_sec` bounds the verification run but is not a hard thread-kill deadline, and independent invocations can still oversubscribe the host because this option is a per-call cap rather than a global admission limit.
 
 For long checks, `start_verification` accepts the verification inputs plus a required `idempotency_key`, optional
 `queue_timeout_sec`, and `max_parallel_checks` (1–3, default 1). It is available when both testing and jobs domains are
