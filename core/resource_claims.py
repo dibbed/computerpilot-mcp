@@ -206,7 +206,7 @@ def validate_resource_capability(
         else WorkflowStore(authority_path, recover=False)
     )
     try:
-        resource = authority.resource_request(request_id)
+        resource = authority.resource_request(request_id, expected_owner_token=owner_token)
     except ToolError as exc:
         if exc.code == "resource_request_not_found":
             raise ToolError("resource_capability_invalid", "Internal resource capability is no longer valid.") from exc

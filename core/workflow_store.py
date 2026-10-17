@@ -1425,6 +1425,29 @@ class WorkflowStore:
             for row in rows
         )
 
+    @staticmethod
+    def _make_admission_room(
+        connection: sqlite3.Connection,
+        table: Literal["workflow_resource_requests", "runtime_capacity_requests"],
+    ) -> None:
+        from core.config import SETTINGS
+
+        limit = SETTINGS.max_runtime_admission_records
+        count = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        if count < limit:
+            return
+        needed = count - limit + 1
+        removed = connection.execute(
+            f"DELETE FROM {table} WHERE ticket IN ("
+            f"SELECT ticket FROM {table} WHERE state='released' ORDER BY ticket LIMIT ?)",
+            (needed,),
+        ).rowcount
+        if removed < needed:
+            raise ToolError(
+                "runtime_admission_storage_exhausted",
+                "Admission record quota is exhausted; unresolved ownership must be reconciled before new work.",
+            )
+
     def reserve_resource_claims(
         self,
         *,
@@ -1452,6 +1475,8 @@ class WorkflowStore:
             raise ToolError("empty_resource_claims", "At least one resource claim is required.")
         if len(canonical) > 256:
             raise ToolError("too_many_resource_claims", "A resource request may contain at most 256 claims.")
+        if sum(len(claim.key.encode("utf-8")) + len(claim.kind.encode("utf-8")) for claim in canonical) > 65_536:
+            raise ToolError("resource_claims_too_large", "A resource claim set may contain at most 64 KiB of keys.")
         now = _now()
 
         with self._lock, closing(self._connect()) as connection:
@@ -1460,6 +1485,7 @@ class WorkflowStore:
                 "SELECT * FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
             ).fetchone()
             if row is None:
+                self._make_admission_room(connection, "workflow_resource_requests")
                 connection.execute(
                     """
                     INSERT INTO workflow_resource_requests(
@@ -1568,12 +1594,35 @@ class WorkflowStore:
             connection.commit()
         return {"admitted": True, "request_id": request_id, "state": "active", "reason": None}
 
-    def resource_request(self, request_id: str) -> dict[str, Any]:
+    def resource_request(self, request_id: str, *, expected_owner_token: str | None = None) -> dict[str, Any]:
         with closing(self._connect()) as connection:
-            row = connection.execute(
-                "SELECT * FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
-            ).fetchone()
+            if expected_owner_token is None:
+                row = connection.execute(
+                    "SELECT * FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT r.* FROM workflow_resource_requests r
+                    WHERE r.request_id=? AND r.owner_token=? AND r.state='active'
+                      AND ((r.workflow_id IS NULL AND r.operation_id IS NULL) OR EXISTS (
+                          SELECT 1 FROM workflow_execution_admissions a
+                          JOIN workflow_operations o ON o.operation_id=a.operation_id
+                          JOIN workflow_leases l ON l.workflow_id=a.workflow_id
+                          JOIN workflows w ON w.workflow_id=a.workflow_id
+                          WHERE a.operation_id=r.operation_id AND a.workflow_id=r.workflow_id
+                            AND a.attempt_token=r.attempt_token AND o.attempt_token=a.attempt_token
+                            AND o.execution_id=a.execution_id
+                            AND o.dispatch_phase IN ('reserved','prepared','may_dispatch')
+                            AND l.lease_token=a.lease_token AND l.expires_at>?
+                            AND w.state='running' AND w.cancel_requested_at IS NULL
+                      ))
+                    """,
+                    (request_id, expected_owner_token, _now()),
+                ).fetchone()
             if row is None:
+                if expected_owner_token is not None:
+                    raise ToolError("resource_capability_invalid", "Internal resource capability is no longer active.")
                 raise ToolError("resource_request_not_found", "Resource request was not found.")
             claims = self._resource_claims_for_request(connection, request_id)
         return {**dict(row), "claims": [claim.public() for claim in claims]}
@@ -1710,6 +1759,8 @@ class WorkflowStore:
 
         if weight < 1 or limit < 1 or weight > limit:
             raise ToolError("invalid_capacity_request", "Capacity weight/limit are invalid.")
+        if not 1 <= len(admission_id) <= 200 or not 1 <= len(owner_token) <= 200 or not 1 <= len(category) <= 80:
+            raise ToolError("invalid_capacity_request", "Capacity identifiers exceed their bounded lengths.")
         now = _now()
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1717,6 +1768,7 @@ class WorkflowStore:
                 "SELECT * FROM runtime_capacity_requests WHERE admission_id = ?", (admission_id,),
             ).fetchone()
             if row is None:
+                self._make_admission_room(connection, "runtime_capacity_requests")
                 connection.execute(
                     """
                     INSERT INTO runtime_capacity_requests(

@@ -7,14 +7,108 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
 
+from core import config
 from core.errors import ToolError
-from core.resource_claims import ResourceClaim, claims_conflict, managed_resource_claims, path_claim, resource_capability
+from core.resource_claims import (
+    ResourceClaim,
+    claims_conflict,
+    make_resource_capability,
+    managed_resource_claims,
+    path_claim,
+    resource_capability,
+    validate_resource_capability,
+)
 from core.workflow_models import StepDefinition, WorkflowDefinition, WorkflowState
 from core.workflow_store import WorkflowStore
+
+
+@pytest.mark.parametrize("category", ["resource", "capacity"])
+def test_admission_record_quota_preserves_unresolved_fences(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, category: str,
+) -> None:
+    monkeypatch.setattr(config, "SETTINGS", SimpleNamespace(max_runtime_admission_records=3))
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+
+    def reserve(index: int) -> dict[str, object]:
+        if category == "capacity":
+            return store.reserve_capacity(
+                admission_id=str(index), category="test", owner_token="owner", weight=1, limit=10,
+            )
+        return store.reserve_resource_claims(
+            request_id=str(index), category="test", owner_token="owner",
+            claims=(path_claim(tmp_path / str(index), "write"),),
+        )
+
+    for index in range(3):
+        assert reserve(index)["admitted"] is True
+    with pytest.raises(ToolError) as raised:
+        reserve(3)
+    assert raised.value.code == "runtime_admission_storage_exhausted"
+    table = "runtime_capacity_requests" if category == "capacity" else "workflow_resource_requests"
+    with sqlite3.connect(store.path) as db:
+        assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 3
+        db.execute(f"UPDATE {table} SET state='quarantined' WHERE ticket=1")
+    if category == "capacity":
+        store.release_capacity("1", owner_token="owner")
+    else:
+        store.release_resource_request("1", owner_token="owner")
+    assert reserve(3)["admitted"] is True
+    with sqlite3.connect(store.path) as db:
+        assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 3
+        assert db.execute(f"SELECT state FROM {table} WHERE ticket=1").fetchone()[0] == "quarantined"
+
+
+def test_resource_claim_set_has_a_byte_budget_before_persistence(tmp_path: Path) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    with pytest.raises(ToolError) as raised:
+        store.reserve_resource_claims(
+            request_id="oversize", owner_token="owner", category="test",
+            claims=tuple(ResourceClaim("http", str(index) + "x" * 3990, "read") for index in range(20)),
+        )
+    assert raised.value.code == "resource_claims_too_large"
+    assert store.health_summary()["active_resource_request_count"] == 0
+
+
+@pytest.mark.parametrize("stale", ["lease", "attempt", "cancel", "completed"])
+def test_workflow_capability_revalidates_live_attempt_before_nested_dispatch(tmp_path: Path, stale: str) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    workflow = store.create(
+        WorkflowDefinition("owner", (StepDefinition("check", "check_file", {"path": str(tmp_path)}),)),
+        initial_state=WorkflowState.QUEUED,
+    )
+    workflow_id = str(workflow["workflow_id"])
+    lease = store.acquire_lease(workflow_id, "worker", 30, allow_reentry=False)
+    store.transition(workflow_id, int(workflow["version"]), WorkflowState.RUNNING, lease_token=lease.lease_token)
+    operation_id = str(store.list_operations(workflow_id)["items"][0]["operation_id"])
+    attempt = store.claim_ready_operation(
+        operation_id, lease_token=lease.lease_token, owner_id="worker", execution_id="execution", global_limit=1,
+    )
+    assert attempt is not None
+    store.reserve_resource_claims(
+        request_id="parent", owner_token="owner", category="workflow_step", workflow_id=workflow_id,
+        operation_id=operation_id, claims=(path_claim(tmp_path, "write", scope="subtree"),),
+    )
+    store.bind_resource_request_attempt("parent", owner_token="owner", attempt_token=str(attempt["attempt_token"]))
+    capability = make_resource_capability("parent", "owner", store.path)
+    validate_resource_capability(capability, (), store)
+    with sqlite3.connect(store.path) as db:
+        if stale == "lease":
+            db.execute("UPDATE workflow_leases SET expires_at='2000-01-01T00:00:00+00:00'")
+        elif stale == "attempt":
+            db.execute("UPDATE workflow_operations SET attempt_token='replacement'")
+        elif stale == "cancel":
+            db.execute("UPDATE workflows SET cancel_requested_at='now'")
+        else:
+            db.execute("DELETE FROM workflow_execution_admissions")
+    with pytest.raises(ToolError) as raised:
+        validate_resource_capability(capability, (), store)
+    assert raised.value.code == "resource_capability_invalid"
+    assert store.resource_request("parent")["state"] == "active"
 
 
 def test_resource_conflict_matrix_handles_exact_and_subtree_paths(tmp_path: Path) -> None:
@@ -253,75 +347,63 @@ def test_capacity_admission_is_shared_between_store_instances(tmp_path: Path) ->
     )["admitted"] is True
 
 
-def test_resource_claim_conflict_is_enforced_across_os_processes(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("first_mode", "second_mode", "subtree", "independent", "overlap"),
+    [("write", "write", False, False, False), ("read", "write", False, False, False),
+     ("read", "read", False, False, True), ("read", "write", True, False, False),
+     ("write", "read", True, False, False), ("write", "write", True, True, True)],
+)
+def test_resource_claim_conflict_is_enforced_across_os_processes(
+    tmp_path: Path, first_mode: Literal["read", "write"], second_mode: Literal["read", "write"],
+    subtree: bool, independent: bool, overlap: bool,
+) -> None:
     db_path = tmp_path / "workflows.sqlite3"
-    target = tmp_path / "shared.txt"
+    root = tmp_path / "repo"
+    first_claim = path_claim(root if subtree else root / "shared.txt", first_mode, scope="subtree" if subtree else "exact")
+    target = tmp_path / "repo2" / "shared.txt" if independent else root / "." / "shared.txt"
+    second_claim = path_claim(target, second_mode)
     repo_root = Path(__file__).resolve().parents[1]
     script = r'''
-import json
-import sys
-import time
+import json,sys,time
 from pathlib import Path
 from core.resource_claims import ResourceClaim
 from core.workflow_store import WorkflowStore
-
-store = WorkflowStore(Path(sys.argv[1]), recover=False)
-claim = ResourceClaim("fs", str(Path(sys.argv[2]).resolve(strict=False)), "write", "exact")
-request_id, owner_token, delay = sys.argv[3], sys.argv[4], float(sys.argv[5])
-release_marker = Path(sys.argv[6])
-result = store.reserve_resource_claims(
-    request_id=request_id,
-    owner_token=owner_token,
-    claims=(claim,),
-    category="process-test",
-)
-print(json.dumps(result), flush=True)
+store=WorkflowStore(Path(sys.argv[1]),recover=False)
+claim=ResourceClaim(**json.loads(sys.argv[2]))
+request_id=sys.argv[3]
+result=store.reserve_resource_claims(request_id=request_id,owner_token=request_id,claims=(claim,),category="process-test")
+print(json.dumps(result),flush=True)
 if result["admitted"]:
-    if delay < 0:
-        deadline = time.monotonic() + 10
-        while not release_marker.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-    else:
-        time.sleep(delay)
-    store.release_resource_request(request_id, owner_token=owner_token)
+    deadline=time.monotonic()+10
+    while sys.argv[4] != "-" and not Path(sys.argv[4]).exists() and time.monotonic()<deadline:
+        time.sleep(0.01)
+    store.release_resource_request(request_id,owner_token=request_id)
 '''
-
     release_marker = tmp_path / "release.marker"
     first = subprocess.Popen(
-        [sys.executable, "-c", script, str(db_path), str(target), "p1", "o1", "-1", str(release_marker)],
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        [sys.executable, "-c", script, str(db_path), json.dumps(first_claim.public()), "p1", str(release_marker)],
+        cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    assert first.stdout is not None
-    first_result = json.loads(first.stdout.readline())
-    assert first_result["admitted"] is True
-
-    second = subprocess.run(
-        [sys.executable, "-c", script, str(db_path), str(target), "p2", "o2", "0", str(release_marker)],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=True,
-    )
-    second_result = json.loads(second.stdout.strip())
-    assert second_result["admitted"] is False
-    assert second_result["reason"] == "resource_conflict"
-
-    release_marker.write_text("release", encoding="utf-8")
-    assert first.wait(timeout=10) == 0
+    try:
+        assert first.stdout is not None
+        assert json.loads(first.stdout.readline())["admitted"] is True
+        second = subprocess.run(
+            [sys.executable, "-c", script, str(db_path), json.dumps(second_claim.public()), "p2", "-"],
+            cwd=repo_root, capture_output=True, text=True, timeout=10, check=True,
+        )
+        second_result = json.loads(second.stdout.strip())
+        assert second_result["admitted"] is overlap
+        if not overlap:
+            assert second_result["reason"] == "resource_conflict"
+    finally:
+        release_marker.write_text("release", encoding="utf-8")
+        first.communicate(timeout=10)
+        assert first.returncode == 0
     third = subprocess.run(
-        [sys.executable, "-c", script, str(db_path), str(target), "p2", "o2", "0", str(release_marker)],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=True,
+        [sys.executable, "-c", script, str(db_path), json.dumps(second_claim.public()), "p3" if overlap else "p2", "-"],
+        cwd=repo_root, capture_output=True, text=True, timeout=10, check=True,
     )
-    third_result = json.loads(third.stdout.strip())
-    assert third_result["admitted"] is True
+    assert json.loads(third.stdout.strip())["admitted"] is True
 
 
 def test_reversed_multikey_requests_do_not_deadlock_or_partially_admit(tmp_path: Path) -> None:
