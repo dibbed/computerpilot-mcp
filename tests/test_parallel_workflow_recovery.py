@@ -136,23 +136,32 @@ def test_real_executor_process_death_keeps_all_effects_without_replay(tmp_path: 
     from core.process_ownership import spawn_owned_process
 
     script = '''
-import sys,time
+import sys,time,threading
 from pathlib import Path
+from core.workflow_actions import ACTION_HANDLERS
+from core.workflow_executor import WorkflowExecutor,NATIVE_ONLY_ROUTING
 from core.workflow_models import StepDefinition,WorkflowDefinition,WorkflowState
 from core.workflow_store import WorkflowStore
 root=Path(sys.argv[1]); store=WorkflowStore(root/'crash.sqlite3',recover=False)
 steps=tuple(StepDefinition(n,'check_file',{'path':str(root/n)},step_id=n) for n in ('a','b','c'))
 w=store.create(WorkflowDefinition('crash',steps,execution_mode='dag',max_parallel_steps=3),initial_state=WorkflowState.QUEUED)
-lease=store.acquire_lease(w['workflow_id'],'crash',30,allow_reentry=False)
-store.transition(w['workflow_id'],w['version'],WorkflowState.RUNNING,lease_token=lease.lease_token)
-for i,o in enumerate(store.list_operations(w['workflow_id'])['items']):
- o=store.claim_ready_operation(o['operation_id'],lease_token=lease.lease_token,owner_id='crash',execution_id='crash',global_limit=3)
- o=store.prepare_operation_attempt(o['operation_id'],expected_version=o['version'],attempt_token=o['attempt_token'],lease_token=lease.lease_token,intent_evidence={'fixture':True},postcondition=None)
- store.mark_operation_may_dispatch(o['operation_id'],expected_version=o['version'],attempt_token=o['attempt_token'],lease_token=lease.lease_token)
- if i<2:
-  with (root/'effects').open('a') as f:f.write(str(i)+'\\n')
-(root/'ready').write_text(w['workflow_id'])
-time.sleep(60)
+lock=threading.Lock(); started=0
+
+def action(arguments,timeout):
+ global started
+ name=Path(arguments['path']).name
+ with lock:
+  if name!='c':
+   with (root/'effects').open('a') as f:f.write(name+'\\n')
+  started+=1
+  if started==3:
+   (root/'ready.tmp').write_text(w['workflow_id'])
+   (root/'ready.tmp').replace(root/'ready')
+ time.sleep(60)
+ return {'ok':True}
+
+ACTION_HANDLERS['check_file']=action
+WorkflowExecutor(store,route_planner=NATIVE_ONLY_ROUTING,enable_dag_execution=True).execute(w['workflow_id'],owner_id='crash')
 '''
     process = spawn_owned_process(
         [sys.executable, "-c", script, str(tmp_path)], cwd=Path(__file__).resolve().parents[1],
@@ -174,7 +183,7 @@ time.sleep(60)
     _expire(store, workflow_id)
     recovered = WorkflowStore(path)
     assert [op["state"] for op in recovered.list_operations(workflow_id)["items"]] == ["uncertain"] * 3
-    assert (tmp_path / "effects").read_text().splitlines() == ["0", "1"]
+    assert sorted((tmp_path / "effects").read_text().splitlines()) == ["a", "b"]
     assert len(recovered.active_admissions(workflow_id)) == 3
 
 
@@ -296,3 +305,90 @@ def test_cancellation_fans_out_preserves_completed_results_and_blocks_join(tmp_p
     assert set(calls) == {"a", "b"}
     assert [op["state"] for op in store.list_operations(workflow["workflow_id"])["items"]] == ["succeeded", "cancelled", "created"]
     assert store.active_admissions(workflow["workflow_id"]) == []
+
+
+def test_last_resource_resolution_repairs_aggregate_after_operation_acknowledgement(tmp_path: Path) -> None:
+    from core.resource_claims import path_claim
+
+    store, workflow_id, token, operations = _running(tmp_path)
+    store.reserve_resource_claims(
+        request_id="effect", owner_token="owner", claims=(path_claim(tmp_path / "owned", "write"),),
+        category="test", workflow_id=workflow_id, operation_id=operations[0]["operation_id"],
+    )
+    store.quarantine_resource_request("effect", owner_token="owner", reason="cleanup unknown")
+    for index, operation in enumerate(operations):
+        store.checkpoint_operation(operation["operation_id"], OperationState.RUNNING, lease_token=token)
+        store.checkpoint_operation(
+            operation["operation_id"], OperationState.UNCERTAIN if index == 0 else OperationState.SUCCEEDED, lease_token=token,
+        )
+    current = store.get(workflow_id)
+    store.transition(workflow_id, current["version"], WorkflowState.UNCERTAIN, lease_token=token)
+    operation = store.get_operation(operations[0]["operation_id"])
+    resolved = store.resolve_uncertain_operation(
+        operation["operation_id"], operation["version"], OperationState.ACKNOWLEDGED,
+        evidence={"source": "operator_assertion", "conclusive": True, "satisfied": True}, event_type="test_ack",
+    )
+    assert resolved["workflow"]["state"] == "uncertain"
+    store.resolve_quarantined_resource_request(
+        "effect", owner_token="owner", resolution="released", evidence="owned child cleanup independently confirmed",
+    )
+    assert store.get(workflow_id)["state"] == "completed"
+
+
+def test_parallel_exception_payload_does_not_cross_persistent_evidence_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.workflow_actions import ACTION_HANDLERS
+    from core.workflow_executor import NATIVE_ONLY_ROUTING, WorkflowExecutor
+
+    canary = "private-exception-canary-18364"
+
+    def failed(*args: Any) -> dict[str, Any]:
+        raise RuntimeError(canary)
+
+    monkeypatch.setitem(ACTION_HANDLERS, "check_file", failed)
+    store = WorkflowStore(tmp_path / "secrets.sqlite3")
+    workflow = store.create(WorkflowDefinition(
+        "private evidence", (StepDefinition("one", "check_file", {"path": "fixture"}, step_id="one"),),
+        execution_mode="dag",
+    ), initial_state=WorkflowState.QUEUED)
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING, enable_dag_execution=True).execute(
+        workflow["workflow_id"], owner_id="private",
+    )
+    with sqlite3.connect(store.path) as connection:
+        snapshot = "\n".join(connection.iterdump())
+    assert canary not in snapshot
+    assert canary not in str(result)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("failed_sibling", [False, True])
+def test_concurrent_recovery_and_resolution_preserve_mixed_branch_truth(
+    tmp_path: Path, cancel: bool, failed_sibling: bool,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    store, workflow_id, token, operations = _running(tmp_path)
+    for index, operation in enumerate(operations):
+        current = _attempt(store, operation["operation_id"], token, "may_dispatch")
+        if index < 2:
+            store.complete_operation_attempt(
+                current["operation_id"], expected_version=current["version"], attempt_token=current["attempt_token"],
+                lease_token=token, final_state=OperationState.FAILED if index == 1 and failed_sibling else OperationState.SUCCEEDED,
+            )
+    if cancel:
+        current = store.get(workflow_id)
+        store.request_cancel(workflow_id, current["version"], reason="persisted cancellation")
+    _expire(store, workflow_id)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: WorkflowStore(store.path), range(2)))
+    recovered = store.list_operations(workflow_id)["items"]
+    assert [op["state"] for op in recovered] == ["succeeded", "failed" if failed_sibling else "succeeded", "uncertain"]
+    assert store.get(workflow_id)["state"] == "uncertain"
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workflow_events WHERE workflow_id=? AND event_type='workflow_restart_recovered'", (workflow_id,),
+        ).fetchone()[0] == 1
+    final = store.resolve_uncertain_operation(
+        recovered[2]["operation_id"], recovered[2]["version"], OperationState.ACKNOWLEDGED,
+        evidence={"source": "operator_assertion", "conclusive": True, "satisfied": True}, event_type="test_ack",
+    )
+    assert final["workflow"]["state"] == ("failed" if failed_sibling else "cancelled" if cancel else "completed")

@@ -1777,7 +1777,7 @@ class WorkflowStore:
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT state, owner_token FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
+                "SELECT state, owner_token,workflow_id FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
             ).fetchone()
             if row is None:
                 raise ToolError("resource_request_not_found", "Resource request was not found.")
@@ -1798,6 +1798,29 @@ class WorkflowStore:
                 """,
                 (resolution, evidence[:2_000], now, request_id, owner_token),
             )
+            workflow_id = row["workflow_id"]
+            workflow = connection.execute(
+                "SELECT state,execution_mode FROM workflows WHERE workflow_id=?", (workflow_id,),
+            ).fetchone() if workflow_id is not None else None
+            if workflow is not None and workflow["execution_mode"] == "dag" and workflow["state"] == "uncertain":
+                connection.execute(
+                    "DELETE FROM workflow_execution_admissions WHERE workflow_id=? "
+                    "AND operation_id IN (SELECT operation_id FROM workflow_operations "
+                    "WHERE workflow_id=? AND state IN ('succeeded','acknowledged','failed','unresolvable','cancelled')) "
+                    "AND NOT EXISTS (SELECT 1 FROM workflow_resource_requests r "
+                    "WHERE r.operation_id=workflow_execution_admissions.operation_id AND r.state!='released')",
+                    (workflow_id, workflow_id),
+                )
+                target, step_index, error, _ = self._aggregate_state(connection, str(workflow_id))
+                connection.execute(
+                    "UPDATE workflows SET state=?,current_step=?,last_error=?,version=version+1,updated_at=? WHERE workflow_id=?",
+                    (target.value, step_index, error, now, workflow_id),
+                )
+                connection.execute(
+                    "INSERT INTO workflow_events(workflow_id,event_type,state,metadata_json,created_at) "
+                    "VALUES (?,'workflow_resource_resolved',?,?,?)",
+                    (workflow_id, target.value, _canonical({"request_id": request_id}), now),
+                )
             connection.commit()
         return self.resource_request(request_id)
 

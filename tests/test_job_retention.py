@@ -253,9 +253,11 @@ def test_noop_cleanup_uses_one_terminal_size_scan_and_one_orphan_connection(
     assert connections == 2
 
 
+@pytest.mark.parametrize("managed", [False, True])
 def test_submit_retries_if_terminal_history_is_pruned_between_dedup_and_status_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    managed: bool,
 ) -> None:
     import core.job_scheduler as scheduler
 
@@ -283,6 +285,18 @@ def test_submit_retries_if_terminal_history_is_pruned_between_dedup_and_status_r
         return original_get(job_id)
 
     monkeypatch.setattr(store, "get", racing_get)
+    if managed:
+        from core.errors import ToolError
+        from core.resource_claims import make_resource_capability
+
+        capability = make_resource_capability("parent", "owner", tmp_path / "workflows.sqlite3")
+        with pytest.raises(ToolError) as failure:
+            store.submit(command, tmp_path, 1, "same-key", _resource_capability=capability)
+        assert failure.value.code == "job_not_found"
+        with store.connect() as db:
+            assert db.execute("SELECT 1 FROM jobs WHERE request_key='same-key'").fetchone() is None
+        assert raced is True
+        return
     result = store.submit(command, tmp_path, 1, "same-key")
 
     assert raced is True

@@ -426,17 +426,17 @@ class WorkflowExecutor:
             raise
         except ActionCancelled as exc:
             final_state = OperationState.UNCERTAIN if crossed_dispatch_barrier and effectful else OperationState.CANCELLED
-            error = str(exc)
+            error = exc.code if isinstance(exc, ToolError) else type(exc).__name__
         except TransientActionError as exc:
             retry_safe = not effectful and descriptor.retry_policy == "transient"
             final_state = OperationState.FAILED if not effectful else OperationState.UNCERTAIN
-            error = str(exc)
+            error = exc.code if isinstance(exc, ToolError) else type(exc).__name__
         except SideEffectUncertain as exc:
             final_state = OperationState.UNCERTAIN
-            error = str(exc)
+            error = exc.code if isinstance(exc, ToolError) else type(exc).__name__
         except Exception as exc:
             final_state = OperationState.UNCERTAIN if crossed_dispatch_barrier and effectful else OperationState.FAILED
-            error = str(exc)
+            error = exc.code if isinstance(exc, ToolError) else type(exc).__name__
 
         latest = self.store.get_operation(operation_id)
         try:
