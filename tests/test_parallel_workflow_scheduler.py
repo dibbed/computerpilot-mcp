@@ -105,6 +105,38 @@ def test_dag_scheduler_respects_cap_and_join_dependencies(tmp_path: Path, monkey
     assert started[-1] == "join"
 
 
+@pytest.mark.parametrize("cleanup_denied", [False, True])
+def test_dag_does_not_checkpoint_success_with_unresolved_analyzer_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_denied: bool,
+) -> None:
+    from core.runtime_capacity import RuntimeCapacityPermit, acquire_runtime_capacity
+
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    permits: list[RuntimeCapacityPermit] = []
+
+    def execute(*args: object, **kwargs: object) -> dict[str, object]:
+        permit = acquire_runtime_capacity(store.path, category="analyzer", limit=1, deadline=time.monotonic() + 1)
+        assert permit is not None
+        permits.append(permit)
+        if cleanup_denied:
+            with pytest.raises(ToolError), permit:
+                raise ToolError("process_cleanup_incomplete", "child cleanup denied")
+        return {"handled": "result available, ownership unresolved"}
+
+    monkeypatch.setattr(workflow_executor, "execute_action", execute)
+    created = store.create(_single_dag("owner"), initial_state=WorkflowState.QUEUED)
+    try:
+        result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING, enable_dag_execution=True).execute(
+            created["workflow_id"], owner_id="worker",
+        )
+        assert result["state"] == "uncertain"
+        assert store.list_operations(created["workflow_id"])["items"][0]["state"] == "uncertain"
+        assert store.health_summary()["quarantined_resource_request_count"] == 1
+    finally:
+        for permit in permits:
+            permit.release()
+
+
 def test_dag_scheduler_cap_one_remains_serial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     tracker = _patch_safe_actions(monkeypatch)
     store = WorkflowStore(tmp_path / "workflows.sqlite3")

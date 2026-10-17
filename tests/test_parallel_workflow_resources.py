@@ -109,6 +109,12 @@ def test_workflow_capability_revalidates_live_attempt_before_nested_dispatch(tmp
         validate_resource_capability(capability, (), store)
     assert raised.value.code == "resource_capability_invalid"
     assert store.resource_request("parent")["state"] == "active"
+    with pytest.raises(ToolError) as capacity_error:
+        store.reserve_capacity(
+            admission_id="late", category="analyzer", owner_token="child", weight=1, limit=1,
+            resource_request_id="parent", resource_owner_token="owner",
+        )
+    assert capacity_error.value.code == "resource_capability_invalid"
 
 
 def test_resource_conflict_matrix_handles_exact_and_subtree_paths(tmp_path: Path) -> None:

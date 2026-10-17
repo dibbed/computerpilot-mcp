@@ -31,6 +31,22 @@ from core.workflow_models import (
 
 SCHEMA_VERSION = 10
 GRAPH_CONTRACT_VERSION = 1
+_RESOURCE_CAPABILITY_SQL = """
+SELECT r.* FROM workflow_resource_requests r
+WHERE r.request_id=? AND r.owner_token=? AND r.state='active'
+  AND ((r.workflow_id IS NULL AND r.operation_id IS NULL) OR EXISTS (
+      SELECT 1 FROM workflow_execution_admissions a
+      JOIN workflow_operations o ON o.operation_id=a.operation_id
+      JOIN workflow_leases l ON l.workflow_id=a.workflow_id
+      JOIN workflows w ON w.workflow_id=a.workflow_id
+      WHERE a.operation_id=r.operation_id AND a.workflow_id=r.workflow_id
+        AND a.attempt_token=r.attempt_token AND o.attempt_token=a.attempt_token
+        AND o.execution_id=a.execution_id
+        AND o.dispatch_phase IN ('reserved','prepared','may_dispatch')
+        AND l.lease_token=a.lease_token AND l.expires_at>?
+        AND w.state='running' AND w.cancel_requested_at IS NULL
+  ))
+"""
 _ROUTE_HISTORY_MAX = 20
 _ROUTE_JSON_MAX_CHARS = 16_000
 _SECRET_MARKERS = (
@@ -1624,22 +1640,7 @@ class WorkflowStore:
                 ).fetchone()
             else:
                 row = connection.execute(
-                    """
-                    SELECT r.* FROM workflow_resource_requests r
-                    WHERE r.request_id=? AND r.owner_token=? AND r.state='active'
-                      AND ((r.workflow_id IS NULL AND r.operation_id IS NULL) OR EXISTS (
-                          SELECT 1 FROM workflow_execution_admissions a
-                          JOIN workflow_operations o ON o.operation_id=a.operation_id
-                          JOIN workflow_leases l ON l.workflow_id=a.workflow_id
-                          JOIN workflows w ON w.workflow_id=a.workflow_id
-                          WHERE a.operation_id=r.operation_id AND a.workflow_id=r.workflow_id
-                            AND a.attempt_token=r.attempt_token AND o.attempt_token=a.attempt_token
-                            AND o.execution_id=a.execution_id
-                            AND o.dispatch_phase IN ('reserved','prepared','may_dispatch')
-                            AND l.lease_token=a.lease_token AND l.expires_at>?
-                            AND w.state='running' AND w.cancel_requested_at IS NULL
-                      ))
-                    """,
+                    _RESOURCE_CAPABILITY_SQL,
                     (request_id, expected_owner_token, _now()),
                 ).fetchone()
             if row is None:
@@ -1800,8 +1801,8 @@ class WorkflowStore:
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             if resource_request_id is not None and connection.execute(
-                "SELECT 1 FROM workflow_resource_requests WHERE request_id=? AND owner_token=? AND state='active'",
-                (resource_request_id, resource_owner_token),
+                _RESOURCE_CAPABILITY_SQL,
+                (resource_request_id, resource_owner_token, now),
             ).fetchone() is None:
                 raise ToolError("resource_capability_invalid", "Parent resource ownership is no longer active.")
             row = connection.execute(
@@ -2260,6 +2261,20 @@ class WorkflowStore:
                 and final_state in {OperationState.FAILED, OperationState.CANCELLED}
             ):
                 validate_operation_transition(current_operation_state, final_state)
+            if connection.execute(
+                """
+                SELECT 1 FROM workflow_resource_requests r
+                WHERE r.operation_id=? AND r.attempt_token=?
+                  AND (r.state='quarantined' OR EXISTS (
+                      SELECT 1 FROM runtime_capacity_requests c
+                      WHERE c.resource_request_id=r.request_id AND c.state!='released'
+                  )) LIMIT 1
+                """,
+                (operation_id, attempt_token),
+            ).fetchone() is not None:
+                final_state = OperationState.UNCERTAIN
+                error = "workflow_child_ownership_unresolved"
+                evidence = {**(evidence or {}), "conclusive": False, "satisfied": False, "ownership_unresolved": True}
             step_state = {
                 OperationState.SUCCEEDED: "completed",
                 OperationState.FAILED: "failed",

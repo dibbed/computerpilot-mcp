@@ -396,7 +396,7 @@ class WorkflowExecutor:
                 result=result,
                 evidence=evidence,
             )
-            settle_resource(OperationState.SUCCEEDED)
+            settle_resource(OperationState(str(settled["state"])))
             return settled
         except _LeaseLostDuringAction:
             self.store.quarantine_resource_request(
@@ -431,7 +431,7 @@ class WorkflowExecutor:
                 },
                 error=error,
             )
-            settle_resource(final_state, reason=error)
+            settle_resource(OperationState(str(settled["state"])), reason=error)
             return settled
         except ToolError as settle_error:
             if settle_error.code in {
