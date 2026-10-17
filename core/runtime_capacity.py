@@ -10,7 +10,8 @@ from pathlib import Path
 
 import psutil
 
-from core.resource_claims import current_resource_capability, validate_resource_capability
+from core.errors import ToolError
+from core.resource_claims import _parse_resource_capability, current_resource_capability, validate_resource_capability
 from core.workflow_store import WorkflowStore
 
 
@@ -31,8 +32,12 @@ class RuntimeCapacityPermit:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        del exc_type, exc, traceback
-        self.release()
+        del exc_type, traceback
+        if isinstance(exc, ToolError) and exc.code == "process_cleanup_incomplete":
+            self.store.quarantine_capacity(self.admission_id, owner_token=self.owner_token)
+            self.released = True
+        else:
+            self.release()
 
 
 def acquire_runtime_capacity(
@@ -51,6 +56,9 @@ def acquire_runtime_capacity(
         validate_resource_capability(inherited, (), store) if inherited is not None
         else store or WorkflowStore(db_path, recover=False)
     )
+    resource_request_id, resource_owner_token = (
+        _parse_resource_capability(inherited)[:2] if inherited is not None else (None, None)
+    )
     admission_id = f"capacity-{uuid.uuid4().hex}"
     owner_token = f"pid-{os.getpid()}-{psutil.Process().create_time():.6f}-{uuid.uuid4().hex}"
     try:
@@ -61,6 +69,8 @@ def acquire_runtime_capacity(
                 owner_token=owner_token,
                 weight=1,
                 limit=limit,
+                resource_request_id=resource_request_id,
+                resource_owner_token=resource_owner_token,
             )
             if result["admitted"] is True:
                 return RuntimeCapacityPermit(capacity_store, admission_id, owner_token)

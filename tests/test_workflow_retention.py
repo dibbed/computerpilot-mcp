@@ -252,8 +252,9 @@ def test_server_health_marks_critical_resource_pressure_unhealthy(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("unresolved", ["operation", "resource", "capacity"])
 def test_server_health_marks_unresolved_workflow_as_degraded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unresolved: str,
 ) -> None:
     settings = replace(SETTINGS, state_dir=tmp_path, memory_dir=tmp_path / "memory")
     monkeypatch.setattr(registry, "SETTINGS", settings)
@@ -262,11 +263,20 @@ def test_server_health_marks_unresolved_workflow_as_degraded(
 
     store = WorkflowStore(settings.workflow_db)
     workflow = store.create(_definition(), initial_state=WorkflowState.UNCERTAIN)
-    with sqlite3.connect(settings.workflow_db) as connection:
-        connection.execute(
-            "UPDATE workflow_operations SET state = 'uncertain' WHERE workflow_id = ?",
-            (workflow["workflow_id"],),
+    if unresolved == "operation":
+        with sqlite3.connect(settings.workflow_db) as connection:
+            connection.execute(
+                "UPDATE workflow_operations SET state = 'uncertain' WHERE workflow_id = ?",
+                (workflow["workflow_id"],),
+            )
+    elif unresolved == "resource":
+        store.reserve_resource_claims(
+            request_id="resource", owner_token="owner", category="test", claims=(path_claim(tmp_path, "write"),),
         )
+        store.quarantine_resource_request("resource", owner_token="owner", reason="cleanup unknown")
+    else:
+        store.reserve_capacity(admission_id="capacity", category="analyzer", owner_token="owner", weight=1, limit=1)
+        store.quarantine_capacity("capacity", owner_token="owner")
 
     async def scenario() -> None:
         async with Client(create_server()) as client:
@@ -275,12 +285,13 @@ def test_server_health_marks_unresolved_workflow_as_degraded(
             health = response.structured_content
             assert health["ok"] is True
             assert health["health_status"] == "degraded"
-            assert "unresolved_uncertain_operations" in health["degraded_reasons"]
-            assert health["unresolved_workflow_operations"] == 1
+            expected_reason = "unresolved_uncertain_operations" if unresolved == "operation" else "resource_ownership_unresolved"
+            assert expected_reason in health["degraded_reasons"]
+            assert health["unresolved_workflow_operations"] == int(unresolved == "operation")
             assert health["workflow_total"] == health["workflow_health"]["workflow_total"]
             assert health["workflow_operation_total"] == health["workflow_health"]["workflow_operation_total"]
             assert health["workflow_event_total"] == health["workflow_health"]["workflow_event_total"]
             assert health["active_workflow_leases"] == health["workflow_health"]["active_workflow_leases"]
-            assert health["workflow_health"]["unresolved_operation_count"] == 1
+            assert health["workflow_health"]["unresolved_operation_count"] == int(unresolved == "operation")
 
     asyncio.run(scenario())

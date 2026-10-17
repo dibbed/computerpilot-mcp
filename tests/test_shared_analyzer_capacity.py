@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -11,6 +12,57 @@ from pathlib import Path
 import pytest
 
 from tools.testing import verification
+
+
+@pytest.mark.parametrize("storage_failure", [False, True])
+def test_cleanup_denial_fences_parent_even_if_quarantine_storage_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage_failure: bool,
+) -> None:
+    from core.errors import ToolError
+    from core.resource_claims import managed_resource_claims, path_claim
+    from core.runtime_capacity import acquire_runtime_capacity
+    from core.workflow_store import WorkflowStore
+
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    claim = path_claim(tmp_path / "target", "write")
+
+    def deny_quarantine(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("disk unavailable")
+
+    if storage_failure:
+        monkeypatch.setattr(store, "quarantine_capacity", deny_quarantine, raising=False)
+    with managed_resource_claims((claim,), category="parent", store=store):
+        permit = acquire_runtime_capacity(
+            store.path, category="analyzer", limit=1, deadline=time.monotonic() + 1, store=store,
+        )
+        assert permit is not None
+        with pytest.raises((ToolError, sqlite3.OperationalError)), permit:
+            raise ToolError("process_cleanup_incomplete", "cleanup denied")
+
+    result = store.reserve_resource_claims(request_id="other", owner_token="other", category="test", claims=(claim,))
+    assert result["admitted"] is False
+    assert result["reason"] == "resource_quarantined"
+    counts = store.health_summary()["runtime_capacity_counts"]
+    assert counts["analyzer:active" if storage_failure else "analyzer:quarantined"] == 1
+
+
+def test_parent_cannot_release_while_analyzer_permit_is_still_active(tmp_path: Path) -> None:
+    from core.resource_claims import managed_resource_claims, path_claim
+    from core.runtime_capacity import acquire_runtime_capacity
+    from core.workflow_store import WorkflowStore
+
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    claim = path_claim(tmp_path / "target", "write")
+    with managed_resource_claims((claim,), category="parent", store=store):
+        permit = acquire_runtime_capacity(
+            store.path, category="analyzer", limit=1, deadline=time.monotonic() + 1, store=store,
+        )
+        assert permit is not None
+    assert store.reserve_resource_claims(
+        request_id="other", owner_token="other", category="test", claims=(claim,),
+    )["admitted"] is False
+    permit.release()
+    assert store.health_summary()["quarantined_resource_request_count"] == 1
 
 
 def test_process_capacity_cleanup_fences_reused_pid(tmp_path: Path) -> None:

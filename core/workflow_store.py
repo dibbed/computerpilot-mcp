@@ -29,7 +29,7 @@ from core.workflow_models import (
     workflow_topological_order,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 GRAPH_CONTRACT_VERSION = 1
 _ROUTE_HISTORY_MAX = 20
 _ROUTE_JSON_MAX_CHARS = 16_000
@@ -228,6 +228,9 @@ class WorkflowStore:
                     if version < 9:
                         self._migrate_v9(connection)
                         version = 9
+                    if version < 10:
+                        self._migrate_v10(connection)
+                        version = 10
             if version > SCHEMA_VERSION:
                 raise ToolError(
                     "workflow_schema_too_new",
@@ -507,6 +510,25 @@ class WorkflowStore:
             CREATE INDEX IF NOT EXISTS idx_runtime_capacity_category_state_ticket
                 ON runtime_capacity_requests(category, state, ticket);
             PRAGMA user_version = 9;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v10(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE runtime_capacity_requests ADD COLUMN resource_request_id TEXT
+                REFERENCES workflow_resource_requests(request_id) ON DELETE SET NULL;
+            CREATE INDEX idx_runtime_capacity_resource_state
+                ON runtime_capacity_requests(resource_request_id, state);
+            UPDATE workflow_resource_requests
+            SET state='quarantined', reason='legacy_unlinked_capacity_requires_reconciliation'
+            WHERE state='active' AND EXISTS (
+                SELECT 1 FROM runtime_capacity_requests WHERE state!='released'
+            );
+            PRAGMA user_version = 10;
             COMMIT;
             """
         )
@@ -1680,6 +1702,17 @@ class WorkflowStore:
             if str(row["state"]) not in {"active", "pending"}:
                 connection.commit()
                 return False
+            if connection.execute(
+                "SELECT 1 FROM runtime_capacity_requests WHERE resource_request_id=? AND state!='released' LIMIT 1",
+                (request_id,),
+            ).fetchone() is not None:
+                connection.execute(
+                    "UPDATE workflow_resource_requests SET state='quarantined', "
+                    "reason='child_capacity_cleanup_unresolved', updated_at=? WHERE request_id=?",
+                    (now, request_id),
+                )
+                connection.commit()
+                return False
             connection.execute(
                 """
                 UPDATE workflow_resource_requests
@@ -1754,6 +1787,8 @@ class WorkflowStore:
         owner_token: str,
         weight: int,
         limit: int,
+        resource_request_id: str | None = None,
+        resource_owner_token: str | None = None,
     ) -> dict[str, Any]:
         """Reserve shared weighted runtime capacity with FIFO pending fairness."""
 
@@ -1764,6 +1799,11 @@ class WorkflowStore:
         now = _now()
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if resource_request_id is not None and connection.execute(
+                "SELECT 1 FROM workflow_resource_requests WHERE request_id=? AND owner_token=? AND state='active'",
+                (resource_request_id, resource_owner_token),
+            ).fetchone() is None:
+                raise ToolError("resource_capability_invalid", "Parent resource ownership is no longer active.")
             row = connection.execute(
                 "SELECT * FROM runtime_capacity_requests WHERE admission_id = ?", (admission_id,),
             ).fetchone()
@@ -1773,10 +1813,10 @@ class WorkflowStore:
                     """
                     INSERT INTO runtime_capacity_requests(
                         admission_id, category, owner_token, weight, limit_snapshot,
-                        state, reason, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+                        state, reason, created_at, updated_at, resource_request_id
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
                     """,
-                    (admission_id, category, owner_token, weight, limit, now, now),
+                    (admission_id, category, owner_token, weight, limit, now, now, resource_request_id),
                 )
                 row = connection.execute(
                     "SELECT * FROM runtime_capacity_requests WHERE admission_id = ?", (admission_id,),
@@ -1787,6 +1827,7 @@ class WorkflowStore:
                 str(row["owner_token"]) != owner_token
                 or str(row["category"]) != category
                 or int(row["weight"]) != weight
+                or row["resource_request_id"] != resource_request_id
             ):
                 raise ToolError("capacity_request_conflict", "Capacity admission id was reused with different inputs.")
             state = str(row["state"])
@@ -1837,6 +1878,26 @@ class WorkflowStore:
             )
             connection.commit()
         return {"admitted": True, "admission_id": admission_id, "state": "active", "reason": None}
+
+    def quarantine_capacity(self, admission_id: str, *, owner_token: str) -> None:
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT owner_token, state, resource_request_id FROM runtime_capacity_requests WHERE admission_id=?",
+                (admission_id,),
+            ).fetchone()
+            if row is None or row["owner_token"] != owner_token or row["state"] == "released":
+                raise ToolError("capacity_owner_mismatch", "Capacity ownership cannot be quarantined.")
+            connection.execute(
+                "UPDATE runtime_capacity_requests SET state='quarantined', reason='process_cleanup_unresolved', "
+                "updated_at=? WHERE admission_id=?", (now, admission_id),
+            )
+            connection.execute(
+                "UPDATE workflow_resource_requests SET state='quarantined', reason='child_capacity_cleanup_unresolved', "
+                "updated_at=? WHERE request_id=? AND state='active'", (now, row["resource_request_id"]),
+            )
+            connection.commit()
 
     def release_capacity(self, admission_id: str, *, owner_token: str) -> bool:
         now = _now()
