@@ -72,6 +72,12 @@ class WorkflowDefinition:
     steps: tuple[StepDefinition, ...]
     description: str = ""
     execution_mode: Literal["sequential", "dag"] = "sequential"
+    max_parallel_steps: int = 1
+    total_timeout_sec: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.execution_mode == "dag" and self.total_timeout_sec is None:
+            object.__setattr__(self, "total_timeout_sec", 7_200.0)
 
 
 _STEP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
@@ -83,17 +89,26 @@ def workflow_topological_order(definition: WorkflowDefinition) -> tuple[int, ...
     steps = definition.steps
     if not steps:
         raise ToolError("empty_workflow", "A workflow must contain at least one step.")
-    if len(steps) > 100:
-        raise ToolError("workflow_too_large", "A workflow may contain at most 100 steps.")
     if definition.execution_mode == "sequential":
         if any(step.step_id is not None or step.depends_on for step in steps):
             raise ToolError(
                 "workflow_dag_metadata_requires_dag_mode",
                 "step_id and depends_on require execution_mode='dag'.",
             )
+        if definition.max_parallel_steps != 1 or definition.total_timeout_sec is not None:
+            raise ToolError(
+                "workflow_parallel_metadata_requires_dag_mode",
+                "Parallel workflow caps/deadlines require execution_mode='dag'.",
+            )
         return tuple(range(len(steps)))
     if definition.execution_mode != "dag":
         raise ToolError("invalid_workflow_execution_mode", "execution_mode must be 'sequential' or 'dag'.")
+    if len(steps) > 100:
+        raise ToolError("workflow_too_large", "A DAG workflow may contain at most 100 steps.")
+    if not 1 <= definition.max_parallel_steps <= 16:
+        raise ToolError("invalid_workflow_parallel_cap", "DAG max_parallel_steps must be between 1 and 16.")
+    if definition.total_timeout_sec is None or not 0 < definition.total_timeout_sec <= 86_400:
+        raise ToolError("invalid_workflow_total_timeout", "DAG total_timeout_sec must be greater than 0 and at most 86400.")
 
     by_id: dict[str, int] = {}
     for index, step in enumerate(steps):

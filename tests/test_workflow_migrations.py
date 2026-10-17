@@ -307,7 +307,7 @@ def test_v5_database_migrates_route_columns_without_losing_legacy_data(tmp_path:
     migrated = store.get("legacy-workflow")
     operations = store.list_operations("legacy-workflow")
 
-    assert SCHEMA_VERSION == 7
+    assert SCHEMA_VERSION == 8
     assert migrated["state"] == "completed"
     assert migrated["execution_mode"] == "sequential"
     assert migrated["graph_contract_version"] == 0
@@ -342,5 +342,13 @@ def test_v5_database_migrates_route_columns_without_losing_legacy_data(tmp_path:
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_step_dependencies'"
         ).fetchone() is not None
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        admission_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_execution_admissions)").fetchall()
+        }
+        operation_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_operations)").fetchall()
+        }
+        assert {"attempt_token", "execution_id", "dispatch_phase", "attempt_generation"} <= operation_columns
+        assert {"attempt_token", "execution_id", "lease_token", "category", "weight"} <= admission_columns
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

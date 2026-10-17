@@ -55,6 +55,8 @@ class WorkflowInput(BaseModel):
     description: str = Field(default="", max_length=2_000)
     steps: list[StepInput] = Field(min_length=1, max_length=100)
     execution_mode: Literal["sequential", "dag"] = "sequential"
+    max_parallel_steps: int = Field(default=1, ge=1, le=16)
+    total_timeout_sec: float | None = Field(default=None, gt=0, le=86_400)
 
     def definition(self) -> WorkflowDefinition:
         return WorkflowDefinition(
@@ -62,6 +64,8 @@ class WorkflowInput(BaseModel):
             tuple(StepDefinition(**step.model_dump()) for step in self.steps),
             self.description,
             self.execution_mode,
+            self.max_parallel_steps,
+            self.total_timeout_sec,
         )
 
 

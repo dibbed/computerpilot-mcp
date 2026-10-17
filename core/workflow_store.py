@@ -27,7 +27,7 @@ from core.workflow_models import (
     workflow_topological_order,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 GRAPH_CONTRACT_VERSION = 1
 _ROUTE_HISTORY_MAX = 20
 _ROUTE_JSON_MAX_CHARS = 16_000
@@ -69,6 +69,8 @@ def _definition_payload(definition: WorkflowDefinition) -> dict[str, Any]:
     payload = asdict(definition)
     if definition.execution_mode == "sequential":
         payload.pop("execution_mode", None)
+        payload.pop("max_parallel_steps", None)
+        payload.pop("total_timeout_sec", None)
         for step in payload["steps"]:
             step.pop("step_id", None)
             step.pop("depends_on", None)
@@ -217,6 +219,9 @@ class WorkflowStore:
                     if version < 7:
                         self._migrate_v7(connection)
                         version = 7
+                    if version < 8:
+                        self._migrate_v8(connection)
+                        version = 8
             if version > SCHEMA_VERSION:
                 raise ToolError(
                     "workflow_schema_too_new",
@@ -406,6 +411,42 @@ class WorkflowStore:
                 SELECT workflow_id, step_index, step_index - 1
                 FROM workflow_steps WHERE step_index > 0;
             PRAGMA user_version = 7;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v8(connection: sqlite3.Connection) -> None:
+        """Persist fenced workflow attempts and active execution admissions."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflows ADD COLUMN max_parallel_steps INTEGER NOT NULL DEFAULT 1;
+            ALTER TABLE workflows ADD COLUMN total_timeout_sec REAL;
+            ALTER TABLE workflow_operations ADD COLUMN attempt_token TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN execution_id TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN dispatch_phase TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN attempt_generation INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE workflow_operations ADD COLUMN next_retry_at TEXT;
+            CREATE TABLE IF NOT EXISTS workflow_execution_admissions (
+                operation_id TEXT PRIMARY KEY REFERENCES workflow_operations(operation_id) ON DELETE CASCADE,
+                workflow_id TEXT NOT NULL REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+                attempt_token TEXT NOT NULL UNIQUE,
+                execution_id TEXT NOT NULL,
+                lease_token TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                weight INTEGER NOT NULL DEFAULT 1,
+                admitted_at TEXT NOT NULL,
+                process_pid INTEGER,
+                process_create_time REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_execution_admissions_active
+                ON workflow_execution_admissions(category, admitted_at, workflow_id);
+            CREATE INDEX IF NOT EXISTS idx_workflow_operations_attempt
+                ON workflow_operations(workflow_id, attempt_token, dispatch_phase);
+            PRAGMA user_version = 8;
             COMMIT;
             """
         )
@@ -621,8 +662,8 @@ class WorkflowStore:
                     workflow_id, idempotency_key, definition_json, inputs_json, inputs_hash, state,
                     current_step, version, created_at, updated_at, last_error,
                     execution_definition_json, execution_definition_hash, execution_compatible,
-                    execution_mode, graph_contract_version
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?, ?, 1, ?, ?)
+                    execution_mode, graph_contract_version, max_parallel_steps, total_timeout_sec
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?, ?, 1, ?, ?, ?, ?)
                 """,
                 (
                     workflow_id,
@@ -637,6 +678,8 @@ class WorkflowStore:
                     execution_definition_hash,
                     definition.execution_mode,
                     GRAPH_CONTRACT_VERSION if definition.execution_mode == "dag" else 0,
+                    definition.max_parallel_steps,
+                    definition.total_timeout_sec,
                 ),
             )
             connection.executemany(
@@ -692,6 +735,17 @@ class WorkflowStore:
                 """,
                 (workflow_id,),
             ).fetchall()
+            admissions = connection.execute(
+                """
+                SELECT adm.operation_id, op.step_index, adm.attempt_token, adm.execution_id,
+                       adm.category, adm.weight, adm.admitted_at
+                FROM workflow_execution_admissions adm
+                JOIN workflow_operations op USING(operation_id)
+                WHERE adm.workflow_id = ?
+                ORDER BY adm.admitted_at, operation_id
+                """,
+                (workflow_id,),
+            ).fetchall()
 
         execution_mode = _execution_mode(row["execution_mode"])
         graph_contract_version = int(row["graph_contract_version"] or 0)
@@ -699,6 +753,7 @@ class WorkflowStore:
         for edge in dependencies:
             dependency_indices.setdefault(int(edge["step_index"]), []).append(int(edge["dependency_step_index"]))
         operation_states = {int(operation["step_index"]): str(operation["state"]) for operation in operations}
+        admitted_indices = {int(admission["step_index"]) for admission in admissions}
         step_ids = {int(step["step_index"]): step["step_id"] for step in steps}
         successful_parent_states = {OperationState.SUCCEEDED.value, OperationState.ACKNOWLEDGED.value}
         blocked_parent_states = {
@@ -726,6 +781,8 @@ class WorkflowStore:
                 own_state = operation_states.get(index, OperationState.CREATED.value)
                 if own_state in successful_parent_states:
                     readiness = "completed"
+                elif index in admitted_indices:
+                    readiness = "active"
                 elif own_state in blocked_parent_states:
                     readiness = "terminal"
                 elif own_state in {
@@ -750,6 +807,30 @@ class WorkflowStore:
                 )
             public_steps.append(item)
 
+        ready_step_indices = [
+            int(step["step_index"]) for step in public_steps if step.get("readiness") == "ready"
+        ]
+        active_step_indices = [
+            int(step["step_index"]) for step in public_steps if step.get("readiness") == "active"
+        ]
+        blocked_step_indices = [
+            int(step["step_index"])
+            for step in public_steps
+            if step.get("readiness") == "blocked_dependencies"
+        ]
+        completed_step_count = sum(1 for step in public_steps if step.get("readiness") == "completed")
+        requested_parallel_steps = int(row["max_parallel_steps"] or 1)
+        if execution_mode == "dag":
+            from core.config import SETTINGS
+
+            effective_parallel_steps = min(
+                requested_parallel_steps,
+                SETTINGS.workflow_max_parallel_steps,
+                SETTINGS.max_running_workflow_steps,
+            )
+        else:
+            effective_parallel_steps = 1
+
         topological_order = list(range(len(steps)))
         if execution_mode == "dag" and int(row["execution_compatible"] or 0) == 1 and row["execution_definition_json"]:
             raw = json.loads(str(row["execution_definition_json"]))
@@ -758,6 +839,8 @@ class WorkflowStore:
                 tuple(StepDefinition(**step) for step in raw["steps"]),
                 str(raw.get("description", "")),
                 execution_mode,
+                int(row["max_parallel_steps"] or raw.get("max_parallel_steps", 1)),
+                float(row["total_timeout_sec"]) if row["total_timeout_sec"] is not None else raw.get("total_timeout_sec"),
             )
             topological_order = list(workflow_topological_order(definition))
 
@@ -773,6 +856,14 @@ class WorkflowStore:
             "execution_mode": execution_mode,
             "graph_contract_version": graph_contract_version,
             "topological_order": topological_order,
+            "max_parallel_steps": requested_parallel_steps,
+            "effective_parallel_steps": effective_parallel_steps,
+            "total_timeout_sec": row["total_timeout_sec"],
+            "active_admission_count": len(admissions),
+            "ready_step_indices": ready_step_indices,
+            "active_step_indices": active_step_indices,
+            "blocked_step_indices": blocked_step_indices,
+            "completed_step_count": completed_step_count,
             "cancel_requested_at": row["cancel_requested_at"],
             "cancel_reason": row["cancel_reason"],
             "created_at": row["created_at"],
@@ -788,7 +879,7 @@ class WorkflowStore:
             row = connection.execute(
                 """
                 SELECT execution_definition_json, execution_compatible,
-                       execution_mode, graph_contract_version
+                       execution_mode, graph_contract_version, max_parallel_steps, total_timeout_sec
                 FROM workflows WHERE workflow_id = ?
                 """,
                 (workflow_id,),
@@ -819,6 +910,10 @@ class WorkflowStore:
             tuple(StepDefinition(**step) for step in raw["steps"]),
             str(raw.get("description", "")),
             execution_mode,
+            int(row["max_parallel_steps"] or raw.get("max_parallel_steps", 1)),
+            float(row["total_timeout_sec"])
+            if row["total_timeout_sec"] is not None
+            else raw.get("total_timeout_sec"),
         )
         workflow_topological_order(definition)
         return definition
@@ -1246,7 +1341,510 @@ class WorkflowStore:
             connection.commit()
         return self.get_operation(operation_id) if return_operation else None
 
-    def acquire_lease(self, workflow_id: str, owner_id: str, ttl_sec: float) -> WorkflowLease:
+    def claim_ready_operation(
+        self,
+        operation_id: str,
+        *,
+        lease_token: str,
+        owner_id: str,
+        execution_id: str,
+        global_limit: int,
+        category: str = "workflow_step",
+        weight: int = 1,
+    ) -> dict[str, Any] | None:
+        """Atomically reserve one dependency-ready operation without dispatching it."""
+
+        if global_limit < 1 or weight < 1:
+            raise ToolError("invalid_workflow_admission_limit", "Workflow admission limits must be positive.")
+        now = _now()
+        attempt_token = uuid.uuid4().hex
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(operation["workflow_id"])
+            workflow = connection.execute(
+                "SELECT state, cancel_requested_at, max_parallel_steps FROM workflows WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+            if workflow is None:
+                raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
+            if str(workflow["state"]) not in {WorkflowState.RUNNING.value, WorkflowState.CANCELLING.value}:
+                connection.commit()
+                return None
+            if workflow["cancel_requested_at"] or str(workflow["state"]) == WorkflowState.CANCELLING.value:
+                connection.commit()
+                return None
+            lease = connection.execute(
+                "SELECT lease_token, expires_at FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if lease is None or str(lease["lease_token"]) != lease_token:
+                raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+            if str(lease["expires_at"]) <= now:
+                raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
+            if str(operation["state"]) not in {OperationState.CREATED.value, OperationState.FAILED.value}:
+                connection.commit()
+                return None
+            if connection.execute(
+                "SELECT 1 FROM workflow_execution_admissions WHERE operation_id = ?", (operation_id,),
+            ).fetchone() is not None:
+                connection.commit()
+                return None
+
+            parent_rows = connection.execute(
+                """
+                SELECT parent.state
+                FROM workflow_step_dependencies dep
+                JOIN workflow_operations parent
+                  ON parent.workflow_id = dep.workflow_id
+                 AND parent.step_index = dep.dependency_step_index
+                 AND parent.operation_index = 0
+                WHERE dep.workflow_id = ? AND dep.step_index = ?
+                """,
+                (workflow_id, int(operation["step_index"])),
+            ).fetchall()
+            if any(
+                str(parent["state"]) not in {OperationState.SUCCEEDED.value, OperationState.ACKNOWLEDGED.value}
+                for parent in parent_rows
+            ):
+                connection.commit()
+                return None
+
+            global_active = int(connection.execute(
+                "SELECT COALESCE(SUM(weight), 0) FROM workflow_execution_admissions WHERE category = ?",
+                (category,),
+            ).fetchone()[0])
+            workflow_active = int(connection.execute(
+                "SELECT COALESCE(SUM(weight), 0) FROM workflow_execution_admissions WHERE workflow_id = ? AND category = ?",
+                (workflow_id, category),
+            ).fetchone()[0])
+            workflow_limit = int(workflow["max_parallel_steps"] or 1)
+            if global_active + weight > global_limit or workflow_active + weight > workflow_limit:
+                connection.commit()
+                return None
+
+            connection.execute(
+                """
+                INSERT INTO workflow_execution_admissions(
+                    operation_id, workflow_id, attempt_token, execution_id, lease_token,
+                    owner_id, category, weight, admitted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    workflow_id,
+                    attempt_token,
+                    execution_id,
+                    lease_token,
+                    owner_id[:200],
+                    category,
+                    weight,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE workflow_operations
+                SET attempt_token = ?, execution_id = ?, dispatch_phase = 'reserved',
+                    attempt_generation = attempt_generation + 1, version = version + 1, updated_at = ?
+                WHERE operation_id = ?
+                """,
+                (attempt_token, execution_id, now, operation_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events(
+                    workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at
+                ) VALUES (?, ?, ?, 'operation_reserved', 'reserved', ?, ?)
+                """,
+                (
+                    workflow_id,
+                    int(operation["step_index"]),
+                    operation_id,
+                    _canonical({"execution_id": execution_id, "category": category, "weight": weight}),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self.get_operation(operation_id)
+
+    def prepare_operation_attempt(
+        self,
+        operation_id: str,
+        *,
+        expected_version: int,
+        attempt_token: str,
+        lease_token: str,
+        intent_evidence: dict[str, Any] | None,
+        postcondition: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Persist prepared intent under the active fenced attempt."""
+
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(operation["workflow_id"])
+            if int(operation["version"]) != expected_version or str(operation["attempt_token"] or "") != attempt_token:
+                raise ToolError("workflow_attempt_conflict", "Workflow operation attempt changed before preparation.")
+            admission = connection.execute(
+                "SELECT lease_token FROM workflow_execution_admissions WHERE operation_id = ? AND attempt_token = ?",
+                (operation_id, attempt_token),
+            ).fetchone()
+            if admission is None or str(admission["lease_token"]) != lease_token:
+                raise ToolError("workflow_attempt_conflict", "Workflow admission no longer owns this attempt.")
+            self._require_current_lease_row(connection, workflow_id, lease_token, now)
+            workflow = connection.execute(
+                "SELECT cancel_requested_at, state FROM workflows WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if workflow is None or workflow["cancel_requested_at"] or str(workflow["state"]) == WorkflowState.CANCELLING.value:
+                raise ToolError("workflow_cancelled_before_dispatch", "Workflow cancellation won before dispatch.")
+            connection.execute(
+                """
+                UPDATE workflow_operations
+                SET dispatch_phase = 'prepared', intent_evidence_json = ?,
+                    postcondition_json = COALESCE(?, postcondition_json), version = version + 1, updated_at = ?
+                WHERE operation_id = ? AND version = ? AND attempt_token = ?
+                """,
+                (
+                    _canonical(intent_evidence) if intent_evidence is not None else None,
+                    _canonical(postcondition) if postcondition is not None else None,
+                    now,
+                    operation_id,
+                    expected_version,
+                    attempt_token,
+                ),
+            )
+            row = connection.execute("SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,)).fetchone()
+            connection.commit()
+        assert row is not None
+        return self.get_operation(operation_id)
+
+    @staticmethod
+    def _require_current_lease_row(
+        connection: sqlite3.Connection,
+        workflow_id: str,
+        lease_token: str,
+        now: str,
+    ) -> sqlite3.Row:
+        lease = connection.execute(
+            "SELECT * FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+        ).fetchone()
+        if lease is None or str(lease["lease_token"]) != lease_token:
+            raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+        if str(lease["expires_at"]) <= now:
+            raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
+        return lease
+
+    def mark_operation_may_dispatch(
+        self,
+        operation_id: str,
+        *,
+        expected_version: int,
+        attempt_token: str,
+        lease_token: str,
+    ) -> dict[str, Any]:
+        """Cross the durable side-effect barrier for exactly one current attempt."""
+
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(operation["workflow_id"])
+            if int(operation["version"]) != expected_version or str(operation["attempt_token"] or "") != attempt_token:
+                raise ToolError("workflow_attempt_conflict", "Workflow operation attempt changed before dispatch.")
+            admission = connection.execute(
+                "SELECT lease_token FROM workflow_execution_admissions WHERE operation_id = ? AND attempt_token = ?",
+                (operation_id, attempt_token),
+            ).fetchone()
+            if admission is None or str(admission["lease_token"]) != lease_token:
+                raise ToolError("workflow_attempt_conflict", "Workflow admission no longer owns this attempt.")
+            self._require_current_lease_row(connection, workflow_id, lease_token, now)
+            workflow = connection.execute(
+                "SELECT cancel_requested_at, state FROM workflows WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if workflow is None or workflow["cancel_requested_at"] or str(workflow["state"]) == WorkflowState.CANCELLING.value:
+                raise ToolError("workflow_cancelled_before_dispatch", "Workflow cancellation won before dispatch.")
+            connection.execute(
+                """
+                UPDATE workflow_operations
+                SET state = 'running', dispatch_phase = 'may_dispatch', attempts = attempts + 1,
+                    version = version + 1, updated_at = ?, started_at = COALESCE(started_at, ?)
+                WHERE operation_id = ? AND version = ? AND attempt_token = ?
+                """,
+                (now, now, operation_id, expected_version, attempt_token),
+            )
+            connection.execute(
+                """
+                UPDATE workflow_steps SET state = 'running', attempts = attempts + 1,
+                    started_at = COALESCE(started_at, ?)
+                WHERE workflow_id = ? AND step_index = ?
+                """,
+                (now, workflow_id, int(operation["step_index"])),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events(
+                    workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at
+                ) VALUES (?, ?, ?, 'operation_may_dispatch', 'running', ?, ?)
+                """,
+                (workflow_id, int(operation["step_index"]), operation_id, _canonical({"attempt_token": attempt_token}), now),
+            )
+            row = connection.execute("SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,)).fetchone()
+            connection.commit()
+        assert row is not None
+        return self.get_operation(operation_id)
+
+    def complete_operation_attempt(
+        self,
+        operation_id: str,
+        *,
+        expected_version: int,
+        attempt_token: str,
+        lease_token: str,
+        final_state: OperationState,
+        result: dict[str, Any] | None = None,
+        evidence: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically settle operation, step, event and admission for one fenced attempt."""
+
+        if final_state not in {
+            OperationState.SUCCEEDED,
+            OperationState.FAILED,
+            OperationState.UNCERTAIN,
+            OperationState.CANCELLED,
+        }:
+            raise ToolError("invalid_operation_resolution", "Unsupported workflow attempt result.")
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(operation["workflow_id"])
+            if int(operation["version"]) != expected_version or str(operation["attempt_token"] or "") != attempt_token:
+                raise ToolError("workflow_attempt_conflict", "Late workflow result does not own the current attempt.")
+            admission = connection.execute(
+                "SELECT lease_token FROM workflow_execution_admissions WHERE operation_id = ? AND attempt_token = ?",
+                (operation_id, attempt_token),
+            ).fetchone()
+            if admission is None or str(admission["lease_token"]) != lease_token:
+                raise ToolError("workflow_attempt_conflict", "Late workflow result no longer owns admission.")
+            self._require_current_lease_row(connection, workflow_id, lease_token, now)
+            current_operation_state = OperationState(str(operation["state"]))
+            dispatch_phase = str(operation["dispatch_phase"] or "")
+            if not (
+                current_operation_state is OperationState.CREATED
+                and dispatch_phase in {"reserved", "prepared"}
+                and final_state in {OperationState.FAILED, OperationState.CANCELLED}
+            ):
+                validate_operation_transition(current_operation_state, final_state)
+            step_state = {
+                OperationState.SUCCEEDED: "completed",
+                OperationState.FAILED: "failed",
+                OperationState.UNCERTAIN: "uncertain",
+                OperationState.CANCELLED: "cancelled",
+            }[final_state]
+            connection.execute(
+                """
+                UPDATE workflow_operations
+                SET state = ?, dispatch_phase = 'settled', version = version + 1,
+                    result_json = ?, evidence_json = ?, error = ?, updated_at = ?, finished_at = ?
+                WHERE operation_id = ? AND version = ? AND attempt_token = ?
+                """,
+                (
+                    final_state.value,
+                    _canonical(redact_inputs(result)) if result is not None else None,
+                    _canonical(redact_inputs(evidence)) if evidence is not None else None,
+                    error[:2_000] if error else None,
+                    now,
+                    now,
+                    operation_id,
+                    expected_version,
+                    attempt_token,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE workflow_steps SET state = ?, evidence_json = ?, error = ?, finished_at = ?
+                WHERE workflow_id = ? AND step_index = ?
+                """,
+                (
+                    step_state,
+                    _canonical(redact_inputs(evidence)) if evidence is not None else None,
+                    error[:2_000] if error else None,
+                    now,
+                    workflow_id,
+                    int(operation["step_index"]),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events(
+                    workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at
+                ) VALUES (?, ?, ?, 'operation_settled', ?, ?, ?)
+                """,
+                (
+                    workflow_id,
+                    int(operation["step_index"]),
+                    operation_id,
+                    final_state.value,
+                    _canonical({"attempt_token": attempt_token}),
+                    now,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM workflow_execution_admissions WHERE operation_id = ? AND attempt_token = ?",
+                (operation_id, attempt_token),
+            )
+            row = connection.execute("SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,)).fetchone()
+            connection.commit()
+        assert row is not None
+        return self.get_operation(operation_id)
+
+    def recompute_workflow_aggregate(
+        self,
+        workflow_id: str,
+        *,
+        lease_token: str,
+        stop_admission_reason: str | None = None,
+        keep_running: bool = False,
+    ) -> dict[str, Any]:
+        """Derive DAG aggregate state from canonical operation/admission facts."""
+
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            workflow = connection.execute(
+                "SELECT * FROM workflows WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if workflow is None:
+                raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
+            self._require_current_lease_row(connection, workflow_id, lease_token, now)
+            operations = connection.execute(
+                """
+                SELECT step_index, state, error FROM workflow_operations
+                WHERE workflow_id = ? AND operation_index = 0
+                ORDER BY step_index
+                """,
+                (workflow_id,),
+            ).fetchall()
+            active_count = int(connection.execute(
+                "SELECT COUNT(*) FROM workflow_execution_admissions WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()[0])
+            states = [str(operation["state"]) for operation in operations]
+            unresolved = any(state in {OperationState.UNCERTAIN.value, OperationState.RECONCILING.value} for state in states)
+            failed = any(state in {OperationState.FAILED.value, OperationState.UNRESOLVABLE.value} for state in states)
+            cancelled = bool(workflow["cancel_requested_at"]) or any(state == OperationState.CANCELLED.value for state in states)
+            all_success = bool(operations) and all(
+                state in {OperationState.SUCCEEDED.value, OperationState.ACKNOWLEDGED.value} for state in states
+            )
+            unfinished_indices = [
+                int(operation["step_index"])
+                for operation in operations
+                if str(operation["state"]) not in {OperationState.SUCCEEDED.value, OperationState.ACKNOWLEDGED.value}
+            ]
+            current_step = min(unfinished_indices) if unfinished_indices else len(operations)
+
+            if active_count > 0:
+                target = WorkflowState.CANCELLING if cancelled else WorkflowState.RUNNING
+            elif unresolved:
+                target = WorkflowState.UNCERTAIN
+            elif failed:
+                target = WorkflowState.FAILED
+            elif cancelled:
+                target = WorkflowState.CANCELLED
+            elif all_success:
+                target = WorkflowState.COMPLETED
+            elif keep_running:
+                target = WorkflowState.RUNNING
+            else:
+                target = WorkflowState.PAUSED
+
+            primary_error = None
+            if failed:
+                primary = next(
+                    (
+                        operation
+                        for operation in operations
+                        if str(operation["state"]) in {OperationState.FAILED.value, OperationState.UNRESOLVABLE.value}
+                    ),
+                    None,
+                )
+                if primary is not None:
+                    primary_error = str(primary["error"] or "workflow operation failed")[:2_000]
+            elif unresolved:
+                primary_error = "workflow has unresolved operation outcome"
+            elif stop_admission_reason:
+                primary_error = stop_admission_reason[:2_000]
+
+            connection.execute(
+                """
+                UPDATE workflows
+                SET state = ?, current_step = ?, version = version + 1, updated_at = ?, last_error = ?
+                WHERE workflow_id = ?
+                """,
+                (target.value, current_step, now, primary_error, workflow_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events(workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at)
+                VALUES (?, NULL, NULL, 'workflow_aggregate_recomputed', ?, ?, ?)
+                """,
+                (
+                    workflow_id,
+                    target.value,
+                    _canonical({"active_count": active_count, "stop_admission_reason": stop_admission_reason}),
+                    now,
+                ),
+            )
+            connection.commit()
+        return self.get(workflow_id)
+
+    def active_admissions(self, workflow_id: str | None = None, *, category: str | None = None) -> list[dict[str, Any]]:
+        filters: list[str] = []
+        parameters: list[Any] = []
+        if workflow_id is not None:
+            filters.append("workflow_id = ?")
+            parameters.append(workflow_id)
+        if category is not None:
+            filters.append("category = ?")
+            parameters.append(category)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"SELECT * FROM workflow_execution_admissions {where} ORDER BY admitted_at, operation_id",
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def acquire_lease(
+        self,
+        workflow_id: str,
+        owner_id: str,
+        ttl_sec: float,
+        *,
+        allow_reentry: bool = True,
+    ) -> WorkflowLease:
         owner_id = owner_id.strip()
         if not owner_id or len(owner_id) > 200:
             raise ToolError("invalid_lease_owner", "Lease owner must contain between 1 and 200 characters.")
@@ -1269,8 +1867,8 @@ class WorkflowStore:
                     (workflow_id, owner_id, token, now, now, expires_at),
                 )
             elif str(current["expires_at"]) > now:
-                if str(current["owner_id"]) != owner_id:
-                    raise ToolError("workflow_already_claimed", "Workflow is already claimed by another executor.")
+                if str(current["owner_id"]) != owner_id or not allow_reentry:
+                    raise ToolError("workflow_already_claimed", "Workflow is already claimed by another execution.")
                 connection.commit()
                 return _lease_from_row(current)
             else:
