@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -89,6 +90,36 @@ def _running_workflow(store: WorkflowStore, definition: WorkflowDefinition, owne
         lease_token=lease.lease_token,
     )
     return store.get(workflow_id), lease.lease_token
+
+
+def test_resource_storage_denial_rolls_back_all_claims_and_prevents_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    workflow = store.create(_dag(), initial_state=WorkflowState.QUEUED)
+    dispatched: list[object] = []
+    original_connect = store._connect
+
+    def connect(*, setup_wal: bool = False) -> sqlite3.Connection:
+        db = original_connect(setup_wal=setup_wal)
+        db.set_authorizer(
+            lambda action, table, column, database, trigger:
+            sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_INSERT and table == "workflow_resource_claims" else sqlite3.SQLITE_OK,
+        )
+        return db
+
+    monkeypatch.setattr(store, "_connect", connect)
+    monkeypatch.setattr(workflow_executor, "execute_action", lambda *args, **kwargs: dispatched.append("action"))
+    monkeypatch.setattr(workflow_executor, "prepare_action_intent", lambda *args, **kwargs: dispatched.append("intent"))
+    with pytest.raises(sqlite3.DatabaseError):
+        WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING, enable_dag_execution=True).execute(
+            workflow["workflow_id"], owner_id="worker",
+        )
+    assert dispatched == []
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM workflow_resource_requests").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM workflow_resource_claims").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM workflow_execution_admissions").fetchone()[0] == 0
 
 
 def test_dag_scheduler_respects_cap_and_join_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

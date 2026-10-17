@@ -166,6 +166,25 @@ def current_resource_capability() -> str | None:
     return _RESOURCE_CAPABILITY.get() or os.getenv(RESOURCE_CAPABILITY_ENV)
 
 
+def native_resource_owner_alive(owner_token: str) -> bool | None:
+    """Unknown/dead native identities deny new work; other owner protocols have their own fences."""
+
+    if not owner_token.startswith("native-owner-"):
+        return None
+    parts = owner_token.split("-")
+    if len(parts) != 5:
+        return False
+    try:
+        pid, created = int(parts[2]), float(parts[3])
+        if pid == os.getpid():
+            return abs(psutil.Process().create_time() - created) < 0.01
+        from core.jobs import same_process
+
+        return same_process(pid, created) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except (ValueError, psutil.Error, OSError):
+        return False
+
+
 @contextmanager
 def resource_capability(token: str) -> Iterator[None]:
     reset = _RESOURCE_CAPABILITY.set(token)

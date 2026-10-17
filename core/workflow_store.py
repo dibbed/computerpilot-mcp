@@ -17,7 +17,7 @@ from typing import Any, Literal, cast
 
 from core.errors import ToolError
 from core.file_lock import exclusive_file_lock
-from core.resource_claims import ResourceClaim, canonical_claims, claim_sets_conflict
+from core.resource_claims import ResourceClaim, canonical_claims, claim_sets_conflict, native_resource_owner_alive
 from core.workflow_models import (
     OperationState,
     StepDefinition,
@@ -1633,6 +1633,8 @@ class WorkflowStore:
         return {"admitted": True, "request_id": request_id, "state": "active", "reason": None}
 
     def resource_request(self, request_id: str, *, expected_owner_token: str | None = None) -> dict[str, Any]:
+        if expected_owner_token is not None and native_resource_owner_alive(expected_owner_token) is False:
+            raise ToolError("resource_capability_invalid", "Native resource ownership cannot be verified.")
         with closing(self._connect()) as connection:
             if expected_owner_token is None:
                 row = connection.execute(
@@ -1804,6 +1806,8 @@ class WorkflowStore:
             raise ToolError("invalid_capacity_request", "Capacity weight/limit are invalid.")
         if not 1 <= len(admission_id) <= 200 or not 1 <= len(owner_token) <= 200 or not 1 <= len(category) <= 80:
             raise ToolError("invalid_capacity_request", "Capacity identifiers exceed their bounded lengths.")
+        if resource_owner_token is not None and native_resource_owner_alive(resource_owner_token) is False:
+            raise ToolError("resource_capability_invalid", "Native resource ownership cannot be verified.")
         now = _now()
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2793,8 +2797,31 @@ class WorkflowStore:
 
     def recover_interrupted(self) -> int:
         now = _now()
+        with closing(self._connect()) as connection:
+            native_rows = connection.execute(
+                "SELECT request_id,owner_token FROM workflow_resource_requests "
+                "WHERE workflow_id IS NULL AND state IN ('active','pending') AND owner_token LIKE 'native-owner-%'",
+            ).fetchall()
+        owner_snapshots: dict[str, bool | None] = {}
+        stale_native: list[tuple[str, str]] = []
+        for native in native_rows:
+            owner = str(native["owner_token"])
+            identity = owner.rsplit("-", 1)[0]
+            if identity not in owner_snapshots:
+                owner_snapshots[identity] = native_resource_owner_alive(owner)
+            if owner_snapshots[identity] is False:
+                stale_native.append((str(native["request_id"]), owner))
+        native_count = 0
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            for request_id, owner in stale_native:
+                native_count += connection.execute(
+                    "UPDATE workflow_resource_requests SET "
+                    "state=CASE WHEN state='pending' THEN 'released' ELSE 'quarantined' END, "
+                    "reason='native_owner_identity_unavailable', updated_at=? "
+                    "WHERE request_id=? AND owner_token=? AND workflow_id IS NULL AND state IN ('active','pending')",
+                    (now, request_id, owner),
+                ).rowcount
             rows = connection.execute(
                 """
                 SELECT workflows.workflow_id, workflows.current_step, workflows.state,
@@ -2979,7 +3006,7 @@ class WorkflowStore:
                     ),
                 )
             connection.commit()
-        return len(rows)
+        return len(rows) + native_count
 
     def list(self, *, offset: int = 0, limit: int = 100) -> dict[str, Any]:
         with closing(self._connect()) as connection:

@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
 import pytest
 
-from core import config
+from core import config, resource_claims
 from core.errors import ToolError
 from core.resource_claims import (
     ResourceClaim,
     claims_conflict,
     make_resource_capability,
+    managed_path_claims,
     managed_resource_claims,
     path_claim,
     resource_capability,
@@ -170,6 +173,39 @@ def test_managed_native_command_refuses_unowned_fallback_before_effect(tmp_path:
     assert store.health_summary()["active_resource_request_count"] == 0
 
 
+@pytest.mark.parametrize("unavailable", ["reused", "denied", "zombie"])
+def test_native_owner_reuse_or_inspection_denial_preserves_the_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unavailable: str,
+) -> None:
+    import psutil
+
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    created = psutil.Process().create_time() - (1 if unavailable == "reused" else 0)
+    pid = os.getpid() + (1 if unavailable == "zombie" else 0)
+    owner = f"native-owner-{pid}-{created:.6f}-0123456789abcdef"
+    claim = path_claim(tmp_path / "target", "write")
+    store.reserve_resource_claims(request_id="native", owner_token=owner, category="native", claims=(claim,))
+
+    def denied(*args: object, **kwargs: object) -> None:
+        raise psutil.AccessDenied()
+
+    if unavailable == "denied":
+        monkeypatch.setattr(psutil, "Process", denied)
+    elif unavailable == "zombie":
+        from core import jobs
+
+        monkeypatch.setattr(jobs, "same_process", lambda *args: True)
+        monkeypatch.setattr(psutil, "Process", lambda *args: SimpleNamespace(status=lambda: psutil.STATUS_ZOMBIE))
+    with pytest.raises(ToolError) as raised:
+        validate_resource_capability(make_resource_capability("native", owner, store.path), (), store)
+    assert raised.value.code == "resource_capability_invalid"
+    store.recover_interrupted()
+    assert store.resource_request("native")["state"] == "quarantined"
+    assert store.reserve_resource_claims(
+        request_id="other", owner_token="other", category="test", claims=(claim,),
+    )["admitted"] is False
+
+
 def test_resource_conflict_matrix_handles_exact_and_subtree_paths(tmp_path: Path) -> None:
     root = str((tmp_path / "repo").resolve(strict=False))
     child = str((tmp_path / "repo" / "a.txt").resolve(strict=False))
@@ -221,6 +257,93 @@ def test_resource_reservation_is_all_or_none_across_store_instances(tmp_path: Pa
         category="workflow_step",
     )
     assert retried["admitted"] is True
+
+
+def test_older_writer_fences_late_readers_without_blocking_independent_work(tmp_path: Path) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    target = tmp_path / "data"
+
+    def reserve(name: str, path: Path, mode: Literal["read", "write"]) -> dict[str, object]:
+        return store.reserve_resource_claims(
+            request_id=name, owner_token=name, category="test", claims=(path_claim(path, mode),),
+        )
+
+    assert reserve("reader", target, "read")["admitted"] is True
+    assert reserve("writer", target, "write")["admitted"] is False
+    assert reserve("late-reader", target, "read")["reason"] == "older_conflicting_request"
+    assert reserve("independent", tmp_path / "other", "write")["admitted"] is True
+    store.release_resource_request("reader", owner_token="reader")
+    assert reserve("writer", target, "write")["admitted"] is True
+    assert reserve("late-reader", target, "read")["admitted"] is False
+    store.release_resource_request("writer", owner_token="writer")
+    assert reserve("late-reader", target, "read")["admitted"] is True
+
+
+def test_git_worktrees_share_the_authoritative_common_directory_claim(tmp_path: Path) -> None:
+    from core.workflow_actions import derive_action_resource_claims
+
+    repo, sibling = tmp_path / "repo", tmp_path / "sibling"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+         "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={tmp_path / 'empty-hooks'}",
+         "commit", "-q", "--allow-empty", "-m", "fixture"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(sibling)], check=True, capture_output=True)
+    first = derive_action_resource_claims("git_stage", {"repo": str(repo), "paths": ["data"]}, {"kind": "git_stage_intent"})
+    second = derive_action_resource_claims("git_stage", {"repo": str(sibling), "paths": ["data"]}, {"kind": "git_stage_intent"})
+    assert {claim for claim in first if claim.kind == "git"} == {claim for claim in second if claim.kind == "git"}
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    assert store.reserve_resource_claims(request_id="a", owner_token="a", category="test", claims=first)["admitted"] is True
+    assert store.reserve_resource_claims(request_id="b", owner_token="b", category="test", claims=second)["admitted"] is False
+
+
+def test_alias_changed_during_claim_wait_is_rejected_before_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first, second, alias = tmp_path / "first", tmp_path / "second", tmp_path / "alias"
+    for directory in (first, second):
+        directory.mkdir()
+        (directory / "data").write_text("before", encoding="utf-8")
+
+    def point_to(target: Path) -> None:
+        if os.name == "nt":
+            if alias.exists():
+                alias.rmdir()
+            subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(target)], check=True, capture_output=True,
+            )
+        else:
+            alias.unlink(missing_ok=True)
+            alias.symlink_to(target, target_is_directory=True)
+
+    point_to(first)
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    store.reserve_resource_claims(
+        request_id="reader", owner_token="reader", category="test", claims=(path_claim(first / "data", "read"),),
+    )
+    monkeypatch.setattr(resource_claims, "managed_resource_claims", partial(managed_resource_claims, store=store))
+
+    def write() -> None:
+        with managed_path_claims(alias / "data", category="test", timeout_sec=5):
+            (alias / "data").write_text("after", encoding="utf-8")
+
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(write)
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if store.health_summary()["pending_resource_request_count"]:
+                    break
+                time.sleep(0.01)
+            assert store.health_summary()["pending_resource_request_count"] == 1
+            point_to(second)
+        finally:
+            store.release_resource_request("reader", owner_token="reader")
+        with pytest.raises(ToolError) as raised:
+            future.result(timeout=5)
+        assert raised.value.code == "resource_path_changed"
+    assert (first / "data").read_text(encoding="utf-8") == "before"
+    assert (second / "data").read_text(encoding="utf-8") == "before"
 
 
 def test_quarantined_resource_request_blocks_conflicts_until_explicit_resolution(tmp_path: Path) -> None:
