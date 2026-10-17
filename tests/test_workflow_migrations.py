@@ -307,8 +307,10 @@ def test_v5_database_migrates_route_columns_without_losing_legacy_data(tmp_path:
     migrated = store.get("legacy-workflow")
     operations = store.list_operations("legacy-workflow")
 
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION == 7
     assert migrated["state"] == "completed"
+    assert migrated["execution_mode"] == "sequential"
+    assert migrated["graph_contract_version"] == 0
     assert migrated["version"] == 7
     assert operations["total_count"] == 1
     operation = operations["items"][0]
@@ -329,5 +331,16 @@ def test_v5_database_migrates_route_columns_without_losing_legacy_data(tmp_path:
             "route_decision_json",
             "fallback_history_json",
         } <= columns
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        workflow_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflows)").fetchall()
+        }
+        step_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_steps)").fetchall()
+        }
+        assert {"execution_mode", "graph_contract_version"} <= workflow_columns
+        assert "step_id" in step_columns
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_step_dependencies'"
+        ).fetchone() is not None
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

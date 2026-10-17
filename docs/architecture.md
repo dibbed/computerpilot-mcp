@@ -158,6 +158,8 @@ For routed steps, the route decision is persisted before the operation enters th
 
 Every in-process `WorkflowExecutor` caller must supply the keyword-only `route_planner`: use the shared `core.execution_router.build_route_planner` factory for callers accepting execution intents, or `core.workflows.NATIVE_ONLY_ROUTING` for callers that only submit steps without intents. Omission and `None` raise `TypeError` at construction. The explicit native-only mode rejects an intent-bearing step before action dispatch. The Router remains advisory, and external MCP workflow actions remain unsupported.
 
+Workflow schema 7 adds an explicit, versioned dependency graph without changing legacy sequential execution identities. Sequential definitions continue to serialize with the pre-graph exact execution bytes and use implicit index-chain dependencies. DAG definitions use `execution_mode="dag"`, immutable `step_id` values and persisted dependency edges; readiness is derived from operation state plus those edges rather than stored as a second authority. The graph foundation is intentionally gated: valid DAGs may be planned, persisted and inspected, but `WorkflowExecutor.execute` rejects them before lease acquisition or dispatch until the bounded scheduler and resource/recovery gates are active.
+
 Built-in plans include `implement_and_verify`, `safe_git_commit`, and `prepare_release`.
 
 Workflow persistence is separate from durable job process state. Jobs own process completion/output; workflows own orchestration and operation lifecycle.

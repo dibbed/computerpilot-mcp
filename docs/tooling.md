@@ -236,6 +236,8 @@ workflow_status / workflow_operations
 
 If an operation becomes uncertain, reconcile it before resuming. A step may also declare a bounded `execution_intent`; the workflow store persists the selected route/policy/decision before execution and preserves bounded fallback history. Uncertain operations are not rerouted or replayed by the router.
 
+Custom workflows can opt into `execution_mode="dag"`. Every DAG step requires a case-sensitive `step_id` of 1–100 ASCII letters/digits/`_`/`-`; `depends_on` contains step IDs, permits explicit roots with an empty list, and rejects duplicate, self, unknown and cyclic dependencies before persistence. Status preserves original step order and adds derived `depends_on`/`readiness` plus a stable topological index projection. Legacy sequential definitions keep implicit index-chain semantics and reject non-default DAG metadata. At this foundation boundary DAG execution is deliberately unavailable: plan/start/status work, while a non-dry-run execute fails before a lease or action dispatch.
+
 Built-in plans:
 
 - `implement_and_verify`

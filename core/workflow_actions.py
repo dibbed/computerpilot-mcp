@@ -20,7 +20,7 @@ from core.execution_models import ExecutionIntent
 from core.job_scheduler import ensure_job_scheduler
 from core.jobs import JobStore
 from core.tool_catalog import intent_route_rules
-from core.workflow_models import WorkflowDefinition
+from core.workflow_models import WorkflowDefinition, workflow_topological_order
 from tools.filesystem.patches import apply_patch_transaction
 from tools.testing.impact import select_affected_tests
 from tools.testing.verification import verify_changed_repository
@@ -466,6 +466,7 @@ def validate_operation(
 
 
 def validate_workflow_definition(definition: WorkflowDefinition) -> None:
+    workflow_topological_order(definition)
     for step in definition.steps:
         validate_operation(step.action, step.arguments, step.postcondition)
         if step.execution_intent is not None:

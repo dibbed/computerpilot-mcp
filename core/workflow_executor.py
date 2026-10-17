@@ -294,6 +294,12 @@ class WorkflowExecutor:
             raise ToolError("workflow_not_queued", "Only a queued workflow can be executed.")
         if dry_run:
             return {**current, "dry_run": True, "would_execute": current["definition"]["steps"]}
+        definition = self.store.execution_definition(workflow_id)
+        if definition.execution_mode == "dag":
+            raise ToolError(
+                "workflow_dag_execution_unavailable",
+                "DAG workflow execution is not enabled until scheduler and resource gates are active.",
+            )
         self.store.materialize_operations(workflow_id, return_operations=False)
         lease = self.store.acquire_lease(workflow_id, owner_id, lease_ttl_sec)
         try:

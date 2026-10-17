@@ -12,20 +12,23 @@ from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from core.errors import ToolError
 from core.file_lock import exclusive_file_lock
 from core.workflow_models import (
     OperationState,
+    StepDefinition,
     WorkflowDefinition,
     WorkflowLease,
     WorkflowState,
     validate_operation_transition,
     validate_workflow_transition,
+    workflow_topological_order,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+GRAPH_CONTRACT_VERSION = 1
 _ROUTE_HISTORY_MAX = 20
 _ROUTE_JSON_MAX_CHARS = 16_000
 _SECRET_MARKERS = (
@@ -60,10 +63,22 @@ def redact_inputs(value: Any, key: str = "") -> Any:
     return value
 
 
+def _definition_payload(definition: WorkflowDefinition) -> dict[str, Any]:
+    """Serialize definitions while preserving exact legacy sequential bytes."""
+
+    payload = asdict(definition)
+    if definition.execution_mode == "sequential":
+        payload.pop("execution_mode", None)
+        for step in payload["steps"]:
+            step.pop("step_id", None)
+            step.pop("depends_on", None)
+    return payload
+
+
 def canonical_execution_definition(definition: WorkflowDefinition) -> str:
     """Serialize the exact durable payload that the executor is allowed to run."""
 
-    return _canonical(asdict(definition))
+    return _canonical(_definition_payload(definition))
 
 
 def public_workflow_projection(value: Any) -> Any:
@@ -82,6 +97,13 @@ def _canonical(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _execution_mode(value: Any) -> Literal["sequential", "dag"]:
+    mode = str(value or "sequential")
+    if mode not in {"sequential", "dag"}:
+        raise ToolError("workflow_definition_conflict", f"Unknown workflow execution mode {mode!r}.")
+    return cast(Literal["sequential", "dag"], mode)
 
 
 def _lease_times(ttl_sec: float) -> tuple[str, str]:
@@ -192,6 +214,9 @@ class WorkflowStore:
                     if version < 6:
                         self._migrate_v6(connection)
                         version = 6
+                    if version < 7:
+                        self._migrate_v7(connection)
+                        version = 7
             if version > SCHEMA_VERSION:
                 raise ToolError(
                     "workflow_schema_too_new",
@@ -354,8 +379,40 @@ class WorkflowStore:
         )
 
     @staticmethod
+    def _migrate_v7(connection: sqlite3.Connection) -> None:
+        """Persist explicit workflow graph identity and dependency edges."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflows ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'sequential';
+            ALTER TABLE workflows ADD COLUMN graph_contract_version INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE workflow_steps ADD COLUMN step_id TEXT;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_steps_step_id
+                ON workflow_steps(workflow_id, step_id) WHERE step_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS workflow_step_dependencies (
+                workflow_id TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                dependency_step_index INTEGER NOT NULL,
+                PRIMARY KEY (workflow_id, step_index, dependency_step_index),
+                FOREIGN KEY (workflow_id, step_index)
+                    REFERENCES workflow_steps(workflow_id, step_index) ON DELETE CASCADE,
+                FOREIGN KEY (workflow_id, dependency_step_index)
+                    REFERENCES workflow_steps(workflow_id, step_index) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_step_dependencies_parent
+                ON workflow_step_dependencies(workflow_id, dependency_step_index, step_index);
+            INSERT OR IGNORE INTO workflow_step_dependencies(workflow_id, step_index, dependency_step_index)
+                SELECT workflow_id, step_index, step_index - 1
+                FROM workflow_steps WHERE step_index > 0;
+            PRAGMA user_version = 7;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
     def _definition_json(definition: WorkflowDefinition) -> str:
-        return _canonical(public_workflow_projection(asdict(definition)))
+        return _canonical(public_workflow_projection(_definition_payload(definition)))
 
     @staticmethod
     def _redact_stored_definitions(connection: sqlite3.Connection) -> None:
@@ -382,6 +439,9 @@ class WorkflowStore:
         }
         if step.get("execution_intent") is not None:
             payload["execution_intent"] = step["execution_intent"]
+        if step.get("step_id") is not None:
+            payload["step_id"] = str(step["step_id"])
+            payload["depends_on"] = list(step.get("depends_on", []))
         return payload, _digest(payload), arguments_fingerprint
 
     @classmethod
@@ -560,8 +620,9 @@ class WorkflowStore:
                 INSERT INTO workflows(
                     workflow_id, idempotency_key, definition_json, inputs_json, inputs_hash, state,
                     current_step, version, created_at, updated_at, last_error,
-                    execution_definition_json, execution_definition_hash, execution_compatible
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?, ?, 1)
+                    execution_definition_json, execution_definition_hash, execution_compatible,
+                    execution_mode, graph_contract_version
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?, ?, 1, ?, ?)
                 """,
                 (
                     workflow_id,
@@ -574,12 +635,34 @@ class WorkflowStore:
                     now,
                     execution_definition_json,
                     execution_definition_hash,
+                    definition.execution_mode,
+                    GRAPH_CONTRACT_VERSION if definition.execution_mode == "dag" else 0,
                 ),
             )
             connection.executemany(
-                "INSERT INTO workflow_steps(workflow_id, step_index, state) VALUES (?, ?, 'created')",
-                [(workflow_id, index) for index in range(len(definition.steps))],
+                "INSERT INTO workflow_steps(workflow_id, step_index, state, step_id) VALUES (?, ?, 'created', ?)",
+                [(workflow_id, index, step.step_id) for index, step in enumerate(definition.steps)],
             )
+            if definition.execution_mode == "dag":
+                by_id = {str(step.step_id): index for index, step in enumerate(definition.steps)}
+                dependency_rows = [
+                    (workflow_id, index, by_id[dependency])
+                    for index, step in enumerate(definition.steps)
+                    for dependency in step.depends_on
+                ]
+            else:
+                dependency_rows = [
+                    (workflow_id, index, index - 1)
+                    for index in range(1, len(definition.steps))
+                ]
+            if dependency_rows:
+                connection.executemany(
+                    """
+                    INSERT INTO workflow_step_dependencies(workflow_id, step_index, dependency_step_index)
+                    VALUES (?, ?, ?)
+                    """,
+                    dependency_rows,
+                )
             self._materialize_workflow(connection, workflow_id, legacy=False)
             connection.commit()
         return self.get(workflow_id)
@@ -592,6 +675,92 @@ class WorkflowStore:
             steps = connection.execute(
                 "SELECT * FROM workflow_steps WHERE workflow_id = ? ORDER BY step_index", (workflow_id,),
             ).fetchall()
+            dependencies = connection.execute(
+                """
+                SELECT step_index, dependency_step_index
+                FROM workflow_step_dependencies
+                WHERE workflow_id = ?
+                ORDER BY step_index, dependency_step_index
+                """,
+                (workflow_id,),
+            ).fetchall()
+            operations = connection.execute(
+                """
+                SELECT step_index, state FROM workflow_operations
+                WHERE workflow_id = ? AND operation_index = 0
+                ORDER BY step_index
+                """,
+                (workflow_id,),
+            ).fetchall()
+
+        execution_mode = _execution_mode(row["execution_mode"])
+        graph_contract_version = int(row["graph_contract_version"] or 0)
+        dependency_indices: dict[int, list[int]] = {}
+        for edge in dependencies:
+            dependency_indices.setdefault(int(edge["step_index"]), []).append(int(edge["dependency_step_index"]))
+        operation_states = {int(operation["step_index"]): str(operation["state"]) for operation in operations}
+        step_ids = {int(step["step_index"]): step["step_id"] for step in steps}
+        successful_parent_states = {OperationState.SUCCEEDED.value, OperationState.ACKNOWLEDGED.value}
+        blocked_parent_states = {
+            OperationState.FAILED.value,
+            OperationState.UNRESOLVABLE.value,
+            OperationState.CANCELLED.value,
+        }
+
+        public_steps: list[dict[str, Any]] = []
+        for step in steps:
+            index = int(step["step_index"])
+            item: dict[str, Any] = {
+                "step_index": index,
+                "state": step["state"],
+                "attempts": step["attempts"],
+                "started_at": step["started_at"],
+                "finished_at": step["finished_at"],
+                "evidence": json.loads(step["evidence_json"]) if step["evidence_json"] else None,
+                "error": step["error"],
+            }
+            if execution_mode == "dag":
+                parent_indices = dependency_indices.get(index, [])
+                parent_ids = [str(step_ids[parent]) for parent in parent_indices]
+                parent_states = [operation_states.get(parent, OperationState.CREATED.value) for parent in parent_indices]
+                own_state = operation_states.get(index, OperationState.CREATED.value)
+                if own_state in successful_parent_states:
+                    readiness = "completed"
+                elif own_state in blocked_parent_states:
+                    readiness = "terminal"
+                elif own_state in {
+                    OperationState.RUNNING.value,
+                    OperationState.WAITING.value,
+                    OperationState.UNCERTAIN.value,
+                    OperationState.RECONCILING.value,
+                }:
+                    readiness = "active"
+                elif any(state in blocked_parent_states for state in parent_states):
+                    readiness = "blocked_dependencies"
+                elif all(state in successful_parent_states for state in parent_states):
+                    readiness = "ready"
+                else:
+                    readiness = "waiting_dependencies"
+                item.update(
+                    {
+                        "step_id": step["step_id"],
+                        "depends_on": parent_ids,
+                        "readiness": readiness,
+                    }
+                )
+            public_steps.append(item)
+
+        topological_order = list(range(len(steps)))
+        if execution_mode == "dag" and int(row["execution_compatible"] or 0) == 1 and row["execution_definition_json"]:
+            raw = json.loads(str(row["execution_definition_json"]))
+            definition = WorkflowDefinition(
+                str(raw["name"]),
+                tuple(StepDefinition(**step) for step in raw["steps"]),
+                str(raw.get("description", "")),
+                execution_mode,
+            )
+            topological_order = list(workflow_topological_order(definition))
+
         return {
             "workflow_id": row["workflow_id"],
             "state": row["state"],
@@ -601,23 +770,15 @@ class WorkflowStore:
             "inputs": json.loads(row["inputs_json"]),
             "execution_compatible": bool(row["execution_compatible"]),
             "execution_definition_hash": row["execution_definition_hash"],
+            "execution_mode": execution_mode,
+            "graph_contract_version": graph_contract_version,
+            "topological_order": topological_order,
             "cancel_requested_at": row["cancel_requested_at"],
             "cancel_reason": row["cancel_reason"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "last_error": row["last_error"],
-            "steps": [
-                {
-                    "step_index": step["step_index"],
-                    "state": step["state"],
-                    "attempts": step["attempts"],
-                    "started_at": step["started_at"],
-                    "finished_at": step["finished_at"],
-                    "evidence": json.loads(step["evidence_json"]) if step["evidence_json"] else None,
-                    "error": step["error"],
-                }
-                for step in steps
-            ],
+            "steps": public_steps,
         }
 
     def execution_definition(self, workflow_id: str) -> WorkflowDefinition:
@@ -626,7 +787,8 @@ class WorkflowStore:
         with closing(self._connect()) as connection:
             row = connection.execute(
                 """
-                SELECT execution_definition_json, execution_compatible
+                SELECT execution_definition_json, execution_compatible,
+                       execution_mode, graph_contract_version
                 FROM workflows WHERE workflow_id = ?
                 """,
                 (workflow_id,),
@@ -638,14 +800,28 @@ class WorkflowStore:
                 "workflow_legacy_definition_unrecoverable",
                 "This legacy workflow has no exact durable execution definition and cannot be executed or resumed.",
             )
-        from core.workflow_models import StepDefinition
+        execution_mode = _execution_mode(row["execution_mode"])
+        graph_contract_version = int(row["graph_contract_version"] or 0)
+        if execution_mode == "dag" and graph_contract_version != GRAPH_CONTRACT_VERSION:
+            raise ToolError(
+                "unsupported_workflow_graph_version",
+                f"Workflow graph contract version {graph_contract_version} is not supported.",
+            )
+        if execution_mode == "sequential" and graph_contract_version != 0:
+            raise ToolError(
+                "workflow_definition_conflict",
+                "Sequential workflow unexpectedly contains graph contract metadata.",
+            )
 
         raw = json.loads(str(row["execution_definition_json"]))
-        return WorkflowDefinition(
+        definition = WorkflowDefinition(
             str(raw["name"]),
             tuple(StepDefinition(**step) for step in raw["steps"]),
             str(raw.get("description", "")),
+            execution_mode,
         )
+        workflow_topological_order(definition)
+        return definition
 
     def list_operations(
         self,
