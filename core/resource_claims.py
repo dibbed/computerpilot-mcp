@@ -231,6 +231,7 @@ def managed_resource_claims(
     timeout_sec: float = 60.0,
     db_path: Path | None = None,
     store: WorkflowStore | None = None,
+    quarantine_on_error: bool = False,
 ) -> Iterator[str]:
     """Coordinate one managed action or safely reuse an active parent capability."""
 
@@ -243,8 +244,16 @@ def managed_resource_claims(
         raise ToolError("empty_resource_claims", "Managed resource coordination requires at least one claim.")
     inherited = current_resource_capability()
     if inherited is not None:
-        validate_resource_capability(inherited, canonical, store)
-        yield inherited
+        authority = validate_resource_capability(inherited, canonical, store)
+        try:
+            yield inherited
+        except BaseException:
+            if quarantine_on_error:
+                request_id, owner_token, _ = _parse_resource_capability(inherited)
+                authority.quarantine_resource_request(
+                    request_id, owner_token=owner_token, reason="managed_effect_or_cleanup_unresolved",
+                )
+            raise
         return
 
     claim_store = store or WorkflowStore(db_path or SETTINGS.workflow_db, recover=False)
@@ -252,6 +261,8 @@ def managed_resource_claims(
     owner_token = f"native-owner-{os.getpid()}-{uuid.uuid4().hex}"
     capability = make_resource_capability(request_id, owner_token, claim_store.path)
     deadline = time.monotonic() + max(0.001, timeout_sec)
+    admitted = False
+    release_on_exit = True
     try:
         while True:
             result = claim_store.reserve_resource_claims(
@@ -261,6 +272,7 @@ def managed_resource_claims(
                 category=category,
             )
             if result["admitted"] is True:
+                admitted = True
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -272,5 +284,15 @@ def managed_resource_claims(
             time.sleep(min(0.05, remaining))
         with resource_capability(capability):
             yield capability
+    except BaseException:
+        if admitted and quarantine_on_error:
+            # Do not release even if persisting quarantine fails: the active claim still fences conflicts.
+            release_on_exit = False
+            claim_store.quarantine_resource_request(
+                request_id, owner_token=owner_token, reason="managed_effect_or_cleanup_unresolved",
+            )
+            raise
+        raise
     finally:
-        claim_store.release_resource_request(request_id, owner_token=owner_token)
+        if release_on_exit:
+            claim_store.release_resource_request(request_id, owner_token=owner_token)

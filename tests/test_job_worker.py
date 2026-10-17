@@ -349,8 +349,9 @@ def test_worker_sees_external_cancel_on_persistent_connection(tmp_path: Path, mo
 
 
 @pytest.mark.parametrize("failure_phase", ["terminate", "close", "alive"])
+@pytest.mark.parametrize("inherited", [False, True])
 def test_worker_records_failure_when_secondary_ownership_cleanup_also_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_phase: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_phase: str, inherited: bool,
 ) -> None:
     path = tmp_path / "jobs.sqlite3"
     store = JobStore(path)
@@ -358,6 +359,15 @@ def test_worker_records_failure_when_secondary_ownership_cleanup_also_fails(
     _seed(store, job_id, tmp_path)
     events: list[str] = []
     capacity = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    if inherited:
+        capacity.reserve_resource_claims(
+            request_id="parent", owner_token="parent-owner", category="test",
+            claims=(coordination_claim(exclusive=True), path_claim(tmp_path, "write", scope="subtree")),
+        )
+        with store.connect() as db:
+            spec = json.loads(db.execute("SELECT spec FROM jobs WHERE id=?", (job_id,)).fetchone()[0])
+            spec["_resource_capability"] = make_resource_capability("parent", "parent-owner", capacity.path)
+            db.execute("UPDATE jobs SET spec=? WHERE id=?", (json.dumps(spec), job_id))
     capacity.reserve_capacity(
         admission_id="child-permit", category="analyzer", owner_token="pid-5432-1.000000-test", weight=1, limit=1,
     )
@@ -401,5 +411,11 @@ def test_worker_records_failure_when_secondary_ownership_cleanup_also_fails(
     assert "cleanup" in row["error"].casefold()
     assert "close" in events and events[-1] == "successor"
     assert capacity.health_summary()["active_analyzer_capacity_weight"] == 1
+    conflicting = capacity.reserve_resource_claims(
+        request_id="after-unknown-cleanup", owner_token="other", category="test",
+        claims=(path_claim(tmp_path, "write", scope="subtree"),),
+    )
+    assert conflicting["admitted"] is False
+    assert conflicting["reason"] == "resource_quarantined"
     if failure_phase in {"terminate", "alive"}:
         assert events.count("terminate") == 2

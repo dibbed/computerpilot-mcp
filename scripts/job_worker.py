@@ -135,6 +135,7 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                     category="native.job",
                     timeout_sec=float(spec["timeout_sec"]),
                     db_path=path.parent / "workflows.sqlite3",
+                    quarantine_on_error=True,
                 )
             )
             resource_authority = validate_resource_capability(capability, ())
@@ -198,6 +199,12 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
             _update(db, job_id, status=status, exit_code=code)
         except BaseException as exc:
             error = exc.message if isinstance(exc, ToolError) else type(exc).__name__
+            if resource_stack is not None:
+                stack, resource_stack = resource_stack, None
+                try:
+                    stack.__exit__(type(exc), exc, exc.__traceback__)
+                except Exception as resource_error:
+                    error += f"; resource quarantine failed ({type(resource_error).__name__})"
             if process is not None:
                 try:
                     if process.poll() is None:

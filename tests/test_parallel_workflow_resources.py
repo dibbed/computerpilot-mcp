@@ -102,6 +102,25 @@ def test_quarantined_resource_request_blocks_conflicts_until_explicit_resolution
     )["admitted"] is True
 
 
+def test_failed_quarantine_does_not_release_unknown_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    claim = path_claim(tmp_path / "target", "write")
+
+    def deny_quarantine(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("storage unavailable")
+
+    monkeypatch.setattr(store, "quarantine_resource_request", deny_quarantine)
+    with pytest.raises(sqlite3.OperationalError):
+        with managed_resource_claims((claim,), category="test", store=store, quarantine_on_error=True):
+            raise PermissionError("cleanup denied")
+
+    assert store.reserve_resource_claims(
+        request_id="conflict", owner_token="other", category="test", claims=(claim,),
+    )["admitted"] is False
+
+
 def test_inherited_resource_capability_cannot_expand_parent_scope(tmp_path: Path) -> None:
     store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
     repo = tmp_path / "repo"
