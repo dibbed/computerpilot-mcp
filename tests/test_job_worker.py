@@ -10,6 +10,7 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import psutil
 import pytest
@@ -93,7 +94,7 @@ def test_cancel_winning_during_resource_wait_prevents_child_dispatch(tmp_path: P
     assert WorkflowStore(tmp_path / "workflows.sqlite3", recover=False).health_summary()["quarantined_resource_request_count"] == 0
 
 
-def test_successful_root_exit_settles_dead_descendant_capacity(tmp_path: Path) -> None:
+def test_successful_root_exit_settles_dead_descendant_capacity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fixture = tmp_path / "capacity_child.py"
     fixture.write_text('''
 import json,os,subprocess,sys,time
@@ -115,6 +116,59 @@ else:
  assert (root/'ready').exists()
 ''', encoding="utf-8")
     store = JobStore(tmp_path / "jobs.sqlite3")
+    probe_worker = tmp_path / "probe_worker.py"
+    probe_worker.write_text('''
+import json,sqlite3,sys
+from contextlib import ExitStack,closing
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0,str(Path.cwd()))
+import psutil
+from core import windows_job
+from core.workflow_store import WorkflowStore
+original=WorkflowStore.release_dead_resource_capacity
+def cleanup(self,*args,**kwargs):
+ trace=[]
+ def record(name,function):
+  def call(*a,**kw):
+   item={'stage':name}
+   if a and hasattr(a[0],'pid'):item['pid']=a[0].pid
+   elif name=='probe':item['pid']=a[0]
+   try:
+    value=function(*a,**kw)
+   except (psutil.Error,OSError) as error:
+    item.update(error=type(error).__name__,winerror=getattr(error,'winerror',None));trace.append(item);raise
+   item['value']=bool(value) if name=='open' else value;trace.append(item);return value
+  return call
+ try:
+  with ExitStack() as stack:
+   for name in ('create_time','is_running','status'):
+    stack.enter_context(patch.object(psutil.Process,name,record(name,getattr(psutil.Process,name))))
+   stack.enter_context(patch.object(windows_job,'process_identity_exited',record('probe',windows_job.process_identity_exited)))
+   if sys.platform=='win32':
+    import _winapi
+    for name,label in (('OpenProcess','open'),('WaitForSingleObject','wait')):
+     stack.enter_context(patch.object(_winapi,name,record(label,getattr(_winapi,name))))
+   result=original(self,*args,**kwargs)
+   trace.append({'released':result})
+   return result
+ finally:
+  with closing(sqlite3.connect(self.path)) as db:
+   trace.append({'capacity':db.execute('SELECT state,count(*) FROM runtime_capacity_requests GROUP BY state').fetchall(),
+                 'claims':db.execute('SELECT state,count(*) FROM workflow_resource_requests GROUP BY state').fetchall()})
+  (self.path.parent/'ownership_probe.json').write_text(json.dumps(trace[:64]),encoding='utf-8')
+WorkflowStore.release_dead_resource_capacity=cleanup
+from scripts.job_worker import run
+run(Path(sys.argv[1]),sys.argv[2],sys.argv[3] if len(sys.argv)>3 else None)
+''', encoding="utf-8")
+    original_popen = subprocess.Popen
+
+    def launch(command: list[str], *args: Any, **kwargs: Any) -> Any:
+        if command[1:3] == ["-m", "scripts.job_worker"] and Path(command[3]) == store.path.resolve():
+            command = [command[0], str(probe_worker), *command[3:]]
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
     job = store.submit([sys.executable, str(fixture), str(Path(__file__).resolve().parents[1]), str(tmp_path)], tmp_path, 15, "descendant")
     try:
         deadline = time.monotonic() + 25
@@ -123,7 +177,10 @@ else:
             if result["status"] not in {"queued", "running"}:
                 break
             time.sleep(0.05)
-        assert result["status"] == "succeeded", result.get("error")
+        if result["status"] != "succeeded":
+            probe_path = tmp_path / "ownership_probe.json"
+            trace = json.loads(probe_path.read_text(encoding="utf-8")) if probe_path.exists() else []
+            pytest.fail(json.dumps({"error": result.get("error"), "ownership_probe": trace}, separators=(",", ":")))
         identity = json.loads((tmp_path / "ready").read_text())
         from core.jobs import same_process
 
