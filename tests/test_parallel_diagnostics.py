@@ -221,6 +221,10 @@ def test_collect_diagnostics_total_deadline_prevents_late_dispatch(
             )
 
     result = asyncio.run(scenario())
-    assert calls == ["ruff"]
+    # Slow hosts may expire the deadline during resource admission, before Ruff starts.
+    # In either valid case mypy must never be dispatched after the total deadline.
+    assert calls in ([], ["ruff"])
     assert result["required_unknown"] is True
+    if not calls:
+        assert result["stages"][0]["timed_out"] is True
     assert result["stages"][1]["timed_out"] is True
