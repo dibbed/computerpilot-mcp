@@ -2065,6 +2065,7 @@ class WorkflowStore:
             ).fetchall()
         identities: set[tuple[int, float]] = set()
         deadline = time.monotonic() + settle_timeout_sec
+        hard_deadline = time.monotonic() + 5.0
         for row in rows:
             parts = str(row["owner_token"]).split("-", 3)
             try:
@@ -2077,6 +2078,8 @@ class WorkflowStore:
                 continue
         released = 0
         for pid, created in identities:
+            if time.monotonic() >= hard_deadline:
+                raise ToolError("process_cleanup_incomplete", "Child capacity cleanup exceeded its deadline.")
             try:
                 process = psutil.Process(pid)
                 if abs(process.create_time() - created) < 0.01 and process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
@@ -2088,7 +2091,10 @@ class WorkflowStore:
                     while confirmed is not True and time.monotonic() < deadline:
                         # Windows can publish process exit shortly after Job Object termination.
                         # Never treat a timeout or an uninspectable owner as dead.
-                        time.sleep(min(0.05, deadline - time.monotonic()))
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        time.sleep(min(0.05, remaining))
                         confirmed = process_identity_exited(pid, created)
                     if confirmed is not True:
                         continue
