@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -2076,7 +2077,12 @@ class WorkflowStore:
             try:
                 process = psutil.Process(pid)
                 if abs(process.create_time() - created) < 0.01 and process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
-                    continue
+                    if os.name != "nt":
+                        continue
+                    from core.windows_job import process_identity_exited
+
+                    if process_identity_exited(pid, created) is not True:
+                        continue
             except psutil.NoSuchProcess:
                 pass
             except (psutil.Error, OSError):

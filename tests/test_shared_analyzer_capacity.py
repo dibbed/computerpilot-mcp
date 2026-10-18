@@ -31,13 +31,14 @@ def test_cleanup_denial_fences_parent_even_if_quarantine_storage_fails(
 
     if storage_failure:
         monkeypatch.setattr(store, "quarantine_capacity", deny_quarantine, raising=False)
-    with managed_resource_claims((claim,), category="parent", store=store):
+    with pytest.raises(ToolError) as cleanup, managed_resource_claims((claim,), category="parent", store=store):
         permit = acquire_runtime_capacity(
             store.path, category="analyzer", limit=1, deadline=time.monotonic() + 1, store=store,
         )
         assert permit is not None
         with pytest.raises((ToolError, sqlite3.OperationalError)), permit:
             raise ToolError("process_cleanup_incomplete", "cleanup denied")
+    assert cleanup.value.code == "process_cleanup_incomplete"
 
     result = store.reserve_resource_claims(request_id="other", owner_token="other", category="test", claims=(claim,))
     assert result["admitted"] is False
@@ -47,17 +48,19 @@ def test_cleanup_denial_fences_parent_even_if_quarantine_storage_fails(
 
 
 def test_parent_cannot_release_while_analyzer_permit_is_still_active(tmp_path: Path) -> None:
+    from core.errors import ToolError
     from core.resource_claims import managed_resource_claims, path_claim
     from core.runtime_capacity import acquire_runtime_capacity
     from core.workflow_store import WorkflowStore
 
     store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
     claim = path_claim(tmp_path / "target", "write")
-    with managed_resource_claims((claim,), category="parent", store=store):
+    with pytest.raises(ToolError) as cleanup, managed_resource_claims((claim,), category="parent", store=store):
         permit = acquire_runtime_capacity(
             store.path, category="analyzer", limit=1, deadline=time.monotonic() + 1, store=store,
         )
         assert permit is not None
+    assert cleanup.value.code == "process_cleanup_incomplete"
     assert store.reserve_resource_claims(
         request_id="other", owner_token="other", category="test", claims=(claim,),
     )["admitted"] is False
@@ -65,11 +68,10 @@ def test_parent_cannot_release_while_analyzer_permit_is_still_active(tmp_path: P
         request_id, owner = db.execute(
             "SELECT request_id, owner_token FROM workflow_resource_requests WHERE state='quarantined'",
         ).fetchone()
-    from core.errors import ToolError
-
     with pytest.raises(ToolError) as raised:
         store.resolve_quarantined_resource_request(request_id, owner_token=owner, resolution="released", evidence="operator ack")
     assert raised.value.code == "resource_children_unresolved"
+    assert permit is not None
     permit.release()
     assert store.health_summary()["quarantined_resource_request_count"] == 1
     store.resolve_quarantined_resource_request(
@@ -100,6 +102,7 @@ def test_process_capacity_cleanup_fences_reused_pid(tmp_path: Path) -> None:
 
 
 def test_quarantined_child_capacity_requires_owned_exit_then_operator_resolution(tmp_path: Path) -> None:
+    from core.errors import ToolError
     from core.executor import run_bounded
     from core.resource_claims import managed_resource_claims, path_claim
     from core.workflow_store import WorkflowStore
@@ -119,10 +122,14 @@ except ToolError:
     pass
 print(json.dumps({'pid':os.getpid(),'created':psutil.Process().create_time()}))
 """
-    with managed_resource_claims((path_claim(tmp_path, "write", scope="subtree"),), category="parent", store=store):
+    with (
+        pytest.raises(ToolError) as cleanup,
+        managed_resource_claims((path_claim(tmp_path, "write", scope="subtree"),), category="parent", store=store),
+    ):
         result = run_bounded([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], timeout_sec=10)
         assert result["ok"] is True
         identity = json.loads(result["stdout"]["text"])
+    assert cleanup.value.code == "process_cleanup_incomplete"
     assert store.health_summary()["runtime_capacity_counts"]["analyzer:quarantined"] == 1
     assert store.release_process_capacity(identity["pid"], identity["created"]) == 1
     assert store.health_summary()["quarantined_resource_request_count"] == 1

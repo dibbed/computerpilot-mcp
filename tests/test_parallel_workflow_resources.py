@@ -753,6 +753,20 @@ def test_inherited_capability_rejects_incompatible_runtime_policy(
     assert store.health_summary()["runtime_capacity_counts"] == {}
 
 
+def test_managed_success_cannot_hide_unresolved_child_capacity(tmp_path: Path) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    with pytest.raises(ToolError) as raised:
+        with managed_resource_claims((path_claim(tmp_path, "write"),), category="parent", store=store) as capability:
+            request, owner, _ = resource_claims._parse_resource_capability(capability)
+            assert store.reserve_capacity(
+                admission_id="unresolved", category="analyzer", owner_token="unknown-owner", weight=1, limit=1,
+                resource_request_id=request, resource_owner_token=owner,
+            )["admitted"] is True
+    assert raised.value.code == "process_cleanup_incomplete"
+    assert store.health_summary()["quarantined_resource_request_count"] == 1
+    assert store.health_summary()["active_analyzer_capacity_weight"] == 1
+
+
 def test_older_incompatible_policy_waiter_drains_active_profile_without_starvation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
     original = config.SETTINGS

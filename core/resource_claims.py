@@ -342,7 +342,9 @@ def managed_resource_claims(
         raise
     finally:
         if release_on_exit:
-            claim_store.release_resource_request(request_id, owner_token=owner_token)
+            released = claim_store.release_resource_request(request_id, owner_token=owner_token)
+            if admitted and not released:
+                raise ToolError("process_cleanup_incomplete", "Managed resource ownership remains unresolved.")
 
 
 @contextmanager

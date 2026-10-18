@@ -206,6 +206,8 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                     resource_authority.release_process_capacity(capacity_pid, capacity_created)
                 resource_id, resource_owner, _ = _parse_resource_capability(capability)
                 resource_authority.release_dead_resource_capacity(resource_id, owner_token=resource_owner)
+            stack, resource_stack = resource_stack, None
+            stack.close()
             _update(db, job_id, status=status, exit_code=code)
         except BaseException as exc:
             error = exc.message if isinstance(exc, ToolError) else type(exc).__name__

@@ -43,6 +43,32 @@ def test_poll_interval_backs_off_for_long_jobs() -> None:
     assert job_worker._poll_interval(30.0) == 1.0
 
 
+def test_worker_settles_resource_context_before_publishing_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.resource_claims import RESOURCE_CAPABILITY_ENV, _parse_resource_capability
+
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id = "6" * 32
+    _seed(store, job_id, tmp_path)
+
+    def spawn(*args: object, **kwargs: object) -> SimpleNamespace:
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        request, owner, path = _parse_resource_capability(env[RESOURCE_CAPABILITY_ENV])
+        authority = WorkflowStore(path, recover=False)
+        assert authority.reserve_capacity(
+            admission_id="unknown-child", category="analyzer", owner_token="unknown-owner", weight=1, limit=1,
+            resource_request_id=request, resource_owner_token=owner,
+        )["admitted"] is True
+        return SimpleNamespace(pid=os.getpid(), poll=lambda: 0, wait=lambda timeout: 0, close_ownership=lambda: None)
+
+    monkeypatch.setattr(job_worker, "spawn_owned_process", spawn)
+    job_worker.run(store.path, job_id)
+    assert store.raw(job_id)["status"] == "failed"
+    authority = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    assert authority.health_summary()["quarantined_resource_request_count"] == 1
+    assert authority.health_summary()["active_analyzer_capacity_weight"] == 1
+
+
 def test_cancel_winning_during_resource_wait_prevents_child_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
     job_id = "7" * 32
@@ -109,7 +135,7 @@ else:
         store.cancel(job["job_id"])
 
 
-@pytest.mark.parametrize("owner", ["live", "denied", "reused", "zombie", "unknown"])
+@pytest.mark.parametrize("owner", ["live", "denied", "reused", "zombie", "unknown", "exited_visible", "wait_denied"])
 def test_child_capacity_reclaim_requires_positive_owner_death(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str,
 ) -> None:
@@ -128,14 +154,19 @@ def test_child_capacity_reclaim_requires_positive_owner_death(
             raise psutil.AccessDenied(pid)
 
         monkeypatch.setattr(psutil, "Process", denied)
-    elif owner in {"reused", "zombie"}:
+    elif owner in {"reused", "zombie", "exited_visible", "wait_denied"}:
         process = SimpleNamespace(
             create_time=lambda: created + 10 if owner == "reused" else created,
-            is_running=lambda: True, status=lambda: psutil.STATUS_ZOMBIE,
+            is_running=lambda: True, status=lambda: psutil.STATUS_ZOMBIE if owner == "zombie" else psutil.STATUS_RUNNING,
         )
         monkeypatch.setattr(psutil, "Process", lambda *args: process)
+        if owner in {"exited_visible", "wait_denied"}:
+            from core import windows_job, workflow_store
+
+            monkeypatch.setattr(workflow_store, "os", SimpleNamespace(name="nt"))
+            monkeypatch.setattr(windows_job, "process_identity_exited", lambda *args: True if owner == "exited_visible" else None)
     released = store.release_dead_resource_capacity("parent", owner_token="owner")
-    assert released == (1 if owner in {"reused", "zombie"} else 0)
+    assert released == (1 if owner in {"reused", "zombie", "exited_visible"} else 0)
     assert store.health_summary()["active_analyzer_capacity_weight"] == (0 if released else 1)
 
 

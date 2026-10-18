@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -10,6 +11,33 @@ import pytest
 
 from core import windows_job
 from core.errors import ToolError
+
+
+@pytest.mark.parametrize("case", ["exited", "live", "reused", "denied", "wait_failed", "close_failed"])
+def test_capacity_exit_probe_uses_identity_and_signaled_handle(monkeypatch: pytest.MonkeyPatch, case: str) -> None:
+    closed: list[int] = []
+
+    def open_process(*args: object) -> int:
+        if case == "denied":
+            raise PermissionError("private-canary")
+        return 123
+
+    def close(handle: int) -> None:
+        closed.append(handle)
+        if case == "close_failed":
+            raise OSError("private-canary")
+
+    kernel = SimpleNamespace(
+        OpenProcess=open_process, SYNCHRONIZE=0x100000, WAIT_OBJECT_0=0, WAIT_TIMEOUT=258,
+        WaitForSingleObject=lambda handle, timeout: 258 if case == "live" else 0xFFFFFFFF if case == "wait_failed" else 0,
+        CloseHandle=close,
+    )
+    monkeypatch.setitem(sys.modules, "_winapi", kernel)
+    monkeypatch.setattr(psutil, "Process", lambda pid: SimpleNamespace(create_time=lambda: 20.0 if case == "reused" else 10.0))
+    assert windows_job.process_identity_exited(42, 10.0) is (
+        True if case in {"exited", "reused"} else False if case == "live" else None
+    )
+    assert closed == ([] if case == "denied" else [123])
 
 
 @pytest.mark.parametrize("root_pending", [False, True])

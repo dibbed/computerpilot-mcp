@@ -146,6 +146,30 @@ def windows_job_objects_enabled() -> bool:
     return os.getenv("MCP_WINDOWS_JOB_OBJECTS", "1").strip().casefold() not in {"0", "false", "no", "off"}
 
 
+def process_identity_exited(pid: int, created: float) -> bool | None:
+    """A visible Windows PID can belong to an exited process with retained handles."""
+    try:
+        import _winapi
+
+        handle = _winapi.OpenProcess(_winapi.SYNCHRONIZE, False, pid)
+        try:
+            # Pin the process object before rechecking identity; never signal a reused PID.
+            if abs(psutil.Process(pid).create_time() - created) >= 0.01:
+                return True
+            result = _winapi.WaitForSingleObject(handle, 0)
+            if result == _winapi.WAIT_OBJECT_0:
+                return True
+            if result == _winapi.WAIT_TIMEOUT:
+                return False
+            return None
+        finally:
+            _winapi.CloseHandle(handle)
+    except psutil.NoSuchProcess:
+        return True
+    except (ImportError, psutil.Error, OSError):
+        return None
+
+
 def current_process_in_job() -> bool | None:
     if os.name != "nt":
         return None
