@@ -227,6 +227,34 @@ def test_child_capacity_reclaim_requires_positive_owner_death(
     assert store.health_summary()["active_analyzer_capacity_weight"] == (0 if released else 1)
 
 
+
+def test_dead_child_capacity_waits_for_confirmed_windows_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core import windows_job, workflow_store
+
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    pid, created = os.getpid(), psutil.Process().create_time()
+    store.reserve_resource_claims(
+        request_id="parent", owner_token="owner", category="test",
+        claims=(path_claim(tmp_path, "write", scope="subtree"),),
+    )
+    assert store.reserve_capacity(
+        admission_id="child", category="analyzer",
+        owner_token=f"pid-{pid}-{created:.6f}-fixture",
+        weight=1, limit=1, resource_request_id="parent", resource_owner_token="owner",
+    )["admitted"] is True
+    # A process may be visible briefly after native tree termination was confirmed.
+    # Never release on the first live probe; require a later positive exit signal.
+    monkeypatch.setattr(workflow_store, "os", SimpleNamespace(name="nt"))
+    observations = iter((False, True))
+    monkeypatch.setattr(windows_job, "process_identity_exited", lambda *_: next(observations))
+    assert store.release_dead_resource_capacity(
+        "parent", owner_token="owner", settle_timeout_sec=0.5,
+    ) == 1
+    assert store.health_summary()["active_analyzer_capacity_weight"] == 0
+
+
 def test_worker_releases_fresh_claim_when_native_ownership_denies_before_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
