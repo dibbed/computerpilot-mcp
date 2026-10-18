@@ -2139,9 +2139,10 @@ class WorkflowStore:
             step_index = int(operation["step_index"])
             connection.execute(
                 "UPDATE workflow_operations SET state='failed', attempts=attempts+1,"
-                "version=version+1,error=?,started_at=COALESCE(started_at,?),"
+                "version=version+1,evidence_json=?,error=?,started_at=COALESCE(started_at,?),"
                 "finished_at=?,updated_at=? WHERE operation_id=?",
-                (error, now, now, now, operation_id),
+                (_canonical({"dispatch_phase": "preflight_rejected", "no_dispatch": True}),
+                 error, now, now, now, operation_id),
             )
             connection.execute(
                 "UPDATE workflow_steps SET state='failed',attempts=attempts+1,error=?,"
@@ -2961,7 +2962,7 @@ class WorkflowStore:
             descriptor = get_action_descriptor(str(operation["action"]))
             if descriptor.mutates or descriptor.name == "verify_changes":
                 evidence = json.loads(operation["evidence_json"] or "{}")
-                if evidence.get("dispatch_phase") not in {"reserved", "prepared"} or operation["external_ref_json"]:
+                if evidence.get("dispatch_phase") not in {"reserved", "prepared", "preflight_rejected"} or operation["external_ref_json"]:
                     raise ToolError("workflow_resume_unsafe_replay", "A failed effectful branch needs proof of no dispatch before retry.")
 
     def advance_running(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -120,6 +121,36 @@ def test_invalid_pre_dispatch_resource_footprint_fails_workflow_without_abandone
     operation = store.list_operations(created["workflow_id"])["items"][0]
     assert operation["state"] == "failed"
     assert store.health_summary()["active_workflow_leases"] == 0
+
+
+def test_preflight_denied_mutation_has_replay_safe_resume_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    repo = tmp_path / "new-repository"
+    repo.mkdir()
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    created = store.create(
+        WorkflowDefinition(
+            "safe-preflight",
+            (StepDefinition("stage", "git_stage", {"repo": str(repo), "paths": ["a.txt"]},
+                            postcondition={"kind": "git_stage_intent"}, step_id="stage"),),
+            execution_mode="dag",
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+    executor = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING, enable_dag_execution=True)
+    failed = executor.execute(created["workflow_id"], owner_id="worker")
+    assert failed["state"] == "failed"
+    operation = store.list_operations(created["workflow_id"])["items"][0]
+    assert operation["state"] == "failed"
+    assert operation["evidence"]["dispatch_phase"] == "preflight_rejected"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    (repo / "a.txt").write_text("safe", encoding="utf-8")
+    queued = store.transition(failed["workflow_id"], failed["version"], WorkflowState.QUEUED)
+    assert queued["state"] == "queued"
+    done = executor.execute(queued["workflow_id"], owner_id="worker")
+    assert done["state"] == "completed"
 
 
 def test_unchanged_running_aggregate_does_not_emit_polling_history(tmp_path: Path) -> None:
