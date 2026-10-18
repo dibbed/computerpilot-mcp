@@ -2106,6 +2106,57 @@ class WorkflowStore:
         # Live ancestors and uninspectable owners retain their own permits and resource fence.
         return released
 
+    def fail_unadmitted_operation(
+        self, operation_id: str, *, lease_token: str, error_code: str,
+    ) -> None:
+        """Atomically fail an operation rejected during footprint preflight.
+
+        No dispatch barrier or admission exists at this point. Persisting the
+        operation, step and event together prevents a stranded running DAG if
+        the coordinator dies immediately after the rejection.
+        """
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT workflow_id,step_index,state,attempt_token FROM workflow_operations "
+                "WHERE operation_id=?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(operation["workflow_id"])
+            self._require_current_lease_row(connection, workflow_id, lease_token, now)
+            if operation["state"] != "created" or operation["attempt_token"] is not None:
+                raise ToolError("workflow_attempt_conflict", "Pre-dispatch rejection no longer owns the operation.")
+            if connection.execute(
+                "SELECT 1 FROM workflow_execution_admissions WHERE operation_id=? "
+                "UNION ALL SELECT 1 FROM workflow_resource_requests "
+                "WHERE operation_id=? AND state!='released' LIMIT 1",
+                (operation_id, operation_id),
+            ).fetchone() is not None:
+                raise ToolError("workflow_attempt_conflict", "Pre-dispatch rejection cannot override a resource owner.")
+            error = error_code[:128]
+            step_index = int(operation["step_index"])
+            connection.execute(
+                "UPDATE workflow_operations SET state='failed', attempts=attempts+1,"
+                "version=version+1,error=?,started_at=COALESCE(started_at,?),"
+                "finished_at=?,updated_at=? WHERE operation_id=?",
+                (error, now, now, now, operation_id),
+            )
+            connection.execute(
+                "UPDATE workflow_steps SET state='failed',attempts=attempts+1,error=?,"
+                "started_at=COALESCE(started_at,?),finished_at=? "
+                "WHERE workflow_id=? AND step_index=?",
+                (error, now, now, workflow_id, step_index),
+            )
+            connection.execute(
+                "INSERT INTO workflow_events(workflow_id,step_index,operation_id,event_type,"
+                "state,metadata_json,created_at) VALUES (?, ?, ?, 'operation_preflight_failed',"
+                "'failed',?,?)",
+                (workflow_id, step_index, operation_id, _canonical({"reason": error}), now),
+            )
+            connection.commit()
+
     def claim_ready_operation(
         self,
         operation_id: str,
@@ -2565,6 +2616,16 @@ class WorkflowStore:
                 connection, workflow_id, keep_running=keep_running,
             )
             primary_error = primary_error or stop_admission_reason
+
+            # A resource-blocked scheduler polls frequently. If canonical state
+            # is unchanged, do not inflate event history or the workflow version.
+            if (
+                target.value == str(workflow["state"])
+                and current_step == int(workflow["current_step"])
+                and primary_error == workflow["last_error"]
+            ):
+                connection.commit()
+                return self.get(workflow_id)
 
             connection.execute(
                 """

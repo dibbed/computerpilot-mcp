@@ -579,14 +579,27 @@ class WorkflowExecutor:
                                 (f"resource-{uuid.uuid4().hex}", f"resource-owner-{uuid.uuid4().hex}"),
                             )
                             resource_waits[index] = (resource_request_id, resource_owner_token)
-                            resource_admission = self.store.reserve_resource_claims(
-                                request_id=resource_request_id,
-                                owner_token=resource_owner_token,
-                                claims=derive_action_resource_claims(
+                            try:
+                                footprint = derive_action_resource_claims(
                                     definition.steps[index].action,
                                     definition.steps[index].arguments,
                                     definition.steps[index].postcondition,
-                                ),
+                                )
+                            except (ToolError, ValueError, OSError) as exc:
+                                # Footprint preflight is before any resource or
+                                # dispatch admission. Record a known failed step,
+                                # never abandon a running workflow with no owner.
+                                self.store.fail_unadmitted_operation(
+                                    str(operation["operation_id"]),
+                                    lease_token=lease.lease_token,
+                                    error_code=exc.code if isinstance(exc, ToolError) else type(exc).__name__,
+                                )
+                                stop_admission_reason = "workflow resource footprint preflight failed"
+                                break
+                            resource_admission = self.store.reserve_resource_claims(
+                                request_id=resource_request_id,
+                                owner_token=resource_owner_token,
+                                claims=footprint,
                                 category="workflow_step",
                                 workflow_id=workflow_id,
                                 operation_id=str(operation["operation_id"]),

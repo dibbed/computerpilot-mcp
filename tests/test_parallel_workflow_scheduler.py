@@ -98,6 +98,52 @@ def _running_workflow(store: WorkflowStore, definition: WorkflowDefinition, owne
     return store.get(workflow_id), lease.lease_token
 
 
+def test_invalid_pre_dispatch_resource_footprint_fails_workflow_without_abandoned_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pytest temp root is inside this checkout; prohibit Git parent discovery.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    invalid_repo = tmp_path / "not-a-git-repo"
+    invalid_repo.mkdir()
+    created = store.create(
+        WorkflowDefinition(
+            "invalid-footprint",
+            (StepDefinition("git-read", "git_status", {"repo": str(invalid_repo)}, step_id="git-read"),),
+            execution_mode="dag",
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+    executor = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING, enable_dag_execution=True)
+    result = executor.execute(created["workflow_id"], owner_id="worker")
+    assert result["state"] == "failed"
+    operation = store.list_operations(created["workflow_id"])["items"][0]
+    assert operation["state"] == "failed"
+    assert store.health_summary()["active_workflow_leases"] == 0
+
+
+def test_unchanged_running_aggregate_does_not_emit_polling_history(tmp_path: Path) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    current, lease = _running_workflow(store, _single_dag("waiting"), "owner")
+    with sqlite3.connect(store.path) as db:
+        before = db.execute(
+            "SELECT COUNT(*) FROM workflow_events WHERE workflow_id=?",
+            (current["workflow_id"],),
+        ).fetchone()[0]
+    for _ in range(6):
+        updated = store.recompute_workflow_aggregate(
+            current["workflow_id"], lease_token=lease, keep_running=True,
+        )
+        assert updated["state"] == "running"
+    with sqlite3.connect(store.path) as db:
+        after = db.execute(
+            "SELECT COUNT(*) FROM workflow_events WHERE workflow_id=?",
+            (current["workflow_id"],),
+        ).fetchone()[0]
+    assert after == before
+    assert updated["version"] == current["version"]
+
+
 def test_resource_storage_denial_rolls_back_all_claims_and_prevents_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
