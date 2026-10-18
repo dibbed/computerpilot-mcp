@@ -602,7 +602,26 @@ def test_workflow_git_mutation_reaps_hook_descendants_before_return(tmp_path: Pa
             alive = abs(process.create_time() - record["created"]) < .01 and process.status() != psutil.STATUS_ZOMBIE
         except psutil.NoSuchProcess:
             alive = False
-        assert not alive
+        if alive:
+            # Native Job Object termination can precede psutil's observable
+            # process-table retirement. Poll the exact PID/create-time briefly;
+            # a leaked descendant still fails after the bounded grace.
+            observed = []
+            for _ in range(24):
+                time.sleep(0.1)
+                try:
+                    candidate = psutil.Process(record["pid"])
+                    alive = (
+                        abs(candidate.create_time() - record["created"]) < .01
+                        and candidate.status() != psutil.STATUS_ZOMBIE
+                    )
+                    observed.append((candidate.status(), candidate.ppid()))
+                except psutil.NoSuchProcess:
+                    alive = False
+                    break
+                if not alive:
+                    break
+            assert not alive, f"child remained alive after 2.4s: {observed[-5:]}"
     finally:
         if identity.exists():
             record = json.loads(identity.read_text(encoding="utf-8"))
