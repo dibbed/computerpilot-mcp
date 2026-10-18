@@ -36,6 +36,31 @@ def _seed(store: JobStore, job_id: str, cwd: Path) -> None:
     (directory / "stderr.bin").touch()
 
 
+def test_pre_spawn_missing_executable_releases_exclusive_job_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id = "b" * 32
+    _seed(store, job_id, tmp_path)
+
+    def absent(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("missing executable")
+
+    monkeypatch.setattr(job_worker, "spawn_owned_process", absent)
+    job_worker.run(store.path, job_id)
+    assert store.raw(job_id)["status"] == "failed"
+
+    resources = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    health = resources.health_summary()
+    assert health["quarantined_resource_request_count"] == 0
+    assert health["active_resource_request_count"] == 0
+    admitted = resources.reserve_resource_claims(
+        request_id="subsequent-write", owner_token="subsequent", category="test",
+        claims=(coordination_claim(), path_claim(tmp_path / "other", "write")),
+    )
+    assert admitted["admitted"] is True
+
+
 def test_poll_interval_backs_off_for_long_jobs() -> None:
     assert job_worker._poll_interval(0.0) == 0.2
     assert job_worker._poll_interval(1.99) == 0.2

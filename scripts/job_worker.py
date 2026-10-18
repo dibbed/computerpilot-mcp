@@ -151,16 +151,24 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 _kick_successor(store)
                 return
             with (directory / "stdout.bin").open("ab") as stdout, (directory / "stderr.bin").open("ab") as stderr:
-                process = spawn_owned_process(
-                    spec["command"],
-                    cwd=spec["cwd"],
-                    env=env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    creationflags=_creation_flags(),
-                    require_native=resource_requires_native_ownership(capability, resource_authority),
-                )
+                try:
+                    process = spawn_owned_process(
+                        spec["command"],
+                        cwd=spec["cwd"],
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=stdout,
+                        stderr=stderr,
+                        creationflags=_creation_flags(),
+                        require_native=resource_requires_native_ownership(capability, resource_authority),
+                    )
+                except FileNotFoundError:
+                    # Popen rejected the executable before creating a child: no
+                    # external effect is possible and the fresh job claim must not
+                    # quarantine unrelated writers. Other spawn failures stay fenced.
+                    resource_stack.close()
+                    resource_stack = None
+                    raise
                 try:
                     created = psutil.Process(process.pid).create_time()
                     # Popen still identifies the original child. If it exited
