@@ -15,6 +15,31 @@ from core.workflow_models import OperationState, StepDefinition, WorkflowDefinit
 from core.workflow_store import WorkflowStore
 
 
+def test_explicit_dag_resume_retries_known_safe_read_failure(tmp_path: Path) -> None:
+    from core.workflow_executor import NATIVE_ONLY_ROUTING, WorkflowExecutor
+
+    missing = tmp_path / "repaired.txt"
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    workflow = store.create(
+        WorkflowDefinition(
+            "repair",
+            (StepDefinition("read", "check_file", {"path": str(missing)}, step_id="read"),),
+            execution_mode="dag",
+        ),
+        initial_state=WorkflowState.QUEUED,
+    )
+    executor = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING, enable_dag_execution=True)
+    first = executor.execute(workflow["workflow_id"], owner_id="worker")
+    assert first["state"] == "failed"
+    missing.write_text("repaired", encoding="utf-8")
+    queued = store.transition(first["workflow_id"], first["version"], WorkflowState.QUEUED)
+    second = executor.execute(queued["workflow_id"], owner_id="worker")
+    assert second["state"] == "completed"
+    operation = store.list_operations(queued["workflow_id"])["items"][0]
+    assert operation["state"] == "succeeded"
+    assert operation["attempts"] == 2
+
+
 def _running(tmp_path: Path) -> tuple[WorkflowStore, str, str, list[dict[str, Any]]]:
     store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
     workflow = store.create(WorkflowDefinition(

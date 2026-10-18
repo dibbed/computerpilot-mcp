@@ -2880,7 +2880,7 @@ class WorkflowStore:
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
-                "SELECT state, version FROM workflows WHERE workflow_id = ?", (workflow_id,),
+                "SELECT state, version, execution_mode FROM workflows WHERE workflow_id = ?", (workflow_id,),
             ).fetchone()
             if current is None:
                 raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
@@ -2897,6 +2897,38 @@ class WorkflowStore:
             validate_workflow_transition(WorkflowState(str(current["state"])), state)
             if state is WorkflowState.QUEUED:
                 self._require_safe_resume(connection, workflow_id)
+                if (
+                    str(current["execution_mode"]) == "dag"
+                    and str(current["state"]) in {"failed", "paused"}
+                ):
+                    # An explicit operator resume may retry proven safe failures,
+                    # independently of the automatic transient retry budget.
+                    # Prior attempt counters and immutable failure events remain.
+                    failed = connection.execute(
+                        "SELECT operation_id,step_index FROM workflow_operations "
+                        "WHERE workflow_id=? AND state='failed'", (workflow_id,),
+                    ).fetchall()
+                    for operation in failed:
+                        operation_id = str(operation["operation_id"])
+                        step_index = int(operation["step_index"])
+                        connection.execute(
+                            "UPDATE workflow_operations SET state='created', version=version+1, "
+                            "attempt_token=NULL,execution_id=NULL,dispatch_phase=NULL,"
+                            "result_json=NULL,evidence_json=NULL,error=NULL,updated_at=? "
+                            "WHERE operation_id=? AND state='failed'",
+                            (_now(), operation_id),
+                        )
+                        connection.execute(
+                            "UPDATE workflow_steps SET state='created',evidence_json=NULL,error=NULL,"
+                            "finished_at=NULL WHERE workflow_id=? AND step_index=?",
+                            (workflow_id, step_index),
+                        )
+                        connection.execute(
+                            "INSERT INTO workflow_events(workflow_id,step_index,operation_id,event_type,"
+                            "state,metadata_json,created_at) VALUES (?, ?, ?, 'operation_explicitly_requeued',"
+                            "'created',?,?)",
+                            (workflow_id, step_index, operation_id, _canonical({}), _now()),
+                        )
             assignments = ["state = ?", "version = version + 1", "updated_at = ?", "last_error = ?"]
             parameters: list[Any] = [state.value, _now(), last_error[:2_000] if last_error else None]
             if current_step is not None:
