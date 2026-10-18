@@ -33,6 +33,36 @@ from core.workflow_models import StepDefinition, WorkflowDefinition, WorkflowSta
 from core.workflow_store import WorkflowStore
 
 
+def test_sequential_workflow_verification_obeys_repository_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core import workflow_actions
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db_path = tmp_path / "workflows.sqlite3"
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path))
+    monkeypatch.setattr(workflow_actions, "SETTINGS", config.SETTINGS)
+    store = WorkflowStore(db_path, recover=False)
+    store.reserve_resource_claims(
+        request_id="reader", owner_token="reader", category="test",
+        claims=(path_claim(repo, "read", scope="subtree"),),
+    )
+    ran = []
+
+    def fake_verify(*args: object, **kwargs: object) -> dict[str, object]:
+        ran.append(True)
+        return {"ok": True}
+
+    monkeypatch.setattr(workflow_actions, "verify_changed_repository", fake_verify)
+    with pytest.raises(ToolError) as error:
+        workflow_actions._verify_changes(
+            {"cwd": str(repo), "ruff_fix": True}, timeout_sec=0.06,
+        )
+    assert error.value.code == "resource_admission_timeout"
+    assert not ran
+
+
 @pytest.mark.parametrize("category", ["resource", "capacity"])
 def test_admission_record_quota_preserves_unresolved_fences(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, category: str,

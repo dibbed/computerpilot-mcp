@@ -236,12 +236,22 @@ def _verify_changes(arguments: dict[str, Any], timeout_sec: float) -> dict[str, 
         }
     }
     allowed["total_timeout_sec"] = min(float(allowed.get("total_timeout_sec", timeout_sec)), timeout_sec)
-    result = verify_changed_repository(
-        resolve_path(str(arguments.get("cwd", "."))),
-        **allowed,
-        analyzer_capacity_db=SETTINGS.workflow_db,
-        analyzer_capacity_limit=SETTINGS.max_running_analyzers,
-    )
+    repo = resolve_path(str(arguments.get("cwd", ".")))
+    # Sequential workflows do not inherit a DAG resource capability. The
+    # verifier may write via pytest or Ruff fix, so coordinate its full subtree
+    # before invoking any analyzer; DAG callers safely reuse the parent claim.
+    with managed_resource_claims(
+        (coordination_claim(), path_claim(repo, "write", scope="subtree")),
+        category="workflow.verify_changes",
+        timeout_sec=timeout_sec,
+        db_path=SETTINGS.workflow_db,
+    ):
+        result = verify_changed_repository(
+            repo,
+            **allowed,
+            analyzer_capacity_db=SETTINGS.workflow_db,
+            analyzer_capacity_limit=SETTINGS.max_running_analyzers,
+        )
     if not result.get("ok"):
         raise ToolError("workflow_verification_failed", "Change-aware verification did not pass.")
     return result
