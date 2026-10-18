@@ -154,7 +154,18 @@ def process_identity_exited(pid: int, created: float) -> bool | None:
     try:
         import _winapi
 
-        handle = _winapi.OpenProcess(_winapi.SYNCHRONIZE, False, pid)
+        try:
+            handle = _winapi.OpenProcess(_winapi.SYNCHRONIZE, False, pid)
+        except OSError:
+            # Exit may win the interval between process-table inspection and OpenProcess.
+            try:
+                if abs(psutil.Process(pid).create_time() - created) >= 0.01:
+                    return True
+            except psutil.NoSuchProcess:
+                return True
+            except (psutil.Error, OSError):
+                pass
+            return None
         try:
             # Pin the process object before rechecking identity; never signal a reused PID.
             if abs(psutil.Process(pid).create_time() - created) >= 0.01:

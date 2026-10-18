@@ -13,12 +13,14 @@ from core import windows_job
 from core.errors import ToolError
 
 
-@pytest.mark.parametrize("case", ["exited", "live", "reused", "denied", "wait_failed", "close_failed"])
+@pytest.mark.parametrize(
+    "case", ["exited", "live", "reused", "denied", "wait_failed", "close_failed", "gone_before_handle", "denied_metadata"],
+)
 def test_capacity_exit_probe_uses_identity_and_signaled_handle(monkeypatch: pytest.MonkeyPatch, case: str) -> None:
     closed: list[int] = []
 
     def open_process(*args: object) -> int:
-        if case == "denied":
+        if case in {"denied", "gone_before_handle", "denied_metadata"}:
             raise PermissionError("private-canary")
         return 123
 
@@ -34,11 +36,18 @@ def test_capacity_exit_probe_uses_identity_and_signaled_handle(monkeypatch: pyte
     )
     monkeypatch.setitem(sys.modules, "_winapi", kernel)
     monkeypatch.setattr(windows_job, "sys", SimpleNamespace(platform="win32"))
-    monkeypatch.setattr(psutil, "Process", lambda pid: SimpleNamespace(create_time=lambda: 20.0 if case == "reused" else 10.0))
+    def metadata(pid: int) -> SimpleNamespace:
+        if case == "gone_before_handle":
+            raise psutil.NoSuchProcess(pid)
+        if case == "denied_metadata":
+            raise psutil.AccessDenied(pid)
+        return SimpleNamespace(create_time=lambda: 20.0 if case == "reused" else 10.0)
+
+    monkeypatch.setattr(psutil, "Process", metadata)
     assert windows_job.process_identity_exited(42, 10.0) is (
-        True if case in {"exited", "reused"} else False if case == "live" else None
+        True if case in {"exited", "reused", "gone_before_handle"} else False if case == "live" else None
     )
-    assert closed == ([] if case == "denied" else [123])
+    assert closed == ([] if case in {"denied", "gone_before_handle", "denied_metadata"} else [123])
 
 
 @pytest.mark.parametrize("root_pending", [False, True])
