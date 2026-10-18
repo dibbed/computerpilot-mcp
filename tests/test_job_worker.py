@@ -123,7 +123,7 @@ else:
             if result["status"] not in {"queued", "running"}:
                 break
             time.sleep(0.05)
-        assert result["status"] == "succeeded", result
+        assert result["status"] == "succeeded", result.get("error")
         identity = json.loads((tmp_path / "ready").read_text())
         from core.jobs import same_process
 
