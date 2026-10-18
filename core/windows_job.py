@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Sequence
@@ -148,6 +149,8 @@ def windows_job_objects_enabled() -> bool:
 
 def process_identity_exited(pid: int, created: float) -> bool | None:
     """A visible Windows PID can belong to an exited process with retained handles."""
+    if sys.platform != "win32":
+        return None
     try:
         import _winapi
 

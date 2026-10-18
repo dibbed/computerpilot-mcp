@@ -33,6 +33,7 @@ def test_capacity_exit_probe_uses_identity_and_signaled_handle(monkeypatch: pyte
         CloseHandle=close,
     )
     monkeypatch.setitem(sys.modules, "_winapi", kernel)
+    monkeypatch.setattr(windows_job, "sys", SimpleNamespace(platform="win32"))
     monkeypatch.setattr(psutil, "Process", lambda pid: SimpleNamespace(create_time=lambda: 20.0 if case == "reused" else 10.0))
     assert windows_job.process_identity_exited(42, 10.0) is (
         True if case in {"exited", "reused"} else False if case == "live" else None
