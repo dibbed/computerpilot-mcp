@@ -66,6 +66,7 @@ class Settings:
     vision_max_bytes: int = _env_int("MCP_VISION_MAX_BYTES", 8 * 1_024 * 1_024, 262_144, 64 * 1_024 * 1_024)
     vision_jpeg_quality: int = _env_int("MCP_VISION_JPEG_QUALITY", 88, 40, 95)
     max_running_jobs: int = _env_int("MCP_MAX_RUNNING_JOBS", 4, 1, 256)
+    workflow_dag_enabled: bool = _env_bool("MCP_WORKFLOW_DAG_ENABLED", False)
     workflow_max_parallel_steps: int = _env_int("MCP_WORKFLOW_MAX_PARALLEL_STEPS", 16, 1, 16)
     max_running_workflow_steps: int = _env_int("MCP_MAX_RUNNING_WORKFLOW_STEPS", 16, 1, 256)
     max_running_analyzers: int = _env_int("MCP_MAX_RUNNING_ANALYZERS", 3, 1, 64)
@@ -154,6 +155,7 @@ class Settings:
             "browser_download_max_bytes": self.browser_download_max_bytes,
             "vision_max_bytes": self.vision_max_bytes,
             "max_running_jobs": self.max_running_jobs,
+            "workflow_dag_enabled": self.workflow_dag_enabled,
             "workflow_max_parallel_steps": self.workflow_max_parallel_steps,
             "max_running_workflow_steps": self.max_running_workflow_steps,
             "max_running_analyzers": self.max_running_analyzers,

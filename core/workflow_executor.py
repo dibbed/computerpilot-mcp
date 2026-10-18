@@ -108,7 +108,7 @@ class WorkflowExecutor:
         store: WorkflowStore,
         *,
         route_planner: RoutePlanner | NativeOnlyRouting,
-        enable_dag_execution: bool = False,
+        enable_dag_execution: bool | None = None,
     ) -> None:
         """Require every caller to declare how its workflow steps are routed.
 
@@ -124,7 +124,7 @@ class WorkflowExecutor:
         else:
             raise TypeError("route_planner must be a plan callable or NATIVE_ONLY_ROUTING")
         self.store = store
-        self.enable_dag_execution = bool(enable_dag_execution)
+        self.enable_dag_execution = SETTINGS.workflow_dag_enabled if enable_dag_execution is None else enable_dag_execution
 
     def _plan_route(
         self,
@@ -697,7 +697,7 @@ class WorkflowExecutor:
             if not self.enable_dag_execution:
                 raise ToolError(
                     "workflow_dag_execution_unavailable",
-                    "DAG workflow execution is not enabled until scheduler and resource gates are active.",
+                    "DAG workflow execution requires the operator setting MCP_WORKFLOW_DAG_ENABLED=1.",
                 )
             return self._execute_dag(
                 workflow_id,

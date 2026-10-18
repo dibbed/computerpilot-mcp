@@ -41,9 +41,13 @@ def test_workflow_lifecycle_tools_persist_and_cancel(tmp_path: Path, monkeypatch
     asyncio.run(scenario())
 
 
-def test_dag_can_be_planned_started_and_inspected_but_not_executed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = replace(workflow_registry.SETTINGS, state_dir=tmp_path)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_dag_public_execution_respects_operator_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    from core import workflow_executor
+
+    settings = replace(workflow_registry.SETTINGS, state_dir=tmp_path, workflow_dag_enabled=enabled)
     monkeypatch.setattr(workflow_registry, "SETTINGS", settings)
+    monkeypatch.setattr(workflow_executor, "SETTINGS", settings)
     monkeypatch.setattr(heartbeat, "SETTINGS", replace(heartbeat.SETTINGS, state_dir=tmp_path))
     target = tmp_path / "present.txt"
     target.write_text("ok", encoding="utf-8")
@@ -78,14 +82,18 @@ def test_dag_can_be_planned_started_and_inspected_but_not_executed(tmp_path: Pat
                 },
             )
             assert dry.structured_content and dry.structured_content["dry_run"] is True
-            denied = await client.call_tool(
+            executed = await client.call_tool(
                 "workflow_execute",
                 {"workflow_id": workflow_id, "expected_version": started.structured_content["version"]},
             )
-            assert denied.structured_content and denied.structured_content["ok"] is False
-            assert denied.structured_content["error"] == "workflow_dag_execution_unavailable"
+            assert executed.structured_content
+            if enabled:
+                assert executed.structured_content["state"] == "completed", executed.structured_content
+            else:
+                assert executed.structured_content["ok"] is False
+                assert executed.structured_content["error"] == "workflow_dag_execution_unavailable"
             status = await client.call_tool("workflow_status", {"workflow_id": workflow_id})
-            assert status.structured_content and status.structured_content["state"] == "queued"
+            assert status.structured_content and status.structured_content["state"] == ("completed" if enabled else "queued")
 
     asyncio.run(scenario())
 

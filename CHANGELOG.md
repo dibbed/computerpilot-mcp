@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Added
+- 2026-10-18: Connect the shared MCP/worker DAG gate to documented `MCP_WORKFLOW_DAG_ENABLED` operator configuration, disabled by default. Planning and queued state remain available while disabled; sequential behavior and default cap 1 are preserved.
 - 2026-10-17: Add schema-9 durable resource requests/claims and shared runtime-capacity admissions for feature-gated DAG execution, including canonical read/write exact/subtree conflict detection, cross-process fairness, lease-loss quarantine, managed patch/Git/terminal/job coordination, and one shared analyzer budget across foreground, background and workflow verification. Public DAG activation remains disabled pending graph-wide cancellation/restart recovery hardening.
 - 2026-10-17: Add the feature-gated parallel workflow scheduler with bounded dependency-ready dispatch, one executor heartbeat, schema-8 active admission rows, fenced attempt tokens, durable dispatch phases, global/per-workflow step caps and late-result rejection; public DAG activation remains disabled pending shared resource and recovery gates.
 - 2026-10-17: Add the gated workflow DAG foundation with explicit step identities/dependencies, deterministic graph validation, schema-7 dependency persistence and derived readiness while preserving legacy sequential execution bytes and keeping DAG execution disabled until scheduler/resource/recovery gates are complete.

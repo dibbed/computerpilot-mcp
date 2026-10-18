@@ -36,6 +36,11 @@ The managed cache is stored under `.agent_state/tunnel-runtime/`.
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `MCP_MAX_RUNNING_JOBS` | maximum concurrently active durable jobs | `4` |
+| `MCP_WORKFLOW_DAG_ENABLED` | operator opt-in for DAG execution in MCP and worker | disabled |
+| `MCP_WORKFLOW_MAX_PARALLEL_STEPS` | maximum accepted effective per-workflow parallel cap | `16` |
+| `MCP_MAX_RUNNING_WORKFLOW_STEPS` | shared active DAG-step budget | `16` |
+| `MCP_MAX_RUNNING_ANALYZERS` | shared managed Ruff/mypy/pytest budget | `3` |
+| `MCP_MAX_RUNTIME_ADMISSION_RECORDS` | per-table retained admission-record limit; unresolved records are protected | `10000` |
 | `MCP_JOB_HISTORY_MAX_COUNT` | retained terminal job count | `1000` |
 | `MCP_JOB_HISTORY_MAX_AGE_DAYS` | terminal job retention age | `30` |
 | `MCP_WORKFLOW_HISTORY_MAX_COUNT` | retained safe terminal workflow count | `1000` |
@@ -43,6 +48,8 @@ The managed cache is stored under `.agent_state/tunnel-runtime/`.
 | `MCP_WORKFLOW_DB_WARN_BYTES` | health warning threshold for workflow DB | `256 MiB` |
 
 Queued/running/orphaned jobs and unresolved workflow evidence are protected from ordinary terminal-history cleanup.
+
+DAG execution remains off by default; planning, persistence, inspection and dry runs remain available. After the same-version recovery, ownership, migration, independent-review and platform gates pass, set `MCP_WORKFLOW_DAG_ENABLED=1` and restart the MCP server and workflow workers. Start with an explicitly selected fixture DAG at `max_parallel_steps=2`; sequential definitions and omitted DAG caps retain cap 1. All processes sharing state must use compatible budget settings. Disable new DAG execution by setting `MCP_WORKFLOW_DAG_ENABLED=0` and restarting workers; drain or cancel active work first, and reconcile uncertainty before retrying. Disabling is not rollback and never clears claims or evidence. Back up SQLite with the connection backup API before migration; an older binary requires its matching pre-upgrade backup rather than opening a newer schema.
 
 ## Browser and image delivery
 
