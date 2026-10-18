@@ -356,6 +356,7 @@ class OwnedProcess:
                         if time.monotonic() >= deadline:
                             raise ToolError("process_cleanup_incomplete", "Job Object still owns active processes.")
                         time.sleep(0.01)
+                    self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
                     job.close()
                 self.job = None
             except Exception as exc:

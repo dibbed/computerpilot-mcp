@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import subprocess
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -9,6 +10,31 @@ import pytest
 
 from core import windows_job
 from core.errors import ToolError
+
+
+@pytest.mark.parametrize("root_pending", [False, True])
+def test_zero_accounting_still_requires_owned_root_handle_exit(root_pending: bool) -> None:
+    events: list[str] = []
+
+    def wait(timeout: float) -> int:
+        events.append("root_exit")
+        assert 0 <= timeout <= 5
+        if root_pending:
+            raise subprocess.TimeoutExpired("owned", timeout)
+        return 1
+
+    job = SimpleNamespace(
+        closed=False, terminate=lambda code: True, active_process_count=lambda: 0,
+        close=lambda: events.append("close"),
+    )
+    owned = windows_job.OwnedProcess(cast(Any, SimpleNamespace(pid=123, wait=wait)), cast(Any, job), "windows_job")
+    if root_pending:
+        with pytest.raises(ToolError) as failure:
+            owned.close_ownership()
+        assert failure.value.code == "process_cleanup_incomplete"
+    else:
+        owned.close_ownership()
+    assert events == ["root_exit", "close"]
 
 
 def test_native_job_accounting_query_is_bounded_and_denials_are_safe(monkeypatch: pytest.MonkeyPatch) -> None:

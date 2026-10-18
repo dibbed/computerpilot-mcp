@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -398,7 +399,7 @@ def test_v9_capacity_upgrade_preserves_unlinked_ownership_and_fails_closed(tmp_p
 def test_v10_partial_upgrade_rolls_back_before_retry(tmp_path: Path) -> None:
     path = tmp_path / "upgrade-denied.sqlite3"
     _seed_v9_admissions(path)
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db:
         db.set_authorizer(
             lambda action, arg1, arg2, database, trigger:
             sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_CREATE_INDEX else sqlite3.SQLITE_OK,
@@ -406,7 +407,7 @@ def test_v10_partial_upgrade_rolls_back_before_retry(tmp_path: Path) -> None:
         with pytest.raises(sqlite3.DatabaseError):
             WorkflowStore._migrate_v10(db)
         db.rollback()
-        db.set_authorizer(None)
+    with closing(sqlite3.connect(path)) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 9
         assert "resource_request_id" not in {row[1] for row in db.execute("PRAGMA table_info(runtime_capacity_requests)")}
     store = WorkflowStore(path, recover=False)

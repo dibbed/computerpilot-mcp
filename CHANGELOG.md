@@ -15,6 +15,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-15: Add `start_verification` in profiles containing testing and jobs. Native verification reuses durable job admission, cancellation and output, reports bounded stage events and stale inputs, and supports opt-in parallel read-only checks without changing foreground defaults.
 
 ### Fixed
+- 2026-10-18: Confirm the owned Windows root process handle has exited before releasing a quiescent Job Object, and verify failed migration rollback with a fresh SQLite connection for Python 3.10 compatibility.
 - 2026-10-18: Recompute a DAG's aggregate after explicit final resource resolution, preserve mixed branch outcomes across concurrent recovery, and keep exception payloads out of parallel workflow evidence and errors.
 - 2026-10-18: Recover and reconcile every DAG branch without replay, preserve unresolved admissions, and recheck resume blockers atomically. Enforce action retry policy, share remaining intent/action/postcondition deadlines, bound file content checks, and serialize durable-job cancellation with a schema-4 pre-spawn barrier.
 - 2026-10-18: Keep Git hooks and filters under exclusive durable coordination and native process ownership. Local Git reads, intent preparation, reconciliation, and test selection disable automatic fsmonitor, signature, external diff/textconv, maintenance, and implicit transport callbacks.
