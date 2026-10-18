@@ -52,10 +52,10 @@ def test_transient_retry_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             raise TransientActionError("temporary")
         return {"ok": True}
 
-    monkeypatch.setitem(ACTION_HANDLERS, "check_file", flaky)
+    monkeypatch.setitem(ACTION_HANDLERS, "check_http", flaky)
     store = WorkflowStore(tmp_path / "workflows.db")
     workflow = store.create(
-        WorkflowDefinition("retry", (StepDefinition("check", "check_file", {"path": "unused"}, max_retries=1),)),
+        WorkflowDefinition("retry", (StepDefinition("check", "check_http", {"url": "http://localhost"}, max_retries=1),)),
         initial_state=WorkflowState.QUEUED,
     )
     result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING).run(workflow["workflow_id"])

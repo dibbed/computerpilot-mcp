@@ -41,6 +41,63 @@ def test_workflow_lifecycle_tools_persist_and_cancel(tmp_path: Path, monkeypatch
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_dag_public_execution_respects_operator_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    from core import workflow_executor
+
+    settings = replace(workflow_registry.SETTINGS, state_dir=tmp_path, workflow_dag_enabled=enabled)
+    monkeypatch.setattr(workflow_registry, "SETTINGS", settings)
+    monkeypatch.setattr(workflow_executor, "SETTINGS", settings)
+    monkeypatch.setattr(heartbeat, "SETTINGS", replace(heartbeat.SETTINGS, state_dir=tmp_path))
+    target = tmp_path / "present.txt"
+    target.write_text("ok", encoding="utf-8")
+
+    async def scenario() -> None:
+        async with Client(create_server()) as client:
+            definition = {
+                "name": "dag-inspect",
+                "execution_mode": "dag",
+                "steps": [
+                    {
+                        "step_id": "root",
+                        "name": "file",
+                        "action": "check_file",
+                        "arguments": {"path": str(target)},
+                        "depends_on": [],
+                    }
+                ],
+            }
+            planned = await client.call_tool("workflow_plan", {"definition": definition})
+            assert planned.structured_content and planned.structured_content["ok"] is True
+            started = await client.call_tool("workflow_start", {"definition": definition})
+            assert started.structured_content and started.structured_content["execution_mode"] == "dag"
+            workflow_id = started.structured_content["workflow_id"]
+            assert started.structured_content["steps"][0]["readiness"] == "ready"
+            dry = await client.call_tool(
+                "workflow_execute",
+                {
+                    "workflow_id": workflow_id,
+                    "expected_version": started.structured_content["version"],
+                    "dry_run": True,
+                },
+            )
+            assert dry.structured_content and dry.structured_content["dry_run"] is True
+            executed = await client.call_tool(
+                "workflow_execute",
+                {"workflow_id": workflow_id, "expected_version": started.structured_content["version"]},
+            )
+            assert executed.structured_content
+            if enabled:
+                assert executed.structured_content["state"] == "completed", executed.structured_content
+            else:
+                assert executed.structured_content["ok"] is False
+                assert executed.structured_content["error"] == "workflow_dag_execution_unavailable"
+            status = await client.call_tool("workflow_status", {"workflow_id": workflow_id})
+            assert status.structured_content and status.structured_content["state"] == ("completed" if enabled else "queued")
+
+    asyncio.run(scenario())
+
+
 def test_each_mcp_execution_attempt_has_a_distinct_lease_owner() -> None:
     first = workflow_registry._mcp_owner_id()
     second = workflow_registry._mcp_owner_id()

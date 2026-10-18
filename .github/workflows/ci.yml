@@ -60,5 +60,9 @@ jobs:
       - name: Verify MCP health check
         run: python -m scripts.health_check --json
 
+      - name: Verify Windows durable-job ownership
+        if: runner.os == 'Windows'
+        run: python -m pytest -o addopts= -q tests/test_job_worker.py::test_successful_root_exit_settles_dead_descendant_capacity --tb=short --basetemp=.pytest-ownership
+
       - name: Run test suite with Pytest
         run: python -m pytest

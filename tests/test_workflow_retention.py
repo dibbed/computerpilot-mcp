@@ -13,6 +13,7 @@ from mcp import Client
 from core import heartbeat, registry, resource_health, workflow_retention
 from core.config import SETTINGS
 from core.registry import create_server
+from core.resource_claims import path_claim
 from core.workflow_retention import WorkflowHistoryPolicy, cleanup_workflow_history
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowState, WorkflowStore
 
@@ -77,6 +78,83 @@ def test_workflow_history_cleanup_skips_linked_state_parent(tmp_path: Path) -> N
     )
     assert result.removed_rows == 0
     assert store.get(old)["state"] == "completed"
+
+
+@pytest.mark.parametrize("resource_state", ["pending", "active", "quarantined"])
+def test_retention_preserves_unsettled_resource_evidence(tmp_path: Path, resource_state: str) -> None:
+    path = tmp_path / "workflows.sqlite3"
+    store = WorkflowStore(path, recover=False)
+    workflow_id = str(store.create(_definition(), initial_state=WorkflowState.COMPLETED)["workflow_id"])
+    store.reserve_resource_claims(
+        request_id="protected-resource", owner_token="owner", category="workflow_step",
+        workflow_id=workflow_id, claims=(path_claim(tmp_path / "target", "write"),),
+    )
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE workflow_resource_requests SET state = ?", (resource_state,))
+        db.execute("UPDATE workflows SET updated_at='2020-01-01T00:00:00.000+00:00'")
+
+    result = cleanup_workflow_history(path, WorkflowHistoryPolicy(1, 0, 1))
+
+    assert result.removed_rows == 0
+    assert result.protected_unresolved_rows == 1
+    assert store.resource_request("protected-resource")["state"] == resource_state
+    assert store.get(workflow_id)["state"] == "completed"
+
+
+def test_retention_rechecks_resource_quarantine_after_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "workflows.sqlite3"
+    store = WorkflowStore(path, recover=False)
+    workflow_id = str(store.create(_definition(), initial_state=WorkflowState.COMPLETED)["workflow_id"])
+    store.reserve_resource_claims(
+        request_id="protected-resource", owner_token="owner", category="workflow_step",
+        workflow_id=workflow_id, claims=(path_claim(tmp_path / "target", "write"),),
+    )
+    store.release_resource_request("protected-resource", owner_token="owner")
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE workflows SET updated_at='2020-01-01T00:00:00.000+00:00'")
+    real_connect = sqlite3.connect
+    inserted = False
+
+    class InjectQuarantine(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+            nonlocal inserted
+            if sql == "BEGIN IMMEDIATE" and not inserted:
+                inserted = True
+                with real_connect(path) as other:
+                    other.execute("UPDATE workflow_resource_requests SET state='quarantined'")
+            return super().execute(sql, parameters)
+
+    monkeypatch.setattr(
+        workflow_retention.sqlite3, "connect",
+        lambda *args, **kwargs: real_connect(*args, factory=InjectQuarantine, **kwargs),
+    )
+    result = cleanup_workflow_history(path, WorkflowHistoryPolicy(1, 0, 1))
+
+    assert inserted
+    assert result.removed_rows == 0
+    assert store.resource_request("protected-resource")["state"] == "quarantined"
+
+
+def test_retention_preserves_execution_admission(tmp_path: Path) -> None:
+    path = tmp_path / "workflows.sqlite3"
+    store = WorkflowStore(path, recover=False)
+    workflow_id = str(store.create(_definition(), initial_state=WorkflowState.CANCELLED)["workflow_id"])
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE workflows SET updated_at='2020-01-01T00:00:00.000+00:00'")
+        db.execute(
+            "INSERT INTO workflow_execution_admissions "
+            "(operation_id, workflow_id, attempt_token, execution_id, lease_token, owner_id, category, admitted_at) "
+            "SELECT operation_id, workflow_id, 'attempt', 'execution', 'lease', 'owner', 'workflow_step', 'now' "
+            "FROM workflow_operations WHERE workflow_id=?", (workflow_id,),
+        )
+
+    result = cleanup_workflow_history(path, WorkflowHistoryPolicy(1, 0, 1))
+
+    assert result.removed_rows == 0
+    assert result.protected_unresolved_rows == 1
+    assert store.get(workflow_id)["state"] == "cancelled"
 
 
 def test_retention_rechecks_lease_acquired_after_eligibility_scan(
@@ -174,8 +252,9 @@ def test_server_health_marks_critical_resource_pressure_unhealthy(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("unresolved", ["operation", "resource", "capacity"])
 def test_server_health_marks_unresolved_workflow_as_degraded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unresolved: str,
 ) -> None:
     settings = replace(SETTINGS, state_dir=tmp_path, memory_dir=tmp_path / "memory")
     monkeypatch.setattr(registry, "SETTINGS", settings)
@@ -184,11 +263,20 @@ def test_server_health_marks_unresolved_workflow_as_degraded(
 
     store = WorkflowStore(settings.workflow_db)
     workflow = store.create(_definition(), initial_state=WorkflowState.UNCERTAIN)
-    with sqlite3.connect(settings.workflow_db) as connection:
-        connection.execute(
-            "UPDATE workflow_operations SET state = 'uncertain' WHERE workflow_id = ?",
-            (workflow["workflow_id"],),
+    if unresolved == "operation":
+        with sqlite3.connect(settings.workflow_db) as connection:
+            connection.execute(
+                "UPDATE workflow_operations SET state = 'uncertain' WHERE workflow_id = ?",
+                (workflow["workflow_id"],),
+            )
+    elif unresolved == "resource":
+        store.reserve_resource_claims(
+            request_id="resource", owner_token="owner", category="test", claims=(path_claim(tmp_path, "write"),),
         )
+        store.quarantine_resource_request("resource", owner_token="owner", reason="cleanup unknown")
+    else:
+        store.reserve_capacity(admission_id="capacity", category="analyzer", owner_token="owner", weight=1, limit=1)
+        store.quarantine_capacity("capacity", owner_token="owner")
 
     async def scenario() -> None:
         async with Client(create_server()) as client:
@@ -197,12 +285,13 @@ def test_server_health_marks_unresolved_workflow_as_degraded(
             health = response.structured_content
             assert health["ok"] is True
             assert health["health_status"] == "degraded"
-            assert "unresolved_uncertain_operations" in health["degraded_reasons"]
-            assert health["unresolved_workflow_operations"] == 1
+            expected_reason = "unresolved_uncertain_operations" if unresolved == "operation" else "resource_ownership_unresolved"
+            assert expected_reason in health["degraded_reasons"]
+            assert health["unresolved_workflow_operations"] == int(unresolved == "operation")
             assert health["workflow_total"] == health["workflow_health"]["workflow_total"]
             assert health["workflow_operation_total"] == health["workflow_health"]["workflow_operation_total"]
             assert health["workflow_event_total"] == health["workflow_health"]["workflow_event_total"]
             assert health["active_workflow_leases"] == health["workflow_health"]["active_workflow_leases"]
-            assert health["workflow_health"]["unresolved_operation_count"] == 1
+            assert health["workflow_health"]["unresolved_operation_count"] == int(unresolved == "operation")
 
     asyncio.run(scenario())

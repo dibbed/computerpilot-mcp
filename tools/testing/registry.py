@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -12,10 +15,14 @@ from pydantic import Field
 
 from core.artifacts import deliver_text
 from core.audit import audit_action
-from core.config import PROJECT_ROOT, resolve_path
+from core.config import PROJECT_ROOT, SETTINGS, resolve_path
+from core.errors import ToolError
 from core.job_scheduler import ensure_job_scheduler
 from core.jobs import JobStore
+from core.resource_claims import coordination_claim, managed_resource_claims, path_claim
+from core.runtime_capacity import acquire_runtime_capacity
 from core.tooling import OPEN_WORLD_WRITE, READ_ONLY, compact_errors
+from core.workflow_store import WorkflowStore
 from tools.testing import runners as _runners
 from tools.testing.background import VerificationRequest, submit_verification
 from tools.testing.diagnostics import merge_diagnostics
@@ -117,29 +124,109 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
         targets: Annotated[list[str] | None, Field(max_length=100)] = None,
         timeout_sec: Annotated[float, Field(gt=0, le=3_600)] = 600,
         max_items: Annotated[int, Field(ge=1, le=1_000)] = 200,
+        max_parallel_checks: Annotated[int, Field(ge=1, le=3)] = 1,
+        total_timeout_sec: Annotated[float | None, Field(gt=0, le=10_800)] = None,
     ) -> dict[str, Any]:
         """Run selected analyzers and return one stable, deduplicated diagnostic stream."""
         working = _cwd(cwd)
-        selected = backends or ["ruff", "mypy", "pytest"]
-        stages: list[dict[str, Any]] = []
-        groups: list[list[dict[str, Any]]] = []
-        for backend in selected:
-            if backend == "ruff":
-                result = run_ruff_summary(working, targets=targets, timeout_sec=timeout_sec, diagnostic_cap=max_items)
-            elif backend == "mypy":
-                result = run_mypy_summary(working, targets=targets, timeout_sec=timeout_sec, diagnostic_cap=max_items)
-            else:
-                result = run_pytest_summary(working, targets=targets, timeout_sec=timeout_sec, diagnostic_cap=max_items)
-            groups.append(result.get("diagnostics", []))
-            stages.append(
-                {
-                    "backend": backend,
-                    "ok": bool(result.get("ok")),
-                    "unavailable": bool(result.get("unavailable")),
-                    "timed_out": bool(result.get("timed_out")),
-                    "diagnostic_count": len(result.get("diagnostics", [])),
+        selected: list[Literal["ruff", "mypy", "pytest"]] = list(backends) if backends else ["ruff", "mypy", "pytest"]
+        admission_store = WorkflowStore(SETTINGS.workflow_db, recover=False)
+        started = time.perf_counter()
+        deadline = None if total_timeout_sec is None else started + total_timeout_sec
+
+        def run_backend(backend: Literal["ruff", "mypy", "pytest"]) -> tuple[dict[str, Any], dict[str, Any]]:
+            remaining = None if deadline is None else deadline - time.perf_counter()
+            if remaining is not None and remaining <= 0:
+                result: dict[str, Any] = {
+                    "ok": False,
+                    "unavailable": False,
+                    "timed_out": True,
+                    "diagnostics": [],
                 }
-            )
+            else:
+                resource_mode: Literal["read", "write"] = "write" if backend == "pytest" else "read"
+                claim_timeout = timeout_sec if remaining is None else max(0.001, min(timeout_sec, remaining))
+                try:
+                    with managed_resource_claims(
+                        [
+                            coordination_claim(),
+                            path_claim(working, resource_mode, scope="subtree"),
+                        ],
+                        category="native.testing.diagnostics",
+                        timeout_sec=claim_timeout,
+                        store=admission_store,
+                    ):
+                        permit_deadline = deadline if deadline is not None else time.perf_counter() + timeout_sec
+                        permit = acquire_runtime_capacity(
+                            SETTINGS.workflow_db,
+                            category="analyzer",
+                            limit=SETTINGS.max_running_analyzers,
+                            deadline=permit_deadline,
+                            store=admission_store,
+                        )
+                        if permit is None:
+                            result = {"ok": False, "unavailable": False, "timed_out": True, "diagnostics": []}
+                        else:
+                            remaining = None if deadline is None else deadline - time.perf_counter()
+                            if remaining is not None and remaining <= 0:
+                                permit.release()
+                                result = {"ok": False, "unavailable": False, "timed_out": True, "diagnostics": []}
+                            else:
+                                effective_timeout = timeout_sec if remaining is None else max(0.001, min(timeout_sec, remaining))
+                                try:
+                                    with permit:
+                                        if backend == "ruff":
+                                            result = run_ruff_summary(
+                                                working,
+                                                targets=targets,
+                                                timeout_sec=effective_timeout,
+                                                diagnostic_cap=max_items,
+                                            )
+                                        elif backend == "mypy":
+                                            result = run_mypy_summary(
+                                                working,
+                                                targets=targets,
+                                                timeout_sec=effective_timeout,
+                                                diagnostic_cap=max_items,
+                                            )
+                                        else:
+                                            result = run_pytest_summary(
+                                                working,
+                                                targets=targets,
+                                                timeout_sec=effective_timeout,
+                                                diagnostic_cap=max_items,
+                                            )
+                                except (ModuleNotFoundError, FileNotFoundError):
+                                    result = {"ok": False, "unavailable": True, "timed_out": False, "diagnostics": []}
+                                except Exception:
+                                    result = {"ok": False, "unavailable": True, "timed_out": False, "diagnostics": []}
+                                if deadline is not None and time.perf_counter() >= deadline and not result.get("timed_out"):
+                                    result = {**result, "ok": False, "timed_out": True}
+                except ToolError as exc:
+                    if exc.code == "resource_admission_timeout":
+                        result = {"ok": False, "unavailable": False, "timed_out": True, "diagnostics": []}
+                    else:
+                        result = {"ok": False, "unavailable": True, "timed_out": False, "diagnostics": []}
+            diagnostics = list(result.get("diagnostics", []))
+            stage = {
+                "backend": backend,
+                "ok": bool(result.get("ok")),
+                "unavailable": bool(result.get("unavailable")),
+                "timed_out": bool(result.get("timed_out")),
+                "diagnostic_count": len(diagnostics),
+            }
+            return result, stage
+
+        if max_parallel_checks == 1 or len(selected) <= 1:
+            completed = [run_backend(backend) for backend in selected]
+        else:
+            capacity = min(max_parallel_checks, len(selected))
+            with ThreadPoolExecutor(max_workers=capacity, thread_name_prefix="diagnostics") as pool:
+                futures = [pool.submit(copy_context().run, run_backend, backend) for backend in selected]
+                completed = [future.result() for future in futures]
+
+        groups = [list(result.get("diagnostics", [])) for result, _stage in completed]
+        stages = [stage for _result, stage in completed]
         diagnostics, truncated = merge_diagnostics(groups, cap=max_items)
         required_unknown = any(stage["unavailable"] or stage["timed_out"] for stage in stages)
         return {
@@ -253,6 +340,7 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
         total_timeout_sec: Annotated[float, Field(gt=0, le=7_200)] = 1_800,
         ruff_fix: bool = False,
         diagnostic_cap: Annotated[int, Field(ge=1, le=200)] = 30,
+        max_parallel_checks: Annotated[int, Field(ge=1, le=3)] = 1,
         delivery: Literal["inline", "file", "auto"] = "inline",
     ) -> dict[str, Any]:
         """Verify changed Python code with syntax, Ruff, mypy, and the narrowest sound pytest scope."""
@@ -265,22 +353,34 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
                 "check_count": len(checks or []),
                 "affected_only": affected_only,
                 "ruff_fix": ruff_fix,
+                "requested_parallel_checks": max_parallel_checks,
             },
         )
-        response = verify_changed_repository(
-            working,
-            changed_paths=changed_paths,
-            base=base,
-            checks=checks,
-            affected_only=affected_only,
-            fallback_policy=fallback_policy,
-            fail_fast=fail_fast,
-            maxfail=maxfail,
-            stage_timeout_sec=stage_timeout_sec,
-            total_timeout_sec=total_timeout_sec,
-            ruff_fix=ruff_fix,
-            diagnostic_cap=diagnostic_cap,
-        )
+        with managed_resource_claims(
+            [
+                coordination_claim(),
+                path_claim(working, "write", scope="subtree"),
+            ],
+            category="native.testing.verify",
+            timeout_sec=total_timeout_sec,
+        ):
+            response = verify_changed_repository(
+                working,
+                changed_paths=changed_paths,
+                base=base,
+                checks=checks,
+                affected_only=affected_only,
+                fallback_policy=fallback_policy,
+                fail_fast=fail_fast,
+                maxfail=maxfail,
+                stage_timeout_sec=stage_timeout_sec,
+                total_timeout_sec=total_timeout_sec,
+                ruff_fix=ruff_fix,
+                diagnostic_cap=diagnostic_cap,
+                max_parallel_checks=max_parallel_checks,
+                analyzer_capacity_db=SETTINGS.workflow_db,
+                analyzer_capacity_limit=SETTINGS.max_running_analyzers,
+            )
         if delivery != "inline":
             delivered = deliver_text(json.dumps(response, ensure_ascii=False, indent=2), delivery)
             if delivered["delivery"] == "file":

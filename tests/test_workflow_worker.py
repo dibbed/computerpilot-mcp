@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -16,6 +18,35 @@ from core.platform import detect_capabilities
 from core.workflow_models import StepDefinition, WorkflowDefinition
 from core.workflows import WorkflowState, workflow_store
 from scripts import workflow_worker
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_worker_operator_dag_gate_in_real_process(tmp_path: Path, enabled: bool) -> None:
+    settings = replace(SETTINGS, state_dir=tmp_path)
+    target = tmp_path / "present.txt"
+    target.write_text("fixture", encoding="utf-8")
+    store = workflow_store(settings.workflow_db)
+    created = store.create(WorkflowDefinition(
+        "operator-dag", tuple(
+            StepDefinition(name=name, action="check_file", arguments={"path": str(target)}, step_id=name, depends_on=())
+            for name in ("left", "right")
+        ), execution_mode="dag", max_parallel_steps=2,
+    ), initial_state=WorkflowState.QUEUED)
+    env = os.environ.copy()
+    env.update(MCP_WORKFLOW_DAG_ENABLED="1" if enabled else "0", MCP_EXTENSIONS_ENABLED="0")
+    code = (
+        "import sys;from pathlib import Path;from dataclasses import replace;import core.config as config;"
+        "config.SETTINGS=replace(config.SETTINGS,state_dir=Path(sys.argv[1]));sys.argv=['workflow_worker','--once'];"
+        "from scripts.workflow_worker import main;raise SystemExit(main())"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path)], cwd=Path(__file__).resolve().parents[1],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    current = store.get(created["workflow_id"])
+    assert current["state"] == ("completed" if enabled else "queued")
+    assert store.active_admissions(created["workflow_id"]) == []
 
 
 class _FakeStore:

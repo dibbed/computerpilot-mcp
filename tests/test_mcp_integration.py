@@ -439,6 +439,53 @@ def test_verify_changes_runs_a_bounded_syntax_plan_over_mcp(tmp_path: Path) -> N
     asyncio.run(scenario())
 
 
+def test_verify_changes_exposes_bounded_parallel_capacity_over_mcp(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("answer = 42\n", encoding="utf-8")
+    tools = {tool.name: tool for tool in asyncio.run(create_server().list_tools())}
+    field = tools["verify_changes"].input_schema["properties"]["max_parallel_checks"]
+    assert field["default"] == 1
+    assert field["minimum"] == 1
+    assert field["maximum"] == 3
+
+    async def scenario() -> None:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            result = _structured(
+                await client.call_tool(
+                    "verify_changes",
+                    {
+                        "repo": str(tmp_path),
+                        "changed_paths": ["app.py"],
+                        "checks": ["syntax"],
+                        "fail_fast": False,
+                        "max_parallel_checks": 2,
+                    },
+                )
+            )
+            assert result["ok"] is True
+            assert result["stages"][0]["status"] == "passed"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("capacity", [0, 4])
+def test_verify_changes_rejects_out_of_range_parallel_capacity_over_mcp(tmp_path: Path, capacity: int) -> None:
+    async def scenario() -> None:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            result = await client.call_tool(
+                "verify_changes",
+                {
+                    "repo": str(tmp_path),
+                    "changed_paths": [],
+                    "checks": [],
+                    "fail_fast": False,
+                    "max_parallel_checks": capacity,
+                },
+            )
+            assert result.is_error is True
+
+    asyncio.run(scenario())
+
+
 def test_memory_round_trip_stays_compact(tmp_path: Path) -> None:
     project_name = f"pytest-{tmp_path.name}"
     memory_path = SETTINGS.memory_dir / f"{project_name}.json"

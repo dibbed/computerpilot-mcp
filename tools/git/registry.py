@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Annotated, Any
 
 from mcp.server import MCPServer
@@ -10,6 +11,7 @@ from pydantic import Field
 
 from core.audit import audit_action
 from core.errors import ToolError
+from core.resource_claims import ResourceClaim, coordination_claim, managed_resource_claims, path_claim
 from core.response import page
 from core.tooling import MUTATING, READ_ONLY, compact_errors
 from tools.git.service import repository as _repo
@@ -18,6 +20,18 @@ from tools.git.service import validate_paths as safe_paths
 from tools.git.service import validate_revision
 
 GitRevision = Annotated[str | None, Field(min_length=1, max_length=500, pattern=r"^[^-]")]
+
+
+def _git_resource_claims(repo: Path) -> tuple[ResourceClaim, ...]:
+    common_raw = _run_git(repo, ["rev-parse", "--git-common-dir"])["stdout"]["text"].strip()
+    common_dir = Path(common_raw)
+    if not common_dir.is_absolute():
+        common_dir = (repo / common_dir).resolve(strict=False)
+    return (
+        coordination_claim(exclusive=True),
+        path_claim(repo, "write", scope="subtree"),
+        path_claim(common_dir, "write", scope="subtree", kind="git"),
+    )
 
 
 def register(mcp: MCPServer) -> None:
@@ -261,7 +275,12 @@ def register(mcp: MCPServer) -> None:
         if name.startswith("-") or not re.fullmatch(r"[A-Za-z0-9._/-]+", name):
             raise ToolError("invalid_branch_name", "Invalid Git branch name.")
         repo = _repo(path)
-        _run_git(repo, ["switch", "-c", name, *([start_point] if start_point else [])])
+        with managed_resource_claims(
+            _git_resource_claims(repo),
+            category="native.git",
+            timeout_sec=120,
+        ):
+            _run_git(repo, ["switch", "-c", name, *([start_point] if start_point else [])])
         audit_action("git_create_branch", target=repo, details={"branch": name})
         return {"ok": True, "repo": str(repo), "branch": name}
 
@@ -271,7 +290,12 @@ def register(mcp: MCPServer) -> None:
         """Stage only explicitly named paths."""
         repo = _repo(path)
         selected = safe_paths(paths)
-        _run_git(repo, ["add", "--", *selected])
+        with managed_resource_claims(
+            _git_resource_claims(repo),
+            category="native.git",
+            timeout_sec=120,
+        ):
+            _run_git(repo, ["add", "--", *selected])
         audit_action("git_stage", target=repo, details={"path_count": len(selected)})
         return {"ok": True, "repo": str(repo), "paths": selected}
 
@@ -280,10 +304,15 @@ def register(mcp: MCPServer) -> None:
     def git_commit(path: str | None, message: Annotated[str, Field(min_length=1, max_length=10_000)]) -> dict[str, Any]:
         """Commit the currently staged index without pushing or rewriting history."""
         repo = _repo(path)
-        if not _run_git(repo, ["diff", "--cached", "--name-only"])["stdout"]["text"].strip():
-            raise ToolError("empty_git_index", "No staged changes to commit.")
-        _run_git(repo, ["commit", "-m", message], 120)
-        full = _run_git(repo, ["rev-parse", "HEAD"])["stdout"]["text"].strip()
+        with managed_resource_claims(
+            _git_resource_claims(repo),
+            category="native.git",
+            timeout_sec=120,
+        ):
+            if not _run_git(repo, ["diff", "--cached", "--name-only"])["stdout"]["text"].strip():
+                raise ToolError("empty_git_index", "No staged changes to commit.")
+            _run_git(repo, ["commit", "-m", message], 120)
+            full = _run_git(repo, ["rev-parse", "HEAD"])["stdout"]["text"].strip()
         audit_action("git_commit", target=repo, details={"message_chars": len(message)})
         return {"ok": True, "repo": str(repo), "hash": full, "subject": message.splitlines()[0]}
 
@@ -298,6 +327,11 @@ def register(mcp: MCPServer) -> None:
         validate_revision(source)
         repo = _repo(path)
         selected = safe_paths(paths)
-        _run_git(repo, ["restore", "--source", source, "--", *selected])
+        with managed_resource_claims(
+            _git_resource_claims(repo),
+            category="native.git",
+            timeout_sec=120,
+        ):
+            _run_git(repo, ["restore", "--source", source, "--", *selected])
         audit_action("git_restore_file", target=repo, details={"path_count": len(selected), "source": source})
         return {"ok": True, "repo": str(repo), "paths": selected, "source": source}

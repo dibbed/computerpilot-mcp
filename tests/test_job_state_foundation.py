@@ -111,13 +111,14 @@ def test_e1_schema_migrates_to_e2_without_resetting_job_state(tmp_path: Path) ->
         columns = {str(item[1]) for item in db.execute("PRAGMA table_info(jobs)")}
         schema_version = int(db.execute("PRAGMA user_version").fetchone()[0])
 
-    assert schema_version == JOB_SCHEMA_VERSION == 3
+    assert schema_version == JOB_SCHEMA_VERSION == 4
     assert {"launch_token", "launch_started"} <= columns
     assert row["version"] == 7
     assert row["queue_deadline"] == deadline
     assert row["status"] == "queued"
     assert row["launch_token"] is None
     assert row["launch_started"] is None
+    assert row["dispatch_phase"] == "legacy"
 
 
 def test_schema_migration_is_idempotent(tmp_path: Path) -> None:
@@ -244,4 +245,4 @@ def test_old_queued_age_does_not_reduce_execution_timeout(tmp_path: Path, monkey
     job_worker.run(store.path, job_id)
     row = store.raw(job_id)
     assert row["status"] == "succeeded"
-    assert row["version"] == 4
+    assert row["version"] == 5

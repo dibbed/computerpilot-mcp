@@ -15,6 +15,7 @@ from mcp import Client
 
 from core import heartbeat, recovery
 from core.errors import ToolError
+from core.process_ownership import spawn_owned_process
 from core.recovery import JOURNAL_SCHEMA_VERSION, OperationRecoveryJournal
 from core.recovery_models import Evidence, OperationState
 from core.registry import create_server
@@ -518,11 +519,14 @@ from pathlib import Path
 
 sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
 from mcp import Client
+from core import config
+
+work = Path({str(tmp_path)!r})
+config.SETTINGS = replace(config.SETTINGS, state_dir=work)
 from core import heartbeat
 from core.registry import create_server
 
-work = Path({str(tmp_path)!r})
-heartbeat.SETTINGS = replace(heartbeat.SETTINGS, state_dir=work)
+heartbeat.SETTINGS = config.SETTINGS
 os.environ["MCP_RUNTIME_GENERATION_ID"] = "runtime-safe-refactor-a"
 os.environ["MCP_LIFECYCLE_CONTROL_FILE"] = str(work / "control.json")
 os.environ["MCP_LIFECYCLE_STATUS_FILE"] = str(work / "status.json")
@@ -546,11 +550,15 @@ asyncio.run(main())
 """,
         encoding="utf-8",
     )
-    process = subprocess.Popen(
+    process = spawn_owned_process(
         [sys.executable, str(helper)],
         cwd=Path(__file__).resolve().parents[1],
+        env=None,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        require_native=True,
     )
     try:
         deadline = time.monotonic() + 15
@@ -569,12 +577,13 @@ asyncio.run(main())
             time.sleep(0.02)
         else:
             raise AssertionError("safe_refactor did not reach the post-write validation window")
-        process.kill()
+        process.terminate_tree(force=True)
         process.wait(timeout=5)
     finally:
         if process.poll() is None:
-            process.kill()
+            process.terminate_tree(force=True)
             process.wait(timeout=5)
+        process.close_ownership()
         if process.stderr is not None:
             process.stderr.close()
 
@@ -586,6 +595,22 @@ asyncio.run(main())
     assert summary["pending_count"] == 0
     assert summary["uncertain"][0]["operation_type"] == "safe_refactor"
     assert str(target) in str(summary["uncertain"][0]["target"])
+    from core.resource_claims import make_resource_capability, path_claim, validate_resource_capability
+    from core.workflow_store import WorkflowStore
+
+    resources = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    import sqlite3
+
+    with sqlite3.connect(resources.path) as db:
+        request_id, owner = db.execute("SELECT request_id,owner_token FROM workflow_resource_requests").fetchone()
+    with pytest.raises(ToolError) as denied:
+        validate_resource_capability(make_resource_capability(request_id, owner, resources.path), (), resources)
+    assert denied.value.code == "resource_capability_invalid"
+    resources.recover_interrupted()
+    assert resources.resource_request(request_id)["state"] == "quarantined"
+    assert resources.reserve_resource_claims(
+        request_id="conflict", owner_token="other", category="test", claims=(path_claim(target, "read"),),
+    )["admitted"] is False
 
 
 def test_server_health_surfaces_recovered_uncertain_operation(

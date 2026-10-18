@@ -15,6 +15,21 @@ from core.state_paths import unlinked_directory_tree, unlinked_regular_file
 
 _TERMINAL_WORKFLOW_STATES = ("completed", "cancelled")
 _UNRESOLVED_OPERATION_STATES = ("uncertain", "reconciling", "unresolvable")
+_UNSETTLED_EVIDENCE_SQL = """
+    EXISTS (
+        SELECT 1 FROM workflow_operations o
+        WHERE o.workflow_id = w.workflow_id
+          AND o.state IN ('uncertain','reconciling','unresolvable')
+    ) OR EXISTS (
+        SELECT 1 FROM workflow_resource_requests r
+        LEFT JOIN workflow_operations o ON o.operation_id = r.operation_id
+        WHERE (r.workflow_id = w.workflow_id OR o.workflow_id = w.workflow_id)
+          AND r.state != 'released'
+    ) OR EXISTS (
+        SELECT 1 FROM workflow_execution_admissions a
+        WHERE a.workflow_id = w.workflow_id
+    )
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,25 +85,20 @@ def cleanup_workflow_history(
         db.execute("PRAGMA foreign_keys=ON")
         protected = int(
             db.execute(
-                """
-                SELECT COUNT(DISTINCT w.workflow_id)
+                f"""
+                SELECT COUNT(*)
                 FROM workflows w
-                JOIN workflow_operations o ON o.workflow_id = w.workflow_id
                 WHERE w.state IN ('completed','cancelled')
-                  AND o.state IN ('uncertain','reconciling','unresolvable')
+                  AND ({_UNSETTLED_EVIDENCE_SQL})
                 """
             ).fetchone()[0]
         )
         rows = db.execute(
-            """
+            f"""
             SELECT w.workflow_id, w.updated_at
             FROM workflows w
             WHERE w.state IN ('completed','cancelled')
-              AND NOT EXISTS (
-                  SELECT 1 FROM workflow_operations o
-                  WHERE o.workflow_id = w.workflow_id
-                    AND o.state IN ('uncertain','reconciling','unresolvable')
-              )
+              AND NOT ({_UNSETTLED_EVIDENCE_SQL})
               AND NOT EXISTS (
                   SELECT 1 FROM workflow_leases l
                   WHERE l.workflow_id = w.workflow_id
@@ -114,18 +124,14 @@ def cleanup_workflow_history(
             try:
                 for workflow_id, reason in reasons.items():
                     deleted = db.execute(
-                        """
-                        DELETE FROM workflows
+                        f"""
+                        DELETE FROM workflows AS w
                         WHERE workflow_id = ?
                           AND state IN ('completed','cancelled')
-                          AND NOT EXISTS (
-                              SELECT 1 FROM workflow_operations o
-                              WHERE o.workflow_id = workflows.workflow_id
-                                AND o.state IN ('uncertain','reconciling','unresolvable')
-                          )
+                          AND NOT ({_UNSETTLED_EVIDENCE_SQL})
                           AND NOT EXISTS (
                               SELECT 1 FROM workflow_leases l
-                              WHERE l.workflow_id = workflows.workflow_id
+                              WHERE l.workflow_id = w.workflow_id
                                 AND l.expires_at > ?
                           )
                         """,
@@ -142,14 +148,10 @@ def cleanup_workflow_history(
                 errors += 1
         remaining = int(
             db.execute(
-                """
+                f"""
                 SELECT COUNT(*) FROM workflows w
                 WHERE w.state IN ('completed','cancelled')
-                  AND NOT EXISTS (
-                      SELECT 1 FROM workflow_operations o
-                      WHERE o.workflow_id = w.workflow_id
-                        AND o.state IN ('uncertain','reconciling','unresolvable')
-                  )
+                  AND NOT ({_UNSETTLED_EVIDENCE_SQL})
                 """
             ).fetchone()[0]
         )

@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from core.config import SETTINGS
 from tools.testing.background import (
     MAX_EVENT_BYTES,
     MAX_REQUEST_BYTES,
@@ -70,6 +71,8 @@ def run_request(payload: str) -> int:
                 repo, **request.options(),
                 stage_callback=lambda event, data: emit(event, data),
                 max_parallel_checks=request.max_parallel_checks,
+                analyzer_capacity_db=SETTINGS.workflow_db,
+                analyzer_capacity_limit=SETTINGS.max_running_analyzers,
                 pytest_extra_args=["--basetemp", str(Path(temporary) / "pytest"), "-o", f"cache_dir={temporary}/cache"],
             )
         after = source_fingerprint(repo, changed_paths=request.changed_paths)

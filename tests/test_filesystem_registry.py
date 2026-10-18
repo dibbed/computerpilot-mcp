@@ -1,11 +1,17 @@
+import sqlite3
 import sys
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from core import config
+from core.resource_claims import coordination_claim, make_resource_capability, path_claim, resource_capability
+from core.workflow_store import WorkflowStore
 from tools.filesystem import registry
 
 ToolFunction = Callable[..., dict[str, Any]]
@@ -33,6 +39,73 @@ class InvalidationCapture:
 
     def clear(self) -> None:
         self.calls.clear()
+
+
+@pytest.mark.parametrize("tool", ["write_file", "create_file", "delete_file", "move_file", "copy_file", "replace_exact"])
+def test_native_writers_reject_read_only_parent_before_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str,
+) -> None:
+    monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+    server = ToolCapture()
+    registry.register(cast(Any, server))
+    target = tmp_path / "data.txt"
+    target.write_text("before", encoding="utf-8")
+    destination = tmp_path / "destination.txt"
+    resources = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    resources.reserve_resource_claims(
+        request_id="reader", owner_token="owner", category="test",
+        claims=(coordination_claim(), path_claim(tmp_path, "read", scope="subtree")),
+    )
+    arguments: dict[str, dict[str, Any]] = {
+        "write_file": {"path": str(target), "content": "after", "backup": False},
+        "create_file": {"path": str(destination), "content": "after"},
+        "delete_file": {"path": str(target)},
+        "move_file": {"source": str(target), "destination": str(destination)},
+        "copy_file": {"source": str(target), "destination": str(destination)},
+        "replace_exact": {"path": str(target), "old": "before", "new": "after", "backup": False},
+    }
+
+    with resource_capability(make_resource_capability("reader", "owner", resources.path)):
+        result = server.functions[tool](**arguments[tool])
+
+    assert result["ok"] is False
+    assert result["error"] == "resource_capability_scope_violation"
+    assert target.read_text(encoding="utf-8") == "before"
+    assert not destination.exists()
+
+
+def test_native_writer_waits_for_shared_reader_without_holding_local_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path))
+    monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+    server = ToolCapture()
+    registry.register(cast(Any, server))
+    target = tmp_path / "data.txt"
+    target.write_text("before", encoding="utf-8")
+    resources = WorkflowStore(config.SETTINGS.workflow_db, recover=False)
+    resources.reserve_resource_claims(
+        request_id="reader", owner_token="owner", category="workflow_step",
+        claims=(coordination_claim(), path_claim(target, "read")),
+    )
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(server.functions["write_file"], str(target), "after", backup=False)
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with sqlite3.connect(resources.path) as db:
+                    pending = db.execute("SELECT COUNT(*) FROM workflow_resource_requests WHERE state='pending'").fetchone()[0]
+                if pending:
+                    break
+                time.sleep(0.01)
+            assert pending == 1
+            assert not future.done()
+            assert target.read_text(encoding="utf-8") == "before"
+            assert not registry.RESOURCE_LOCKS._entries
+        finally:
+            resources.release_resource_request("reader", owner_token="owner")
+        assert future.result(timeout=5)["ok"] is True
+    assert target.read_text(encoding="utf-8") == "after"
 
 
 def test_fifty_concurrent_edits_keep_all_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

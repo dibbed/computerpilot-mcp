@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import tempfile
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
@@ -13,6 +14,7 @@ from typing import Any, Literal
 from core.backups import BACKUP_RETENTION
 from core.errors import ToolError
 from core.executor import run_bounded
+from core.resource_claims import coordination_claim, managed_resource_claims, path_claim
 from core.resource_locks import RESOURCE_LOCKS
 from tools.filesystem import service
 from tools.project.context import CONTEXT_CACHE
@@ -353,7 +355,18 @@ def apply_patch_transaction(
         for path in (_resolve_under(resolved_root, file_patch.old_path), _resolve_under(resolved_root, file_patch.new_path))
         if path is not None
     ]
-    with RESOURCE_LOCKS.sync(*all_paths):
+    with ExitStack() as stack:
+        stack.enter_context(
+            managed_resource_claims(
+                [
+                    coordination_claim(),
+                    path_claim(resolved_root, "read" if dry_run else "write", scope="subtree"),
+                ],
+                category="native.filesystem.patch",
+                timeout_sec=timeout_sec,
+            )
+        )
+        stack.enter_context(RESOURCE_LOCKS.sync(*all_paths))
         prepared = tuple(_prepare(resolved_root, item, encoding=encoding) for item in patch_set.files)
         expected = expected_sha256 or {}
         for item in prepared:

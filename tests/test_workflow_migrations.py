@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -307,8 +308,10 @@ def test_v5_database_migrates_route_columns_without_losing_legacy_data(tmp_path:
     migrated = store.get("legacy-workflow")
     operations = store.list_operations("legacy-workflow")
 
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION == 11
     assert migrated["state"] == "completed"
+    assert migrated["execution_mode"] == "sequential"
+    assert migrated["graph_contract_version"] == 0
     assert migrated["version"] == 7
     assert operations["total_count"] == 1
     operation = operations["items"][0]
@@ -329,5 +332,134 @@ def test_v5_database_migrates_route_columns_without_losing_legacy_data(tmp_path:
             "route_decision_json",
             "fallback_history_json",
         } <= columns
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        workflow_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflows)").fetchall()
+        }
+        step_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_steps)").fetchall()
+        }
+        assert {"execution_mode", "graph_contract_version"} <= workflow_columns
+        assert "step_id" in step_columns
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_step_dependencies'"
+        ).fetchone() is not None
+        admission_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_execution_admissions)").fetchall()
+        }
+        operation_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_operations)").fetchall()
+        }
+        assert {"attempt_token", "execution_id", "dispatch_phase", "attempt_generation"} <= operation_columns
+        assert {"attempt_token", "execution_id", "lease_token", "category", "weight"} <= admission_columns
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_resource_requests'"
+        ).fetchone() is not None
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_resource_claims'"
+        ).fetchone() is not None
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_capacity_requests'"
+        ).fetchone() is not None
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def _seed_v9_admissions(path: Path) -> None:
+    _seed_v024_database(path)
+    with sqlite3.connect(path) as db:
+        for version in range(1, 10):
+            getattr(WorkflowStore, f"_migrate_v{version}")(db)
+        db.execute(
+            "INSERT INTO workflow_resource_requests "
+            "(request_id, workflow_id, owner_token, category, state, created_at, updated_at) "
+            "VALUES ('legacy-resource','legacy-workflow','owner','test','active','before','before')",
+        )
+        db.execute(
+            "INSERT INTO runtime_capacity_requests "
+            "(admission_id, category, owner_token, weight, limit_snapshot, state, created_at, updated_at) "
+            "VALUES ('legacy-permit','analyzer','owner',1,1,'active','before','before')",
+        )
+
+
+def test_v9_capacity_upgrade_preserves_unlinked_ownership_and_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "v9.sqlite3"
+    _seed_v9_admissions(path)
+    store = WorkflowStore(path, recover=False)
+
+    assert store.get("legacy-workflow")["version"] == 7
+    assert store.resource_request("legacy-resource")["state"] == "quarantined"
+    with sqlite3.connect(path) as db:
+        row = db.execute("SELECT admission_id, state, resource_request_id FROM runtime_capacity_requests").fetchone()
+        assert row == ("legacy-permit", "active", None)
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_v10_partial_upgrade_rolls_back_before_retry(tmp_path: Path) -> None:
+    path = tmp_path / "upgrade-denied.sqlite3"
+    _seed_v9_admissions(path)
+    with closing(sqlite3.connect(path)) as db:
+        db.set_authorizer(
+            lambda action, arg1, arg2, database, trigger:
+            sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_CREATE_INDEX else sqlite3.SQLITE_OK,
+        )
+        with pytest.raises(sqlite3.DatabaseError):
+            WorkflowStore._migrate_v10(db)
+        db.rollback()
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert "resource_request_id" not in {row[1] for row in db.execute("PRAGMA table_info(runtime_capacity_requests)")}
+    store = WorkflowStore(path, recover=False)
+    assert store.health_summary()["runtime_capacity_counts"]["analyzer:active"] == 1
+
+
+def _seed_v10_policy_owners(path: Path) -> None:
+    _seed_v9_admissions(path)
+    with closing(sqlite3.connect(path)) as db, db:
+        WorkflowStore._migrate_v10(db)
+        db.execute("UPDATE workflow_resource_requests SET state='active',reason=NULL WHERE request_id='legacy-resource'")
+        db.execute(
+            "INSERT INTO workflow_resource_requests(request_id,owner_token,category,state,created_at,updated_at) "
+            "VALUES ('legacy-pending','pending-owner','test','pending','before','before')",
+        )
+
+
+def test_v11_policy_migration_preserves_unknown_effects_and_denies_legacy_activation(tmp_path: Path) -> None:
+    path = tmp_path / "v10-policy.sqlite3"
+    _seed_v10_policy_owners(path)
+    store = WorkflowStore(path, recover=False)
+    assert store.resource_request("legacy-resource")["state"] == "quarantined"
+    assert store.resource_request("legacy-resource")["reason"] == "legacy_resource_policy_unknown"
+    assert store.resource_request("legacy-pending")["state"] == "released"
+    assert store.get("legacy-workflow")["version"] == 7
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert db.execute("SELECT state FROM runtime_capacity_requests").fetchone()[0] == "active"
+        with pytest.raises(sqlite3.IntegrityError, match="resource_policy_incompatible"):
+            db.execute("UPDATE workflow_resource_requests SET state='active' WHERE request_id='legacy-pending'")
+        with pytest.raises(sqlite3.IntegrityError, match="resource_policy_incompatible"):
+            db.execute(
+                "INSERT INTO workflow_resource_requests(request_id,owner_token,category,state,created_at,updated_at) "
+                "VALUES ('old-client','old-owner','test','pending','before','before')",
+            )
+
+
+def test_v11_partial_policy_upgrade_rolls_back_without_unlocking_owners(tmp_path: Path) -> None:
+    path = tmp_path / "policy-upgrade-denied.sqlite3"
+    _seed_v10_policy_owners(path)
+    with closing(sqlite3.connect(path)) as db:
+        db.set_authorizer(
+            lambda action, table, column, database, trigger:
+            sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_CREATE_TRIGGER else sqlite3.SQLITE_OK,
+        )
+        with pytest.raises(sqlite3.DatabaseError):
+            WorkflowStore._migrate_v11(db)
+        db.rollback()
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert "policy_fingerprint" not in {row[1] for row in db.execute("PRAGMA table_info(workflow_resource_requests)")}
+        assert db.execute("SELECT state FROM workflow_resource_requests WHERE request_id='legacy-resource'").fetchone()[0] == "active"
+    assert WorkflowStore(path, recover=False).resource_request("legacy-resource")["state"] == "quarantined"

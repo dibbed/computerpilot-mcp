@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -30,13 +32,31 @@ def validate_paths(paths: list[str]) -> list[str]:
     return paths
 
 
+def command_arguments(args: Sequence[str]) -> list[str]:
+    command = list(args)
+    if command and command[0] in {"diff", "show", "log"}:
+        command[1:1] = ["--no-ext-diff", "--no-textconv"]
+    elif command and command[0] == "blame":
+        command[1:1] = ["--no-textconv"]
+    return [
+        "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.quotepath=false",
+        "-c", "log.showSignature=false", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *command,
+    ]
+
+
+def command_environment() -> dict[str, str]:
+    # Native Git tools operate locally; missing objects must never start a transport.
+    return {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": ""}
+
+
 def run_git(repo: Path, args: list[str], timeout_sec: float = 30) -> dict[str, Any]:
     executable = shutil.which("git")
     if executable is None:
         raise ToolError("git_not_found", "Git is not installed or not on PATH.")
     result = run_bounded(
-        [executable, "-c", "core.quotepath=false", *args],
+        [executable, *command_arguments(args)],
         cwd=repo,
+        env=command_environment(),
         timeout_sec=timeout_sec,
         stdout_limit=None,
         stderr_limit=None,

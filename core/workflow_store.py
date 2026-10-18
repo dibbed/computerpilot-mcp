@@ -4,28 +4,60 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from core.errors import ToolError
 from core.file_lock import exclusive_file_lock
+from core.resource_claims import ResourceClaim, canonical_claims, claim_sets_conflict, native_resource_owner_alive
 from core.workflow_models import (
     OperationState,
+    StepDefinition,
     WorkflowDefinition,
     WorkflowLease,
     WorkflowState,
     validate_operation_transition,
     validate_workflow_transition,
+    workflow_topological_order,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 11
+GRAPH_CONTRACT_VERSION = 1
+_RESOURCE_CAPABILITY_SQL = """
+SELECT r.* FROM workflow_resource_requests r
+WHERE r.request_id=? AND r.owner_token=? AND r.state='active' AND r.policy_fingerprint=?
+  AND ((r.workflow_id IS NULL AND r.operation_id IS NULL) OR EXISTS (
+      SELECT 1 FROM workflow_execution_admissions a
+      JOIN workflow_operations o ON o.operation_id=a.operation_id
+      JOIN workflow_leases l ON l.workflow_id=a.workflow_id
+      JOIN workflows w ON w.workflow_id=a.workflow_id
+      WHERE a.operation_id=r.operation_id AND a.workflow_id=r.workflow_id
+        AND a.attempt_token=r.attempt_token AND o.attempt_token=a.attempt_token
+        AND o.execution_id=a.execution_id
+        AND o.dispatch_phase IN ('reserved','prepared','may_dispatch')
+        AND l.lease_token=a.lease_token AND l.expires_at>?
+        AND w.state='running' AND w.cancel_requested_at IS NULL
+  ))
+"""
+
+
+def _runtime_policy_fingerprint() -> str:
+    from core.config import SETTINGS
+
+    policy = (1, SETTINGS.max_running_jobs, SETTINGS.max_running_analyzers,
+              SETTINGS.max_running_workflow_steps, SETTINGS.workflow_max_parallel_steps)
+    return hashlib.sha256(json.dumps(policy, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 _ROUTE_HISTORY_MAX = 20
 _ROUTE_JSON_MAX_CHARS = 16_000
 _SECRET_MARKERS = (
@@ -60,10 +92,24 @@ def redact_inputs(value: Any, key: str = "") -> Any:
     return value
 
 
+def _definition_payload(definition: WorkflowDefinition) -> dict[str, Any]:
+    """Serialize definitions while preserving exact legacy sequential bytes."""
+
+    payload = asdict(definition)
+    if definition.execution_mode == "sequential":
+        payload.pop("execution_mode", None)
+        payload.pop("max_parallel_steps", None)
+        payload.pop("total_timeout_sec", None)
+        for step in payload["steps"]:
+            step.pop("step_id", None)
+            step.pop("depends_on", None)
+    return payload
+
+
 def canonical_execution_definition(definition: WorkflowDefinition) -> str:
     """Serialize the exact durable payload that the executor is allowed to run."""
 
-    return _canonical(asdict(definition))
+    return _canonical(_definition_payload(definition))
 
 
 def public_workflow_projection(value: Any) -> Any:
@@ -82,6 +128,13 @@ def _canonical(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _execution_mode(value: Any) -> Literal["sequential", "dag"]:
+    mode = str(value or "sequential")
+    if mode not in {"sequential", "dag"}:
+        raise ToolError("workflow_definition_conflict", f"Unknown workflow execution mode {mode!r}.")
+    return cast(Literal["sequential", "dag"], mode)
 
 
 def _lease_times(ttl_sec: float) -> tuple[str, str]:
@@ -107,12 +160,13 @@ def _lease_from_row(row: sqlite3.Row) -> WorkflowLease:
 
 
 class WorkflowStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, recover: bool = True) -> None:
         self.path = path
         self._lock = threading.RLock()
         path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
-        self.recover_interrupted()
+        if recover:
+            self.recover_interrupted()
 
     def _connect(self, *, setup_wal: bool = False) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
@@ -192,6 +246,21 @@ class WorkflowStore:
                     if version < 6:
                         self._migrate_v6(connection)
                         version = 6
+                    if version < 7:
+                        self._migrate_v7(connection)
+                        version = 7
+                    if version < 8:
+                        self._migrate_v8(connection)
+                        version = 8
+                    if version < 9:
+                        self._migrate_v9(connection)
+                        version = 9
+                    if version < 10:
+                        self._migrate_v10(connection)
+                        version = 10
+                    if version < 11:
+                        self._migrate_v11(connection)
+                        version = 11
             if version > SCHEMA_VERSION:
                 raise ToolError(
                     "workflow_schema_too_new",
@@ -354,8 +423,180 @@ class WorkflowStore:
         )
 
     @staticmethod
+    def _migrate_v7(connection: sqlite3.Connection) -> None:
+        """Persist explicit workflow graph identity and dependency edges."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflows ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'sequential';
+            ALTER TABLE workflows ADD COLUMN graph_contract_version INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE workflow_steps ADD COLUMN step_id TEXT;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_steps_step_id
+                ON workflow_steps(workflow_id, step_id) WHERE step_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS workflow_step_dependencies (
+                workflow_id TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                dependency_step_index INTEGER NOT NULL,
+                PRIMARY KEY (workflow_id, step_index, dependency_step_index),
+                FOREIGN KEY (workflow_id, step_index)
+                    REFERENCES workflow_steps(workflow_id, step_index) ON DELETE CASCADE,
+                FOREIGN KEY (workflow_id, dependency_step_index)
+                    REFERENCES workflow_steps(workflow_id, step_index) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_step_dependencies_parent
+                ON workflow_step_dependencies(workflow_id, dependency_step_index, step_index);
+            INSERT OR IGNORE INTO workflow_step_dependencies(workflow_id, step_index, dependency_step_index)
+                SELECT workflow_id, step_index, step_index - 1
+                FROM workflow_steps WHERE step_index > 0;
+            PRAGMA user_version = 7;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v8(connection: sqlite3.Connection) -> None:
+        """Persist fenced workflow attempts and active execution admissions."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflows ADD COLUMN max_parallel_steps INTEGER NOT NULL DEFAULT 1;
+            ALTER TABLE workflows ADD COLUMN total_timeout_sec REAL;
+            ALTER TABLE workflow_operations ADD COLUMN attempt_token TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN execution_id TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN dispatch_phase TEXT;
+            ALTER TABLE workflow_operations ADD COLUMN attempt_generation INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE workflow_operations ADD COLUMN next_retry_at TEXT;
+            CREATE TABLE IF NOT EXISTS workflow_execution_admissions (
+                operation_id TEXT PRIMARY KEY REFERENCES workflow_operations(operation_id) ON DELETE CASCADE,
+                workflow_id TEXT NOT NULL REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+                attempt_token TEXT NOT NULL UNIQUE,
+                execution_id TEXT NOT NULL,
+                lease_token TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                weight INTEGER NOT NULL DEFAULT 1,
+                admitted_at TEXT NOT NULL,
+                process_pid INTEGER,
+                process_create_time REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_execution_admissions_active
+                ON workflow_execution_admissions(category, admitted_at, workflow_id);
+            CREATE INDEX IF NOT EXISTS idx_workflow_operations_attempt
+                ON workflow_operations(workflow_id, attempt_token, dispatch_phase);
+            PRAGMA user_version = 8;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v9(connection: sqlite3.Connection) -> None:
+        """Persist fair resource requests/claims and shared runtime capacity admissions."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS workflow_resource_requests (
+                ticket INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                workflow_id TEXT REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+                operation_id TEXT REFERENCES workflow_operations(operation_id) ON DELETE CASCADE,
+                attempt_token TEXT,
+                owner_token TEXT NOT NULL,
+                category TEXT NOT NULL,
+                state TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                resolved_evidence TEXT
+            );
+            CREATE TABLE IF NOT EXISTS workflow_resource_claims (
+                claim_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL REFERENCES workflow_resource_requests(request_id) ON DELETE CASCADE,
+                resource_kind TEXT NOT NULL,
+                resource_key TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                scope TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_resource_requests_state_ticket
+                ON workflow_resource_requests(state, ticket);
+            CREATE INDEX IF NOT EXISTS idx_workflow_resource_requests_operation
+                ON workflow_resource_requests(operation_id, state);
+            CREATE INDEX IF NOT EXISTS idx_workflow_resource_claims_request
+                ON workflow_resource_claims(request_id, resource_kind, resource_key);
+            CREATE TABLE IF NOT EXISTS runtime_capacity_requests (
+                ticket INTEGER PRIMARY KEY AUTOINCREMENT,
+                admission_id TEXT NOT NULL UNIQUE,
+                category TEXT NOT NULL,
+                owner_token TEXT NOT NULL,
+                weight INTEGER NOT NULL,
+                limit_snapshot INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_capacity_category_state_ticket
+                ON runtime_capacity_requests(category, state, ticket);
+            PRAGMA user_version = 9;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v10(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE runtime_capacity_requests ADD COLUMN resource_request_id TEXT
+                REFERENCES workflow_resource_requests(request_id) ON DELETE SET NULL;
+            CREATE INDEX idx_runtime_capacity_resource_state
+                ON runtime_capacity_requests(resource_request_id, state);
+            UPDATE workflow_resource_requests
+            SET state='quarantined', reason='legacy_unlinked_capacity_requires_reconciliation'
+            WHERE state='active' AND EXISTS (
+                SELECT 1 FROM runtime_capacity_requests WHERE state!='released'
+            );
+            PRAGMA user_version = 10;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v11(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflow_resource_requests ADD COLUMN policy_fingerprint TEXT NOT NULL DEFAULT '';
+            UPDATE workflow_resource_requests SET state='quarantined',reason='legacy_resource_policy_unknown'
+                WHERE state='active';
+            UPDATE workflow_resource_requests SET state='released',reason='legacy_policy_pending_not_dispatched'
+                WHERE state='pending';
+            CREATE TRIGGER resource_policy_insert BEFORE INSERT ON workflow_resource_requests
+            WHEN NEW.state IN ('pending','active')
+            BEGIN
+                SELECT CASE WHEN NEW.policy_fingerprint='' OR (NEW.state='active' AND EXISTS (
+                    SELECT 1 FROM workflow_resource_requests r
+                    WHERE r.state='active' AND r.policy_fingerprint<>NEW.policy_fingerprint
+                )) THEN RAISE(ABORT,'resource_policy_incompatible') END;
+            END;
+            CREATE TRIGGER resource_policy_activate BEFORE UPDATE OF state,policy_fingerprint ON workflow_resource_requests
+            WHEN NEW.state='active' AND (OLD.state<>'active' OR OLD.policy_fingerprint<>NEW.policy_fingerprint)
+            BEGIN
+                SELECT CASE WHEN NEW.policy_fingerprint='' OR EXISTS (
+                    SELECT 1 FROM workflow_resource_requests r
+                    WHERE r.state='active' AND r.request_id<>NEW.request_id AND r.policy_fingerprint<>NEW.policy_fingerprint
+                ) THEN RAISE(ABORT,'resource_policy_incompatible') END;
+            END;
+            PRAGMA user_version = 11;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
     def _definition_json(definition: WorkflowDefinition) -> str:
-        return _canonical(public_workflow_projection(asdict(definition)))
+        return _canonical(public_workflow_projection(_definition_payload(definition)))
 
     @staticmethod
     def _redact_stored_definitions(connection: sqlite3.Connection) -> None:
@@ -382,6 +623,9 @@ class WorkflowStore:
         }
         if step.get("execution_intent") is not None:
             payload["execution_intent"] = step["execution_intent"]
+        if step.get("step_id") is not None:
+            payload["step_id"] = str(step["step_id"])
+            payload["depends_on"] = list(step.get("depends_on", []))
         return payload, _digest(payload), arguments_fingerprint
 
     @classmethod
@@ -560,8 +804,9 @@ class WorkflowStore:
                 INSERT INTO workflows(
                     workflow_id, idempotency_key, definition_json, inputs_json, inputs_hash, state,
                     current_step, version, created_at, updated_at, last_error,
-                    execution_definition_json, execution_definition_hash, execution_compatible
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?, ?, 1)
+                    execution_definition_json, execution_definition_hash, execution_compatible,
+                    execution_mode, graph_contract_version, max_parallel_steps, total_timeout_sec
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?, ?, 1, ?, ?, ?, ?)
                 """,
                 (
                     workflow_id,
@@ -574,12 +819,36 @@ class WorkflowStore:
                     now,
                     execution_definition_json,
                     execution_definition_hash,
+                    definition.execution_mode,
+                    GRAPH_CONTRACT_VERSION if definition.execution_mode == "dag" else 0,
+                    definition.max_parallel_steps,
+                    definition.total_timeout_sec,
                 ),
             )
             connection.executemany(
-                "INSERT INTO workflow_steps(workflow_id, step_index, state) VALUES (?, ?, 'created')",
-                [(workflow_id, index) for index in range(len(definition.steps))],
+                "INSERT INTO workflow_steps(workflow_id, step_index, state, step_id) VALUES (?, ?, 'created', ?)",
+                [(workflow_id, index, step.step_id) for index, step in enumerate(definition.steps)],
             )
+            if definition.execution_mode == "dag":
+                by_id = {str(step.step_id): index for index, step in enumerate(definition.steps)}
+                dependency_rows = [
+                    (workflow_id, index, by_id[dependency])
+                    for index, step in enumerate(definition.steps)
+                    for dependency in step.depends_on
+                ]
+            else:
+                dependency_rows = [
+                    (workflow_id, index, index - 1)
+                    for index in range(1, len(definition.steps))
+                ]
+            if dependency_rows:
+                connection.executemany(
+                    """
+                    INSERT INTO workflow_step_dependencies(workflow_id, step_index, dependency_step_index)
+                    VALUES (?, ?, ?)
+                    """,
+                    dependency_rows,
+                )
             self._materialize_workflow(connection, workflow_id, legacy=False)
             connection.commit()
         return self.get(workflow_id)
@@ -592,6 +861,132 @@ class WorkflowStore:
             steps = connection.execute(
                 "SELECT * FROM workflow_steps WHERE workflow_id = ? ORDER BY step_index", (workflow_id,),
             ).fetchall()
+            dependencies = connection.execute(
+                """
+                SELECT step_index, dependency_step_index
+                FROM workflow_step_dependencies
+                WHERE workflow_id = ?
+                ORDER BY step_index, dependency_step_index
+                """,
+                (workflow_id,),
+            ).fetchall()
+            operations = connection.execute(
+                """
+                SELECT step_index, state FROM workflow_operations
+                WHERE workflow_id = ? AND operation_index = 0
+                ORDER BY step_index
+                """,
+                (workflow_id,),
+            ).fetchall()
+            admissions = connection.execute(
+                """
+                SELECT adm.operation_id, op.step_index, adm.attempt_token, adm.execution_id,
+                       adm.category, adm.weight, adm.admitted_at
+                FROM workflow_execution_admissions adm
+                JOIN workflow_operations op USING(operation_id)
+                WHERE adm.workflow_id = ?
+                ORDER BY adm.admitted_at, operation_id
+                """,
+                (workflow_id,),
+            ).fetchall()
+
+        execution_mode = _execution_mode(row["execution_mode"])
+        graph_contract_version = int(row["graph_contract_version"] or 0)
+        dependency_indices: dict[int, list[int]] = {}
+        for edge in dependencies:
+            dependency_indices.setdefault(int(edge["step_index"]), []).append(int(edge["dependency_step_index"]))
+        operation_states = {int(operation["step_index"]): str(operation["state"]) for operation in operations}
+        admitted_indices = {int(admission["step_index"]) for admission in admissions}
+        step_ids = {int(step["step_index"]): step["step_id"] for step in steps}
+        successful_parent_states = {OperationState.SUCCEEDED.value, OperationState.ACKNOWLEDGED.value}
+        blocked_parent_states = {
+            OperationState.FAILED.value,
+            OperationState.UNRESOLVABLE.value,
+            OperationState.CANCELLED.value,
+        }
+
+        public_steps: list[dict[str, Any]] = []
+        for step in steps:
+            index = int(step["step_index"])
+            item: dict[str, Any] = {
+                "step_index": index,
+                "state": step["state"],
+                "attempts": step["attempts"],
+                "started_at": step["started_at"],
+                "finished_at": step["finished_at"],
+                "evidence": json.loads(step["evidence_json"]) if step["evidence_json"] else None,
+                "error": step["error"],
+            }
+            if execution_mode == "dag":
+                parent_indices = dependency_indices.get(index, [])
+                parent_ids = [str(step_ids[parent]) for parent in parent_indices]
+                parent_states = [operation_states.get(parent, OperationState.CREATED.value) for parent in parent_indices]
+                own_state = operation_states.get(index, OperationState.CREATED.value)
+                if own_state in successful_parent_states:
+                    readiness = "completed"
+                elif index in admitted_indices:
+                    readiness = "active"
+                elif own_state in blocked_parent_states:
+                    readiness = "terminal"
+                elif own_state in {
+                    OperationState.RUNNING.value,
+                    OperationState.WAITING.value,
+                    OperationState.UNCERTAIN.value,
+                    OperationState.RECONCILING.value,
+                }:
+                    readiness = "active"
+                elif any(state in blocked_parent_states for state in parent_states):
+                    readiness = "blocked_dependencies"
+                elif all(state in successful_parent_states for state in parent_states):
+                    readiness = "ready"
+                else:
+                    readiness = "waiting_dependencies"
+                item.update(
+                    {
+                        "step_id": step["step_id"],
+                        "depends_on": parent_ids,
+                        "readiness": readiness,
+                    }
+                )
+            public_steps.append(item)
+
+        ready_step_indices = [
+            int(step["step_index"]) for step in public_steps if step.get("readiness") == "ready"
+        ]
+        active_step_indices = [
+            int(step["step_index"]) for step in public_steps if step.get("readiness") == "active"
+        ]
+        blocked_step_indices = [
+            int(step["step_index"])
+            for step in public_steps
+            if step.get("readiness") == "blocked_dependencies"
+        ]
+        completed_step_count = sum(1 for step in public_steps if step.get("readiness") == "completed")
+        requested_parallel_steps = int(row["max_parallel_steps"] or 1)
+        if execution_mode == "dag":
+            from core.config import SETTINGS
+
+            effective_parallel_steps = min(
+                requested_parallel_steps,
+                SETTINGS.workflow_max_parallel_steps,
+                SETTINGS.max_running_workflow_steps,
+            )
+        else:
+            effective_parallel_steps = 1
+
+        topological_order = list(range(len(steps)))
+        if execution_mode == "dag" and int(row["execution_compatible"] or 0) == 1 and row["execution_definition_json"]:
+            raw = json.loads(str(row["execution_definition_json"]))
+            definition = WorkflowDefinition(
+                str(raw["name"]),
+                tuple(StepDefinition(**step) for step in raw["steps"]),
+                str(raw.get("description", "")),
+                execution_mode,
+                int(row["max_parallel_steps"] or raw.get("max_parallel_steps", 1)),
+                float(row["total_timeout_sec"]) if row["total_timeout_sec"] is not None else raw.get("total_timeout_sec"),
+            )
+            topological_order = list(workflow_topological_order(definition))
+
         return {
             "workflow_id": row["workflow_id"],
             "state": row["state"],
@@ -601,23 +996,23 @@ class WorkflowStore:
             "inputs": json.loads(row["inputs_json"]),
             "execution_compatible": bool(row["execution_compatible"]),
             "execution_definition_hash": row["execution_definition_hash"],
+            "execution_mode": execution_mode,
+            "graph_contract_version": graph_contract_version,
+            "topological_order": topological_order,
+            "max_parallel_steps": requested_parallel_steps,
+            "effective_parallel_steps": effective_parallel_steps,
+            "total_timeout_sec": row["total_timeout_sec"],
+            "active_admission_count": len(admissions),
+            "ready_step_indices": ready_step_indices,
+            "active_step_indices": active_step_indices,
+            "blocked_step_indices": blocked_step_indices,
+            "completed_step_count": completed_step_count,
             "cancel_requested_at": row["cancel_requested_at"],
             "cancel_reason": row["cancel_reason"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "last_error": row["last_error"],
-            "steps": [
-                {
-                    "step_index": step["step_index"],
-                    "state": step["state"],
-                    "attempts": step["attempts"],
-                    "started_at": step["started_at"],
-                    "finished_at": step["finished_at"],
-                    "evidence": json.loads(step["evidence_json"]) if step["evidence_json"] else None,
-                    "error": step["error"],
-                }
-                for step in steps
-            ],
+            "steps": public_steps,
         }
 
     def execution_definition(self, workflow_id: str) -> WorkflowDefinition:
@@ -626,7 +1021,8 @@ class WorkflowStore:
         with closing(self._connect()) as connection:
             row = connection.execute(
                 """
-                SELECT execution_definition_json, execution_compatible
+                SELECT execution_definition_json, execution_compatible,
+                       execution_mode, graph_contract_version, max_parallel_steps, total_timeout_sec
                 FROM workflows WHERE workflow_id = ?
                 """,
                 (workflow_id,),
@@ -638,14 +1034,32 @@ class WorkflowStore:
                 "workflow_legacy_definition_unrecoverable",
                 "This legacy workflow has no exact durable execution definition and cannot be executed or resumed.",
             )
-        from core.workflow_models import StepDefinition
+        execution_mode = _execution_mode(row["execution_mode"])
+        graph_contract_version = int(row["graph_contract_version"] or 0)
+        if execution_mode == "dag" and graph_contract_version != GRAPH_CONTRACT_VERSION:
+            raise ToolError(
+                "unsupported_workflow_graph_version",
+                f"Workflow graph contract version {graph_contract_version} is not supported.",
+            )
+        if execution_mode == "sequential" and graph_contract_version != 0:
+            raise ToolError(
+                "workflow_definition_conflict",
+                "Sequential workflow unexpectedly contains graph contract metadata.",
+            )
 
         raw = json.loads(str(row["execution_definition_json"]))
-        return WorkflowDefinition(
+        definition = WorkflowDefinition(
             str(raw["name"]),
             tuple(StepDefinition(**step) for step in raw["steps"]),
             str(raw.get("description", "")),
+            execution_mode,
+            int(row["max_parallel_steps"] or raw.get("max_parallel_steps", 1)),
+            float(row["total_timeout_sec"])
+            if row["total_timeout_sec"] is not None
+            else raw.get("total_timeout_sec"),
         )
+        workflow_topological_order(definition)
+        return definition
 
     def list_operations(
         self,
@@ -938,7 +1352,7 @@ class WorkflowStore:
                 raise ToolError("workflow_operation_not_uncertain", "Only an uncertain operation can be resolved.")
             workflow_id, step_index = str(operation["workflow_id"]), int(operation["step_index"])
             workflow = connection.execute(
-                "SELECT state, current_step FROM workflows WHERE workflow_id = ?", (workflow_id,),
+                "SELECT state, current_step, execution_mode FROM workflows WHERE workflow_id = ?", (workflow_id,),
             ).fetchone()
             if workflow is None or str(workflow["state"]) != WorkflowState.UNCERTAIN.value:
                 raise ToolError("workflow_not_uncertain", "The operation aggregate is not in uncertain state.")
@@ -995,6 +1409,18 @@ class WorkflowStore:
                 (workflow_state.value, current_step, 1 if workflow_state is WorkflowState.UNCERTAIN else 2,
                  now, workflow_state.value, workflow_id),
             )
+            if str(workflow["execution_mode"]) == "dag":
+                if final_state is not OperationState.UNCERTAIN:
+                    connection.execute(
+                        "DELETE FROM workflow_execution_admissions WHERE operation_id=? AND NOT EXISTS "
+                        "(SELECT 1 FROM workflow_resource_requests WHERE operation_id=? AND state!='released')",
+                        (operation_id, operation_id),
+                    )
+                aggregate, next_index, aggregate_error, _ = self._aggregate_state(connection, workflow_id)
+                connection.execute(
+                    "UPDATE workflows SET state=?,current_step=?,last_error=? WHERE workflow_id=?",
+                    (aggregate.value, next_index, aggregate_error, workflow_id),
+                )
             connection.execute(
                 """
                 INSERT INTO workflow_events(workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at)
@@ -1070,7 +1496,1186 @@ class WorkflowStore:
             connection.commit()
         return self.get_operation(operation_id) if return_operation else None
 
-    def acquire_lease(self, workflow_id: str, owner_id: str, ttl_sec: float) -> WorkflowLease:
+    @staticmethod
+    def _resource_claims_for_request(
+        connection: sqlite3.Connection,
+        request_id: str,
+    ) -> tuple[ResourceClaim, ...]:
+        rows = connection.execute(
+            """
+            SELECT resource_kind, resource_key, mode, scope
+            FROM workflow_resource_claims
+            WHERE request_id = ?
+            ORDER BY resource_kind, resource_key, scope, mode
+            """,
+            (request_id,),
+        ).fetchall()
+        return tuple(
+            ResourceClaim(
+                str(row["resource_kind"]),
+                str(row["resource_key"]),
+                cast(Literal["read", "write"], str(row["mode"])),
+                cast(Literal["exact", "subtree"], str(row["scope"])),
+            )
+            for row in rows
+        )
+
+    @staticmethod
+    def _make_admission_room(
+        connection: sqlite3.Connection,
+        table: Literal["workflow_resource_requests", "runtime_capacity_requests"],
+    ) -> None:
+        from core.config import SETTINGS
+
+        limit = SETTINGS.max_runtime_admission_records
+        count = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        if count < limit:
+            return
+        needed = count - limit + 1
+        removed = connection.execute(
+            f"DELETE FROM {table} WHERE ticket IN ("
+            f"SELECT ticket FROM {table} WHERE state='released' ORDER BY ticket LIMIT ?)",
+            (needed,),
+        ).rowcount
+        if removed < needed:
+            raise ToolError(
+                "runtime_admission_storage_exhausted",
+                "Admission record quota is exhausted; unresolved ownership must be reconciled before new work.",
+            )
+
+    def reserve_resource_claims(
+        self,
+        *,
+        request_id: str,
+        owner_token: str,
+        claims: Sequence[ResourceClaim],
+        category: str,
+        workflow_id: str | None = None,
+        operation_id: str | None = None,
+        attempt_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist one fair, all-or-none resource request and activate it when conflict-free."""
+
+        request_id = request_id.strip()
+        owner_token = owner_token.strip()
+        category = category.strip()
+        if not request_id or len(request_id) > 200:
+            raise ToolError("invalid_resource_request", "Resource request id must contain 1..200 characters.")
+        if not owner_token or len(owner_token) > 200:
+            raise ToolError("invalid_resource_owner", "Resource owner token must contain 1..200 characters.")
+        if not category or len(category) > 80:
+            raise ToolError("invalid_resource_category", "Resource category must contain 1..80 characters.")
+        canonical = canonical_claims(claims)
+        if not canonical:
+            raise ToolError("empty_resource_claims", "At least one resource claim is required.")
+        if len(canonical) > 256:
+            raise ToolError("too_many_resource_claims", "A resource request may contain at most 256 claims.")
+        if sum(len(claim.key.encode("utf-8")) + len(claim.kind.encode("utf-8")) for claim in canonical) > 65_536:
+            raise ToolError("resource_claims_too_large", "A resource claim set may contain at most 64 KiB of keys.")
+        now = _now()
+        policy_fingerprint = _runtime_policy_fingerprint()
+
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
+            ).fetchone()
+            if row is None:
+                self._make_admission_room(connection, "workflow_resource_requests")
+                connection.execute(
+                    """
+                    INSERT INTO workflow_resource_requests(
+                        request_id, workflow_id, operation_id, attempt_token, owner_token,
+                        category, state, reason, created_at, updated_at, policy_fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
+                    """,
+                    (
+                        request_id,
+                        workflow_id,
+                        operation_id,
+                        attempt_token,
+                        owner_token,
+                        category,
+                        now,
+                        now,
+                        policy_fingerprint,
+                    ),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO workflow_resource_claims(
+                        request_id, resource_kind, resource_key, mode, scope
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [(request_id, claim.kind, claim.key, claim.mode, claim.scope) for claim in canonical],
+                )
+                row = connection.execute(
+                    "SELECT * FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
+                ).fetchone()
+            if row is None:  # pragma: no cover - guarded by insert/read above
+                raise ToolError("resource_request_missing", "Resource request could not be persisted.")
+            if str(row["owner_token"]) != owner_token or str(row["category"]) != category:
+                raise ToolError("resource_request_conflict", "Resource request id is already owned by another request.")
+            persisted_claims = self._resource_claims_for_request(connection, request_id)
+            if persisted_claims != canonical:
+                raise ToolError("resource_request_conflict", "Resource request id was reused with different claims.")
+            state = str(row["state"])
+            if row["policy_fingerprint"] != policy_fingerprint:
+                connection.commit()
+                return {"admitted": False, "request_id": request_id, "state": state, "reason": "resource_policy_incompatible"}
+            if state == "active":
+                connection.commit()
+                return {"admitted": True, "request_id": request_id, "state": state, "reason": None}
+            if state == "quarantined":
+                connection.commit()
+                return {
+                    "admitted": False,
+                    "request_id": request_id,
+                    "state": state,
+                    "reason": "resource_quarantined",
+                }
+            if state == "released":
+                connection.commit()
+                return {
+                    "admitted": False,
+                    "request_id": request_id,
+                    "state": state,
+                    "reason": "resource_request_terminal",
+                }
+
+            current_ticket = int(row["ticket"])
+            other_rows = connection.execute(
+                """
+                SELECT request_id, ticket, state, policy_fingerprint
+                FROM workflow_resource_requests
+                WHERE request_id <> ? AND state IN ('pending', 'active', 'quarantined')
+                ORDER BY ticket
+                """,
+                (request_id,),
+            ).fetchall()
+            conflict_reason: str | None = None
+            for other in other_rows:
+                other_state = str(other["state"])
+                if other_state == "pending" and int(other["ticket"]) > current_ticket:
+                    continue
+                if other_state in {"active", "pending"} and other["policy_fingerprint"] != policy_fingerprint:
+                    conflict_reason = "resource_policy_incompatible"
+                    break
+                other_claims = self._resource_claims_for_request(connection, str(other["request_id"]))
+                if not claim_sets_conflict(canonical, other_claims):
+                    continue
+                if other_state == "quarantined":
+                    conflict_reason = "resource_quarantined"
+                    break
+                if other_state == "active":
+                    conflict_reason = "resource_conflict"
+                    break
+                conflict_reason = "older_conflicting_request"
+                break
+
+            if conflict_reason is not None:
+                connection.execute(
+                    "UPDATE workflow_resource_requests SET reason = ?, updated_at = ? WHERE request_id = ?",
+                    (conflict_reason, now, request_id),
+                )
+                connection.commit()
+                return {
+                    "admitted": False,
+                    "request_id": request_id,
+                    "state": "pending",
+                    "reason": conflict_reason,
+                }
+
+            connection.execute(
+                """
+                UPDATE workflow_resource_requests
+                SET state = 'active', reason = NULL, updated_at = ?
+                WHERE request_id = ? AND state = 'pending'
+                """,
+                (now, request_id),
+            )
+            connection.commit()
+        return {"admitted": True, "request_id": request_id, "state": "active", "reason": None}
+
+    def resource_request(self, request_id: str, *, expected_owner_token: str | None = None) -> dict[str, Any]:
+        if expected_owner_token is not None and native_resource_owner_alive(expected_owner_token) is False:
+            raise ToolError("resource_capability_invalid", "Native resource ownership cannot be verified.")
+        with closing(self._connect()) as connection:
+            if expected_owner_token is None:
+                row = connection.execute(
+                    "SELECT * FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    _RESOURCE_CAPABILITY_SQL,
+                    (request_id, expected_owner_token, _runtime_policy_fingerprint(), _now()),
+                ).fetchone()
+            if row is None:
+                if expected_owner_token is not None:
+                    raise ToolError("resource_capability_invalid", "Internal resource capability is no longer active.")
+                raise ToolError("resource_request_not_found", "Resource request was not found.")
+            claims = self._resource_claims_for_request(connection, request_id)
+        return {**dict(row), "claims": [claim.public() for claim in claims]}
+
+    def bind_resource_request_attempt(
+        self,
+        request_id: str,
+        *,
+        owner_token: str,
+        attempt_token: str,
+    ) -> dict[str, Any]:
+        """Attach one active resource request to the exact durable workflow attempt."""
+
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state, owner_token, attempt_token FROM workflow_resource_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError("resource_request_not_found", "Resource request was not found.")
+            if str(row["owner_token"]) != owner_token:
+                raise ToolError("resource_owner_mismatch", "Resource request owner token does not match.")
+            if str(row["state"]) != "active":
+                raise ToolError("resource_request_not_active", "Resource request must be active before binding an attempt.")
+            current_attempt = row["attempt_token"]
+            if current_attempt is not None and str(current_attempt) != attempt_token:
+                raise ToolError("resource_attempt_conflict", "Resource request is already bound to another attempt.")
+            connection.execute(
+                """
+                UPDATE workflow_resource_requests
+                SET attempt_token = ?, updated_at = ?
+                WHERE request_id = ? AND owner_token = ? AND state = 'active'
+                """,
+                (attempt_token, now, request_id, owner_token),
+            )
+            connection.commit()
+        return self.resource_request(request_id)
+
+    def release_resource_request(self, request_id: str, *, owner_token: str) -> bool:
+        """Release only an active request owned by the exact token; quarantine needs resolution."""
+
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state, owner_token FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return False
+            if str(row["owner_token"]) != owner_token:
+                raise ToolError("resource_owner_mismatch", "Resource request owner token does not match.")
+            if str(row["state"]) not in {"active", "pending"}:
+                connection.commit()
+                return False
+            if connection.execute(
+                "SELECT 1 FROM runtime_capacity_requests WHERE resource_request_id=? AND state!='released' LIMIT 1",
+                (request_id,),
+            ).fetchone() is not None:
+                connection.execute(
+                    "UPDATE workflow_resource_requests SET state='quarantined', "
+                    "reason='child_capacity_cleanup_unresolved', updated_at=? WHERE request_id=?",
+                    (now, request_id),
+                )
+                connection.commit()
+                return False
+            connection.execute(
+                """
+                UPDATE workflow_resource_requests
+                SET state = 'released', reason = NULL, updated_at = ?
+                WHERE request_id = ? AND owner_token = ? AND state IN ('active', 'pending')
+                """,
+                (now, request_id, owner_token),
+            )
+            connection.commit()
+        return True
+
+    def quarantine_resource_request(self, request_id: str, *, owner_token: str, reason: str) -> dict[str, Any]:
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state, owner_token FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError("resource_request_not_found", "Resource request was not found.")
+            if str(row["owner_token"]) != owner_token:
+                raise ToolError("resource_owner_mismatch", "Resource request owner token does not match.")
+            if str(row["state"]) == "released":
+                raise ToolError("resource_request_terminal", "Released resource request cannot be quarantined.")
+            connection.execute(
+                """
+                UPDATE workflow_resource_requests
+                SET state = 'quarantined', reason = ?, updated_at = ?
+                WHERE request_id = ? AND owner_token = ?
+                """,
+                (reason[:2_000], now, request_id, owner_token),
+            )
+            connection.commit()
+        return self.resource_request(request_id)
+
+    def resolve_quarantined_resource_request(
+        self,
+        request_id: str,
+        *,
+        owner_token: str,
+        resolution: Literal["released"],
+        evidence: str,
+    ) -> dict[str, Any]:
+        if not evidence.strip():
+            raise ToolError("resource_resolution_evidence_required", "Resource resolution requires bounded operator evidence.")
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state, owner_token,workflow_id FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError("resource_request_not_found", "Resource request was not found.")
+            if str(row["owner_token"]) != owner_token:
+                raise ToolError("resource_owner_mismatch", "Resource request owner token does not match.")
+            if str(row["state"]) != "quarantined":
+                raise ToolError("resource_request_not_quarantined", "Resource request is not quarantined.")
+            if connection.execute(
+                "SELECT 1 FROM runtime_capacity_requests WHERE resource_request_id=? AND state!='released' LIMIT 1",
+                (request_id,),
+            ).fetchone() is not None:
+                raise ToolError("resource_children_unresolved", "Child process capacity must settle before resource resolution.")
+            connection.execute(
+                """
+                UPDATE workflow_resource_requests
+                SET state = ?, reason = 'resolved', resolved_evidence = ?, updated_at = ?
+                WHERE request_id = ? AND owner_token = ? AND state = 'quarantined'
+                """,
+                (resolution, evidence[:2_000], now, request_id, owner_token),
+            )
+            workflow_id = row["workflow_id"]
+            workflow = connection.execute(
+                "SELECT state,execution_mode FROM workflows WHERE workflow_id=?", (workflow_id,),
+            ).fetchone() if workflow_id is not None else None
+            if workflow is not None and workflow["execution_mode"] == "dag" and workflow["state"] == "uncertain":
+                connection.execute(
+                    "DELETE FROM workflow_execution_admissions WHERE workflow_id=? "
+                    "AND operation_id IN (SELECT operation_id FROM workflow_operations "
+                    "WHERE workflow_id=? AND state IN ('succeeded','acknowledged','failed','unresolvable','cancelled')) "
+                    "AND NOT EXISTS (SELECT 1 FROM workflow_resource_requests r "
+                    "WHERE r.operation_id=workflow_execution_admissions.operation_id AND r.state!='released')",
+                    (workflow_id, workflow_id),
+                )
+                target, step_index, error, _ = self._aggregate_state(connection, str(workflow_id))
+                connection.execute(
+                    "UPDATE workflows SET state=?,current_step=?,last_error=?,version=version+1,updated_at=? WHERE workflow_id=?",
+                    (target.value, step_index, error, now, workflow_id),
+                )
+                connection.execute(
+                    "INSERT INTO workflow_events(workflow_id,event_type,state,metadata_json,created_at) "
+                    "VALUES (?,'workflow_resource_resolved',?,?,?)",
+                    (workflow_id, target.value, _canonical({"request_id": request_id}), now),
+                )
+            connection.commit()
+        return self.resource_request(request_id)
+
+    def reserve_capacity(
+        self,
+        *,
+        admission_id: str,
+        category: str,
+        owner_token: str,
+        weight: int,
+        limit: int,
+        resource_request_id: str | None = None,
+        resource_owner_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Reserve shared weighted runtime capacity with FIFO pending fairness."""
+
+        if weight < 1 or limit < 1 or weight > limit:
+            raise ToolError("invalid_capacity_request", "Capacity weight/limit are invalid.")
+        if not 1 <= len(admission_id) <= 200 or not 1 <= len(owner_token) <= 200 or not 1 <= len(category) <= 80:
+            raise ToolError("invalid_capacity_request", "Capacity identifiers exceed their bounded lengths.")
+        if resource_owner_token is not None and native_resource_owner_alive(resource_owner_token) is False:
+            raise ToolError("resource_capability_invalid", "Native resource ownership cannot be verified.")
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if resource_request_id is not None and connection.execute(
+                _RESOURCE_CAPABILITY_SQL,
+                (resource_request_id, resource_owner_token, _runtime_policy_fingerprint(), now),
+            ).fetchone() is None:
+                raise ToolError("resource_capability_invalid", "Parent resource ownership is no longer active.")
+            row = connection.execute(
+                "SELECT * FROM runtime_capacity_requests WHERE admission_id = ?", (admission_id,),
+            ).fetchone()
+            if row is None:
+                self._make_admission_room(connection, "runtime_capacity_requests")
+                connection.execute(
+                    """
+                    INSERT INTO runtime_capacity_requests(
+                        admission_id, category, owner_token, weight, limit_snapshot,
+                        state, reason, created_at, updated_at, resource_request_id
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
+                    """,
+                    (admission_id, category, owner_token, weight, limit, now, now, resource_request_id),
+                )
+                row = connection.execute(
+                    "SELECT * FROM runtime_capacity_requests WHERE admission_id = ?", (admission_id,),
+                ).fetchone()
+            if row is None:  # pragma: no cover
+                raise ToolError("capacity_request_missing", "Capacity request could not be persisted.")
+            if (
+                str(row["owner_token"]) != owner_token
+                or str(row["category"]) != category
+                or int(row["weight"]) != weight
+                or row["resource_request_id"] != resource_request_id
+            ):
+                raise ToolError("capacity_request_conflict", "Capacity admission id was reused with different inputs.")
+            state = str(row["state"])
+            if state == "active":
+                connection.commit()
+                return {"admitted": True, "admission_id": admission_id, "state": state, "reason": None}
+            if state in {"quarantined", "released"}:
+                connection.commit()
+                return {
+                    "admitted": False,
+                    "admission_id": admission_id,
+                    "state": state,
+                    "reason": "capacity_quarantined" if state == "quarantined" else "capacity_request_terminal",
+                }
+            ticket = int(row["ticket"])
+            older_pending = connection.execute(
+                """
+                SELECT 1 FROM runtime_capacity_requests
+                WHERE category = ? AND state = 'pending' AND ticket < ?
+                ORDER BY ticket LIMIT 1
+                """,
+                (category, ticket),
+            ).fetchone()
+            active_weight = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(weight), 0) FROM runtime_capacity_requests
+                    WHERE category = ? AND state IN ('active', 'quarantined')
+                    """,
+                    (category,),
+                ).fetchone()[0]
+            )
+            if older_pending is not None or active_weight + weight > limit:
+                reason = "older_capacity_request" if older_pending is not None else "capacity_exhausted"
+                connection.execute(
+                    "UPDATE runtime_capacity_requests SET reason = ?, limit_snapshot = ?, updated_at = ? WHERE admission_id = ?",
+                    (reason, limit, now, admission_id),
+                )
+                connection.commit()
+                return {"admitted": False, "admission_id": admission_id, "state": "pending", "reason": reason}
+            connection.execute(
+                """
+                UPDATE runtime_capacity_requests
+                SET state = 'active', reason = NULL, limit_snapshot = ?, updated_at = ?
+                WHERE admission_id = ? AND state = 'pending'
+                """,
+                (limit, now, admission_id),
+            )
+            connection.commit()
+        return {"admitted": True, "admission_id": admission_id, "state": "active", "reason": None}
+
+    def quarantine_capacity(self, admission_id: str, *, owner_token: str) -> None:
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT owner_token, state, resource_request_id FROM runtime_capacity_requests WHERE admission_id=?",
+                (admission_id,),
+            ).fetchone()
+            if row is None or row["owner_token"] != owner_token or row["state"] == "released":
+                raise ToolError("capacity_owner_mismatch", "Capacity ownership cannot be quarantined.")
+            connection.execute(
+                "UPDATE runtime_capacity_requests SET state='quarantined', reason='process_cleanup_unresolved', "
+                "updated_at=? WHERE admission_id=?", (now, admission_id),
+            )
+            connection.execute(
+                "UPDATE workflow_resource_requests SET state='quarantined', reason='child_capacity_cleanup_unresolved', "
+                "updated_at=? WHERE request_id=? AND state='active'", (now, row["resource_request_id"]),
+            )
+            connection.commit()
+
+    def release_capacity(self, admission_id: str, *, owner_token: str) -> bool:
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state, owner_token FROM runtime_capacity_requests WHERE admission_id = ?", (admission_id,),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return False
+            if str(row["owner_token"]) != owner_token:
+                raise ToolError("capacity_owner_mismatch", "Capacity owner token does not match.")
+            if str(row["state"]) not in {"active", "pending"}:
+                connection.commit()
+                return False
+            connection.execute(
+                """
+                UPDATE runtime_capacity_requests
+                SET state = 'released', reason = NULL, updated_at = ?
+                WHERE admission_id = ? AND owner_token = ? AND state IN ('active', 'pending')
+                """,
+                (now, admission_id, owner_token),
+            )
+            connection.commit()
+        return True
+
+    def release_process_capacity(self, pid: int, created: float) -> int:
+        """Release permits only after the caller confirms owned process-tree cleanup."""
+
+        if pid < 1 or created <= 0:
+            raise ValueError("A positive process identity is required.")
+        owner_prefix = f"pid-{pid}-{created:.6f}-%"
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            count = connection.execute(
+                """
+                UPDATE runtime_capacity_requests
+                SET state = 'released', reason = 'owned_process_cleanup_complete', updated_at = ?
+                WHERE owner_token LIKE ? AND state IN ('active', 'pending', 'quarantined')
+                """,
+                (_now(), owner_prefix),
+            ).rowcount
+            connection.commit()
+        return count
+
+    def release_dead_resource_capacity(
+        self, request_id: str, *, owner_token: str, settle_timeout_sec: float = 0.0,
+    ) -> int:
+        """Settle child permits only on positive death evidence after native cleanup."""
+        import psutil
+
+        if not 0.0 <= settle_timeout_sec <= 5.0:
+            raise ValueError("Child exit confirmation timeout must be in 0..5 seconds.")
+
+        with closing(self._connect()) as connection:
+            resource = connection.execute(
+                "SELECT owner_token FROM workflow_resource_requests WHERE request_id=?", (request_id,),
+            ).fetchone()
+            if resource is None or resource["owner_token"] != owner_token:
+                raise ToolError("resource_owner_mismatch", "Cleanup does not own this resource request.")
+            rows = connection.execute(
+                "SELECT DISTINCT owner_token FROM runtime_capacity_requests WHERE resource_request_id=? AND state!='released'",
+                (request_id,),
+            ).fetchall()
+        identities: set[tuple[int, float]] = set()
+        deadline = time.monotonic() + settle_timeout_sec
+        hard_deadline = time.monotonic() + 5.0
+        for row in rows:
+            parts = str(row["owner_token"]).split("-", 3)
+            try:
+                if len(parts) != 4 or parts[0] != "pid" or not parts[3]:
+                    continue
+                pid, created = int(parts[1]), float(parts[2])
+                if pid > 0 and 0 < created < float("inf"):
+                    identities.add((pid, created))
+            except ValueError:
+                continue
+        released = 0
+        for pid, created in identities:
+            if time.monotonic() >= hard_deadline:
+                raise ToolError("process_cleanup_incomplete", "Child capacity cleanup exceeded its deadline.")
+            try:
+                process = psutil.Process(pid)
+                if abs(process.create_time() - created) < 0.01 and process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                    if os.name != "nt":
+                        continue
+                    from core.windows_job import process_identity_exited
+
+                    confirmed = process_identity_exited(pid, created)
+                    while confirmed is not True and time.monotonic() < deadline:
+                        # Windows can publish process exit shortly after Job Object termination.
+                        # Never treat a timeout or an uninspectable owner as dead.
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        time.sleep(min(0.05, remaining))
+                        confirmed = process_identity_exited(pid, created)
+                    if confirmed is not True:
+                        continue
+            except psutil.NoSuchProcess:
+                pass
+            except (psutil.Error, OSError):
+                continue
+            released += self.release_process_capacity(pid, created)
+        # Live ancestors and uninspectable owners retain their own permits and resource fence.
+        return released
+
+    def fail_unadmitted_operation(
+        self, operation_id: str, *, lease_token: str, error_code: str,
+    ) -> None:
+        """Atomically fail an operation rejected during footprint preflight.
+
+        No dispatch barrier or admission exists at this point. Persisting the
+        operation, step and event together prevents a stranded running DAG if
+        the coordinator dies immediately after the rejection.
+        """
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT workflow_id,step_index,state,attempt_token FROM workflow_operations "
+                "WHERE operation_id=?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(operation["workflow_id"])
+            self._require_current_lease_row(connection, workflow_id, lease_token, now)
+            if operation["state"] != "created" or operation["attempt_token"] is not None:
+                raise ToolError("workflow_attempt_conflict", "Pre-dispatch rejection no longer owns the operation.")
+            if connection.execute(
+                "SELECT 1 FROM workflow_execution_admissions WHERE operation_id=? "
+                "UNION ALL SELECT 1 FROM workflow_resource_requests "
+                "WHERE operation_id=? AND state!='released' LIMIT 1",
+                (operation_id, operation_id),
+            ).fetchone() is not None:
+                raise ToolError("workflow_attempt_conflict", "Pre-dispatch rejection cannot override a resource owner.")
+            error = error_code[:128]
+            step_index = int(operation["step_index"])
+            connection.execute(
+                "UPDATE workflow_operations SET state='failed', attempts=attempts+1,"
+                "version=version+1,evidence_json=?,error=?,started_at=COALESCE(started_at,?),"
+                "finished_at=?,updated_at=? WHERE operation_id=?",
+                (_canonical({"dispatch_phase": "preflight_rejected", "no_dispatch": True}),
+                 error, now, now, now, operation_id),
+            )
+            connection.execute(
+                "UPDATE workflow_steps SET state='failed',attempts=attempts+1,error=?,"
+                "started_at=COALESCE(started_at,?),finished_at=? "
+                "WHERE workflow_id=? AND step_index=?",
+                (error, now, now, workflow_id, step_index),
+            )
+            connection.execute(
+                "INSERT INTO workflow_events(workflow_id,step_index,operation_id,event_type,"
+                "state,metadata_json,created_at) VALUES (?, ?, ?, 'operation_preflight_failed',"
+                "'failed',?,?)",
+                (workflow_id, step_index, operation_id, _canonical({"reason": error}), now),
+            )
+            connection.commit()
+
+    def claim_ready_operation(
+        self,
+        operation_id: str,
+        *,
+        lease_token: str,
+        owner_id: str,
+        execution_id: str,
+        global_limit: int,
+        category: str = "workflow_step",
+        weight: int = 1,
+    ) -> dict[str, Any] | None:
+        """Atomically reserve one dependency-ready operation without dispatching it."""
+
+        if global_limit < 1 or weight < 1:
+            raise ToolError("invalid_workflow_admission_limit", "Workflow admission limits must be positive.")
+        now = _now()
+        attempt_token = uuid.uuid4().hex
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(operation["workflow_id"])
+            workflow = connection.execute(
+                "SELECT state, cancel_requested_at, max_parallel_steps FROM workflows WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+            if workflow is None:
+                raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
+            if str(workflow["state"]) not in {WorkflowState.RUNNING.value, WorkflowState.CANCELLING.value}:
+                connection.commit()
+                return None
+            if workflow["cancel_requested_at"] or str(workflow["state"]) == WorkflowState.CANCELLING.value:
+                connection.commit()
+                return None
+            lease = connection.execute(
+                "SELECT lease_token, expires_at FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if lease is None or str(lease["lease_token"]) != lease_token:
+                raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+            if str(lease["expires_at"]) <= now:
+                raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
+            if str(operation["state"]) not in {OperationState.CREATED.value, OperationState.FAILED.value}:
+                connection.commit()
+                return None
+            if connection.execute(
+                "SELECT 1 FROM workflow_execution_admissions WHERE operation_id = ?", (operation_id,),
+            ).fetchone() is not None:
+                connection.commit()
+                return None
+
+            parent_rows = connection.execute(
+                """
+                SELECT parent.state
+                FROM workflow_step_dependencies dep
+                JOIN workflow_operations parent
+                  ON parent.workflow_id = dep.workflow_id
+                 AND parent.step_index = dep.dependency_step_index
+                 AND parent.operation_index = 0
+                WHERE dep.workflow_id = ? AND dep.step_index = ?
+                """,
+                (workflow_id, int(operation["step_index"])),
+            ).fetchall()
+            if any(
+                str(parent["state"]) not in {OperationState.SUCCEEDED.value, OperationState.ACKNOWLEDGED.value}
+                for parent in parent_rows
+            ):
+                connection.commit()
+                return None
+
+            global_active = int(connection.execute(
+                "SELECT COALESCE(SUM(weight), 0) FROM workflow_execution_admissions WHERE category = ?",
+                (category,),
+            ).fetchone()[0])
+            workflow_active = int(connection.execute(
+                "SELECT COALESCE(SUM(weight), 0) FROM workflow_execution_admissions WHERE workflow_id = ? AND category = ?",
+                (workflow_id, category),
+            ).fetchone()[0])
+            workflow_limit = int(workflow["max_parallel_steps"] or 1)
+            if global_active + weight > global_limit or workflow_active + weight > workflow_limit:
+                connection.commit()
+                return None
+
+            connection.execute(
+                """
+                INSERT INTO workflow_execution_admissions(
+                    operation_id, workflow_id, attempt_token, execution_id, lease_token,
+                    owner_id, category, weight, admitted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    workflow_id,
+                    attempt_token,
+                    execution_id,
+                    lease_token,
+                    owner_id[:200],
+                    category,
+                    weight,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE workflow_operations
+                SET attempt_token = ?, execution_id = ?, dispatch_phase = 'reserved',
+                    attempt_generation = attempt_generation + 1, version = version + 1, updated_at = ?
+                WHERE operation_id = ?
+                """,
+                (attempt_token, execution_id, now, operation_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events(
+                    workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at
+                ) VALUES (?, ?, ?, 'operation_reserved', 'reserved', ?, ?)
+                """,
+                (
+                    workflow_id,
+                    int(operation["step_index"]),
+                    operation_id,
+                    _canonical({"execution_id": execution_id, "category": category, "weight": weight}),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self.get_operation(operation_id)
+
+    def prepare_operation_attempt(
+        self,
+        operation_id: str,
+        *,
+        expected_version: int,
+        attempt_token: str,
+        lease_token: str,
+        intent_evidence: dict[str, Any] | None,
+        postcondition: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Persist prepared intent under the active fenced attempt."""
+
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(operation["workflow_id"])
+            if int(operation["version"]) != expected_version or str(operation["attempt_token"] or "") != attempt_token:
+                raise ToolError("workflow_attempt_conflict", "Workflow operation attempt changed before preparation.")
+            admission = connection.execute(
+                "SELECT lease_token FROM workflow_execution_admissions WHERE operation_id = ? AND attempt_token = ?",
+                (operation_id, attempt_token),
+            ).fetchone()
+            if admission is None or str(admission["lease_token"]) != lease_token:
+                raise ToolError("workflow_attempt_conflict", "Workflow admission no longer owns this attempt.")
+            self._require_current_lease_row(connection, workflow_id, lease_token, now)
+            workflow = connection.execute(
+                "SELECT cancel_requested_at, state FROM workflows WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if workflow is None or workflow["cancel_requested_at"] or str(workflow["state"]) == WorkflowState.CANCELLING.value:
+                raise ToolError("workflow_cancelled_before_dispatch", "Workflow cancellation won before dispatch.")
+            connection.execute(
+                """
+                UPDATE workflow_operations
+                SET dispatch_phase = 'prepared', intent_evidence_json = ?,
+                    postcondition_json = COALESCE(?, postcondition_json), version = version + 1, updated_at = ?
+                WHERE operation_id = ? AND version = ? AND attempt_token = ?
+                """,
+                (
+                    _canonical(intent_evidence) if intent_evidence is not None else None,
+                    _canonical(postcondition) if postcondition is not None else None,
+                    now,
+                    operation_id,
+                    expected_version,
+                    attempt_token,
+                ),
+            )
+            row = connection.execute("SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,)).fetchone()
+            connection.commit()
+        assert row is not None
+        return self.get_operation(operation_id)
+
+    @staticmethod
+    def _require_current_lease_row(
+        connection: sqlite3.Connection,
+        workflow_id: str,
+        lease_token: str,
+        now: str,
+    ) -> sqlite3.Row:
+        lease = connection.execute(
+            "SELECT * FROM workflow_leases WHERE workflow_id = ?", (workflow_id,),
+        ).fetchone()
+        if lease is None or str(lease["lease_token"]) != lease_token:
+            raise ToolError("workflow_lease_token_mismatch", "Workflow lease token does not match the current owner.")
+        if str(lease["expires_at"]) <= now:
+            raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
+        return lease
+
+    def mark_operation_may_dispatch(
+        self,
+        operation_id: str,
+        *,
+        expected_version: int,
+        attempt_token: str,
+        lease_token: str,
+    ) -> dict[str, Any]:
+        """Cross the durable side-effect barrier for exactly one current attempt."""
+
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(operation["workflow_id"])
+            if int(operation["version"]) != expected_version or str(operation["attempt_token"] or "") != attempt_token:
+                raise ToolError("workflow_attempt_conflict", "Workflow operation attempt changed before dispatch.")
+            admission = connection.execute(
+                "SELECT lease_token FROM workflow_execution_admissions WHERE operation_id = ? AND attempt_token = ?",
+                (operation_id, attempt_token),
+            ).fetchone()
+            if admission is None or str(admission["lease_token"]) != lease_token:
+                raise ToolError("workflow_attempt_conflict", "Workflow admission no longer owns this attempt.")
+            self._require_current_lease_row(connection, workflow_id, lease_token, now)
+            workflow = connection.execute(
+                "SELECT cancel_requested_at, state FROM workflows WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if workflow is None or workflow["cancel_requested_at"] or str(workflow["state"]) == WorkflowState.CANCELLING.value:
+                raise ToolError("workflow_cancelled_before_dispatch", "Workflow cancellation won before dispatch.")
+            connection.execute(
+                """
+                UPDATE workflow_operations
+                SET state = 'running', dispatch_phase = 'may_dispatch', attempts = attempts + 1,
+                    version = version + 1, updated_at = ?, started_at = COALESCE(started_at, ?)
+                WHERE operation_id = ? AND version = ? AND attempt_token = ?
+                """,
+                (now, now, operation_id, expected_version, attempt_token),
+            )
+            connection.execute(
+                """
+                UPDATE workflow_steps SET state = 'running', attempts = attempts + 1,
+                    started_at = COALESCE(started_at, ?)
+                WHERE workflow_id = ? AND step_index = ?
+                """,
+                (now, workflow_id, int(operation["step_index"])),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events(
+                    workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at
+                ) VALUES (?, ?, ?, 'operation_may_dispatch', 'running', ?, ?)
+                """,
+                (workflow_id, int(operation["step_index"]), operation_id, _canonical({"attempt_token": attempt_token}), now),
+            )
+            row = connection.execute("SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,)).fetchone()
+            connection.commit()
+        assert row is not None
+        return self.get_operation(operation_id)
+
+    def complete_operation_attempt(
+        self,
+        operation_id: str,
+        *,
+        expected_version: int,
+        attempt_token: str,
+        lease_token: str,
+        final_state: OperationState,
+        result: dict[str, Any] | None = None,
+        evidence: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically settle operation, step, event and admission for one fenced attempt."""
+
+        if final_state not in {
+            OperationState.SUCCEEDED,
+            OperationState.FAILED,
+            OperationState.UNCERTAIN,
+            OperationState.CANCELLED,
+        }:
+            raise ToolError("invalid_operation_resolution", "Unsupported workflow attempt result.")
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise ToolError("workflow_operation_not_found", "Workflow operation was not found.")
+            workflow_id = str(operation["workflow_id"])
+            if int(operation["version"]) != expected_version or str(operation["attempt_token"] or "") != attempt_token:
+                raise ToolError("workflow_attempt_conflict", "Late workflow result does not own the current attempt.")
+            admission = connection.execute(
+                "SELECT lease_token FROM workflow_execution_admissions WHERE operation_id = ? AND attempt_token = ?",
+                (operation_id, attempt_token),
+            ).fetchone()
+            if admission is None or str(admission["lease_token"]) != lease_token:
+                raise ToolError("workflow_attempt_conflict", "Late workflow result no longer owns admission.")
+            self._require_current_lease_row(connection, workflow_id, lease_token, now)
+            current_operation_state = OperationState(str(operation["state"]))
+            dispatch_phase = str(operation["dispatch_phase"] or "")
+            if not (
+                current_operation_state in {OperationState.CREATED, OperationState.FAILED}
+                and dispatch_phase in {"reserved", "prepared"}
+                and final_state in {OperationState.FAILED, OperationState.CANCELLED}
+            ):
+                validate_operation_transition(current_operation_state, final_state)
+            if connection.execute(
+                """
+                SELECT 1 FROM workflow_resource_requests r
+                WHERE r.operation_id=? AND r.attempt_token=?
+                  AND (r.state='quarantined' OR EXISTS (
+                      SELECT 1 FROM runtime_capacity_requests c
+                      WHERE c.resource_request_id=r.request_id AND c.state!='released'
+                  )) LIMIT 1
+                """,
+                (operation_id, attempt_token),
+            ).fetchone() is not None:
+                final_state = OperationState.UNCERTAIN
+                error = "workflow_child_ownership_unresolved"
+                evidence = {**(evidence or {}), "conclusive": False, "satisfied": False, "ownership_unresolved": True}
+            step_state = {
+                OperationState.SUCCEEDED: "completed",
+                OperationState.FAILED: "failed",
+                OperationState.UNCERTAIN: "uncertain",
+                OperationState.CANCELLED: "cancelled",
+            }[final_state]
+            connection.execute(
+                """
+                UPDATE workflow_operations
+                SET state = ?, dispatch_phase = 'settled', version = version + 1,
+                    result_json = ?, evidence_json = ?, error = ?, updated_at = ?, finished_at = ?
+                WHERE operation_id = ? AND version = ? AND attempt_token = ?
+                """,
+                (
+                    final_state.value,
+                    _canonical(redact_inputs(result)) if result is not None else None,
+                    _canonical(redact_inputs(evidence)) if evidence is not None else None,
+                    error[:2_000] if error else None,
+                    now,
+                    now,
+                    operation_id,
+                    expected_version,
+                    attempt_token,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE workflow_steps SET state = ?, evidence_json = ?, error = ?, finished_at = ?
+                WHERE workflow_id = ? AND step_index = ?
+                """,
+                (
+                    step_state,
+                    _canonical(redact_inputs(evidence)) if evidence is not None else None,
+                    error[:2_000] if error else None,
+                    now,
+                    workflow_id,
+                    int(operation["step_index"]),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events(
+                    workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at
+                ) VALUES (?, ?, ?, 'operation_settled', ?, ?, ?)
+                """,
+                (
+                    workflow_id,
+                    int(operation["step_index"]),
+                    operation_id,
+                    final_state.value,
+                    _canonical({"attempt_token": attempt_token}),
+                    now,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM workflow_execution_admissions WHERE operation_id = ? AND attempt_token = ?",
+                (operation_id, attempt_token),
+            )
+            row = connection.execute("SELECT * FROM workflow_operations WHERE operation_id = ?", (operation_id,)).fetchone()
+            connection.commit()
+        assert row is not None
+        return self.get_operation(operation_id)
+
+    @staticmethod
+    def _aggregate_state(
+        connection: sqlite3.Connection, workflow_id: str, *, keep_running: bool = False,
+    ) -> tuple[WorkflowState, int, str | None, int]:
+        workflow = connection.execute(
+            "SELECT cancel_requested_at FROM workflows WHERE workflow_id=?", (workflow_id,),
+        ).fetchone()
+        operations = connection.execute(
+            "SELECT step_index,state,error FROM workflow_operations WHERE workflow_id=? AND operation_index=0 ORDER BY step_index",
+            (workflow_id,),
+        ).fetchall()
+        active = int(connection.execute(
+            "SELECT COUNT(*) FROM workflow_execution_admissions a JOIN workflow_operations o USING(operation_id) "
+            "WHERE a.workflow_id=? AND o.state IN ('created','running','waiting')", (workflow_id,),
+        ).fetchone()[0])
+        states = {str(operation["state"]) for operation in operations}
+        success = {"succeeded", "acknowledged"}
+        unfinished = [int(operation["step_index"]) for operation in operations if str(operation["state"]) not in success]
+        current_step = min(unfinished) if unfinished else len(operations)
+        unresolved = bool(states & {"uncertain", "reconciling"}) or connection.execute(
+            "SELECT 1 FROM workflow_resource_requests WHERE workflow_id=? AND state IN ('active','quarantined') LIMIT 1",
+            (workflow_id,),
+        ).fetchone() is not None
+        failed = bool(states & {"failed", "unresolvable"})
+        cancelled = bool(workflow["cancel_requested_at"]) or "cancelled" in states
+        error = None
+        if active:
+            target = WorkflowState.CANCELLING if cancelled else WorkflowState.RUNNING
+        elif unresolved:
+            target = WorkflowState.UNCERTAIN
+            error = "workflow has unresolved operation or resource ownership"
+        elif failed:
+            target = WorkflowState.FAILED
+            error = next(str(op["error"] or "workflow operation failed")[:2_000]
+                         for op in operations if str(op["state"]) in {"failed", "unresolvable"})
+        elif cancelled:
+            target = WorkflowState.CANCELLED
+        elif operations and states <= success:
+            target = WorkflowState.COMPLETED
+        else:
+            target = WorkflowState.RUNNING if keep_running else WorkflowState.PAUSED
+        return target, current_step, error, active
+
+    def recompute_workflow_aggregate(
+        self,
+        workflow_id: str,
+        *,
+        lease_token: str,
+        stop_admission_reason: str | None = None,
+        keep_running: bool = False,
+    ) -> dict[str, Any]:
+        """Derive DAG aggregate state from canonical operation/admission facts."""
+
+        now = _now()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            workflow = connection.execute(
+                "SELECT * FROM workflows WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+            if workflow is None:
+                raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
+            self._require_current_lease_row(connection, workflow_id, lease_token, now)
+            target, current_step, primary_error, active_count = self._aggregate_state(
+                connection, workflow_id, keep_running=keep_running,
+            )
+            primary_error = primary_error or stop_admission_reason
+
+            # A resource-blocked scheduler polls frequently. If canonical state
+            # is unchanged, do not inflate event history or the workflow version.
+            if (
+                target.value == str(workflow["state"])
+                and current_step == int(workflow["current_step"])
+                and primary_error == workflow["last_error"]
+            ):
+                connection.commit()
+                return self.get(workflow_id)
+
+            connection.execute(
+                """
+                UPDATE workflows
+                SET state = ?, current_step = ?, version = version + 1, updated_at = ?, last_error = ?
+                WHERE workflow_id = ?
+                """,
+                (target.value, current_step, now, primary_error, workflow_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events(workflow_id, step_index, operation_id, event_type, state, metadata_json, created_at)
+                VALUES (?, NULL, NULL, 'workflow_aggregate_recomputed', ?, ?, ?)
+                """,
+                (
+                    workflow_id,
+                    target.value,
+                    _canonical({"active_count": active_count, "stop_admission_reason": stop_admission_reason}),
+                    now,
+                ),
+            )
+            connection.commit()
+        return self.get(workflow_id)
+
+    def active_admissions(self, workflow_id: str | None = None, *, category: str | None = None) -> list[dict[str, Any]]:
+        filters: list[str] = []
+        parameters: list[Any] = []
+        if workflow_id is not None:
+            filters.append("workflow_id = ?")
+            parameters.append(workflow_id)
+        if category is not None:
+            filters.append("category = ?")
+            parameters.append(category)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"SELECT * FROM workflow_execution_admissions {where} ORDER BY admitted_at, operation_id",
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def acquire_lease(
+        self,
+        workflow_id: str,
+        owner_id: str,
+        ttl_sec: float,
+        *,
+        allow_reentry: bool = True,
+    ) -> WorkflowLease:
         owner_id = owner_id.strip()
         if not owner_id or len(owner_id) > 200:
             raise ToolError("invalid_lease_owner", "Lease owner must contain between 1 and 200 characters.")
@@ -1093,8 +2698,8 @@ class WorkflowStore:
                     (workflow_id, owner_id, token, now, now, expires_at),
                 )
             elif str(current["expires_at"]) > now:
-                if str(current["owner_id"]) != owner_id:
-                    raise ToolError("workflow_already_claimed", "Workflow is already claimed by another executor.")
+                if str(current["owner_id"]) != owner_id or not allow_reentry:
+                    raise ToolError("workflow_already_claimed", "Workflow is already claimed by another execution.")
                 connection.commit()
                 return _lease_from_row(current)
             else:
@@ -1276,7 +2881,7 @@ class WorkflowStore:
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
-                "SELECT state, version FROM workflows WHERE workflow_id = ?", (workflow_id,),
+                "SELECT state, version, execution_mode FROM workflows WHERE workflow_id = ?", (workflow_id,),
             ).fetchone()
             if current is None:
                 raise ToolError("workflow_not_found", f"Workflow {workflow_id!r} was not found.")
@@ -1291,6 +2896,40 @@ class WorkflowStore:
                 if str(lease["expires_at"]) <= _now():
                     raise ToolError("workflow_lease_expired", "Workflow lease has expired.")
             validate_workflow_transition(WorkflowState(str(current["state"])), state)
+            if state is WorkflowState.QUEUED:
+                self._require_safe_resume(connection, workflow_id)
+                if (
+                    str(current["execution_mode"]) == "dag"
+                    and str(current["state"]) in {"failed", "paused"}
+                ):
+                    # An explicit operator resume may retry proven safe failures,
+                    # independently of the automatic transient retry budget.
+                    # Prior attempt counters and immutable failure events remain.
+                    failed = connection.execute(
+                        "SELECT operation_id,step_index FROM workflow_operations "
+                        "WHERE workflow_id=? AND state='failed'", (workflow_id,),
+                    ).fetchall()
+                    for operation in failed:
+                        operation_id = str(operation["operation_id"])
+                        step_index = int(operation["step_index"])
+                        connection.execute(
+                            "UPDATE workflow_operations SET state='created', version=version+1, "
+                            "attempt_token=NULL,execution_id=NULL,dispatch_phase=NULL,"
+                            "result_json=NULL,evidence_json=NULL,error=NULL,updated_at=? "
+                            "WHERE operation_id=? AND state='failed'",
+                            (_now(), operation_id),
+                        )
+                        connection.execute(
+                            "UPDATE workflow_steps SET state='created',evidence_json=NULL,error=NULL,"
+                            "finished_at=NULL WHERE workflow_id=? AND step_index=?",
+                            (workflow_id, step_index),
+                        )
+                        connection.execute(
+                            "INSERT INTO workflow_events(workflow_id,step_index,operation_id,event_type,"
+                            "state,metadata_json,created_at) VALUES (?, ?, ?, 'operation_explicitly_requeued',"
+                            "'created',?,?)",
+                            (workflow_id, step_index, operation_id, _canonical({}), _now()),
+                        )
             assignments = ["state = ?", "version = version + 1", "updated_at = ?", "last_error = ?"]
             parameters: list[Any] = [state.value, _now(), last_error[:2_000] if last_error else None]
             if current_step is not None:
@@ -1304,6 +2943,27 @@ class WorkflowStore:
                 raise ToolError("workflow_version_conflict", "Workflow changed; reload status before retrying.")
             connection.commit()
         return self.get(workflow_id)
+
+    @staticmethod
+    def _require_safe_resume(connection: sqlite3.Connection, workflow_id: str) -> None:
+        from core.workflow_actions import get_action_descriptor
+
+        if connection.execute(
+            "SELECT 1 FROM workflow_operations WHERE workflow_id=? AND state IN ('running','waiting','uncertain','reconciling') "
+            "UNION ALL SELECT 1 FROM workflow_resource_requests WHERE workflow_id=? AND state!='released' "
+            "UNION ALL SELECT 1 FROM workflow_execution_admissions WHERE workflow_id=? LIMIT 1",
+            (workflow_id, workflow_id, workflow_id),
+        ).fetchone() is not None:
+            raise ToolError("workflow_resume_unresolved", "All branches, child ownership and resource claims must settle before resume.")
+        for operation in connection.execute(
+            "SELECT action,evidence_json,external_ref_json FROM workflow_operations "
+            "WHERE workflow_id=? AND state IN ('failed','unresolvable')", (workflow_id,),
+        ):
+            descriptor = get_action_descriptor(str(operation["action"]))
+            if descriptor.mutates or descriptor.name == "verify_changes":
+                evidence = json.loads(operation["evidence_json"] or "{}")
+                if evidence.get("dispatch_phase") not in {"reserved", "prepared", "preflight_rejected"} or operation["external_ref_json"]:
+                    raise ToolError("workflow_resume_unsafe_replay", "A failed effectful branch needs proof of no dispatch before retry.")
 
     def advance_running(
         self,
@@ -1392,13 +3052,100 @@ class WorkflowStore:
                 raise ToolError("workflow_step_not_found", "Workflow step was not found.")
             connection.commit()
 
+    def _recover_dag_execution(self, connection: sqlite3.Connection, workflow_id: str, now: str) -> None:
+        operations = connection.execute(
+            "SELECT * FROM workflow_operations WHERE workflow_id=? ORDER BY step_index,operation_index", (workflow_id,),
+        ).fetchall()
+        for operation in operations:
+            operation_id = str(operation["operation_id"])
+            state = str(operation["state"])
+            phase = str(operation["dispatch_phase"] or "")
+            has_child = bool(operation["external_ref_json"]) or connection.execute(
+                "SELECT 1 FROM runtime_capacity_requests c JOIN workflow_resource_requests r "
+                "ON r.request_id=c.resource_request_id WHERE r.operation_id=? AND c.state!='released' LIMIT 1",
+                (operation_id,),
+            ).fetchone() is not None
+            safe = state == "created" and not has_child and (
+                phase in {"reserved", "prepared"} or
+                (not phase and not operation["started_at"] and int(operation["attempts"]) == 0)
+            )
+            if state in {"running", "waiting", "reconciling"} or (state == "created" and not safe):
+                state = "uncertain"
+            connection.execute(
+                "UPDATE workflow_operations SET state=?, version=version+1, updated_at=?, "
+                "dispatch_phase=CASE WHEN ? THEN NULL ELSE dispatch_phase END, "
+                "error=CASE WHEN ?='uncertain' THEN 'runtime_ended_without_checkpoint' ELSE error END "
+                "WHERE operation_id=?", (state, now, int(safe), state, operation_id),
+            )
+            step_state = {"succeeded": "completed", "acknowledged": "completed", "unresolvable": "failed"}.get(state, state)
+            connection.execute(
+                "UPDATE workflow_steps SET state=?, evidence_json=?, error=?, "
+                "finished_at=CASE WHEN ?='created' THEN NULL ELSE COALESCE(finished_at,?) END "
+                "WHERE workflow_id=? AND step_index=?",
+                (step_state, operation["evidence_json"], "runtime_ended_without_checkpoint" if state == "uncertain" else operation["error"],
+                 state, now, workflow_id, operation["step_index"]),
+            )
+            connection.execute(
+                "UPDATE workflow_resource_requests SET state=CASE WHEN state='pending' OR ? THEN 'released' "
+                "ELSE 'quarantined' END,reason='workflow_lease_lost_before_resource_reconciliation',updated_at=? "
+                "WHERE operation_id=? AND state IN ('active','pending')",
+                (int(safe or (state in {"succeeded", "acknowledged", "failed", "unresolvable", "cancelled"} and not has_child)),
+                 now, operation_id),
+            )
+            if safe or state in {"succeeded", "acknowledged", "failed", "unresolvable", "cancelled"}:
+                connection.execute(
+                    "DELETE FROM workflow_execution_admissions WHERE operation_id=? AND NOT EXISTS "
+                    "(SELECT 1 FROM workflow_resource_requests WHERE operation_id=? AND state!='released')",
+                    (operation_id, operation_id),
+                )
+        # Unbound reservations cannot authorize dispatch; an active unbound owner still needs evidence.
+        connection.execute(
+            "UPDATE workflow_resource_requests SET state=CASE WHEN state='pending' THEN 'released' ELSE 'quarantined' END, "
+            "reason='workflow_lease_lost_before_resource_reconciliation',updated_at=? "
+            "WHERE workflow_id=? AND operation_id IS NULL AND state IN ('active','pending')", (now, workflow_id),
+        )
+        target, current_step, error, _ = self._aggregate_state(connection, workflow_id)
+        connection.execute(
+            "UPDATE workflows SET state=?,current_step=?,version=version+1,updated_at=?,last_error=? WHERE workflow_id=?",
+            (target.value, current_step, now, error, workflow_id),
+        )
+        connection.execute("DELETE FROM workflow_leases WHERE workflow_id=?", (workflow_id,))
+        connection.execute(
+            "INSERT INTO workflow_events(workflow_id,event_type,state,metadata_json,created_at) "
+            "VALUES (?,'workflow_restart_recovered',?,?,?)",
+            (workflow_id, target.value, _canonical({"operation_count": len(operations)}), now),
+        )
+
     def recover_interrupted(self) -> int:
         now = _now()
+        with closing(self._connect()) as connection:
+            native_rows = connection.execute(
+                "SELECT request_id,owner_token FROM workflow_resource_requests "
+                "WHERE workflow_id IS NULL AND state IN ('active','pending') AND owner_token LIKE 'native-owner-%'",
+            ).fetchall()
+        owner_snapshots: dict[str, bool | None] = {}
+        stale_native: list[tuple[str, str]] = []
+        for native in native_rows:
+            owner = str(native["owner_token"])
+            identity = owner.rsplit("-", 1)[0]
+            if identity not in owner_snapshots:
+                owner_snapshots[identity] = native_resource_owner_alive(owner)
+            if owner_snapshots[identity] is False:
+                stale_native.append((str(native["request_id"]), owner))
+        native_count = 0
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            for request_id, owner in stale_native:
+                native_count += connection.execute(
+                    "UPDATE workflow_resource_requests SET "
+                    "state=CASE WHEN state='pending' THEN 'released' ELSE 'quarantined' END, "
+                    "reason='native_owner_identity_unavailable', updated_at=? "
+                    "WHERE request_id=? AND owner_token=? AND workflow_id IS NULL AND state IN ('active','pending')",
+                    (now, request_id, owner),
+                ).rowcount
             rows = connection.execute(
                 """
-                SELECT workflows.workflow_id, workflows.current_step, workflows.state,
+                SELECT workflows.workflow_id, workflows.current_step, workflows.state, workflows.execution_mode,
                        workflows.cancel_requested_at
                 FROM workflows
                 LEFT JOIN workflow_leases ON workflow_leases.workflow_id = workflows.workflow_id
@@ -1411,6 +3158,25 @@ class WorkflowStore:
                 workflow_id = str(row["workflow_id"])
                 step_index = int(row["current_step"])
                 workflow_state = str(row["state"])
+                if str(row["execution_mode"]) == "dag":
+                    self._recover_dag_execution(connection, workflow_id, now)
+                    continue
+                connection.execute(
+                    """
+                    UPDATE workflow_resource_requests
+                    SET state = 'quarantined', reason = ?, updated_at = ?
+                    WHERE workflow_id = ? AND state = 'active'
+                    """,
+                    ("workflow_lease_lost_before_resource_reconciliation", now, workflow_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE workflow_resource_requests
+                    SET state = 'released', reason = 'recovery_cancelled_pending', updated_at = ?
+                    WHERE workflow_id = ? AND state = 'pending'
+                    """,
+                    (now, workflow_id),
+                )
                 operation = connection.execute(
                     """
                     SELECT operation_id, state, attempts, started_at, evidence_json, error
@@ -1564,7 +3330,7 @@ class WorkflowStore:
                     ),
                 )
             connection.commit()
-        return len(rows)
+        return len(rows) + native_count
 
     def list(self, *, offset: int = 0, limit: int = 100) -> dict[str, Any]:
         with closing(self._connect()) as connection:
@@ -1638,6 +3404,41 @@ class WorkflowStore:
                     (_now(),),
                 ).fetchone()[0]
             )
+            resource_request_counts = {
+                str(row["state"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) AS count FROM workflow_resource_requests GROUP BY state ORDER BY state"
+                ).fetchall()
+            }
+            quarantined_resources = connection.execute(
+                """
+                SELECT category, state, reason, created_at, updated_at
+                FROM workflow_resource_requests
+                WHERE state = 'quarantined'
+                ORDER BY updated_at ASC LIMIT ?
+                """,
+                (bounded,),
+            ).fetchall()
+            capacity_counts = {
+                f"{row['category']}:{row['state']}": int(row["count"])
+                for row in connection.execute(
+                    """
+                    SELECT category, state, COUNT(*) AS count
+                    FROM runtime_capacity_requests
+                    GROUP BY category, state
+                    ORDER BY category, state
+                    """
+                ).fetchall()
+            }
+            analyzer_active_weight = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(weight), 0)
+                    FROM runtime_capacity_requests
+                    WHERE category = 'analyzer' AND state IN ('active','quarantined')
+                    """
+                ).fetchone()[0]
+            )
             event_total = int(connection.execute("SELECT COUNT(*) FROM workflow_events").fetchone()[0])
         db_bytes = 0
         for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
@@ -1669,6 +3470,13 @@ class WorkflowStore:
             "oldest_unresolved_operations": [dict(row) for row in unresolved],
             "active_lease_count": lease_count,
             "active_workflow_leases": lease_count,
+            "resource_request_counts": resource_request_counts,
+            "active_resource_request_count": resource_request_counts.get("active", 0),
+            "pending_resource_request_count": resource_request_counts.get("pending", 0),
+            "quarantined_resource_request_count": resource_request_counts.get("quarantined", 0),
+            "oldest_quarantined_resources": [dict(row) for row in quarantined_resources],
+            "runtime_capacity_counts": capacity_counts,
+            "active_analyzer_capacity_weight": analyzer_active_weight,
             "sample_limit": bounded,
         }
 

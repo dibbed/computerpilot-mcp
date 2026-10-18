@@ -18,6 +18,21 @@ from core.windows_job import current_process_in_job, spawn_owned_process
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows Job Object integration requires Windows")
 
 
+def test_capacity_exit_probe_distinguishes_live_and_signaled_retained_handle(tmp_path: Path) -> None:
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=tmp_path)
+    created = psutil.Process(process.pid).create_time()
+    try:
+        assert windows_job.process_identity_exited(process.pid, created) is False
+        process.kill()
+        process.wait(timeout=5)
+        # Popen retains its native handle until collection, even after wait.
+        assert windows_job.process_identity_exited(process.pid, created) is True
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
 def _alive(pid: int) -> bool:
     try:
         process = psutil.Process(pid)
@@ -66,7 +81,8 @@ def test_nested_job_object_kill_on_close_reaps_parent_and_grandchild(
         assert _alive(owned.pid)
         assert _alive(grandchild_pid)
         owned.close_ownership()
-        _wait_dead(owned.pid, grandchild_pid)
+        assert not _alive(owned.pid)
+        assert not _alive(grandchild_pid)
     finally:
         owned.close_ownership()
         if _alive(owned.pid):

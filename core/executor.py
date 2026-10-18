@@ -22,6 +22,7 @@ import psutil
 from core.artifacts import Delivery, deliver_stream
 from core.errors import ToolError
 from core.process_ownership import OwnedProcess, spawn_owned_process
+from core.resource_claims import RESOURCE_CAPABILITY_ENV, current_resource_capability, resource_requires_native_ownership
 from core.timings import timing_span
 
 OutputMode = Literal["head", "tail", "both"]
@@ -180,7 +181,13 @@ def _creation_flags() -> int:
 def _process_env(extra: dict[str, str] | None) -> dict[str, str]:
     env = os.environ.copy()
     if extra:
-        env.update({str(key): str(value) for key, value in extra.items()})
+        env.update({
+            str(key): str(value) for key, value in extra.items()
+            if str(key).casefold() != RESOURCE_CAPABILITY_ENV.casefold()
+        })
+    capability = current_resource_capability()
+    if capability is not None:
+        env[RESOURCE_CAPABILITY_ENV] = capability
     return env
 
 
@@ -259,6 +266,7 @@ def run_bounded(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 creationflags=_creation_flags(),
+                require_native=resource_requires_native_ownership(),
             )
         stdout_thread = threading.Thread(target=_read_pipe, args=(process.stdout, stdout), daemon=True)
         stderr_thread = threading.Thread(target=_read_pipe, args=(process.stderr, stderr), daemon=True)
@@ -367,6 +375,7 @@ def start_background(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 creationflags=_creation_flags(),
+                require_native=resource_requires_native_ownership(),
             )
     except Exception:
         stdout.close()

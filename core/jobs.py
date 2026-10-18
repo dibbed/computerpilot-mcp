@@ -20,7 +20,7 @@ from core.config import SETTINGS
 from core.errors import ToolError
 from core.resource_locks import RESOURCE_LOCKS
 
-JOB_SCHEMA_VERSION = 3
+JOB_SCHEMA_VERSION = 4
 JOB_STATUS_COLUMNS = (
     "id,status,created,updated,version,queue_deadline,worker_pid,worker_created,pid,pid_created,"
     "exit_code,cancel_requested,error"
@@ -99,7 +99,8 @@ class JobStore:
                     version INTEGER NOT NULL DEFAULT 1, queue_deadline REAL,
                     launch_token TEXT, launch_started REAL,
                     worker_pid INTEGER, worker_created REAL, pid INTEGER, pid_created REAL,
-                    exit_code INTEGER, cancel_requested INTEGER NOT NULL DEFAULT 0, error TEXT
+                    exit_code INTEGER, cancel_requested INTEGER NOT NULL DEFAULT 0, error TEXT,
+                    dispatch_phase TEXT NOT NULL DEFAULT 'pending'
                 )""")
                 columns = {str(row[1]) for row in db.execute("PRAGMA table_info(jobs)")}
                 if "version" not in columns:
@@ -110,6 +111,8 @@ class JobStore:
                     db.execute("ALTER TABLE jobs ADD COLUMN launch_token TEXT")
                 if "launch_started" not in columns:
                     db.execute("ALTER TABLE jobs ADD COLUMN launch_started REAL")
+                if "dispatch_phase" not in columns:
+                    db.execute("ALTER TABLE jobs ADD COLUMN dispatch_phase TEXT NOT NULL DEFAULT 'legacy'")
                 db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_jobs_status_launch_queue "
                     "ON jobs(status, launch_token, created, id)"
@@ -134,6 +137,7 @@ class JobStore:
         encoding: str = "utf-8",
         *,
         queue_timeout_sec: float | None = None,
+        _resource_capability: str | None = None,
         _retention_retry: bool = False,
     ) -> dict[str, Any]:
         if not command or not command[0] or not cwd.is_dir():
@@ -142,6 +146,11 @@ class JobStore:
             raise ValueError("Execution timeout must be positive.")
         if queue_timeout_sec is not None and queue_timeout_sec <= 0:
             raise ValueError("Queue timeout must be positive when provided.")
+        if _resource_capability is not None:
+            from core.resource_claims import RESOURCE_CAPABILITY_MAX_LENGTH
+
+            if not _resource_capability or len(_resource_capability) > RESOURCE_CAPABILITY_MAX_LENGTH:
+                raise ValueError("Internal resource capability exceeds its supported size or is empty.")
         codecs.lookup(encoding)
         spec_data: dict[str, Any] = {
             "command": command,
@@ -151,16 +160,19 @@ class JobStore:
         }
         if queue_timeout_sec is not None:
             spec_data["queue_timeout_sec"] = queue_timeout_sec
+        fingerprint_spec = json.dumps(spec_data, sort_keys=True)
+        fingerprint = hashlib.sha256(fingerprint_spec.encode()).hexdigest()
+        if _resource_capability is not None:
+            spec_data["_resource_capability"] = _resource_capability
         spec = json.dumps(spec_data, sort_keys=True)
-        fingerprint = hashlib.sha256(spec.encode()).hexdigest()
         job_id = uuid.uuid4().hex
         now = time.time()
         queue_deadline = None if queue_timeout_sec is None else now + queue_timeout_sec
         with closing(self.connect()) as db, db:
             inserted = db.execute(
                 "INSERT OR IGNORE INTO jobs "
-                "(id,request_key,fingerprint,spec,status,created,updated,version,queue_deadline) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "(id,request_key,fingerprint,spec,status,created,updated,version,queue_deadline,dispatch_phase) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'pending')",
                 (job_id, request_key, fingerprint, spec, "queued", now, now, 1, queue_deadline),
             ).rowcount
             existing = db.execute("SELECT id,fingerprint FROM jobs WHERE request_key=?", (request_key,)).fetchone()
@@ -170,7 +182,7 @@ class JobStore:
             try:
                 result = self.get(existing["id"])
             except ToolError as exc:
-                if exc.code != "job_not_found" or _retention_retry:
+                if exc.code != "job_not_found" or _retention_retry or _resource_capability is not None:
                     raise
                 # Terminal-history retention may delete the row after the
                 # idempotency transaction commits but before the follow-up
@@ -183,6 +195,7 @@ class JobStore:
                     request_key,
                     encoding,
                     queue_timeout_sec=queue_timeout_sec,
+                    _resource_capability=_resource_capability,
                     _retention_retry=True,
                 )
             if result["status"] == "queued":
@@ -456,7 +469,7 @@ class JobStore:
                 return "wait"
             claim_time = time.time()
             claimed = db.execute(
-                "UPDATE jobs SET status='running',launch_token=NULL,launch_started=NULL,worker_pid=?,"
+                "UPDATE jobs SET status='running',dispatch_phase='pending',launch_token=NULL,launch_started=NULL,worker_pid=?,"
                 "worker_created=?,updated=?,version=version+1 WHERE id=? AND status='queued' "
                 "AND launch_token IS ? AND cancel_requested=0 "
                 "AND (queue_deadline IS NULL OR queue_deadline>?)",
@@ -476,6 +489,29 @@ class JobStore:
         except BaseException:
             db.rollback()
             raise
+
+    def mark_may_dispatch(
+        self, job_id: str, *, worker_pid: int, worker_created: float, db: sqlite3.Connection | None = None,
+    ) -> bool:
+        """Serialize the last no-effect boundary with cancellation under the job authority."""
+        if db is None:
+            with closing(self.connect()) as connection:
+                return self.mark_may_dispatch(job_id, worker_pid=worker_pid, worker_created=worker_created, db=connection)
+        with db:
+            admitted = db.execute(
+                "UPDATE jobs SET dispatch_phase='may_dispatch',updated=?,version=version+1 "
+                "WHERE id=? AND status='running' AND cancel_requested=0 AND dispatch_phase='pending' "
+                "AND worker_pid=? AND worker_created=?",
+                (time.time(), job_id, worker_pid, worker_created),
+            ).rowcount == 1
+            if not admitted:
+                db.execute(
+                    "UPDATE jobs SET status='cancelled',updated=?,version=version+1 "
+                    "WHERE id=? AND worker_pid=? AND worker_created=? AND status='running' "
+                    "AND dispatch_phase='pending' AND cancel_requested=1",
+                    (time.time(), job_id, worker_pid, worker_created),
+                )
+            return admitted
 
     def get(self, job_id: str) -> dict[str, Any]:
         return self._public(self._reconcile([self._status_raw(job_id)])[0])

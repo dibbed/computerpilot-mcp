@@ -238,10 +238,13 @@ def test_count_retention_coalesces_concurrent_atomic_backup_publication(
     def blocked_scan(path: Path) -> tuple[list[backups.BackupEntry], int]:
         nonlocal calls
         entries = scan(path)
-        calls += 1
-        if calls == 1:
-            entered.set()
-            assert release.wait(2)
+        # Other retention managers from earlier tests may scan unrelated directories.
+        # Count only this fixture's manager, not every caller of the patched function.
+        if path == directory:
+            calls += 1
+            if calls == 1:
+                entered.set()
+                assert release.wait(2)
         return entries
 
     monkeypatch.setattr(backups, "_scan_backups", blocked_scan)

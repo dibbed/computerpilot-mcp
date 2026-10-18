@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -10,6 +11,7 @@ from typing import Any, Literal
 
 from core.errors import ToolError
 from core.executor import run_bounded
+from tools.git.service import command_arguments, command_environment
 from tools.project import service
 
 Decision = Literal["focused", "focused_plus_full_recommended", "full_suite", "none"]
@@ -41,14 +43,22 @@ class ChangedPaths:
     base: str | None
 
 
-def _git(repo: Path, args: list[str]) -> str:
+def _remaining(deadline: float | None) -> float:
+    remaining = 60.0 if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Affected-test selection deadline expired.")
+    return remaining
+
+
+def _git(repo: Path, args: list[str], *, deadline: float | None = None) -> str:
     executable = shutil.which("git")
     if executable is None:
         raise ToolError("git_not_found", "Git is not installed or not on PATH.")
     result = run_bounded(
-        [executable, "-c", "core.quotepath=false", *args],
+        [executable, *command_arguments(args)],
         cwd=repo,
-        timeout_sec=60,
+        env=command_environment(),
+        timeout_sec=min(60, _remaining(deadline)),
         stdout_limit=None,
         stderr_limit=20_000,
         output_mode="head",
@@ -84,18 +94,20 @@ def _parse_name_status(payload: str) -> list[ChangedPath]:
     return rows
 
 
-def discover_changed_paths(repo: Path, base: str | None = None) -> ChangedPaths:
+def discover_changed_paths(repo: Path, base: str | None = None, *, deadline: float | None = None) -> ChangedPaths:
     resolved = repo.resolve(strict=False)
     if not (resolved / ".git").exists():
         # Worktrees can have a .git file; git itself remains the final validation.
-        _git(resolved, ["rev-parse", "--show-toplevel"])
+        _git(resolved, ["rev-parse", "--show-toplevel"], deadline=deadline)
     rows: list[ChangedPath] = []
     if base:
-        rows.extend(_parse_name_status(_git(resolved, ["diff", "--name-status", "-z", base])))
+        rows.extend(_parse_name_status(_git(resolved, ["diff", "--name-status", "-z", base], deadline=deadline)))
     else:
-        rows.extend(_parse_name_status(_git(resolved, ["diff", "--name-status", "-z"])))
-        rows.extend(_parse_name_status(_git(resolved, ["diff", "--cached", "--name-status", "-z"])))
-    untracked = [item for item in _git(resolved, ["ls-files", "--others", "--exclude-standard", "-z"]).split("\0") if item]
+        rows.extend(_parse_name_status(_git(resolved, ["diff", "--name-status", "-z"], deadline=deadline)))
+        rows.extend(_parse_name_status(_git(resolved, ["diff", "--cached", "--name-status", "-z"], deadline=deadline)))
+    untracked = [
+        item for item in _git(resolved, ["ls-files", "--others", "--exclude-standard", "-z"], deadline=deadline).split("\0") if item
+    ]
     rows.extend(ChangedPath(path=PurePosixPath(path).as_posix(), status="??") for path in untracked)
     merged: dict[str, ChangedPath] = {}
     for row in rows:
@@ -170,12 +182,14 @@ def select_affected_tests(
     max_results: int = 500,
     include_changed_tests: bool = True,
     fallback_policy: Literal["report", "select_full_suite"] = "report",
+    deadline: float | None = None,
 ) -> dict[str, Any]:
+    _remaining(deadline)
     root = repo.resolve(strict=False)
     if not root.is_dir():
         raise NotADirectoryError(f"Repository directory not found: {root}")
     if changed_paths is None:
-        changed_records = discover_changed_paths(root, base).items
+        changed_records = discover_changed_paths(root, base, deadline=deadline).items
     else:
         changed_records = tuple(ChangedPath(path=PurePosixPath(path).as_posix(), status="explicit") for path in changed_paths)
     normalized_changed = sorted({item.path for item in changed_records})
@@ -194,6 +208,7 @@ def select_affected_tests(
     reverse: dict[str, set[str]] = defaultdict(set)
     parse_errors: list[dict[str, str]] = []
     for module, path in modules.items():
+        _remaining(deadline)
         metadata = service.python_metadata(path)
         if metadata.parse_error:
             if len(parse_errors) < 20:
@@ -216,6 +231,7 @@ def select_affected_tests(
     distance: dict[str, int] = {str(module): 0 for module in changed_modules}
     queue: deque[str] = deque(distance)
     while queue:
+        _remaining(deadline)
         module = queue.popleft()
         depth = distance[module]
         if depth >= max_depth:
@@ -229,6 +245,7 @@ def select_affected_tests(
     depths: dict[str, int] = {}
     changed_names = {PurePosixPath(path).stem.removeprefix("test_") for path in executable_changes}
     for module, depth in distance.items():
+        _remaining(deadline)
         module_path = modules.get(module)
         if module_path is None:
             continue
@@ -245,6 +262,7 @@ def select_affected_tests(
                 evidence[changed_path].add("changed_test")
                 depths.setdefault(changed_path, 0)
     for module_path in modules.values():
+        _remaining(deadline)
         relative = module_path.relative_to(root).as_posix()
         if _is_test(relative) and PurePosixPath(relative).stem.removeprefix("test_") in changed_names:
             evidence[relative].add("naming_convention")

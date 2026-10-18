@@ -10,18 +10,30 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from core.config import resolve_path
+from core.config import SETTINGS, resolve_path
 from core.errors import ToolError
 from core.execution_models import ExecutionIntent
+from core.executor import run_bounded
 from core.job_scheduler import ensure_job_scheduler
 from core.jobs import JobStore
+from core.resource_claims import (
+    ResourceClaim,
+    canonical_claims,
+    coordination_claim,
+    current_resource_capability,
+    endpoint_claim,
+    managed_resource_claims,
+    path_claim,
+)
 from core.tool_catalog import intent_route_rules
-from core.workflow_models import WorkflowDefinition
+from core.workflow_models import WorkflowDefinition, workflow_topological_order
 from tools.filesystem.patches import apply_patch_transaction
+from tools.git.service import command_arguments, command_environment
 from tools.testing.impact import select_affected_tests
 from tools.testing.verification import verify_changed_repository
 
@@ -45,6 +57,7 @@ class VerifyChangesInput(_ActionInput):
     total_timeout_sec: float = 1800
     ruff_fix: bool = False
     diagnostic_cap: int = 20
+    max_parallel_checks: int = Field(default=1, ge=1, le=3)
 
 
 class GitStatusInput(_ActionInput):
@@ -133,6 +146,7 @@ class ActionContext:
     is_cancel_requested: Callable[[], bool]
     persist_external_ref: Callable[[dict[str, Any]], None]
     persist_intent_evidence: Callable[[dict[str, Any]], None]
+    durable_job_timeout_sec: float | None = None
 
 
 class ActionCancelled(RuntimeError):
@@ -167,10 +181,28 @@ def _run_git(
     *command: str,
     uncertain_on_timeout: bool = False,
 ) -> dict[str, Any]:
+    if timeout_sec <= 0:
+        raise TimeoutError("Workflow Git deadline expired.")
     repo = resolve_path(str(arguments.get("repo", ".")))
+    if uncertain_on_timeout:
+        with managed_resource_claims(
+            (coordination_claim(exclusive=True), path_claim(repo, "write", scope="subtree")),
+            category="workflow.git", timeout_sec=timeout_sec, quarantine_on_error=True,
+        ):
+            owned = run_bounded(
+                ["git", "-C", str(repo), *command_arguments(command)], cwd=repo, timeout_sec=timeout_sec,
+                env=command_environment(),
+                stdout_limit=80_000, stderr_limit=8_000, output_mode="head", encoding="utf-8",
+            )
+            if owned["timed_out"] or not owned.get("capture_complete", True):
+                raise SideEffectUncertain("Git mutation ended without a known result.")
+        if owned["exit_code"] != 0:
+            raise ToolError("workflow_git_failed", owned["stderr"]["text"].strip()[:2_000] or "Git command failed.")
+        return {"repo": str(repo), "stdout": owned["stdout"]["text"][:20_000], "exit_code": owned["exit_code"]}
     try:
         completed = subprocess.run(
-            ["git", "-C", str(repo), *command],
+            ["git", "-C", str(repo), *command_arguments(command)],
+            env=command_environment(),
             capture_output=True,
             text=True,
             timeout=timeout_sec,
@@ -178,8 +210,6 @@ def _run_git(
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired as exc:
-        if uncertain_on_timeout:
-            raise SideEffectUncertain("Git mutation timed out without a known result.") from exc
         raise TransientActionError("Git read timed out.") from exc
     if completed.returncode != 0:
         raise ToolError("workflow_git_failed", completed.stderr.strip()[:2_000] or "Git command failed.")
@@ -203,24 +233,46 @@ def _verify_changes(arguments: dict[str, Any], timeout_sec: float) -> dict[str, 
             "total_timeout_sec",
             "ruff_fix",
             "diagnostic_cap",
+            "max_parallel_checks",
         }
     }
+    deadline = time.monotonic() + timeout_sec
     allowed["total_timeout_sec"] = min(float(allowed.get("total_timeout_sec", timeout_sec)), timeout_sec)
-    result = verify_changed_repository(resolve_path(str(arguments.get("cwd", "."))), **allowed)
+    repo = resolve_path(str(arguments.get("cwd", ".")))
+    # Sequential workflows do not inherit a DAG resource capability. The
+    # verifier may write via pytest or Ruff fix, so coordinate its full subtree
+    # before invoking any analyzer; DAG callers safely reuse the parent claim.
+    with managed_resource_claims(
+        (coordination_claim(), path_claim(repo, "write", scope="subtree")),
+        category="workflow.verify_changes",
+        timeout_sec=timeout_sec,
+        db_path=SETTINGS.workflow_db,
+    ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Workflow verification deadline expired during resource admission.")
+        allowed["total_timeout_sec"] = min(float(allowed["total_timeout_sec"]), remaining)
+        result = verify_changed_repository(
+            repo,
+            **allowed,
+            analyzer_capacity_db=SETTINGS.workflow_db,
+            analyzer_capacity_limit=SETTINGS.max_running_analyzers,
+        )
     if not result.get("ok"):
         raise ToolError("workflow_verification_failed", "Change-aware verification did not pass.")
     return result
 
 
 def _git_status(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
-    result = _run_git(arguments, timeout_sec, "status", "--short", "--branch")
+    deadline = time.monotonic() + timeout_sec
+    result = _run_git(arguments, deadline - time.monotonic(), "status", "--short", "--branch")
     lines = result["stdout"].splitlines()
     dirty = any(line and not line.startswith("##") for line in lines)
     if arguments.get("require_clean") is True and dirty:
         raise ToolError("workflow_git_dirty", "Repository must be clean for this workflow.")
     tag = arguments.get("tag_must_not_exist")
     if isinstance(tag, str) and tag:
-        tag_result = _run_git(arguments, timeout_sec, "tag", "--list", tag)
+        tag_result = _run_git(arguments, deadline - time.monotonic(), "tag", "--list", tag)
         if tag_result["stdout"].strip():
             raise ToolError("workflow_tag_exists", f"Git tag {tag!r} already exists.")
     result["dirty"] = dirty
@@ -231,8 +283,9 @@ def _git_stage(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
     paths = arguments.get("paths")
     if not isinstance(paths, list) or not paths or not all(isinstance(item, str) and item for item in paths):
         raise ToolError("invalid_workflow_action", "git_stage requires a non-empty paths list.")
-    result = _run_git(arguments, timeout_sec, "add", "--", *paths, uncertain_on_timeout=True)
-    staged = _run_git(arguments, timeout_sec, "diff", "--cached", "--name-only")["stdout"].splitlines()
+    deadline = time.monotonic() + timeout_sec
+    result = _run_git(arguments, deadline - time.monotonic(), "add", "--", *paths, uncertain_on_timeout=True)
+    staged = _run_git(arguments, deadline - time.monotonic(), "diff", "--cached", "--name-only")["stdout"].splitlines()
     result["requested_paths"] = paths
     result["staged_paths"] = staged
     return result
@@ -242,8 +295,9 @@ def _git_commit(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]
     message = arguments.get("message")
     if not isinstance(message, str) or not message.strip() or len(message) > 10_000:
         raise ToolError("invalid_workflow_action", "git_commit requires a bounded non-empty message.")
-    result = _run_git(arguments, timeout_sec, "commit", "-m", message, uncertain_on_timeout=True)
-    head = _run_git(arguments, timeout_sec, "rev-parse", "HEAD")["stdout"].strip()
+    deadline = time.monotonic() + timeout_sec
+    result = _run_git(arguments, deadline - time.monotonic(), "commit", "-m", message, uncertain_on_timeout=True)
+    head = _run_git(arguments, deadline - time.monotonic(), "rev-parse", "HEAD")["stdout"].strip()
     result["head"] = head
     return result
 
@@ -263,9 +317,10 @@ def _run_durable_job(
     job = store.submit(
         [executable, *args],
         resolve_path(str(arguments.get("cwd", "."))),
-        timeout_sec,
+        context.durable_job_timeout_sec if context is not None and context.durable_job_timeout_sec is not None else timeout_sec,
         idempotency_key,
         str(arguments.get("encoding", "utf-8")),
+        _resource_capability=current_resource_capability(),
     )
     job_id = str(job["job_id"])
     if context is not None:
@@ -292,7 +347,7 @@ def _run_durable_job(
 
 
 def _check_file(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
-    del timeout_sec
+    deadline = time.monotonic() + timeout_sec
     path = resolve_path(str(arguments.get("path", "")))
     exists = path.exists()
     expected = bool(arguments.get("exists", True))
@@ -302,7 +357,25 @@ def _check_file(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]
     if contains is not None:
         if not isinstance(contains, str) or not path.is_file():
             raise ToolError("invalid_workflow_action", "check_file contains requires an existing text file.")
-        if contains not in path.read_text(encoding="utf-8", errors="replace"):
+        if path.stat().st_size > SETTINGS.max_file_write_chars * 4 or len(contains) > SETTINGS.max_file_write_chars:
+            raise ToolError("workflow_file_check_limit", "File content check exceeds the bounded text size limit.")
+        matched = contains == ""
+        tail = ""
+        scanned = 0
+        with path.open(encoding="utf-8", errors="replace", newline=None) as handle:
+            while not matched:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("File content check deadline expired.")
+                chunk = handle.read(65_536)
+                if not chunk:
+                    break
+                scanned += len(chunk)
+                if scanned > SETTINGS.max_file_write_chars * 4:
+                    raise ToolError("workflow_file_check_limit", "File grew beyond the bounded text scan limit.")
+                window = tail + chunk
+                matched = contains in window
+                tail = window[-(len(contains) - 1):] if len(contains) > 1 else ""
+        if not matched:
             raise ToolError("workflow_file_check_failed", "Expected text was not found in the file.")
     return {"path": str(path), "exists": exists, "contains_matched": contains is not None}
 
@@ -339,12 +412,13 @@ def _apply_patch(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any
 
 
 def _affected_tests(arguments: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
-    del timeout_sec
+    deadline = time.monotonic() + timeout_sec
     return select_affected_tests(
         resolve_path(str(arguments["cwd"])),
         changed_paths=arguments.get("changed_paths"),
         base=arguments.get("base"),
         fallback_policy=arguments["fallback_policy"],
+        deadline=deadline,
     )
 
 
@@ -465,9 +539,62 @@ def validate_operation(
     return descriptor, validated
 
 
+def derive_action_resource_claims(
+    name: str,
+    arguments: dict[str, Any],
+    postcondition: dict[str, Any] | None,
+) -> tuple[ResourceClaim, ...]:
+    """Derive a conservative authoritative footprint for one allowlisted workflow action."""
+
+    _descriptor, validated = validate_operation(name, arguments, postcondition)
+    claims: list[ResourceClaim] = []
+    if name == "run_durable_job":
+        claims.append(coordination_claim(exclusive=True))
+        claims.append(path_claim(str(validated["cwd"]), "write", scope="subtree"))
+        return canonical_claims(claims)
+
+    claims.append(coordination_claim(exclusive=name in {"git_stage", "git_commit"}))
+    if name == "check_file":
+        claims.append(path_claim(str(validated["path"]), "read"))
+    elif name == "check_http":
+        claims.append(endpoint_claim(str(validated["url"])))
+    elif name == "affected_tests":
+        claims.append(path_claim(str(validated["cwd"]), "read", scope="subtree"))
+    elif name == "verify_changes":
+        # pytest executes repository code and Ruff fix may mutate; treat the repo as write-coarse
+        # unless a future isolation policy proves a narrower footprint.
+        claims.append(path_claim(str(validated["cwd"]), "write", scope="subtree"))
+    elif name == "apply_patch":
+        claims.append(path_claim(str(validated["cwd"]), "write", scope="subtree"))
+    elif name in {"git_status", "git_stage", "git_commit"}:
+        repo = resolve_path(str(validated["repo"]))
+        common_dir_raw = _run_git({"repo": str(repo)}, 10, "rev-parse", "--git-common-dir")["stdout"].strip()
+        common_dir = Path(common_dir_raw)
+        if not common_dir.is_absolute():
+            common_dir = (repo / common_dir).resolve(strict=False)
+        claims.append(path_claim(repo, "write" if name in {"git_stage", "git_commit"} else "read", scope="subtree"))
+        claims.append(
+            path_claim(
+                common_dir,
+                "write" if name in {"git_stage", "git_commit"} else "read",
+                scope="subtree",
+                kind="git",
+            )
+        )
+    else:  # pragma: no cover - validate_operation rejects unavailable adapters
+        raise ToolError("workflow_resource_footprint_unavailable", f"No resource footprint is defined for {name!r}.")
+    return canonical_claims(claims)
+
+
 def validate_workflow_definition(definition: WorkflowDefinition) -> None:
+    workflow_topological_order(definition)
     for step in definition.steps:
-        validate_operation(step.action, step.arguments, step.postcondition)
+        _descriptor, validated = validate_operation(step.action, step.arguments, step.postcondition)
+        if definition.execution_mode == "dag" and step.action == "verify_changes" and validated["ruff_fix"]:
+            raise ToolError(
+                "workflow_parallel_fix_unavailable",
+                "DAG verification cannot apply Ruff fixes without a mutation recovery contract.",
+            )
         if step.execution_intent is not None:
             try:
                 intent = ExecutionIntent(**step.execution_intent)
@@ -483,8 +610,18 @@ def prepare_action_intent(
     name: str,
     arguments: dict[str, Any],
     postcondition: dict[str, Any] | None,
+    *,
+    timeout_sec: float = 60,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Materialize result-independent recovery intent before a side effect begins."""
+
+    deadline = time.monotonic() + timeout_sec
+
+    def remaining() -> float:
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise TimeoutError("Workflow intent deadline expired.")
+        return budget
 
     descriptor, validated = validate_operation(name, arguments, postcondition)
     if not descriptor.mutates:
@@ -497,7 +634,7 @@ def prepare_action_intent(
             dry_run=True,
             expected_sha256=validated.get("expected_sha256"),
             backup=False,
-            timeout_sec=60,
+            timeout_sec=remaining(),
             encoding=str(validated["encoding"]),
         )
         files: list[dict[str, Any]] = []
@@ -532,8 +669,8 @@ def prepare_action_intent(
     if name == "git_commit":
         repo = str(resolve_path(str(validated["repo"])))
         git_args = {"repo": repo}
-        before_head = _run_git(git_args, 10, "rev-parse", "HEAD")["stdout"].strip()
-        staged_tree = _run_git(git_args, 10, "write-tree")["stdout"].strip()
+        before_head = _run_git(git_args, min(10, remaining()), "rev-parse", "HEAD")["stdout"].strip()
+        staged_tree = _run_git(git_args, min(10, remaining()), "write-tree")["stdout"].strip()
         message_hash = hashlib.sha256(str(validated["message"]).strip().encode("utf-8")).hexdigest()
         commit_expected: dict[str, Any] = {
             "repo": repo,
