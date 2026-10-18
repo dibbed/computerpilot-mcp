@@ -39,7 +39,10 @@ def _single_dag(name: str, *, cap: int = 2) -> WorkflowDefinition:
     )
 
 
-def _patch_safe_actions(monkeypatch: pytest.MonkeyPatch, *, fail_step: str | None = None) -> dict[str, Any]:
+def _patch_safe_actions(
+    monkeypatch: pytest.MonkeyPatch, *, fail_step: str | None = None, hold_until_two: bool = False,
+) -> dict[str, Any]:
+    barrier = threading.Barrier(2, timeout=10) if hold_until_two else None
     lock = threading.Lock()
     active = 0
     peak = 0
@@ -61,7 +64,10 @@ def _patch_safe_actions(monkeypatch: pytest.MonkeyPatch, *, fail_step: str | Non
             started.append(name)
         try:
             if name in {"a", "b"}:
-                time.sleep(0.05)
+                if barrier is not None:
+                    barrier.wait()
+                else:
+                    time.sleep(0.05)
             if name == fail_step:
                 raise ToolError("simulated_failure", "simulated")
             return {"name": name}
@@ -123,7 +129,7 @@ def test_resource_storage_denial_rolls_back_all_claims_and_prevents_dispatch(
 
 
 def test_dag_scheduler_respects_cap_and_join_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    tracker = _patch_safe_actions(monkeypatch)
+    tracker = _patch_safe_actions(monkeypatch, hold_until_two=True)
     store = WorkflowStore(tmp_path / "workflows.sqlite3")
     created = store.create(_dag(2), initial_state=WorkflowState.QUEUED)
     result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING, enable_dag_execution=True).execute(
