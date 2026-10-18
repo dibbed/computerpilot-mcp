@@ -2044,9 +2044,14 @@ class WorkflowStore:
             connection.commit()
         return count
 
-    def release_dead_resource_capacity(self, request_id: str, *, owner_token: str) -> int:
-        """Settle remaining child permits after the caller confirms native tree cleanup."""
+    def release_dead_resource_capacity(
+        self, request_id: str, *, owner_token: str, settle_timeout_sec: float = 0.0,
+    ) -> int:
+        """Settle child permits only on positive death evidence after native cleanup."""
         import psutil
+
+        if not 0.0 <= settle_timeout_sec <= 5.0:
+            raise ValueError("Child exit confirmation timeout must be in 0..5 seconds.")
 
         with closing(self._connect()) as connection:
             resource = connection.execute(
@@ -2059,7 +2064,7 @@ class WorkflowStore:
                 (request_id,),
             ).fetchall()
         identities: set[tuple[int, float]] = set()
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + settle_timeout_sec
         for row in rows:
             parts = str(row["owner_token"]).split("-", 3)
             try:
@@ -2072,8 +2077,6 @@ class WorkflowStore:
                 continue
         released = 0
         for pid, created in identities:
-            if time.monotonic() >= deadline:
-                raise ToolError("process_cleanup_incomplete", "Child capacity cleanup exceeded its deadline.")
             try:
                 process = psutil.Process(pid)
                 if abs(process.create_time() - created) < 0.01 and process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
@@ -2081,7 +2084,13 @@ class WorkflowStore:
                         continue
                     from core.windows_job import process_identity_exited
 
-                    if process_identity_exited(pid, created) is not True:
+                    confirmed = process_identity_exited(pid, created)
+                    while confirmed is not True and time.monotonic() < deadline:
+                        # Windows can publish process exit shortly after Job Object termination.
+                        # Never treat a timeout or an uninspectable owner as dead.
+                        time.sleep(min(0.05, deadline - time.monotonic()))
+                        confirmed = process_identity_exited(pid, created)
+                    if confirmed is not True:
                         continue
             except psutil.NoSuchProcess:
                 pass
