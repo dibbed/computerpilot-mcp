@@ -15,6 +15,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-15: Add `start_verification` in profiles containing testing and jobs. Native verification reuses durable job admission, cancellation and output, reports bounded stage events and stale inputs, and supports opt-in parallel read-only checks without changing foreground defaults.
 
 ### Fixed
+- 2026-10-18: Bind shared resource admission to a schema-11 runtime-budget fingerprint. Incompatible processes wait before dispatch, inherited capabilities cannot change budgets, and legacy active ownership remains quarantined after upgrade; SQLite triggers also reject old clients omitting the policy.
 - 2026-10-18: Preserve terminal ownership after cleanup denial even through an inherited claim and failed quarantine storage. Reclaim positively dead resource-bound analyzer owners after normal job cleanup, retain live/unknown owners, and settle fenced retries that fail or cancel before dispatch.
 - 2026-10-18: Confirm the owned Windows root process handle has exited before releasing a quiescent Job Object, and verify failed migration rollback with a fresh SQLite connection for Python 3.10 compatibility.
 - 2026-10-18: Recompute a DAG's aggregate after explicit final resource resolution, preserve mixed branch outcomes across concurrent recovery, and keep exception payloads out of parallel workflow evidence and errors.

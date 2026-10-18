@@ -29,11 +29,11 @@ from core.workflow_models import (
     workflow_topological_order,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 GRAPH_CONTRACT_VERSION = 1
 _RESOURCE_CAPABILITY_SQL = """
 SELECT r.* FROM workflow_resource_requests r
-WHERE r.request_id=? AND r.owner_token=? AND r.state='active'
+WHERE r.request_id=? AND r.owner_token=? AND r.state='active' AND r.policy_fingerprint=?
   AND ((r.workflow_id IS NULL AND r.operation_id IS NULL) OR EXISTS (
       SELECT 1 FROM workflow_execution_admissions a
       JOIN workflow_operations o ON o.operation_id=a.operation_id
@@ -47,6 +47,16 @@ WHERE r.request_id=? AND r.owner_token=? AND r.state='active'
         AND w.state='running' AND w.cancel_requested_at IS NULL
   ))
 """
+
+
+def _runtime_policy_fingerprint() -> str:
+    from core.config import SETTINGS
+
+    policy = (1, SETTINGS.max_running_jobs, SETTINGS.max_running_analyzers,
+              SETTINGS.max_running_workflow_steps, SETTINGS.workflow_max_parallel_steps)
+    return hashlib.sha256(json.dumps(policy, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 _ROUTE_HISTORY_MAX = 20
 _ROUTE_JSON_MAX_CHARS = 16_000
 _SECRET_MARKERS = (
@@ -247,6 +257,9 @@ class WorkflowStore:
                     if version < 10:
                         self._migrate_v10(connection)
                         version = 10
+                    if version < 11:
+                        self._migrate_v11(connection)
+                        version = 11
             if version > SCHEMA_VERSION:
                 raise ToolError(
                     "workflow_schema_too_new",
@@ -545,6 +558,37 @@ class WorkflowStore:
                 SELECT 1 FROM runtime_capacity_requests WHERE state!='released'
             );
             PRAGMA user_version = 10;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v11(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflow_resource_requests ADD COLUMN policy_fingerprint TEXT NOT NULL DEFAULT '';
+            UPDATE workflow_resource_requests SET state='quarantined',reason='legacy_resource_policy_unknown'
+                WHERE state='active';
+            UPDATE workflow_resource_requests SET state='released',reason='legacy_policy_pending_not_dispatched'
+                WHERE state='pending';
+            CREATE TRIGGER resource_policy_insert BEFORE INSERT ON workflow_resource_requests
+            WHEN NEW.state IN ('pending','active')
+            BEGIN
+                SELECT CASE WHEN NEW.policy_fingerprint='' OR (NEW.state='active' AND EXISTS (
+                    SELECT 1 FROM workflow_resource_requests r
+                    WHERE r.state='active' AND r.policy_fingerprint<>NEW.policy_fingerprint
+                )) THEN RAISE(ABORT,'resource_policy_incompatible') END;
+            END;
+            CREATE TRIGGER resource_policy_activate BEFORE UPDATE OF state,policy_fingerprint ON workflow_resource_requests
+            WHEN NEW.state='active' AND (OLD.state<>'active' OR OLD.policy_fingerprint<>NEW.policy_fingerprint)
+            BEGIN
+                SELECT CASE WHEN NEW.policy_fingerprint='' OR EXISTS (
+                    SELECT 1 FROM workflow_resource_requests r
+                    WHERE r.state='active' AND r.request_id<>NEW.request_id AND r.policy_fingerprint<>NEW.policy_fingerprint
+                ) THEN RAISE(ABORT,'resource_policy_incompatible') END;
+            END;
+            PRAGMA user_version = 11;
             COMMIT;
             """
         )
@@ -1528,6 +1572,7 @@ class WorkflowStore:
         if sum(len(claim.key.encode("utf-8")) + len(claim.kind.encode("utf-8")) for claim in canonical) > 65_536:
             raise ToolError("resource_claims_too_large", "A resource claim set may contain at most 64 KiB of keys.")
         now = _now()
+        policy_fingerprint = _runtime_policy_fingerprint()
 
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1540,8 +1585,8 @@ class WorkflowStore:
                     """
                     INSERT INTO workflow_resource_requests(
                         request_id, workflow_id, operation_id, attempt_token, owner_token,
-                        category, state, reason, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+                        category, state, reason, created_at, updated_at, policy_fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
                     """,
                     (
                         request_id,
@@ -1552,6 +1597,7 @@ class WorkflowStore:
                         category,
                         now,
                         now,
+                        policy_fingerprint,
                     ),
                 )
                 connection.executemany(
@@ -1573,6 +1619,9 @@ class WorkflowStore:
             if persisted_claims != canonical:
                 raise ToolError("resource_request_conflict", "Resource request id was reused with different claims.")
             state = str(row["state"])
+            if row["policy_fingerprint"] != policy_fingerprint:
+                connection.commit()
+                return {"admitted": False, "request_id": request_id, "state": state, "reason": "resource_policy_incompatible"}
             if state == "active":
                 connection.commit()
                 return {"admitted": True, "request_id": request_id, "state": state, "reason": None}
@@ -1596,7 +1645,7 @@ class WorkflowStore:
             current_ticket = int(row["ticket"])
             other_rows = connection.execute(
                 """
-                SELECT request_id, ticket, state
+                SELECT request_id, ticket, state, policy_fingerprint
                 FROM workflow_resource_requests
                 WHERE request_id <> ? AND state IN ('pending', 'active', 'quarantined')
                 ORDER BY ticket
@@ -1608,6 +1657,9 @@ class WorkflowStore:
                 other_state = str(other["state"])
                 if other_state == "pending" and int(other["ticket"]) > current_ticket:
                     continue
+                if other_state in {"active", "pending"} and other["policy_fingerprint"] != policy_fingerprint:
+                    conflict_reason = "resource_policy_incompatible"
+                    break
                 other_claims = self._resource_claims_for_request(connection, str(other["request_id"]))
                 if not claim_sets_conflict(canonical, other_claims):
                     continue
@@ -1655,7 +1707,7 @@ class WorkflowStore:
             else:
                 row = connection.execute(
                     _RESOURCE_CAPABILITY_SQL,
-                    (request_id, expected_owner_token, _now()),
+                    (request_id, expected_owner_token, _runtime_policy_fingerprint(), _now()),
                 ).fetchone()
             if row is None:
                 if expected_owner_token is not None:
@@ -1848,7 +1900,7 @@ class WorkflowStore:
             connection.execute("BEGIN IMMEDIATE")
             if resource_request_id is not None and connection.execute(
                 _RESOURCE_CAPABILITY_SQL,
-                (resource_request_id, resource_owner_token, now),
+                (resource_request_id, resource_owner_token, _runtime_policy_fingerprint(), now),
             ).fetchone() is None:
                 raise ToolError("resource_capability_invalid", "Parent resource ownership is no longer active.")
             row = connection.execute(

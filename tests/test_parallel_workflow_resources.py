@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,7 +37,7 @@ from core.workflow_store import WorkflowStore
 def test_admission_record_quota_preserves_unresolved_fences(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, category: str,
 ) -> None:
-    monkeypatch.setattr(config, "SETTINGS", SimpleNamespace(max_runtime_admission_records=3))
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, max_runtime_admission_records=3))
     store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
 
     def reserve(index: int) -> dict[str, object]:
@@ -724,6 +725,56 @@ def test_forged_resource_capability_fails_closed(tmp_path: Path) -> None:
     assert raised.value.code == "resource_capability_invalid"
 
 
+@pytest.mark.parametrize("entrypoint", ["scope", "process", "capacity"])
+def test_inherited_capability_rejects_incompatible_runtime_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entrypoint: str,
+) -> None:
+    from core.executor import run_bounded
+
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    with managed_resource_claims((path_claim(tmp_path, "write", scope="subtree"),), category="parent", store=store) as capability:
+        monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, max_running_analyzers=config.SETTINGS.max_running_analyzers + 1))
+        with pytest.raises(ToolError) as failure:
+            if entrypoint == "scope":
+                validate_resource_capability(capability, (), store)
+            elif entrypoint == "capacity":
+                request_id, owner, _ = resource_claims._parse_resource_capability(capability)
+                store.reserve_capacity(
+                    admission_id="denied", category="analyzer", owner_token="child", weight=1, limit=3,
+                    resource_request_id=request_id, resource_owner_token=owner,
+                )
+            else:
+                run_bounded(
+                    [sys.executable, "-c", f"from pathlib import Path; Path({str(tmp_path / 'effect')!r}).touch()"],
+                    cwd=tmp_path, timeout_sec=1,
+                )
+        assert failure.value.code == "resource_capability_invalid"
+    assert not (tmp_path / "effect").exists()
+    assert store.health_summary()["runtime_capacity_counts"] == {}
+
+
+def test_older_incompatible_policy_waiter_drains_active_profile_without_starvation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    original = config.SETTINGS
+
+    def reserve(name: str) -> dict[str, object]:
+        return store.reserve_resource_claims(
+            request_id=name, owner_token=name, category="test", claims=(path_claim(tmp_path / name, "write"),),
+        )
+
+    assert reserve("active-a")["admitted"] is True
+    monkeypatch.setattr(config, "SETTINGS", replace(original, max_running_analyzers=original.max_running_analyzers + 1))
+    assert reserve("older-b")["reason"] == "resource_policy_incompatible"
+    monkeypatch.setattr(config, "SETTINGS", original)
+    assert reserve("newer-a")["admitted"] is False
+    store.release_resource_request("active-a", owner_token="active-a")
+    monkeypatch.setattr(config, "SETTINGS", replace(original, max_running_analyzers=original.max_running_analyzers + 1))
+    assert reserve("older-b")["admitted"] is True
+    store.release_resource_request("older-b", owner_token="older-b")
+    monkeypatch.setattr(config, "SETTINGS", original)
+    assert reserve("newer-a")["admitted"] is True
+
+
 @pytest.mark.parametrize("durable", [True, False])
 def test_child_reuses_parent_claim_across_processes(tmp_path: Path, durable: bool) -> None:
     from core.executor import run_bounded
@@ -792,6 +843,7 @@ def test_capacity_admission_is_shared_between_store_instances(tmp_path: Path) ->
     )["admitted"] is True
 
 
+@pytest.mark.parametrize("different_policy", [False, True])
 @pytest.mark.parametrize(
     ("first_mode", "second_mode", "subtree", "independent", "overlap"),
     [("write", "write", False, False, False), ("read", "write", False, False, False),
@@ -800,8 +852,9 @@ def test_capacity_admission_is_shared_between_store_instances(tmp_path: Path) ->
 )
 def test_resource_claim_conflict_is_enforced_across_os_processes(
     tmp_path: Path, first_mode: Literal["read", "write"], second_mode: Literal["read", "write"],
-    subtree: bool, independent: bool, overlap: bool,
+    subtree: bool, independent: bool, overlap: bool, different_policy: bool,
 ) -> None:
+    overlap = overlap and not different_policy
     db_path = tmp_path / "workflows.sqlite3"
     root = tmp_path / "repo"
     first_claim = path_claim(root if subtree else root / "shared.txt", first_mode, scope="subtree" if subtree else "exact")
@@ -825,28 +878,32 @@ if result["admitted"]:
     store.release_resource_request(request_id,owner_token=request_id)
 '''
     release_marker = tmp_path / "release.marker"
+    first_env, second_env = os.environ.copy(), os.environ.copy()
+    if different_policy:
+        first_env["MCP_MAX_RUNNING_ANALYZERS"] = "1"
+        second_env["MCP_MAX_RUNNING_ANALYZERS"] = "3"
     first = subprocess.Popen(
         [sys.executable, "-c", script, str(db_path), json.dumps(first_claim.public()), "p1", str(release_marker)],
-        cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=first_env,
     )
     try:
         assert first.stdout is not None
         assert json.loads(first.stdout.readline())["admitted"] is True
         second = subprocess.run(
             [sys.executable, "-c", script, str(db_path), json.dumps(second_claim.public()), "p2", "-"],
-            cwd=repo_root, capture_output=True, text=True, timeout=10, check=True,
+            cwd=repo_root, capture_output=True, text=True, timeout=10, check=True, env=second_env,
         )
         second_result = json.loads(second.stdout.strip())
         assert second_result["admitted"] is overlap
         if not overlap:
-            assert second_result["reason"] == "resource_conflict"
+            assert second_result["reason"] == ("resource_policy_incompatible" if different_policy else "resource_conflict")
     finally:
         release_marker.write_text("release", encoding="utf-8")
         first.communicate(timeout=10)
         assert first.returncode == 0
     third = subprocess.run(
         [sys.executable, "-c", script, str(db_path), json.dumps(second_claim.public()), "p3" if overlap else "p2", "-"],
-        cwd=repo_root, capture_output=True, text=True, timeout=10, check=True,
+        cwd=repo_root, capture_output=True, text=True, timeout=10, check=True, env=second_env,
     )
     assert json.loads(third.stdout.strip())["admitted"] is True
 
