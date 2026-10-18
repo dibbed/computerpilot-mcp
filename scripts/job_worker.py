@@ -205,7 +205,11 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 for capacity_pid, capacity_created in capacity_identities:
                     resource_authority.release_process_capacity(capacity_pid, capacity_created)
                 resource_id, resource_owner, _ = _parse_resource_capability(capability)
-                resource_authority.release_dead_resource_capacity(resource_id, owner_token=resource_owner)
+                resource_authority.release_dead_resource_capacity(
+                    resource_id,
+                    owner_token=resource_owner,
+                    settle_timeout_sec=1.5 if getattr(process, "ownership_backend", None) == "windows_job" else 0.0,
+                )
             stack, resource_stack = resource_stack, None
             stack.close()
             _update(db, job_id, status=status, exit_code=code)
