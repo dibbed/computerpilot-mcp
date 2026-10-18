@@ -236,6 +236,7 @@ def _verify_changes(arguments: dict[str, Any], timeout_sec: float) -> dict[str, 
             "max_parallel_checks",
         }
     }
+    deadline = time.monotonic() + timeout_sec
     allowed["total_timeout_sec"] = min(float(allowed.get("total_timeout_sec", timeout_sec)), timeout_sec)
     repo = resolve_path(str(arguments.get("cwd", ".")))
     # Sequential workflows do not inherit a DAG resource capability. The
@@ -247,6 +248,10 @@ def _verify_changes(arguments: dict[str, Any], timeout_sec: float) -> dict[str, 
         timeout_sec=timeout_sec,
         db_path=SETTINGS.workflow_db,
     ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Workflow verification deadline expired during resource admission.")
+        allowed["total_timeout_sec"] = min(float(allowed["total_timeout_sec"]), remaining)
         result = verify_changed_repository(
             repo,
             **allowed,

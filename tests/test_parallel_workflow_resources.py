@@ -7,6 +7,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -31,6 +32,45 @@ from core.resource_claims import (
 )
 from core.workflow_models import StepDefinition, WorkflowDefinition, WorkflowState
 from core.workflow_store import WorkflowStore
+
+
+def test_sequential_verifier_deducts_admission_wait_from_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core import workflow_actions
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path))
+    monkeypatch.setattr(workflow_actions, "SETTINGS", config.SETTINGS)
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    store.reserve_resource_claims(
+        request_id="reader", owner_token="reader", category="test",
+        claims=(path_claim(repo, "read", scope="subtree"),),
+    )
+    observed: list[tuple[float, float]] = []
+    start = time.monotonic()
+
+    def fake_verify(*args: object, **kwargs: object) -> dict[str, object]:
+        value = kwargs["total_timeout_sec"]
+        assert isinstance(value, (int, float))
+        observed.append((time.monotonic() - start, float(value)))
+        return {"ok": True}
+
+    monkeypatch.setattr(workflow_actions, "verify_changed_repository", fake_verify)
+    release = threading.Timer(
+        0.15, lambda: store.release_resource_request("reader", owner_token="reader"),
+    )
+    release.start()
+    try:
+        assert workflow_actions._verify_changes({"cwd": str(repo)}, timeout_sec=0.8)["ok"] is True
+    finally:
+        release.join(timeout=2)
+    assert len(observed) == 1
+    elapsed_to_verifier, allotted = observed[0]
+    assert elapsed_to_verifier >= 0.1
+    assert allotted <= 0.8 - elapsed_to_verifier + 0.04
+    assert allotted > 0
 
 
 def test_sequential_workflow_verification_obeys_repository_claims(
