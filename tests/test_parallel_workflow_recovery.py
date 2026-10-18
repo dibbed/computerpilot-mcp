@@ -392,3 +392,43 @@ def test_concurrent_recovery_and_resolution_preserve_mixed_branch_truth(
         evidence={"source": "operator_assertion", "conclusive": True, "satisfied": True}, event_type="test_ack",
     )
     assert final["workflow"]["state"] == ("failed" if failed_sibling else "cancelled" if cancel else "completed")
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_retry_pre_dispatch_failure_or_cancel_settles_current_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel: bool,
+) -> None:
+    from core import workflow_executor
+    from core.workflow_actions import TransientActionError
+    from core.workflow_executor import NATIVE_ONLY_ROUTING, WorkflowExecutor
+
+    store = WorkflowStore(tmp_path / "retry-prepare.sqlite3")
+    workflow = store.create(WorkflowDefinition(
+        "retry prepare", (StepDefinition("one", "check_http", {"url": "http://localhost"}, step_id="one", max_retries=1),),
+        execution_mode="dag",
+    ), initial_state=WorkflowState.QUEUED)
+    prepared = []
+
+    def prepare(*args: Any, **kwargs: Any) -> tuple[None, None]:
+        prepared.append(True)
+        if len(prepared) == 2:
+            if cancel:
+                current = store.get(workflow["workflow_id"])
+                store.request_cancel(workflow["workflow_id"], current["version"], reason="cancel retry before dispatch")
+            else:
+                raise TimeoutError("retry intent timeout")
+        return None, None
+
+    def execute(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise TransientActionError("known safe read failure")
+
+    monkeypatch.setattr(workflow_executor, "prepare_action_intent", prepare)
+    monkeypatch.setattr(workflow_executor, "execute_action", execute)
+    monkeypatch.setattr(workflow_executor, "_retry_backoff_seconds", lambda _: 0)
+    result = WorkflowExecutor(store, route_planner=NATIVE_ONLY_ROUTING, enable_dag_execution=True).execute(
+        workflow["workflow_id"], owner_id="retry",
+    )
+    assert result["state"] == ("cancelled" if cancel else "failed")
+    assert len(prepared) == 2
+    assert store.active_admissions(workflow["workflow_id"]) == []
+    assert store.health_summary()["active_resource_request_count"] == 0

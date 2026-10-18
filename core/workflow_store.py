@@ -1991,6 +1991,48 @@ class WorkflowStore:
             connection.commit()
         return count
 
+    def release_dead_resource_capacity(self, request_id: str, *, owner_token: str) -> int:
+        """Settle remaining child permits after the caller confirms native tree cleanup."""
+        import psutil
+
+        with closing(self._connect()) as connection:
+            resource = connection.execute(
+                "SELECT owner_token FROM workflow_resource_requests WHERE request_id=?", (request_id,),
+            ).fetchone()
+            if resource is None or resource["owner_token"] != owner_token:
+                raise ToolError("resource_owner_mismatch", "Cleanup does not own this resource request.")
+            rows = connection.execute(
+                "SELECT DISTINCT owner_token FROM runtime_capacity_requests WHERE resource_request_id=? AND state!='released'",
+                (request_id,),
+            ).fetchall()
+        identities: set[tuple[int, float]] = set()
+        deadline = time.monotonic() + 5.0
+        for row in rows:
+            parts = str(row["owner_token"]).split("-", 3)
+            try:
+                if len(parts) != 4 or parts[0] != "pid" or not parts[3]:
+                    continue
+                pid, created = int(parts[1]), float(parts[2])
+                if pid > 0 and 0 < created < float("inf"):
+                    identities.add((pid, created))
+            except ValueError:
+                continue
+        released = 0
+        for pid, created in identities:
+            if time.monotonic() >= deadline:
+                raise ToolError("process_cleanup_incomplete", "Child capacity cleanup exceeded its deadline.")
+            try:
+                process = psutil.Process(pid)
+                if abs(process.create_time() - created) < 0.01 and process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                    continue
+            except psutil.NoSuchProcess:
+                pass
+            except (psutil.Error, OSError):
+                continue
+            released += self.release_process_capacity(pid, created)
+        # Live ancestors and uninspectable owners retain their own permits and resource fence.
+        return released
+
     def claim_ready_operation(
         self,
         operation_id: str,
@@ -2302,7 +2344,7 @@ class WorkflowStore:
             current_operation_state = OperationState(str(operation["state"]))
             dispatch_phase = str(operation["dispatch_phase"] or "")
             if not (
-                current_operation_state is OperationState.CREATED
+                current_operation_state in {OperationState.CREATED, OperationState.FAILED}
                 and dispatch_phase in {"reserved", "prepared"}
                 and final_state in {OperationState.FAILED, OperationState.CANCELLED}
             ):

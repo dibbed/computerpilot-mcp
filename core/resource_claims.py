@@ -222,6 +222,7 @@ def validate_resource_capability(
     from core.errors import ToolError
     from core.workflow_store import WorkflowStore
 
+
     request_id, owner_token, authority_path = _parse_resource_capability(token)
     authority = (
         store if store is not None and store.path.resolve(strict=False) == authority_path
@@ -277,6 +278,14 @@ def managed_resource_claims(
     from core.errors import ToolError
     from core.workflow_store import WorkflowStore
 
+    def quarantine(authority: WorkflowStore, request_id: str, owner_token: str) -> None:
+        try:
+            authority.quarantine_resource_request(
+                request_id, owner_token=owner_token, reason="managed_effect_or_cleanup_unresolved",
+            )
+        except Exception as exc:
+            raise ToolError("process_cleanup_incomplete", "Resource ownership quarantine could not be persisted.") from exc
+
     canonical = canonical_claims(claims)
     if not canonical:
         raise ToolError("empty_resource_claims", "Managed resource coordination requires at least one claim.")
@@ -286,11 +295,11 @@ def managed_resource_claims(
         try:
             yield inherited
         except BaseException as exc:
-            if quarantine_on_error and not isinstance(exc, NativeOwnershipRequiredError):
+            if not isinstance(exc, NativeOwnershipRequiredError) and (
+                quarantine_on_error or (isinstance(exc, ToolError) and exc.code == "process_cleanup_incomplete")
+            ):
                 request_id, owner_token, _ = _parse_resource_capability(inherited)
-                authority.quarantine_resource_request(
-                    request_id, owner_token=owner_token, reason="managed_effect_or_cleanup_unresolved",
-                )
+                quarantine(authority, request_id, owner_token)
             raise
         return
 
@@ -323,12 +332,12 @@ def managed_resource_claims(
         with resource_capability(capability):
             yield capability
     except BaseException as exc:
-        if admitted and quarantine_on_error and not isinstance(exc, NativeOwnershipRequiredError):
+        if admitted and not isinstance(exc, NativeOwnershipRequiredError) and (
+            quarantine_on_error or (isinstance(exc, ToolError) and exc.code == "process_cleanup_incomplete")
+        ):
             # Do not release even if persisting quarantine fails: the active claim still fences conflicts.
             release_on_exit = False
-            claim_store.quarantine_resource_request(
-                request_id, owner_token=owner_token, reason="managed_effect_or_cleanup_unresolved",
-            )
+            quarantine(claim_store, request_id, owner_token)
             raise
         raise
     finally:

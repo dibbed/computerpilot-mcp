@@ -22,6 +22,7 @@ from core.jobs import JobStore
 from core.process_ownership import OwnedProcess, spawn_owned_process
 from core.resource_claims import (
     RESOURCE_CAPABILITY_ENV,
+    _parse_resource_capability,
     coordination_claim,
     managed_resource_claims,
     path_claim,
@@ -203,6 +204,8 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 process.close_ownership()
                 for capacity_pid, capacity_created in capacity_identities:
                     resource_authority.release_process_capacity(capacity_pid, capacity_created)
+                resource_id, resource_owner, _ = _parse_resource_capability(capability)
+                resource_authority.release_dead_resource_capacity(resource_id, owner_token=resource_owner)
             _update(db, job_id, status=status, exit_code=code)
         except BaseException as exc:
             error = exc.message if isinstance(exc, ToolError) else type(exc).__name__

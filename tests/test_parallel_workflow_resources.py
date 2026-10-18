@@ -633,10 +633,28 @@ def test_failed_quarantine_does_not_release_unknown_effect(
         raise sqlite3.OperationalError("storage unavailable")
 
     monkeypatch.setattr(store, "quarantine_resource_request", deny_quarantine)
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(ToolError, match="quarantine"):
         with managed_resource_claims((claim,), category="test", store=store, quarantine_on_error=True):
             raise PermissionError("cleanup denied")
 
+    assert store.reserve_resource_claims(
+        request_id="conflict", owner_token="other", category="test", claims=(claim,),
+    )["admitted"] is False
+
+
+def test_inherited_cleanup_storage_failure_preserves_parent_fence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    claim = path_claim(tmp_path / "target", "write")
+
+    def denied(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("private-storage-canary")
+
+    monkeypatch.setattr(store, "quarantine_resource_request", denied)
+    with pytest.raises(ToolError) as failure:
+        with managed_resource_claims((claim,), category="parent", store=store):
+            with managed_resource_claims((claim,), category="child", store=store):
+                raise ToolError("process_cleanup_incomplete", "child cleanup denied")
+    assert "private-storage-canary" not in failure.value.message
     assert store.reserve_resource_claims(
         request_id="conflict", owner_token="other", category="test", claims=(claim,),
     )["admitted"] is False

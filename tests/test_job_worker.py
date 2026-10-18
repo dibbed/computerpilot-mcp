@@ -5,6 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
@@ -64,6 +65,78 @@ def test_cancel_winning_during_resource_wait_prevents_child_dispatch(tmp_path: P
     assert dispatched == []
     assert store.raw(job_id)["status"] == "cancelled"
     assert WorkflowStore(tmp_path / "workflows.sqlite3", recover=False).health_summary()["quarantined_resource_request_count"] == 0
+
+
+def test_successful_root_exit_settles_dead_descendant_capacity(tmp_path: Path) -> None:
+    fixture = tmp_path / "capacity_child.py"
+    fixture.write_text('''
+import json,os,subprocess,sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+import psutil
+from core.runtime_capacity import acquire_runtime_capacity
+root=Path(sys.argv[2])
+if len(sys.argv)>3:
+ permit=acquire_runtime_capacity(root/'workflows.sqlite3',category='analyzer',limit=1,deadline=time.monotonic()+5)
+ assert permit is not None
+ (root/'ready.tmp').write_text(json.dumps({'pid':os.getpid(),'created':psutil.Process().create_time()}))
+ (root/'ready.tmp').replace(root/'ready')
+ time.sleep(60)
+else:
+ subprocess.Popen([sys.executable,__file__,sys.argv[1],sys.argv[2],'child'])
+ deadline=time.monotonic()+10
+ while not (root/'ready').exists() and time.monotonic()<deadline:time.sleep(.01)
+ assert (root/'ready').exists()
+''', encoding="utf-8")
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = store.submit([sys.executable, str(fixture), str(Path(__file__).resolve().parents[1]), str(tmp_path)], tmp_path, 15, "descendant")
+    try:
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            result = store.get(job["job_id"])
+            if result["status"] not in {"queued", "running"}:
+                break
+            time.sleep(0.05)
+        assert result["status"] == "succeeded", result
+        identity = json.loads((tmp_path / "ready").read_text())
+        from core.jobs import same_process
+
+        assert not same_process(identity["pid"], identity["created"])
+        health = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False).health_summary()
+        assert health["active_analyzer_capacity_weight"] == 0
+        assert health["quarantined_resource_request_count"] == 0
+    finally:
+        store.cancel(job["job_id"])
+
+
+@pytest.mark.parametrize("owner", ["live", "denied", "reused", "zombie", "unknown"])
+def test_child_capacity_reclaim_requires_positive_owner_death(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str,
+) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    pid, created = os.getpid(), psutil.Process().create_time()
+    store.reserve_resource_claims(
+        request_id="parent", owner_token="owner", category="test", claims=(path_claim(tmp_path, "write", scope="subtree"),),
+    )
+    capacity_owner = "unknown-owner" if owner == "unknown" else f"pid-{pid}-{created:.6f}-fixture"
+    assert store.reserve_capacity(
+        admission_id="child", category="analyzer", owner_token=capacity_owner,
+        weight=1, limit=1, resource_request_id="parent", resource_owner_token="owner",
+    )["admitted"] is True
+    if owner == "denied":
+        def denied(*args: object) -> None:
+            raise psutil.AccessDenied(pid)
+
+        monkeypatch.setattr(psutil, "Process", denied)
+    elif owner in {"reused", "zombie"}:
+        process = SimpleNamespace(
+            create_time=lambda: created + 10 if owner == "reused" else created,
+            is_running=lambda: True, status=lambda: psutil.STATUS_ZOMBIE,
+        )
+        monkeypatch.setattr(psutil, "Process", lambda *args: process)
+    released = store.release_dead_resource_capacity("parent", owner_token="owner")
+    assert released == (1 if owner in {"reused", "zombie"} else 0)
+    assert store.health_summary()["active_analyzer_capacity_weight"] == (0 if released else 1)
 
 
 def test_worker_releases_fresh_claim_when_native_ownership_denies_before_spawn(
