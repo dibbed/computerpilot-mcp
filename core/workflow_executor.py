@@ -226,6 +226,7 @@ class WorkflowExecutor:
             is_cancel_requested=lambda: self.store.cancel_requested(workflow_id),
             persist_external_ref=persist_external_ref,
             persist_intent_evidence=persist_intent_evidence,
+            durable_job_timeout_sec=step.timeout_sec,
         )
         result: dict[str, Any] | None = None
         evidence: dict[str, Any] | None = None
@@ -355,6 +356,7 @@ class WorkflowExecutor:
             is_cancel_requested=lambda: stop_signal.is_set() or self.store.cancel_requested(workflow_id),
             persist_external_ref=persist_external_ref,
             persist_intent_evidence=persist_intent_evidence,
+            durable_job_timeout_sec=step.timeout_sec,
         )
         capability = make_resource_capability(resource_request_id, resource_owner_token, self.store.path)
         try:

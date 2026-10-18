@@ -146,6 +146,7 @@ class ActionContext:
     is_cancel_requested: Callable[[], bool]
     persist_external_ref: Callable[[dict[str, Any]], None]
     persist_intent_evidence: Callable[[dict[str, Any]], None]
+    durable_job_timeout_sec: float | None = None
 
 
 class ActionCancelled(RuntimeError):
@@ -311,7 +312,7 @@ def _run_durable_job(
     job = store.submit(
         [executable, *args],
         resolve_path(str(arguments.get("cwd", "."))),
-        timeout_sec,
+        context.durable_job_timeout_sec if context is not None and context.durable_job_timeout_sec is not None else timeout_sec,
         idempotency_key,
         str(arguments.get("encoding", "utf-8")),
         _resource_capability=current_resource_capability(),

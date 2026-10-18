@@ -11,6 +11,32 @@ from core.workflow_actions import ACTION_HANDLERS, ActionCancelled, ActionContex
 from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 
 
+def test_durable_job_submission_timeout_is_stable_across_attempt_budgets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core import workflow_actions
+
+    submitted: list[float] = []
+
+    class FakeJobStore:
+        def submit(self, command: object, cwd: object, timeout_sec: float, key: str,
+                   encoding: str, *, _resource_capability: str | None = None) -> dict[str, object]:
+            submitted.append(timeout_sec)
+            return {"job_id": "stable-job", "status": "succeeded", "exit_code": 0}
+
+    monkeypatch.setattr(workflow_actions, "JobStore", FakeJobStore)
+    monkeypatch.setattr(workflow_actions, "ensure_job_scheduler", lambda store: None)
+    context = ActionContext(
+        workflow_id="w", operation_id="o", is_cancel_requested=lambda: False,
+        persist_external_ref=lambda value: None, persist_intent_evidence=lambda value: None,
+        durable_job_timeout_sec=5.0,
+    )
+    arguments = {"executable": "fake", "args": [], "cwd": str(tmp_path), "idempotency_key": "shared"}
+    workflow_actions._run_durable_job(arguments, 4.9, context)
+    workflow_actions._run_durable_job(arguments, 4.4, context)
+    assert submitted == [5.0, 5.0]
+
+
 def test_running_workflow_enters_cancelling_then_stops_after_completed_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
