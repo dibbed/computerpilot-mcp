@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 
-from core.registry import create_server
+from mcp.server import MCPServer
+
+from tools.language.registry import register
 
 
 def test_language_tool_schemas_do_not_expose_arbitrary_command() -> None:
-    tools = {tool.name: tool for tool in asyncio.run(create_server().list_tools())}
+    server = MCPServer("language-schema")
+    register(server)
+    tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
     for name in (
         "symbol_definition",
         "symbol_references",

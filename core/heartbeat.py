@@ -13,9 +13,10 @@ from typing import Any
 from core.artifact_retention import schedule_artifact_retention
 from core.audit import flush_audit
 from core.backups import BACKUP_RETENTION
-from core.config import SETTINGS
+from core.config import SETTINGS, ensure_runtime_dirs
 from core.health_snapshot import bound_runtime_health, collect_server_health
 from core.job_retention import schedule_job_history_retention
+from core.job_scheduler import ensure_job_scheduler
 from core.lifecycle import RUNTIME_LIFECYCLE
 from core.recovery import OPERATION_RECOVERY
 from core.tool_activity import TOOL_ACTIVITY
@@ -27,6 +28,12 @@ RUNTIME_HEALTH_PUBLISH_INTERVAL_SEC = 10.0
 
 @asynccontextmanager
 async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
+    ensure_runtime_dirs()
+    store_getter = getattr(server, "job_store_getter", None)
+    if store_getter is not None:
+        store = await asyncio.to_thread(store_getter)
+        await asyncio.to_thread(ensure_job_scheduler, store)
+
     async def pulse(path: Path) -> None:
         path.write_text(str(os.getpid()), encoding="ascii")
         while True:
@@ -70,6 +77,8 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     RUNTIME_LIFECYCLE.configure_from_env()
     OPERATION_RECOVERY.configure_from_env(SETTINGS.state_dir)
     TOOL_ACTIVITY.configure_from_env()
+    if hasattr(server, "__dict__"):
+        server.runtime_started = True
     BACKUP_RETENTION.schedule()
     value = os.environ.get("MCP_HEARTBEAT_FILE")
     health_value = os.environ.get("MCP_RUNTIME_HEALTH_FILE")
@@ -106,6 +115,8 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     try:
         yield {}
     finally:
+        if hasattr(server, "__dict__"):
+            server.runtime_started = False
         RUNTIME_LIFECYCLE.mark_stopping()
         if extension_manager is not None:
             try:

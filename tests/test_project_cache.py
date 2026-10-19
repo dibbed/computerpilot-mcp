@@ -10,6 +10,8 @@ from typing import Any, cast
 
 import pytest
 
+from core.errors import ToolError
+from tools.project import context as project_context
 from tools.project import registry, service
 from tools.project.context import lookup_code_context
 from tools.project.index import PythonFileMetadata, PythonMetadataCache, build_python_metadata
@@ -429,3 +431,233 @@ def test_concurrent_waiters_retry_after_invalidation(tmp_path: Path) -> None:
     assert all(result.functions[0].qualified_name == "new" for result in results)
     assert all(result is results[0] for result in results)
     assert cache.stats()["entries"] == 1
+
+
+def test_file_version_detects_same_size_same_mtime_content_change(tmp_path: Path) -> None:
+    from tools.project.index import file_version
+
+    target = tmp_path / "app.py"
+    target.write_text("def foo():\n    return 1\n", encoding="utf-8")
+    original = target.stat()
+    first = file_version(target)
+
+    target.write_text("def bar():\n    return 2\n", encoding="utf-8")
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+    after = target.stat()
+    second = file_version(target)
+
+    assert after.st_size == original.st_size
+    assert after.st_mtime_ns == original.st_mtime_ns
+    assert first.mtime_ns == second.mtime_ns
+    assert first.size == second.size
+    assert first.content_sha256 != second.content_sha256
+
+
+def test_context_same_size_same_mtime_change_invalidates_both_caches(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("def foo():\n    return 1\n", encoding="utf-8")
+    original = target.stat()
+    metadata_cache = PythonMetadataCache(max_files=8, max_bytes=4 * 1024 * 1024)
+    context_cache = project_context.ContextIndexCache(max_entries=4, max_bytes=4 * 1024 * 1024)
+
+    assert metadata_cache.get(target).functions[0].qualified_name == "foo"
+    first = context_cache.get(tmp_path, 5_000)
+
+    target.write_text("def bar():\n    return 2\n", encoding="utf-8")
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+    assert target.stat().st_size == original.st_size
+    assert target.stat().st_mtime_ns == original.st_mtime_ns
+
+    assert metadata_cache.get(target).functions[0].qualified_name == "bar"
+    second = context_cache.get(tmp_path, 5_000)
+
+    assert first.snapshot_id != second.snapshot_id
+    assert [item.qualified_name for item in second.definitions] == ["app.bar"]
+
+
+def test_context_delete_rename_invalidates(tmp_path: Path) -> None:
+    cache = project_context.ContextIndexCache(max_entries=4, max_bytes=4 * 1024 * 1024)
+    target = tmp_path / "app.py"
+    target.write_text("def foo():\n    return 1\n", encoding="utf-8")
+    first = cache.get(tmp_path, 5_000)
+
+    renamed = tmp_path / "renamed.py"
+    target.rename(renamed)
+    second = cache.get(tmp_path, 5_000)
+
+    assert first.snapshot_id != second.snapshot_id
+    assert [item.qualified_name for item in second.definitions] == ["renamed.foo"]
+
+
+@pytest.mark.parametrize("invalidate_file", [False, True])
+def test_context_build_cannot_publish_after_invalidation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalidate_file: bool
+) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("def foo():\n    return 1\n", encoding="utf-8")
+    cache = project_context.ContextIndexCache(max_entries=4, max_bytes=4 * 1024 * 1024)
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+    original = project_context._build_context_index
+
+    def observed(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        index = original(*args, **kwargs)
+        if calls == 1:
+            started.set()
+            assert release.wait(5)
+        return index
+
+    monkeypatch.setattr(project_context, "_build_context_index", observed)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(cache.get, tmp_path, 5_000)
+        assert started.wait(5)
+        cache.invalidate(target if invalidate_file else tmp_path)
+        release.set()
+        stale = future.result(timeout=5)
+
+    assert stale.freshness == "stale"
+    assert cache.stats()["entries"] == 0
+    refreshed = cache.get(tmp_path, 5_000)
+    assert refreshed.freshness == "current"
+    assert cache.stats()["entries"] == 1
+
+
+def test_context_lru_count_and_byte_limits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    roots = []
+    for name in ("alpha", "beta", "gamma"):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "app.py").write_text(f"def {name}():\n    return 1\n", encoding="utf-8")
+        roots.append(root)
+    calls: Counter[str] = Counter()
+    original = project_context._build_context_index
+
+    def observed(*args: Any, **kwargs: Any) -> Any:
+        calls[Path(args[0]).name] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(project_context, "_build_context_index", observed)
+    cache = project_context.ContextIndexCache(max_entries=2, max_bytes=8 * 1024 * 1024)
+    cache.get(roots[0], 5_000)
+    cache.get(roots[1], 5_000)
+    cache.get(roots[0], 5_000)
+    cache.get(roots[2], 5_000)
+
+    assert cache.stats()["entries"] == 2
+    cache.get(roots[1], 5_000)
+    assert calls["beta"] == 2
+    assert calls["alpha"] == 1
+    assert cache.stats()["entries"] == 2
+
+    tight = project_context.ContextIndexCache(max_entries=8, max_bytes=1)
+    tight.get(roots[0], 5_000)
+    tight.get(roots[0], 5_000)
+    assert tight.stats()["entries"] == 0
+    assert tight.stats()["bytes"] == 0
+    assert tight.stats()["max_entries"] == 8
+    assert tight.stats()["max_bytes"] == 1
+
+
+def test_context_lru_also_bounds_generation_metadata(tmp_path: Path) -> None:
+    cache = project_context.ContextIndexCache(max_entries=2, max_bytes=8 * 1024 * 1024)
+    roots = []
+    for number in range(12):
+        root = tmp_path / str(number)
+        root.mkdir()
+        (root / "app.py").write_text(f"def value_{number}():\n    return 1\n", encoding="utf-8")
+        roots.append(root)
+        assert cache.get(root, 5_000).definitions[0].qualified_name == f"app.value_{number}"
+        assert cache.stats()["generations"] <= 2
+    assert cache.stats()["entries"] == 2
+    cache.invalidate(roots[-1] / "app.py")
+    assert cache.stats()["entries"] == 1
+    cache.clear()
+    assert cache.stats()["entries"] == cache.stats()["generations"] == 0
+
+
+def test_context_source_snapshot_change_never_returns_mixed_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("def foo():\n    return 1\n", encoding="utf-8")
+    cache = project_context.ContextIndexCache(max_entries=4, max_bytes=4 * 1024 * 1024)
+    attempts = 0
+    original = project_context._build_context_index
+
+    def observed(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        index = original(*args, **kwargs)
+        if attempts == 1:
+            target.write_text("def bar():\n    return 2\n", encoding="utf-8")
+        return index
+
+    monkeypatch.setattr(project_context, "_build_context_index", observed)
+    index = cache.get(tmp_path, 5_000)
+
+    assert [item.qualified_name for item in index.definitions] == ["app.bar"]
+    assert index.freshness == "current"
+    assert attempts == 2
+
+
+def test_context_build_deadline_raises_before_any_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("def foo():\n    return 1\n", encoding="utf-8")
+    cache = project_context.ContextIndexCache(max_entries=4, max_bytes=4 * 1024 * 1024)
+    monkeypatch.setattr(project_context, "CONTEXT_INDEX_DEADLINE_SECONDS", -1.0)
+
+    with pytest.raises(ToolError) as excinfo:
+        cache.get(tmp_path, 5_000)
+
+    assert excinfo.value.code == "context_index_deadline"
+    assert cache.stats()["entries"] == 0
+
+
+def test_context_symlink_outside_root_is_skipped(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.py"
+    secret.write_text("def leak():\n    return 1\n", encoding="utf-8")
+    link = root / "linked.py"
+    try:
+        link.symlink_to(secret)
+    except OSError:
+        pytest.skip("Symlink creation is not available in this environment.")
+
+    result = lookup_code_context(root, "leak")
+
+    assert result["definitions"] == []
+    assert "symlink_outside_root" in result["incomplete_reasons"]
+    assert result["complete"] is False
+
+
+def test_project_large_file_is_bounded(tmp_path: Path) -> None:
+    target = tmp_path / "huge.py"
+    target.write_text("value = 1\n" * 250_000, encoding="utf-8")
+    assert target.stat().st_size > 2 * 1024 * 1024
+    cache = PythonMetadataCache(max_files=8, max_bytes=4 * 1024 * 1024)
+
+    with pytest.raises(ToolError) as excinfo:
+        cache.get(target)
+
+    assert excinfo.value.code == "project_file_too_large"
+    metadata = build_python_metadata(target)
+    assert metadata.parse_error is not None
+    assert "2 MiB" in metadata.parse_error
+
+
+def test_project_discovery_sorts_before_cap(tmp_path: Path) -> None:
+    for name in ("c.py", "a.py", "b.py"):
+        (tmp_path / name).write_text("def value():\n    return 1\n", encoding="utf-8")
+
+    files, truncated = service.iter_files(tmp_path, 2)
+
+    assert [path.name for path in files] == ["a.py", "b.py"]
+    assert truncated is True

@@ -6,6 +6,11 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+### Changed
+- 2026-10-19: Defer runtime directories and durable job recovery to server lifespan; jobs and testing share one thread-safe lazy store. Catalog construction and advisory reads do not launch jobs; health reports unavailable before startup, and startup storage failures remain fail-closed.
+- 2026-10-19: Validate standard LSP method parameters before dispatch, including strict UTF-16 positions, local workspace URIs and bounded JSON/documents. Malformed or nonstandard legacy parameters and unsupported partial-result tokens now fail with fixed safe errors; tool names and valid legacy requests remain supported.
+- 2026-10-19: Bound Python context caches by content digests, entry/byte/build limits and stable source snapshots; retire generation metadata on eviction and invalidate containing projects for changed files. Preserve deterministic relationship pagination and explicit completeness. Add disabled-by-default pinned LSP provider configuration and native process-tree ownership with a minimal launch environment, pre-launch document guards, safe protocol errors and fail-closed cleanup. Persistent-session activation remains pending acceptance.
+
 ### Added
 - 2026-10-18: Connect the shared MCP/worker DAG gate to documented `MCP_WORKFLOW_DAG_ENABLED` operator configuration, disabled by default. Planning and queued state remain available while disabled; sequential behavior and default cap 1 are preserved.
 - 2026-10-17: Add schema-9 durable resource requests/claims and shared runtime-capacity admissions for feature-gated DAG execution, including canonical read/write exact/subtree conflict detection, cross-process fairness, lease-loss quarantine, managed patch/Git/terminal/job coordination, and one shared analyzer budget across foreground, background and workflow verification. Public DAG activation remains disabled pending graph-wide cancellation/restart recovery hardening.

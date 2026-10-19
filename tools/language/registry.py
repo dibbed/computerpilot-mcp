@@ -14,6 +14,7 @@ from core.config import resolve_path
 from core.tooling import MUTATING, OPEN_WORLD_READ, compact_errors
 from tools.language.edits import apply_workspace_edit, prepare_workspace_edit
 from tools.language.lsp import LspClient
+from tools.language.requests import validate_request
 
 
 def _command() -> list[str]:
@@ -24,7 +25,9 @@ def _command() -> list[str]:
 
 
 def _request(root: str, timeout_sec: float, method: str, params: dict[str, Any]) -> Any:
-    return LspClient(_command(), resolve_path(root), timeout_sec=timeout_sec).request(method, params)
+    workspace = resolve_path(root)
+    validated = validate_request(workspace, method, params)
+    return LspClient(_command(), workspace, timeout_sec=timeout_sec).request(method, validated)
 
 
 def register(mcp: MCPServer) -> None:

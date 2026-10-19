@@ -270,7 +270,7 @@ def register(mcp: MCPServer) -> None:
         include_references: bool = True,
         include_imports: bool = True,
         include_tests: bool = True,
-        max_depth: Annotated[int, Field(ge=1, le=2)] = 1,
+        max_depth: Annotated[int, Field(strict=True, ge=0, le=2)] = 1,
         max_files: Annotated[int, Field(ge=1, le=50_000)] = 5_000,
         max_relationships: Annotated[int, Field(ge=1, le=1_000)] = 100,
         source_max_chars: Annotated[int, Field(ge=0, le=200_000)] = 20_000,

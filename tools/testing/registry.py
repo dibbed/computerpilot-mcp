@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from pathlib import Path
@@ -17,8 +18,7 @@ from core.artifacts import deliver_text
 from core.audit import audit_action
 from core.config import PROJECT_ROOT, SETTINGS, resolve_path
 from core.errors import ToolError
-from core.job_scheduler import ensure_job_scheduler
-from core.jobs import JobStore
+from core.jobs import JobStore, lazy_job_store
 from core.resource_claims import coordination_claim, managed_resource_claims, path_claim
 from core.runtime_capacity import acquire_runtime_capacity
 from core.tooling import OPEN_WORLD_WRITE, READ_ONLY, compact_errors
@@ -39,9 +39,10 @@ def _cwd(value: str | None) -> Path:
     return resolve_path(value) if value else PROJECT_ROOT
 
 
-def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
-    watch_store = JobStore()
-    ensure_job_scheduler(watch_store)
+def register(
+    mcp: MCPServer, *, background_enabled: bool = False, store_getter: Callable[[], JobStore] | None = None,
+) -> None:
+    get_store = store_getter or lazy_job_store(lambda: JobStore())
 
     if background_enabled:
 
@@ -76,7 +77,7 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
                 ruff_fix=ruff_fix, diagnostic_cap=diagnostic_cap, max_parallel_checks=max_parallel_checks,
             )
             audit_action("start_verification", target=working, details={"check_count": len(checks) if checks is not None else len(_CHECKS)})
-            return submit_verification(watch_store, request, idempotency_key, queue_timeout_sec)
+            return submit_verification(get_store(), request, idempotency_key, queue_timeout_sec)
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("start_validation_watch")
@@ -108,7 +109,7 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
         ]
         request_key = idempotency_key or f"validation-watch-{fingerprint}"
         audit_action("start_validation_watch", target=working, details={"request_key": request_key})
-        return watch_store.submit(
+        return get_store().submit(
             [_runners.python_for(working), *args],
             working,
             max_runtime_sec + 120,

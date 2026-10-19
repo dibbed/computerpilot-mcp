@@ -8,12 +8,13 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict
 
-from core.config import SETTINGS, ensure_runtime_dirs
+from core.config import SETTINGS
 from core.execution_models import ExecutionIntent, ExternalRouteMetadata
 from core.execution_router import ExecutionRouter
 from core.extensions.bridge import ExtensionMCPServer
 from core.health_snapshot import collect_server_health
 from core.heartbeat import lifespan
+from core.jobs import JobStore, lazy_job_store
 from core.platform import available_domains, detect_capabilities
 from core.recovery import OPERATION_RECOVERY
 from core.resource_health import collect_resource_metrics
@@ -64,10 +65,10 @@ def create_server() -> MCPServer:
     install_sdk_timing_hooks()
     ArgModelBase.model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
     ArgModelBase.model_rebuild(force=True)
-    ensure_runtime_dirs()
     profile = resolve_profile(SETTINGS.tool_profile)
     capabilities = detect_capabilities()
     active_domains = available_domains(profile.domains, capabilities)
+    store_getter = lazy_job_store(lambda: JobStore()) if {"jobs", "testing"}.intersection(active_domains) else None
     server = ExtensionMCPServer(
         tool_profile=profile.name,
         name=SETTINGS.server_name,
@@ -87,11 +88,14 @@ def create_server() -> MCPServer:
         lifespan=lifespan,
         middleware=[ToolRequestTimingMiddleware()],
     )
+    server.job_store_getter = store_getter
     for domain in active_domains:
         registrar = REGISTRARS.get(domain)
         if registrar is not None:
             if domain == "testing":
-                register_testing(server, background_enabled="jobs" in active_domains)
+                register_testing(server, background_enabled="jobs" in active_domains, store_getter=store_getter)
+            elif domain == "jobs":
+                register_jobs(server, store_getter=store_getter)
             else:
                 registrar(server)
 
@@ -273,6 +277,13 @@ def create_server() -> MCPServer:
     @server.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("server_health")
     async def server_health() -> dict[str, Any]:
+        if not getattr(server, "runtime_started", False):
+            native = await MCPServer.list_tools(server)
+            return {
+                "ok": True, "health_status": "unavailable", "snapshot_reason": "runtime_not_started",
+                "server": SETTINGS.server_name, "version": SETTINGS.version, "tool_profile": profile.name,
+                "tool_count": len(native), "unique_tool_names": len({tool.name for tool in native}) == len(native),
+            }
         return await collect_server_health(
             server,
             settings=SETTINGS,

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 from mcp import types
@@ -22,10 +22,15 @@ from core.extensions.output import ExtensionResult, ResultLimits, finalize_envel
 
 _EXTERNAL_VISIBLE: ContextVar[bool] = ContextVar("external_catalog_visible", default=True)
 
+if TYPE_CHECKING:
+    from core.jobs import JobStore
+
 
 class ExtensionMCPServer(MCPServer):
     def __init__(self, *args: Any, tool_profile: str = "full", **kwargs: Any) -> None:
         self.tool_profile = tool_profile
+        self.job_store_getter: Callable[[], JobStore] | None = None
+        self.runtime_started = False
         self.extension_manager: ExtensionLifecycleManager | None = None
         subscriptions = kwargs.pop("subscriptions", None)
         self.catalog_subscriptions = subscriptions if subscriptions is not None else InMemorySubscriptionBus()

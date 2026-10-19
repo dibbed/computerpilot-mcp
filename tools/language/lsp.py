@@ -13,11 +13,12 @@ from typing import Any, BinaryIO
 from urllib.parse import unquote, urlparse
 
 from core.errors import ToolError
-from core.executor import _creation_flags
+from core.process_ownership import OwnedProcess
+from tools.language import transport
 
 _MAX_HEADER_BYTES = 64 * 1024
 _MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
-_MAX_STDERR_BYTES = 64 * 1024
+_CLOSE_GRACE_SEC = 0.5
 
 
 def position_to_offset(text: str, position: dict[str, int]) -> int:
@@ -177,19 +178,14 @@ def _reader(
         output.put(exc)
 
 
-def _stderr_reader(stream: BinaryIO, sink: list[bytes]) -> None:
-    tail = bytearray()
+def _stderr_reader(stream: BinaryIO) -> None:
+    """Drain private stderr so the child never blocks on a full pipe; content is discarded."""
+
     try:
-        while True:
-            chunk = stream.read(4096)
-            if not chunk:
-                break
-            tail.extend(chunk)
-            if len(tail) > _MAX_STDERR_BYTES:
-                del tail[:-_MAX_STDERR_BYTES]
+        while stream.read(4096):
+            pass
     except OSError:
         pass
-    sink.append(bytes(tail))
 
 
 def _language_id(path: Path) -> str:
@@ -230,7 +226,7 @@ class LspClient:
         self.capabilities: dict[str, Any] = {}
 
     @staticmethod
-    def _send(process: subprocess.Popen[bytes], payload: dict[str, Any]) -> None:
+    def _send(process: OwnedProcess, payload: dict[str, Any]) -> None:
         if process.stdin is None:
             raise ToolError("lsp_protocol_error", "Language server stdin is unavailable.")
         try:
@@ -241,7 +237,7 @@ class LspClient:
 
     def _wait_response(
         self,
-        process: subprocess.Popen[bytes],
+        process: OwnedProcess,
         messages: queue.Queue[dict[str, Any] | BaseException],
         request_id: int,
         deadline: float,
@@ -259,7 +255,7 @@ class LspClient:
                     raise ToolError("lsp_protocol_error", "Language server closed stdout before the required response.")
                 if isinstance(item, ToolError):
                     raise item
-                raise ToolError("lsp_protocol_error", str(item)) from item
+                raise ToolError("lsp_protocol_error", "Language server returned an invalid response.") from None
             if item.get("id") == request_id and "method" not in item:
                 return item
             if "id" in item and "method" in item:
@@ -281,7 +277,8 @@ class LspClient:
         uri = str(document["uri"])
         path = uri_to_path(uri, self.workspace)
         try:
-            payload = path.read_bytes()
+            with path.open("rb") as handle:
+                payload = handle.read(_MAX_DOCUMENT_BYTES + 1)
         except OSError as exc:
             raise ToolError("lsp_document_unavailable", f"Cannot read LSP document: {path}") from exc
         if len(payload) > _MAX_DOCUMENT_BYTES:
@@ -312,17 +309,10 @@ class LspClient:
             raise ToolError("lsp_server_not_found", f"Language server executable not found: {self.command[0]}")
         if not self.workspace.is_dir():
             raise ToolError("lsp_workspace_not_found", f"Language server workspace not found: {self.workspace}")
-        process = subprocess.Popen(
-            [executable, *self.command[1:]],
-            cwd=self.workspace,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=_creation_flags(),
-        )
+        document = self._document_notification(method, params)
+        process = transport._open_command_transport([executable, *self.command[1:]], self.workspace)
         assert process.stdout is not None and process.stderr is not None
         responses: queue.Queue[dict[str, Any] | BaseException] = queue.Queue()
-        stderr_tail: list[bytes] = []
         reader = threading.Thread(
             target=_reader,
             args=(process.stdout, responses),
@@ -332,7 +322,7 @@ class LspClient:
         )
         stderr_reader = threading.Thread(
             target=_stderr_reader,
-            args=(process.stderr, stderr_tail),
+            args=(process.stderr,),
             name="lsp-stderr-reader",
             daemon=True,
         )
@@ -353,11 +343,10 @@ class LspClient:
             )
             initialize = self._wait_response(process, responses, 1, deadline)
             if "error" in initialize:
-                raise ToolError("lsp_request_failed", str(initialize["error"]))
+                raise ToolError("lsp_request_failed", "Language server rejected initialization.")
             self.capabilities = dict((initialize.get("result") or {}).get("capabilities") or {})
             self._send(process, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
-            document = self._document_notification(method, params)
             if document is not None:
                 notification, opened_uri = document
                 self._send(process, notification)
@@ -378,7 +367,7 @@ class LspClient:
             self._send(process, {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None})
             shutdown = self._wait_response(process, responses, 3, deadline)
             if "error" in shutdown:
-                raise ToolError("lsp_request_failed", str(shutdown["error"]))
+                raise ToolError("lsp_request_failed", "Language server rejected the shutdown request.")
             self._send(process, {"jsonrpc": "2.0", "method": "exit", "params": {}})
             if process.stdin is not None:
                 process.stdin.close()
@@ -391,22 +380,15 @@ class LspClient:
             if target is None:
                 raise ToolError("lsp_protocol_error", "Language server omitted the requested response.")
             if "error" in target:
-                raise ToolError("lsp_request_failed", str(target["error"]))
+                raise ToolError("lsp_request_failed", "Language server rejected the request.")
             return target.get("result")
         except ToolError:
             raise
-        except Exception as exc:
-            raise ToolError("lsp_protocol_error", str(exc)) from exc
+        except Exception:
+            raise ToolError("lsp_protocol_error", "Language server protocol failed.") from None
         finally:
-            if process.poll() is None:
-                process.kill()
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                pass
+            closed = transport.close_transport(process, timeout_sec=_CLOSE_GRACE_SEC)
             reader.join(timeout=1)
             stderr_reader.join(timeout=1)
-            if target is None and stderr_tail:
-                detail = stderr_tail[-1].decode("utf-8", errors="replace").strip()
-                if detail:
-                    self.capabilities.setdefault("_last_stderr", detail[-1_000:])
+            if not closed or reader.is_alive() or stderr_reader.is_alive():
+                raise ToolError("lsp_cleanup_incomplete", "Language server cleanup could not be confirmed.") from None

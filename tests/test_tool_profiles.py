@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import threading
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from mcp import Client
@@ -11,6 +14,40 @@ from core import registry
 from core.config import Settings
 from core.errors import ToolError
 from core.tool_profiles import PROFILE_DOMAINS, resolve_profile
+
+
+@pytest.mark.parametrize("profile", list(PROFILE_DOMAINS))
+def test_catalog_construction_has_no_disk_process_or_thread_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
+) -> None:
+    from core import config, jobs
+    from tools.jobs import registry as job_tools
+    from tools.testing import registry as test_tools
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("catalog inspection attempted runtime activation")
+
+    monkeypatch.setenv("MCP_TIMINGS", "0")
+    monkeypatch.setattr(registry, "SETTINGS", replace(registry.SETTINGS, tool_profile=profile, state_dir=tmp_path / "absent"))
+    monkeypatch.setattr(config, "ensure_runtime_dirs", forbidden)
+    monkeypatch.setattr(registry, "ensure_runtime_dirs", forbidden, raising=False)
+    for module in (jobs, job_tools, test_tools):
+        monkeypatch.setattr(module, "JobStore", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(threading.Thread, "start", forbidden)
+
+    async def scenario() -> None:
+        server = registry.create_server()
+        assert await server.list_tools()
+        for name, args in (
+            ("recommend_tools", {"query": "read file"}),
+            ("execution_recommend", {"intent": "filesystem.read"}),
+            ("server_health", {}),
+        ):
+            await server.call_tool(name, args)
+
+    asyncio.run(scenario())
+    assert not (tmp_path / "absent").exists()
 
 
 def _names(profile: str) -> set[str]:
