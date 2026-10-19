@@ -579,13 +579,18 @@ def test_manager_rate_limits_repeated_cleanup_scans(tmp_path: Path, monkeypatch:
         now: float | None = None,
         protected_paths: set[Path] | None = None,
     ) -> BackupCleanupResult:
-        calls.append(time.monotonic())
+        if directory == tmp_path:
+            calls.append(time.monotonic())
         return original(directory, policy, now=now, protected_paths=protected_paths)
 
     monkeypatch.setattr(backups, "cleanup_backups", tracked_cleanup)
     manager = BackupRetentionManager(tmp_path, _policy(interval=0.05))
     manager.schedule()
     assert manager.flush(2)
+    unrelated = BackupRetentionManager(tmp_path / "unrelated", _policy(interval=0.05))
+    unrelated.schedule()
+    assert unrelated.flush(2)
+    assert unrelated.snapshot()["last_result"] is not None
     manager.schedule()
     assert manager.flush(2)
     assert len(calls) == 2
