@@ -433,6 +433,55 @@ def test_concurrent_waiters_retry_after_invalidation(tmp_path: Path) -> None:
     assert cache.stats()["entries"] == 1
 
 
+@pytest.mark.parametrize("changed_read", [1, 3])
+def test_metadata_cache_retries_transient_content_version_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_read: int,
+) -> None:
+    from tools.project import index
+
+    target = tmp_path / "race.py"
+    target.write_text("def old():\n    return 1\n", encoding="utf-8")
+    original = index.file_version
+    reads = 0
+
+    def racing(path: Path) -> index.FileVersion:
+        nonlocal reads
+        reads += 1
+        if reads == changed_read:
+            target.write_text("def new():\n    return 2\n", encoding="utf-8")
+            raise ToolError("project_file_changed_during_parse", "Python source changed while being read")
+        return original(path)
+
+    monkeypatch.setattr(index, "file_version", racing)
+    cache = PythonMetadataCache(max_files=2, max_bytes=1024 * 1024)
+    result = cache.get(target)
+    assert result.functions[0].qualified_name == "new"
+    assert cache.get(target) is result
+
+
+def test_metadata_cache_bounds_retries_for_continuous_content_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.project import index
+
+    target = tmp_path / "race.py"
+    target.write_text("def old():\n    return 1\n", encoding="utf-8")
+    reads = 0
+
+    def changing(path: Path) -> index.FileVersion:
+        nonlocal reads
+        reads += 1
+        raise ToolError("project_file_changed_during_parse", "Python source changed while being read")
+
+    monkeypatch.setattr(index, "file_version", changing)
+    cache = PythonMetadataCache(max_files=2, max_bytes=1024 * 1024)
+    with pytest.raises(ToolError) as failure:
+        cache.get(target)
+    assert failure.value.code == "project_file_changed_during_parse"
+    assert reads == index.MAX_PARSE_VERSION_RETRIES
+    assert cache.stats()["entries"] == 0
+
+
 def test_file_version_detects_same_size_same_mtime_content_change(tmp_path: Path) -> None:
     from tools.project.index import file_version
 

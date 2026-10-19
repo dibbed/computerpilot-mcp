@@ -321,6 +321,12 @@ class PythonMetadataCache:
 
     @staticmethod
     def _version(path: Path) -> FileVersion:
+        for _attempt in range(MAX_PARSE_VERSION_RETRIES - 1):
+            try:
+                return file_version(path)
+            except ToolError as exc:
+                if exc.code != "project_file_changed_during_parse":
+                    raise
         return file_version(path)
 
     def _cached_locked(self, key: str, version: FileVersion) -> PythonFileMetadata | None:
