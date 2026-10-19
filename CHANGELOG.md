@@ -22,6 +22,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-15: Add `start_verification` in profiles containing testing and jobs. Native verification reuses durable job admission, cancellation and output, reports bounded stage events and stale inputs, and supports opt-in parallel read-only checks without changing foreground defaults.
 
 ### Fixed
+- 2026-10-19: Reject unsupported future workflow schemas before changing journal mode or creating tables, under the existing migration lock. Preserve database bytes, rows and schema when an older runtime refuses a newer database.
 - 2026-10-18: Confirm Windows analyzer-owner exit using an identity-checked signaled process handle, including delayed PID visibility. Finalize resource ownership before publishing job success; unresolved child capacity now fails the managed boundary while preserving its fence.
 - 2026-10-18: Bind shared resource admission to a schema-11 runtime-budget fingerprint. Incompatible processes wait before dispatch, inherited capabilities cannot change budgets, and legacy active ownership remains quarantined after upgrade; SQLite triggers also reject old clients omitting the policy.
 - 2026-10-18: Preserve terminal ownership after cleanup denial even through an inherited claim and failed quarantine storage. Reclaim positively dead resource-bound analyzer owners after normal job cleanup, retain live/unknown owners, and settle fenced retries that fail or cancel before dispatch.

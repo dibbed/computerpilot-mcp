@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -14,6 +15,28 @@ from core import workflow_store
 from core.errors import ToolError
 from core.workflow_store import SCHEMA_VERSION
 from core.workflows import WorkflowStore
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_future_schema_is_rejected_without_database_writes(tmp_path: Path, recover: bool) -> None:
+    path = tmp_path / "future.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(
+            f"CREATE TABLE future_truth (id INTEGER PRIMARY KEY, value TEXT);"
+            f"INSERT INTO future_truth VALUES (1, 'preserve'); PRAGMA user_version={SCHEMA_VERSION + 1};"
+        )
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ToolError) as failure:
+        WorkflowStore(path, recover=recover)
+    assert failure.value.code == "workflow_schema_too_new"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION + 1
+        assert connection.execute("SELECT name FROM sqlite_master ORDER BY name").fetchall() == [("future_truth",)]
+        assert connection.execute("SELECT * FROM future_truth").fetchall() == [(1, "preserve")]
+    assert not path.with_name(path.name + "-wal").exists()
+    assert not path.with_name(path.name + "-shm").exists()
 
 
 def _seed_v024_database(path: Path) -> None:
