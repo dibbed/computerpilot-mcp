@@ -11,17 +11,312 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from core.errors import ToolError
+from core.process_ownership import OwnedProcess
 from core.windows_job import NativeOwnershipRequiredError
 from tools.language import transport
 from tools.language.lsp import LspClient
 from tools.language.providers import LspProvider
 
 FIXTURE = Path(__file__).parent / "fixtures" / "persistent_lsp_server.py"
+
+
+class ProtocolStream(io.BytesIO):
+    """Finite fragmented input that stays open until its process exits."""
+
+    def __init__(self, data: bytes, stopped: threading.Event, ready: threading.Event) -> None:
+        super().__init__(data)
+        self.stopped = stopped
+        self.ready = ready
+        self.changed = threading.Condition()
+        self.body_reads = 0
+        self.chunk_size = 3 if len(data) < 10_000 else 4096
+
+    def read(self, size: int | None = -1) -> bytes:
+        self.body_reads += 1
+        return super().read(min(size, self.chunk_size) if size is not None and size >= 0 else self.chunk_size)
+
+    def readline(self, size: int | None = -1) -> bytes:
+        self.ready.wait(5)
+        with self.changed:
+            while not self.stopped.is_set():
+                line = super().readline(size)
+                if line:
+                    return line
+                self.changed.wait(0.05)
+            return b""
+
+    def feed(self, data: bytes) -> None:
+        with self.changed:
+            offset = self.tell()
+            self.seek(0, 2)
+            self.write(data)
+            self.seek(offset)
+            self.changed.notify_all()
+
+
+class ProtocolInput(io.BytesIO):
+    def __init__(self, ready: threading.Event) -> None:
+        super().__init__()
+        self.ready = ready
+        self.on_write: Any = None
+
+    def write(self, data: Any) -> int:
+        size = super().write(data)
+        self.ready.set()
+        if self.on_write is not None:
+            self.on_write(data)
+        return size
+
+
+class ProtocolProcess:
+    def __init__(self, data: bytes) -> None:
+        self.stopped = threading.Event()
+        self.ready = threading.Event()
+        self.stdin = ProtocolInput(self.ready)
+        self.stdout = ProtocolStream(data, self.stopped, self.ready)
+        self.stderr = io.BytesIO()
+        self.terminated = False
+        self.released = False
+
+    def poll(self) -> int | None:
+        return 0 if self.stopped.is_set() else None
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.stopped.set()
+        return 0
+
+    def terminate_tree(self, *, force: bool = True) -> dict[str, Any]:
+        self.terminated = True
+        self.stopped.set()
+        return {}
+
+    def close_ownership(self) -> None:
+        self.released = True
+
+
+def protocol_transport(data: bytes, **bounds: int) -> tuple[Any, ProtocolProcess]:
+    process = ProtocolProcess(data)
+    return transport.LspTransport(cast(OwnedProcess, process), **bounds), process
+
+
+def transport_result(channel: Any) -> dict[str, object]:
+    return channel.receive(deadline=time.monotonic() + 2, cancel=threading.Event())
+
+
+def test_transport_fragmented_body_and_old_response_correlation() -> None:
+    from tools.language.lsp import _frame
+
+    channel, process = protocol_transport(b"".join(_frame(row) for row in (
+        {"id": 1, "result": "first"}, {"id": 1, "result": "stale"},
+    )))
+    try:
+        channel.send({"id": 1, "method": "initialize"})
+        assert transport_result(channel)["result"] == "first"
+        channel.send({"id": 2, "method": "workspace/symbol"})
+        process.stdout.feed(_frame({"id": 2, "result": "second"}))
+        assert transport_result(channel)["result"] == "second"
+        with pytest.raises(ToolError):
+            channel.send({"id": 2, "method": "workspace/symbol"})
+    finally:
+        assert channel.close()
+    assert process.released
+
+
+@pytest.mark.parametrize("data", [
+    b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+    b"Content-Length: +2\r\n\r\n{}",
+    b"Content-Length: 10000000\r\n\r\n",
+    b"Content-Length: 2\r\n\r\n[]",
+    b"Content-Length: 1\r\n\r\n\xff",
+])
+def test_transport_malformed_frame_is_closed_without_body_overread(data: bytes) -> None:
+    channel, process = protocol_transport(data)
+    try:
+        with pytest.raises(ToolError):
+            channel.send({"id": 1, "method": "initialize"})
+            transport_result(channel)
+        if b"10000000" in data:
+            assert process.stdout.body_reads == 0
+        assert process.stopped.wait(1)
+    finally:
+        assert channel.close()
+
+
+@pytest.mark.parametrize("kind", ["count", "bytes", "depth", "future", "invalid_id", "invalid_method"])
+def test_transport_untrusted_output_limits(kind: str) -> None:
+    from tools.language.lsp import _frame
+
+    messages: list[dict[str, Any]] = [{"method": "$/progress", "params": {}}] * 65
+    if kind == "bytes":
+        messages = [{"method": "$/progress", "params": {"value": "x" * 3_000_000}}] * 3
+    elif kind == "depth":
+        value: Any = None
+        for _ in range(33):
+            value = [value]
+        messages = [{"id": 1, "result": value}]
+    elif kind == "future":
+        messages = [{"id": 2, "result": None}]
+    elif kind == "invalid_id":
+        messages = [{"id": True, "result": None}]
+    elif kind == "invalid_method":
+        messages = [{"method": 42}]
+    channel, process = protocol_transport(b"".join(_frame(row) for row in messages))
+    try:
+        channel.send({"id": 1, "method": "initialize"})
+        if kind in {"count", "bytes"}:
+            assert process.stopped.wait(3)
+        with pytest.raises(ToolError):
+            transport_result(channel)
+    finally:
+        assert channel.close()
+
+
+def test_transport_server_callbacks_never_dispatch_edits() -> None:
+    from tools.language.lsp import _frame, _parse_frames
+
+    channel, process = protocol_transport(b"".join(_frame(row) for row in (
+        {"id": "config", "method": "workspace/configuration", "params": {"items": [{}, {}]}},
+        {"id": "edit", "method": "workspace/applyEdit", "params": {"edit": {"changes": {}}}},
+        {"id": 1, "result": "safe"},
+    )))
+    try:
+        channel.send({"id": 1, "method": "initialize"})
+        assert transport_result(channel)["result"] == "safe"
+        replies = _parse_frames(process.stdin.getvalue(), 4_000_000)
+        assert replies[1] == {"jsonrpc": "2.0", "id": "config", "result": [None, None]}
+        assert replies[2]["error"]["code"] == -32601
+    finally:
+        assert channel.close()
+
+
+def test_transport_notification_flood_is_bounded_even_with_fast_consumer() -> None:
+    from tools.language.lsp import _frame
+
+    callback = _frame({"id": "callback", "method": "workspace/configuration", "params": {"items": []}})
+    channel, process = protocol_transport(callback)
+
+    def next_callback(data: bytes) -> None:
+        if b'"result":' in data:
+            process.stdout.feed(callback)
+
+    process.stdin.on_write = next_callback
+    try:
+        channel.send({"id": 1, "method": "initialize"})
+        with pytest.raises(ToolError, match="malformed"):
+            transport_result(channel)
+        assert channel._notifications == 257
+        assert process.terminated
+    finally:
+        assert channel.close()
+
+
+def test_transport_request_budget_resets_only_between_requests() -> None:
+    from tools.language.lsp import _frame
+
+    channel, process = protocol_transport(_frame({"id": 1, "result": "x" * 350}), max_message_bytes=500, max_request_bytes=600)
+    try:
+        channel.send({"id": 1, "method": "initialize"})
+        transport_result(channel)
+        first_wire = channel.wire_bytes
+        channel.send({"id": 2, "method": "workspace/symbol"})
+        process.stdout.feed(_frame({"id": 2, "result": "x" * 350}))
+        transport_result(channel)
+        assert channel.wire_bytes > first_wire
+        channel.send({"id": 3, "method": "workspace/symbol"})
+        with pytest.raises(ToolError, match="total limit"):
+            channel.send({"method": "initialized", "params": "x" * 550})
+    finally:
+        assert channel.close()
+
+
+def test_transport_future_response_before_next_dispatch_is_rejected() -> None:
+    from tools.language.lsp import _frame
+
+    channel, process = protocol_transport(_frame({"id": 1, "result": None}))
+    try:
+        channel.send({"id": 1, "method": "initialize"})
+        transport_result(channel)
+        process.stdout.feed(_frame({"id": 2, "result": "unsolicited"}))
+        assert process.stopped.wait(1)
+        with pytest.raises(ToolError):
+            channel.send({"id": 2, "method": "workspace/symbol"})
+    finally:
+        assert channel.close()
+
+
+def test_transport_cancel_timeout_and_multiple_owners_are_denied() -> None:
+    channel, process = protocol_transport(b"")
+    try:
+        channel.send({"id": 1, "method": "initialize"})
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(ToolError, match="cancelled"):
+            channel.receive(deadline=time.monotonic() + 1, cancel=cancel)
+        with pytest.raises(ToolError, match="timeout"):
+            channel.receive(deadline=time.monotonic() - 1, cancel=threading.Event())
+        denied: list[str] = []
+
+        def wrong_owner() -> None:
+            try:
+                channel.send({"method": "exit"})
+            except ToolError as error:
+                denied.append(error.code)
+
+        writer = threading.Thread(target=wrong_owner)
+        writer.start()
+        writer.join(1)
+        assert denied == ["lsp_protocol_error"]
+        with pytest.raises(ToolError):
+            channel.send({"id": 2, "method": "workspace/symbol"})
+    finally:
+        assert channel.close()
+        assert channel.close()
+    assert process.released
+
+
+def test_transport_fragmented_headers_over_real_pipe() -> None:
+    from tools.language.lsp import _frame
+
+    read_fd, write_fd = os.pipe()
+    framed = _frame({"id": 1, "result": "😀"})
+
+    def fragmented_writer() -> None:
+        with os.fdopen(write_fd, "wb", buffering=0) as output:
+            for byte in framed:
+                output.write(bytes([byte]))
+
+    writer = threading.Thread(target=fragmented_writer)
+    writer.start()
+    try:
+        with os.fdopen(read_fd, "rb") as source:
+            message, size = transport._read_message(source, 500)
+            assert message == {"id": 1, "result": "😀"}
+            assert size == len(framed)
+    finally:
+        writer.join(2)
+    assert not writer.is_alive()
+
+
+def test_transport_partial_progress_is_bounded_and_never_reported_complete() -> None:
+    from tools.language.lsp import _frame
+
+    channel, _process = protocol_transport(b"".join(_frame(row) for row in (
+        {"method": "$/progress", "params": {"token": "partial", "value": [{"name": "source"}]}},
+        {"id": 1, "result": []},
+    )))
+    try:
+        channel.send({"id": 1, "method": "workspace/symbol", "params": {"partialResultToken": "partial"}})
+        result = transport_result(channel)
+        assert result["complete"] is False
+        assert result["partialResults"] == [[{"name": "source"}]]
+        assert channel.notification_counts == {"textDocument/publishDiagnostics": 0, "$/progress": 1}
+    finally:
+        assert channel.close()
 
 
 class FixtureSession:
