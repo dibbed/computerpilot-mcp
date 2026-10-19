@@ -343,11 +343,6 @@ class PythonMetadataCache:
     def get(self, path: Path) -> PythonFileMetadata:
         target = path.resolve(strict=False)
         key = canonical_path(target)
-        version = self._version(target)
-        with self._lock:
-            cached = self._cached_locked(key, version)
-            if cached is not None:
-                return cached
         return self._flights.run(key, lambda: self._load_stable(target, key))
 
     def _load_stable(self, target: Path, key: str) -> PythonFileMetadata:

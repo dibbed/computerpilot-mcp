@@ -433,30 +433,90 @@ def test_concurrent_waiters_retry_after_invalidation(tmp_path: Path) -> None:
     assert cache.stats()["entries"] == 1
 
 
-@pytest.mark.parametrize("changed_read", [1, 3])
+@pytest.mark.parametrize("after_load", [False, True])
 def test_metadata_cache_retries_transient_content_version_race(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_read: int,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after_load: bool,
 ) -> None:
     from tools.project import index
 
     target = tmp_path / "race.py"
     target.write_text("def old():\n    return 1\n", encoding="utf-8")
     original = index.file_version
-    reads = 0
+    loaded = False
+    changed = False
+
+    def loader(path: Path) -> PythonFileMetadata:
+        nonlocal loaded
+        result = build_python_metadata(path)
+        loaded = True
+        return result
 
     def racing(path: Path) -> index.FileVersion:
-        nonlocal reads
-        reads += 1
-        if reads == changed_read:
+        nonlocal changed
+        if not changed and loaded == after_load:
+            changed = True
             target.write_text("def new():\n    return 2\n", encoding="utf-8")
             raise ToolError("project_file_changed_during_parse", "Python source changed while being read")
         return original(path)
 
     monkeypatch.setattr(index, "file_version", racing)
-    cache = PythonMetadataCache(max_files=2, max_bytes=1024 * 1024)
+    cache = PythonMetadataCache(max_files=2, max_bytes=1024 * 1024, loader=loader)
     result = cache.get(target)
     assert result.functions[0].qualified_name == "new"
     assert cache.get(target) is result
+
+
+def test_concurrent_metadata_waiters_share_version_reads_during_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.project import index
+
+    target = tmp_path / "race.py"
+    target.write_text("def old():\n    return 1\n", encoding="utf-8")
+    started = threading.Event()
+    release = threading.Event()
+    joined = threading.Event()
+    owner: int | None = None
+    original_version = index.file_version
+
+    def loader(path: Path) -> PythonFileMetadata:
+        nonlocal owner
+        result = build_python_metadata(path)
+        if owner is None:
+            owner = threading.get_ident()
+            started.set()
+            assert release.wait(5)
+        return result
+
+    def guarded(path: Path) -> index.FileVersion:
+        if started.is_set() and not release.is_set() and threading.get_ident() != owner:
+            raise ToolError("project_file_changed_during_parse", "Writer is updating the source")
+        return original_version(path)
+
+    cache = PythonMetadataCache(max_files=2, max_bytes=1024 * 1024, loader=loader)
+    original_run = cache._flights.run
+
+    def observed_run(*args: Any, **kwargs: Any) -> Any:
+        if started.is_set() and threading.get_ident() != owner:
+            joined.set()
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(index, "file_version", guarded)
+    monkeypatch.setattr(cache._flights, "run", observed_run)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(cache.get, target)
+        assert started.wait(5)
+        second = pool.submit(cache.get, target)
+        second.add_done_callback(lambda future: joined.set())
+        try:
+            assert joined.wait(5)
+            target.write_text("def new():\n    return 2\n", encoding="utf-8")
+            cache.invalidate(target)
+        finally:
+            release.set()
+        result = first.result(timeout=5)
+        assert result.functions[0].qualified_name == "new"
+        assert second.result(timeout=5) is result
 
 
 def test_metadata_cache_bounds_retries_for_continuous_content_race(
