@@ -327,7 +327,16 @@ def test_lsp_environment_excludes_secret_and_loader_vars(tmp_path: Path, monkeyp
     monkeypatch.setenv("PYTHONHOME", str(tmp_path / "canary-pythonhome"))
     monkeypatch.setenv("NODE_OPTIONS", "--require=canary")
     monkeypatch.setenv("NODE_PATH", str(tmp_path / "canary-nodepath"))
+    monkeypatch.setenv("__CF_USER_TEXT_ENCODING", "canary-parent-corefoundation")
     monkeypatch.setenv("PATH", str(tmp_path / "canary-path") + os.pathsep + os.environ.get("PATH", ""))
+    launched_environments: list[dict[str, str]] = []
+    original_spawn = transport.spawn_owned_process
+
+    def capture_spawn(*args: Any, **kwargs: Any) -> Any:
+        launched_environments.append(dict(kwargs["env"]))
+        return original_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(transport, "spawn_owned_process", capture_spawn)
 
     dump = tmp_path / "env.json"
     probe = tmp_path / "dump_env.py"
@@ -357,7 +366,13 @@ def test_lsp_environment_excludes_secret_and_loader_vars(tmp_path: Path, monkeyp
         parent_value = os.environ.get(name)
         if parent_value is not None:
             assert env.get(name.upper()) == parent_value
-    assert set(env) <= {"PATH"} | {name.upper() for name in os_vars}
+    allowed = {"PATH"} | {name.upper() for name in os_vars}
+    assert len(launched_environments) == 1
+    assert {name.upper() for name in launched_environments[0]} <= allowed
+    assert "canary-parent-corefoundation" not in env.values()
+    # Darwin may synthesize this key after launch; it is never forwarded in the explicit environment.
+    runtime_added = {"__CF_USER_TEXT_ENCODING"} if sys.platform == "darwin" else set()
+    assert set(env) <= allowed | runtime_added
 
 
 def test_lsp_error_and_stderr_canaries_do_not_escape(tmp_path: Path) -> None:
