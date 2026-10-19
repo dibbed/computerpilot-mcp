@@ -88,6 +88,7 @@ class ProtocolProcess:
 
     def wait(self, timeout: float | None = None) -> int:
         self.stopped.set()
+        self.ready.set()
         return 0
 
     def terminate_tree(self, *, force: bool = True) -> dict[str, Any]:
@@ -317,6 +318,35 @@ def test_transport_partial_progress_is_bounded_and_never_reported_complete() -> 
         assert channel.notification_counts == {"textDocument/publishDiagnostics": 0, "$/progress": 1}
     finally:
         assert channel.close()
+
+
+@pytest.mark.parametrize("bounds", [{"max_message_bytes": 4_000_001}, {"max_total_bytes": 8_000_001}])
+def test_client_invalid_transport_bounds_never_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bounds: dict[str, int]) -> None:
+    launched: list[object] = []
+    monkeypatch.setattr(transport, "_open_command_transport", lambda *args: launched.append(args))
+    with pytest.raises(ValueError):
+        LspClient([sys.executable, str(FIXTURE)], tmp_path, **bounds)
+    assert not launched
+
+
+@pytest.mark.parametrize("failed_start", [1, 2])
+def test_transport_thread_start_failure_closes_owned_process(monkeypatch: pytest.MonkeyPatch, failed_start: int) -> None:
+    process = ProtocolProcess(b"")
+    starts = 0
+    original = threading.Thread.start
+
+    def fail_start(thread: threading.Thread) -> None:
+        nonlocal starts
+        starts += 1
+        if starts == failed_start:
+            raise RuntimeError("private-start-canary")
+        original(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(ToolError, match="could not be started"):
+        transport.LspTransport(cast(OwnedProcess, process))
+    assert process.released
+    assert process.poll() == 0
 
 
 class FixtureSession:

@@ -149,8 +149,13 @@ class LspTransport:
         self.wire_bytes = 0
         self._reader = threading.Thread(target=self._read, name="lsp-stdout-reader", daemon=True)
         self._stderr = threading.Thread(target=_stderr_reader, args=(process.stderr,), name="lsp-stderr-reader", daemon=True)
-        self._reader.start()
-        self._stderr.start()
+        try:
+            self._reader.start()
+            self._stderr.start()
+        except RuntimeError:
+            if not self.close():
+                raise ToolError("lsp_cleanup_incomplete", "Language server cleanup could not be confirmed.") from None
+            raise ToolError("lsp_launch_failed", "Language server reader could not be started.") from None
 
     def _fail(self, error: ToolError) -> None:
         with self._condition:
@@ -293,8 +298,9 @@ class LspTransport:
         if self._close_result is None:
             self._closing.set()
             closed = close_transport(self.process, timeout_sec=0.5)
-            self._reader.join(1)
-            self._stderr.join(1)
+            for reader in (self._reader, self._stderr):
+                if reader.ident is not None:
+                    reader.join(1)
             self._close_result = closed and not self._reader.is_alive() and not self._stderr.is_alive()
         return self._close_result
 

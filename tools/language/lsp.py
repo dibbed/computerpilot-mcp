@@ -99,7 +99,7 @@ class LspClient:
             raise ValueError("A language server command is required.")
         if timeout_sec <= 0:
             raise ValueError("timeout_sec must be positive.")
-        if max_message_bytes <= 0 or max_total_bytes < max_message_bytes:
+        if not 0 < max_message_bytes <= 4_000_000 or not max_message_bytes <= max_total_bytes <= 8_000_000:
             raise ValueError("LSP response bounds are invalid.")
         self.command = command
         self.workspace = workspace.resolve(strict=False)
