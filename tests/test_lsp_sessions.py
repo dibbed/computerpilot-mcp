@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -360,6 +361,87 @@ def test_manager_construction_and_snapshot_do_not_start_threads(monkeypatch: pyt
     manager = sessions.LspSessionManager((), generation="test")
     assert manager.snapshot()["active"] == 0
     assert calls == []
+
+
+def test_manager_restart_backoff_starts_after_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    provider, _log = manager_provider(tmp_path)
+    clock = [100.0]
+    validations = 0
+    starts: list[float] = []
+    original = sessions.validate_provider
+
+    def slow_validation(*args: Any, **kwargs: Any) -> LspProvider:
+        nonlocal validations
+        validations += 1
+        if validations == 1:
+            clock[0] += 6
+        return original(*args, **kwargs)
+
+    def fail_start(thread: threading.Thread) -> None:
+        starts.append(clock[0])
+        raise RuntimeError("fixture start unavailable")
+
+    monkeypatch.setattr(sessions, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(sessions, "validate_provider", slow_validation)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    manager = sessions.LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        with pytest.raises(ToolError):
+            await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "first"}, timeout_sec=30)
+        with pytest.raises(ToolError) as failure:
+            await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "second"}, timeout_sec=30)
+        assert failure.value.code == "lsp_restart_limited"
+
+    asyncio.run(scenario())
+    assert starts == [106.0]
+
+
+@pytest.mark.parametrize("kind", ["exited_child", "reused_pid"])
+def test_manager_cpu_budget_retains_consumption_across_tree_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    from tools.language import sessions
+    from tools.language.providers import make_session_key
+
+    provider, _log = manager_provider(tmp_path)
+    phase = [0]
+
+    class CpuProbe:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def children(self, *, recursive: bool) -> list[CpuProbe]:
+            return [CpuProbe(2)] if kind == "exited_child" and phase[0] == 0 else []
+
+        def create_time(self) -> float:
+            return float(phase[0] + 1) if kind == "reused_pid" else float(self.pid)
+
+        def memory_info(self) -> Any:
+            return SimpleNamespace(rss=100)
+
+        def cpu_times(self) -> Any:
+            used = 20 if self.pid == 2 else (10 if phase[0] == 0 else (41 if kind == "exited_child" else 35))
+            return SimpleNamespace(user=used, system=0)
+
+        def num_handles(self) -> int:
+            return 1
+
+        def num_fds(self) -> int:
+            return 1
+
+    monkeypatch.setattr(sessions.psutil, "Process", CpuProbe)
+    manager = sessions.LspSessionManager((provider,), generation="test")
+    key = make_session_key(tmp_path, "python", provider, "test")
+    session = sessions._Session(key, provider, process=cast(OwnedProcess, SimpleNamespace(pid=1, poll=lambda: None)))
+    manager._sample(session)
+    baseline = session.cpu_seconds
+    phase[0] = 1
+    with pytest.raises(ToolError) as failure:
+        manager._sample(session, cpu_baseline=baseline)
+    assert failure.value.code == "lsp_resource_exceeded"
 
 
 class ProtocolStream(io.BytesIO):

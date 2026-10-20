@@ -58,6 +58,7 @@ class _Session:
     last_activity: float = field(default_factory=time.monotonic)
     rss_bytes: int = 0
     cpu_seconds: float = 0.0
+    cpu_samples: dict[tuple[int, float], float] = field(default_factory=dict)
 
 
 def _error(code: str = "lsp_session_failed") -> ToolError:
@@ -122,7 +123,7 @@ class LspSessionManager:
             if session is None:
                 if len(self._sessions) >= 4:
                     raise _error("lsp_capacity_exceeded")
-                self._admit_start(key, started)
+                self._admit_start(key, time.monotonic())
                 session = _Session(key, provider)
                 launch = threading.Thread(target=self._own, args=(session, deadline), name="lsp-session-owner", daemon=True)
                 session.owner_thread = launch
@@ -172,38 +173,46 @@ class LspSessionManager:
         try:
             root = psutil.Process(session.process.pid)
             processes = [root, *root.children(recursive=True)]
+            if len(processes) > 512:
+                raise _error("lsp_resource_exceeded")
             rss = 0
             handles = 0
-            cpu = 0.0
+            consumed = 0.0
+            samples: dict[tuple[int, float], float] = {}
             for process in processes:
                 rss += process.memory_info().rss
                 times = process.cpu_times()
-                cpu += times.user + times.system
+                identity = (process.pid, process.create_time())
+                cpu = times.user + times.system
+                samples[identity] = cpu
+                consumed += max(0.0, cpu - session.cpu_samples.get(identity, 0.0))
                 handles += process.num_handles() if os.name == "nt" else process.num_fds()
         except (psutil.Error, OSError, AttributeError):
             raise _error("lsp_resource_measurement_unavailable") from None
         with self._lock:
             session.rss_bytes = rss
-            session.cpu_seconds = cpu
+            session.cpu_seconds += consumed
+            session.cpu_samples = samples
             total = sum(item.rss_bytes for item in self._sessions.values() if item.state != "CLOSED")
         if rss > _MAX_RSS_BYTES or total > _MAX_TOTAL_RSS_BYTES or handles > 512:
             raise _error("lsp_resource_exceeded")
-        if cpu_baseline is not None and cpu - cpu_baseline > 30:
+        if cpu_baseline is not None and session.cpu_seconds - cpu_baseline > 30:
             raise _error("lsp_resource_exceeded")
 
-    def _receive(self, session: _Session, deadline: float, cancel: threading.Event) -> dict[str, object]:
+    def _receive(
+        self, session: _Session, deadline: float, cancel: threading.Event, *, cpu_baseline: float,
+    ) -> dict[str, object]:
         assert session.transport is not None
-        self._sample(session)
-        baseline = session.cpu_seconds
+        self._sample(session, cpu_baseline=cpu_baseline)
         while True:
             try:
                 response = session.transport.receive(deadline=min(deadline, time.monotonic() + _SAMPLE_SEC), cancel=cancel)
-                self._sample(session, cpu_baseline=baseline)
+                self._sample(session, cpu_baseline=cpu_baseline)
                 return response
             except ToolError as error:
                 if error.code != "lsp_timeout" or time.monotonic() >= deadline:
                     raise
-                self._sample(session, cpu_baseline=baseline)
+                self._sample(session, cpu_baseline=cpu_baseline)
 
     def _own(self, session: _Session, startup_deadline: float) -> None:
         failed = False
@@ -218,12 +227,17 @@ class LspSessionManager:
             channel = LspTransport(session.process)
             session.transport = channel
             self._sample(session)
+            cpu_baseline = session.cpu_seconds
+            if session.stop.is_set() or time.monotonic() >= startup_deadline:
+                return
             channel.send({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"processId": None, "rootUri": Path(session.key.workspace_root).as_uri(),
                            "capabilities": {"workspace": {"configuration": True, "applyEdit": False}}},
             })
-            initialized = self._receive(session, min(startup_deadline, time.monotonic() + 30), session.stop)
+            initialized = self._receive(
+                session, min(startup_deadline, time.monotonic() + 30), session.stop, cpu_baseline=cpu_baseline,
+            )
             result = initialized.get("result")
             if "error" in initialized or not isinstance(result, dict) or not isinstance(result.get("capabilities"), dict):
                 raise _error()
@@ -248,6 +262,8 @@ class LspSessionManager:
                     continue
                 ticket.phase = "preparing"
                 message = json.loads(ticket.payload)
+                self._sample(session)
+                cpu_baseline = session.cpu_seconds
                 if ticket.cancelled.is_set() or session.stop.is_set() or ticket.deadline <= time.monotonic():
                     _finish(ticket, error=_error("lsp_cancelled"))
                     session.current = None
@@ -255,7 +271,7 @@ class LspSessionManager:
                 ticket.phase = "may_dispatch"
                 channel.send({"jsonrpc": "2.0", "id": ticket.request_id, **message})
                 try:
-                    response = self._receive(session, ticket.deadline, ticket.cancelled)
+                    response = self._receive(session, ticket.deadline, ticket.cancelled, cpu_baseline=cpu_baseline)
                 except ToolError as error:
                     if error.code in {"lsp_cancelled", "lsp_timeout"}:
                         channel.send({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": ticket.request_id}})
