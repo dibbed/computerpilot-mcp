@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-20: Add optional typed request models and suffix-derived language selection to the seven read-only LSP tools; legacy `params`, tool names, read-only annotations and response envelopes remain unchanged, and language/suffix mismatches fail before dispatch.
 - 2026-10-20: Connect opt-in persistent LSP requests to server lifecycle and bounded health counters; keep blocking language work off the MCP loop and retain mutation admission until writes finish. Persistent mode remains disabled by default pending acceptance.
 - 2026-10-20: Synchronize persistent LSP documents with negotiated versions, bounded UTF-8 disk snapshots and document retention; reject stale responses and retire sessions after provider or workspace identity changes. Persistent mode remains disabled pending lifecycle acceptance.
 - 2026-10-20: Add an inert-by-default LSP session manager with bounded per-workspace queues, a single protocol owner, native process reuse, cancellation without replay, resource monitoring and quarantine on unresolved cleanup. Persistent mode remains disabled pending lifecycle integration and acceptance.

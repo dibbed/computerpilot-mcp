@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import shutil
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import anyio
 from mcp.server import MCPServer
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from core.audit import audit_action
 from core.config import SETTINGS, resolve_path
@@ -19,8 +19,19 @@ from core.errors import ToolError
 from core.tooling import MUTATING, OPEN_WORLD_READ, compact_errors
 from tools.language.edits import apply_workspace_edit, prepare_workspace_edit
 from tools.language.lsp import LspClient
-from tools.language.requests import validate_request
+from tools.language.requests import (
+    DiagnosticRequest,
+    DocumentRequest,
+    PositionRequest,
+    ReferencesRequest,
+    WorkspaceSymbolRequest,
+    language_for_uri,
+    select_request,
+    validate_request,
+)
 from tools.language.sessions import LspSessionManager
+
+LanguageId = Literal["python", "typescript", "typescriptreact", "javascript", "javascriptreact", "php"]
 
 
 def _command() -> list[str]:
@@ -47,16 +58,30 @@ async def _run_sync(call: Callable[[], Any]) -> Any:
             raise asyncio.CancelledError
 
 
+def _resolve_language(method: str, params: Mapping[str, object], language_id: str | None) -> str:
+    if method.startswith("textDocument/"):
+        document = params.get("textDocument")
+        uri = document.get("uri") if isinstance(document, Mapping) else None
+        if isinstance(uri, str):
+            suffix_language = language_for_uri(uri)
+            if suffix_language is not None:
+                if language_id is not None and language_id != suffix_language:
+                    raise ToolError("lsp_language_mismatch", "The language_id does not match the document suffix.")
+                return language_id or suffix_language
+    return language_id or "python"
+
+
 async def _request(
     root: str, timeout_sec: float, method: str, params: dict[str, Any], *,
     manager: LspSessionManager | None = None, language_id: str | None = None,
 ) -> Any:
+    language = _resolve_language(method, params, language_id)
     deadline = time.monotonic() + timeout_sec
     if manager is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ToolError("lsp_timeout", "Language request deadline expired before dispatch.")
-        return await manager.arequest(Path(root), language_id or "python", method, params, timeout_sec=remaining)
+        return await manager.arequest(Path(root), language, method, params, timeout_sec=remaining)
 
     def legacy_request() -> Any:
         workspace = resolve_path(root)
@@ -69,31 +94,129 @@ async def _request(
     return await _run_sync(legacy_request)
 
 
+async def _dispatch_read(
+    root: str,
+    params: dict[str, Any] | None,
+    request: BaseModel | None,
+    timeout_sec: float,
+    method: str,
+    *,
+    manager: LspSessionManager | None,
+    language_id: str | None,
+) -> dict[str, Any]:
+    selected = select_request(params, request)
+    result = await _request(root, timeout_sec, method, selected, manager=manager, language_id=language_id)
+    return {"ok": True, "method": method, "result": result}
+
+
 def register(mcp: MCPServer, *, manager: LspSessionManager | None = None) -> None:
     if SETTINGS.persistent_enabled and manager is None:
         raise ToolError("lsp_configuration_invalid", "Persistent language tools require a server-owned session manager.")
 
-    def common(method: str, operation: str) -> Callable[..., Awaitable[dict[str, Any]]]:
-        @mcp.tool(name=operation, annotations=OPEN_WORLD_READ, structured_output=True)
-        @compact_errors(operation)
-        async def tool(
-            root: Annotated[str, Field(min_length=1, max_length=32_767)],
-            params: Annotated[dict[str, Any], Field(max_length=100)],
-            timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
-        ) -> dict[str, Any]:
-            """Run one bounded request through the trusted discovered language server."""
-            result = await _request(root, timeout_sec, method, params, manager=manager)
-            return {"ok": True, "method": method, "result": result}
+    @mcp.tool(name="symbol_definition", annotations=OPEN_WORLD_READ, structured_output=True)
+    @compact_errors("symbol_definition")
+    async def symbol_definition(
+        root: Annotated[str, Field(min_length=1, max_length=32_767)],
+        params: Annotated[dict[str, Any] | None, Field(max_length=100)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+        request: PositionRequest | None = None,
+        language_id: LanguageId | None = None,
+    ) -> dict[str, Any]:
+        """Return definitions for a position from the trusted language server."""
+        return await _dispatch_read(
+            root, params, request, timeout_sec, "textDocument/definition",
+            manager=manager, language_id=language_id,
+        )
 
-        return tool
+    @mcp.tool(name="symbol_references", annotations=OPEN_WORLD_READ, structured_output=True)
+    @compact_errors("symbol_references")
+    async def symbol_references(
+        root: Annotated[str, Field(min_length=1, max_length=32_767)],
+        params: Annotated[dict[str, Any] | None, Field(max_length=100)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+        request: ReferencesRequest | None = None,
+        language_id: LanguageId | None = None,
+    ) -> dict[str, Any]:
+        """Return references for a position from the trusted language server."""
+        return await _dispatch_read(
+            root, params, request, timeout_sec, "textDocument/references",
+            manager=manager, language_id=language_id,
+        )
 
-    common("textDocument/definition", "symbol_definition")
-    common("textDocument/references", "symbol_references")
-    common("textDocument/documentSymbol", "document_symbols")
-    common("workspace/symbol", "workspace_symbols")
-    common("textDocument/hover", "symbol_hover")
-    common("textDocument/prepareCallHierarchy", "call_hierarchy")
-    common("textDocument/diagnostic", "language_diagnostics")
+    @mcp.tool(name="document_symbols", annotations=OPEN_WORLD_READ, structured_output=True)
+    @compact_errors("document_symbols")
+    async def document_symbols(
+        root: Annotated[str, Field(min_length=1, max_length=32_767)],
+        params: Annotated[dict[str, Any] | None, Field(max_length=100)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+        request: DocumentRequest | None = None,
+        language_id: LanguageId | None = None,
+    ) -> dict[str, Any]:
+        """Return symbols declared in one document."""
+        return await _dispatch_read(
+            root, params, request, timeout_sec, "textDocument/documentSymbol",
+            manager=manager, language_id=language_id,
+        )
+
+    @mcp.tool(name="workspace_symbols", annotations=OPEN_WORLD_READ, structured_output=True)
+    @compact_errors("workspace_symbols")
+    async def workspace_symbols(
+        root: Annotated[str, Field(min_length=1, max_length=32_767)],
+        params: Annotated[dict[str, Any] | None, Field(max_length=100)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+        request: WorkspaceSymbolRequest | None = None,
+        language_id: LanguageId | None = None,
+    ) -> dict[str, Any]:
+        """Search workspace symbols across the trusted language server."""
+        return await _dispatch_read(
+            root, params, request, timeout_sec, "workspace/symbol",
+            manager=manager, language_id=language_id,
+        )
+
+    @mcp.tool(name="symbol_hover", annotations=OPEN_WORLD_READ, structured_output=True)
+    @compact_errors("symbol_hover")
+    async def symbol_hover(
+        root: Annotated[str, Field(min_length=1, max_length=32_767)],
+        params: Annotated[dict[str, Any] | None, Field(max_length=100)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+        request: PositionRequest | None = None,
+        language_id: LanguageId | None = None,
+    ) -> dict[str, Any]:
+        """Return hover information for a position."""
+        return await _dispatch_read(
+            root, params, request, timeout_sec, "textDocument/hover",
+            manager=manager, language_id=language_id,
+        )
+
+    @mcp.tool(name="call_hierarchy", annotations=OPEN_WORLD_READ, structured_output=True)
+    @compact_errors("call_hierarchy")
+    async def call_hierarchy(
+        root: Annotated[str, Field(min_length=1, max_length=32_767)],
+        params: Annotated[dict[str, Any] | None, Field(max_length=100)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+        request: PositionRequest | None = None,
+        language_id: LanguageId | None = None,
+    ) -> dict[str, Any]:
+        """Prepare call hierarchy items for a position."""
+        return await _dispatch_read(
+            root, params, request, timeout_sec, "textDocument/prepareCallHierarchy",
+            manager=manager, language_id=language_id,
+        )
+
+    @mcp.tool(name="language_diagnostics", annotations=OPEN_WORLD_READ, structured_output=True)
+    @compact_errors("language_diagnostics")
+    async def language_diagnostics(
+        root: Annotated[str, Field(min_length=1, max_length=32_767)],
+        params: Annotated[dict[str, Any] | None, Field(max_length=100)] = None,
+        timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
+        request: DiagnosticRequest | None = None,
+        language_id: LanguageId | None = None,
+    ) -> dict[str, Any]:
+        """Return language diagnostics for one document."""
+        return await _dispatch_read(
+            root, params, request, timeout_sec, "textDocument/diagnostic",
+            manager=manager, language_id=language_id,
+        )
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("rename_symbol")

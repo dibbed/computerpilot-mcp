@@ -7,7 +7,7 @@ import math
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import unquote_to_bytes, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
@@ -59,6 +59,47 @@ class DiagnosticRequest(DocumentRequest):
 
 class RenameRequest(PositionRequest):
     newName: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+_SUFFIX_LANGUAGES: dict[str, str] = {
+    # Provider-supported languages only; unknown suffixes retain the legacy python default.
+    ".py": "python",
+    ".pyi": "python",
+    ".js": "javascript",
+    ".jsx": "javascriptreact",
+    ".ts": "typescript",
+    ".tsx": "typescriptreact",
+    ".php": "php",
+}
+_MAX_URI_CHARS = 32_767
+
+
+def language_for_uri(uri: str) -> str | None:
+    """Infer one supported language from a bounded document URI without filesystem access."""
+
+    if len(uri) > _MAX_URI_CHARS:
+        return None
+    try:
+        decoded = unquote_to_bytes(urlsplit(uri).path).decode("utf-8", errors="strict")
+    except (UnicodeError, ValueError):
+        return None
+    return _SUFFIX_LANGUAGES.get(Path(decoded).suffix.casefold())
+
+
+def select_request(
+    params: Mapping[str, object] | None, request: BaseModel | None
+) -> dict[str, Any]:
+    """Select exactly one legacy params tree or typed request model."""
+
+    if (params is None) == (request is None):
+        raise ToolError("lsp_request_shape", "Provide exactly one of params or request.")
+    if request is not None:
+        if not isinstance(request, BaseModel):
+            raise ToolError("lsp_request_shape", "Provide exactly one of params or request.")
+        return request.model_dump(exclude_none=True)
+    if not isinstance(params, Mapping):
+        raise ToolError("lsp_request_shape", "Provide exactly one of params or request.")
+    return dict(params)
 
 
 _MODELS: dict[str, type[_Request]] = {
