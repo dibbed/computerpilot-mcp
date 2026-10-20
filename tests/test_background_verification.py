@@ -323,7 +323,9 @@ def test_cancel_running_verification_reaps_test_process(tmp_path: Path) -> None:
     marker = tmp_path / "test-pid"
     (repo / "test_cancel.py").write_text(
         "import os,time\nfrom pathlib import Path\ndef test_wait():\n"
-        f"    Path({str(marker)!r}).write_text(str(os.getpid()))\n"
+        f"    pending = Path({str(marker.with_suffix('.pending'))!r})\n"
+        "    pending.write_text(str(os.getpid()))\n"
+        f"    pending.replace(Path({str(marker)!r}))\n"
         "    time.sleep(60)\n", encoding="utf-8",
     )
     store = JobStore(tmp_path / "state" / "jobs.sqlite3")
