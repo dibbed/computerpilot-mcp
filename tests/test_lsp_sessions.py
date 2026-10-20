@@ -1243,6 +1243,37 @@ def test_manager_idle_cleanup_releases_process(tmp_path: Path, monkeypatch: pyte
     assert "shutdown" in log.read_text(encoding="utf-8")
 
 
+def test_manager_hung_shutdown_reaps_owner_without_orphans(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, "hang-shutdown")
+    manager = LspSessionManager((provider,), generation="hung-shutdown")
+
+    async def scenario() -> None:
+        pid = 0
+        try:
+            result = await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "hung"}, timeout_sec=5)
+            assert isinstance(result, dict) and type(result["pid"]) is int
+            pid = result["pid"]
+            started = time.monotonic()
+            await asyncio.to_thread(manager.close_all, timeout_sec=5)
+            assert time.monotonic() - started < 3
+            snapshot = manager.snapshot()
+            assert snapshot["active"] == snapshot["quarantined"] == snapshot["in_flight"] == 0
+            assert snapshot["spawn_count"] == 1
+            assert snapshot["restart_count"] == 0
+        finally:
+            await asyncio.to_thread(manager.close_all, timeout_sec=5)
+        _wait_for_exit(pid, timeout=3)
+        assert pid and not _process_alive(pid)
+
+    asyncio.run(scenario())
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert lines.count("dispatch:hung") == 1
+    assert lines.count("shutdown-hang") == 1
+    assert "shutdown" not in lines
+
+
 def test_manager_queue_and_session_admission_are_bounded(tmp_path: Path) -> None:
     from tools.language.sessions import LspSessionManager
 
