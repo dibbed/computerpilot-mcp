@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -27,10 +28,33 @@ from tools.language.providers import LspProvider
 FIXTURE = Path(__file__).parent / "fixtures" / "persistent_lsp_server.py"
 
 
-def manager_provider(root: Path, mode: str = "normal", *, delay: float | None = None) -> tuple[LspProvider, Path]:
+def manager_provider(
+    root: Path, mode: str = "normal", *, delay: float | None = None, sync_kind: int = 1, open_close: bool = True,
+) -> tuple[LspProvider, Path]:
     entrypoint = root / "managed-fixture.py"
     log = root / "managed-fixture.log"
     source = FIXTURE.read_text(encoding="utf-8")
+    sync_anchor = '"textDocumentSync": {"openClose": True, "change": 1}'
+    assert source.count(sync_anchor) == 1
+    sync = {"openClose": open_close, "change": sync_kind, "save": {"includeText": True}}
+    source = source.replace(sync_anchor, '"textDocumentSync": ' + repr(sync))
+    notification_anchor = '        if "id" not in message:'
+    assert source.count(notification_anchor) == 1
+    source = source.replace(
+        notification_anchor, notification_anchor + '\n            _append_log(log_path, "notify:" + json.dumps(message))',
+    )
+    change_anchor = '            elif method == "textDocument/didClose":'
+    assert source.count(change_anchor) == 1
+    source = source.replace(change_anchor, '''            elif method == "textDocument/didChange":
+                params = _dict(message.get("params"))
+                document = _dict(params.get("textDocument"))
+                uri = document.get("uri")
+                changes = params.get("contentChanges")
+                version = document.get("version")
+                if isinstance(uri, str) and uri in opened and isinstance(version, int):
+                    if isinstance(changes, list) and changes and version > opened[uri][0]:
+                        opened[uri] = (version, str(changes[-1].get("text", "")))
+''' + change_anchor)
     anchor = '        result: dict[str, object] = {"method": method, "initialized": initialized}'
     assert source.count(anchor) == 1
     source = source.replace(
@@ -49,6 +73,459 @@ def manager_provider(root: Path, mode: str = "normal", *, delay: float | None = 
         "pyright", ("python",), executable, hashlib.sha256(executable.read_bytes()).hexdigest(),
         entrypoint, hashlib.sha256(entrypoint.read_bytes()).hexdigest(), "fixture", (root,),
     ), log
+
+
+def manager_notifications(log: Path) -> list[dict[str, Any]]:
+    return [json.loads(line[7:]) for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("notify:")]
+
+
+def hover_params(path: Path) -> dict[str, object]:
+    return {"textDocument": {"uri": path.as_uri()}, "position": {"line": 0, "character": 0}}
+
+
+@pytest.mark.parametrize("sync_kind", [0, 1, 2])
+def test_manager_document_sync_versions_and_utf16_range(tmp_path: Path, sync_kind: int) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, sync_kind=sync_kind)
+    path = tmp_path / "source.py"
+    path.write_bytes("😀\r\nold😀".encode())
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            first = await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            second = await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            assert isinstance(first, dict) and isinstance(second, dict)
+            assert first["version"] == second["version"] == 1
+            path.write_bytes("new😀\r\n".encode())
+            changed = await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            assert isinstance(changed, dict) and changed["version"] == 2
+            assert manager.snapshot()["documents"] == 1
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+        assert manager.snapshot()["documents"] == 0
+
+    asyncio.run(scenario())
+    notifications = manager_notifications(log)
+    opened = [item for item in notifications if item["method"] == "textDocument/didOpen"]
+    changes = [item for item in notifications if item["method"] == "textDocument/didChange"]
+    assert len(opened) == (2 if sync_kind == 0 else 1)
+    assert len(changes) == (0 if sync_kind == 0 else 1)
+    if sync_kind == 2:
+        assert changes[0]["params"]["contentChanges"][0]["range"] == {
+            "start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 5},
+        }
+    saves = [item for item in notifications if item["method"] == "textDocument/didSave"]
+    assert len(saves) == 1
+    assert saves[0]["params"]["text"] == "new😀\r\n"
+
+
+def test_manager_disk_change_during_hover_is_stale(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, "slow", delay=0.3)
+    path = tmp_path / "source.py"
+    path.write_text("before", encoding="utf-8")
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            request = asyncio.create_task(manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5))
+            await manager_until(lambda: log.read_text(encoding="utf-8").splitlines().count("dispatch:") == 2)
+            original = path.stat()
+            path.write_text("after!", encoding="utf-8")
+            os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+            with pytest.raises(ToolError) as failure:
+                await request
+            assert failure.value.code == "lsp_result_stale"
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_manager_queued_position_is_checked_against_opened_snapshot(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, "slow", delay=0.3)
+    path = tmp_path / "source.py"
+    path.write_text("first\nsecond", encoding="utf-8")
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        active = asyncio.create_task(manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "block"}, timeout_sec=5))
+        try:
+            await manager_until(lambda: log.exists() and "dispatch:block" in log.read_text(encoding="utf-8").splitlines())
+            params = {"textDocument": {"uri": path.as_uri()}, "position": {"line": 1, "character": 1}}
+            queued = asyncio.create_task(manager.arequest(tmp_path, "python", "textDocument/hover", params, timeout_sec=5))
+            await manager_until(lambda: manager.snapshot()["queue_depth"] == 1)
+            path.write_text("short", encoding="utf-8")
+            await active
+            with pytest.raises(ToolError) as failure:
+                await queued
+            assert failure.value.code == "lsp_position_invalid"
+            assert "dispatch:" not in log.read_text(encoding="utf-8").splitlines()
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("when", ["before", "during"])
+def test_manager_workspace_query_uses_current_open_documents(tmp_path: Path, when: str) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, "slow", delay=0.2)
+    path = tmp_path / "source.py"
+    path.write_text("old", encoding="utf-8")
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            if when == "before":
+                path.write_text("new", encoding="utf-8")
+            query = asyncio.create_task(manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "workspace"}, timeout_sec=5))
+            await manager_until(lambda: "dispatch:workspace" in log.read_text(encoding="utf-8").splitlines())
+            if when == "during":
+                path.write_text("new", encoding="utf-8")
+                with pytest.raises(ToolError) as failure:
+                    await query
+                assert failure.value.code == "lsp_result_stale"
+            else:
+                await query
+                changes = [item for item in manager_notifications(log) if item["method"] == "textDocument/didChange"]
+                assert len(changes) == 1
+                assert changes[0]["params"]["contentChanges"][0]["text"] == "new"
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_manager_document_lru_evicts_with_did_close(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path)
+    manager = LspSessionManager((provider,), generation="test")
+    paths = [tmp_path / f"source-{index}.py" for index in range(17)]
+    for path in paths:
+        path.write_text("x", encoding="utf-8")
+
+    async def scenario() -> None:
+        try:
+            for path in paths:
+                await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            assert manager.snapshot()["documents"] == 16
+            await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(paths[0]), timeout_sec=5)
+            assert manager.snapshot()["documents"] == 16
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    notifications = manager_notifications(log)
+    first_close = next(item for item in notifications if item["method"] == "textDocument/didClose")
+    assert first_close["params"]["textDocument"]["uri"] == paths[0].as_uri()
+    assert sum(item["method"] == "textDocument/didOpen" for item in notifications) == 18
+
+
+@pytest.mark.parametrize("suffix,language", [(".tsx", "typescriptreact"), (".jsx", "javascriptreact"), (".py", "python")])
+def test_manager_document_language_and_unicode_identity(tmp_path: Path, suffix: str, language: str) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path)
+    path = tmp_path / ("نمونه" + suffix)
+    path.write_text("value = 1", encoding="utf-8")
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            alias = path.with_name(path.name.upper()) if os.name == "nt" else path
+            await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(alias), timeout_sec=5)
+            assert manager.snapshot()["documents"] == 1
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    opens = [item for item in manager_notifications(log) if item["method"] == "textDocument/didOpen"]
+    assert len(opens) == 1
+    assert opens[0]["params"]["textDocument"]["languageId"] == language
+
+
+def test_manager_missing_sync_capability_denies_before_document_send(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, open_close=False)
+    path = tmp_path / "source.py"
+    path.write_text("x", encoding="utf-8")
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(ToolError) as failure:
+                await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            assert failure.value.code == "lsp_sync_unsupported"
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    assert all(item["method"] != "textDocument/didOpen" for item in manager_notifications(log))
+
+
+def test_manager_deleted_document_closes_and_recreated_document_reopens(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path)
+    path = tmp_path / "source.py"
+    path.write_text("old", encoding="utf-8")
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            path.unlink()
+            with pytest.raises(ToolError):
+                await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            await manager_until(lambda: manager.snapshot()["documents"] == 0)
+            path.write_text("new", encoding="utf-8")
+            result = await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            assert isinstance(result, dict) and result["version"] == 1
+            assert manager.snapshot()["spawn_count"] == 1
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    methods = [item["method"] for item in manager_notifications(log)]
+    assert methods.count("textDocument/didOpen") == methods.count("textDocument/didClose") == 2
+
+
+@pytest.mark.parametrize("change", ["marker", "config", "pin"])
+def test_manager_identity_changes_retire_old_session(tmp_path: Path, change: str) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, _log = manager_provider(tmp_path)
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            first = await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "first"}, timeout_sec=5)
+            assert isinstance(first, dict)
+            if change == "pin":
+                assert provider.entrypoint is not None
+                provider.entrypoint.write_text(provider.entrypoint.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+                with pytest.raises(ToolError) as failure:
+                    await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "denied"}, timeout_sec=5)
+                assert failure.value.code == "lsp_provider_changed"
+                await manager_until(lambda: manager.snapshot()["active"] == 0)
+            else:
+                if change == "marker":
+                    (tmp_path / ".git").write_text("gitdir: fixture-other-worktree\n", encoding="utf-8")
+                else:
+                    manager._providers = (replace(provider, declared_version="changed"),)
+                second = await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "second"}, timeout_sec=5)
+                assert isinstance(second, dict) and first["pid"] != second["pid"]
+                assert manager.snapshot()["active"] == 1
+            assert not _process_alive(first["pid"])
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_manager_concurrent_retirement_submits_only_one_drain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+    from tools.language.providers import make_session_key
+
+    provider, _log = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="test")
+    key = make_session_key(tmp_path, "python", provider, "test")
+    session = sessions._Session(key, provider, state="READY")
+    manager._sessions[key] = session
+
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        submissions = 0
+
+        async def blocked_drain(*_args: object) -> None:
+            nonlocal submissions
+            submissions += 1
+            entered.set()
+            await release.wait()
+            session.state = "CLOSED"
+
+        monkeypatch.setattr(sessions.asyncio, "to_thread", blocked_drain)
+        first = asyncio.create_task(manager._retire_obsolete(tmp_path, "python"))
+        await entered.wait()
+        other = asyncio.create_task(manager._retire_obsolete(tmp_path, "python"))
+        try:
+            await asyncio.sleep(0)
+            assert submissions == 1
+            with pytest.raises(ToolError) as failure:
+                await other
+            assert failure.value.code == "lsp_session_failed"
+        finally:
+            release.set()
+            await asyncio.gather(first, other, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_manager_rename_never_evicts_its_active_input_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    provider, log = manager_provider(tmp_path)
+    monkeypatch.setattr(sessions, "_MAX_DOCUMENT_TOTAL_BYTES", 10)
+    manager = sessions.LspSessionManager((provider,), generation="test")
+    paths = [tmp_path / "a.py", tmp_path / "b.py"]
+    for path in paths:
+        path.write_text("1234", encoding="utf-8")
+
+    async def scenario() -> None:
+        try:
+            for path in paths:
+                await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            paths[1].write_text("12345678", encoding="utf-8")
+            with pytest.raises(ToolError) as failure:
+                await manager.arequest(
+                    tmp_path, "python", "textDocument/rename", {**hover_params(paths[0]), "newName": "renamed"}, timeout_sec=5,
+                )
+            assert failure.value.code == "lsp_document_capacity"
+            assert paths[0].as_uri() in next(iter(manager._sessions.values())).documents
+            assert log.read_text(encoding="utf-8").splitlines().count("dispatch:") == 2
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_manager_document_byte_capacity_evicts_without_exceeding_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    provider, log = manager_provider(tmp_path)
+    monkeypatch.setattr(sessions, "_MAX_DOCUMENT_TOTAL_BYTES", 10)
+    manager = sessions.LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            for name in ("a.py", "b.py"):
+                path = tmp_path / name
+                path.write_text("123456", encoding="utf-8")
+                await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+                assert manager.snapshot()["document_bytes"] == 6
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    closes = [item for item in manager_notifications(log) if item["method"] == "textDocument/didClose"]
+    assert closes[0]["params"]["textDocument"]["uri"] == (tmp_path / "a.py").as_uri()
+
+
+def test_manager_rename_carries_private_immutable_snapshot(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager, RenameResult
+
+    provider, _log = manager_provider(tmp_path)
+    path = tmp_path / "source.py"
+    path.write_bytes(b"before\r\n")
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            result = await manager.arequest(
+                tmp_path, "python", "textDocument/rename", {**hover_params(path), "newName": "after"}, timeout_sec=5,
+            )
+            assert isinstance(result, RenameResult)
+            assert result.snapshot_version == {path.as_uri(): 1}
+            assert result.source_sha256 == {path.as_uri(): hashlib.sha256(path.read_bytes()).hexdigest()}
+            assert "snapshot_version" not in json.loads(json.dumps(result))
+            with pytest.raises(TypeError):
+                cast(dict[str, int], result.snapshot_version)[path.as_uri()] = 2
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_disk_snapshot_retries_pointer_replacement_with_equal_stat_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    path = tmp_path / "source.py"
+    replacement = tmp_path / "replacement.py"
+    path.write_bytes(b"old")
+    previous = path.stat()
+    replacement.write_bytes(b"new")
+    os.utime(replacement, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+    original_stat = Path.stat
+    original_fstat = os.fstat
+    replaced = False
+    reads: list[int] = []
+
+    def replace_before_open(target: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        nonlocal replaced
+        result = original_stat(target, follow_symlinks=follow_symlinks)
+        if target == path and not replaced:
+            replaced = True
+            replacement.replace(path)
+        return result
+
+    def count_fstat(fd: int) -> os.stat_result:
+        reads.append(fd)
+        return original_fstat(fd)
+
+    monkeypatch.setattr(sessions, "uri_to_path", lambda _uri, _root: path)
+    monkeypatch.setattr(Path, "stat", replace_before_open)
+    monkeypatch.setattr(sessions, "os", SimpleNamespace(fstat=count_fstat, name=os.name))
+    _path, digest, text, size = sessions._disk_document(path.as_uri(), tmp_path, time.monotonic() + 2)
+    assert text == "new" and size == 3
+    assert digest == hashlib.sha256(b"new").hexdigest()
+    assert len(reads) == 4
+
+
+def test_disk_snapshot_read_retries_are_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    path = tmp_path / "source.py"
+    path.write_bytes(b"source")
+    original_fstat = os.fstat
+    probes: list[int] = []
+
+    def unstable(fd: int) -> Any:
+        probes.append(fd)
+        info = original_fstat(fd)
+        return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_size=info.st_size, st_mtime_ns=info.st_mtime_ns + 1)
+
+    monkeypatch.setattr(sessions, "os", SimpleNamespace(fstat=unstable, name=os.name))
+    with pytest.raises(ToolError) as failure:
+        sessions._disk_document(path.as_uri(), tmp_path, time.monotonic() + 2)
+    assert failure.value.code == "lsp_document_changed"
+    assert len(probes) == 6  # Initial read plus two bounded retries.
+
+
+@pytest.mark.parametrize("kind,code", [("encoding", "lsp_document_encoding"), ("size", "lsp_document_too_large")])
+def test_manager_invalid_document_is_never_opened(tmp_path: Path, kind: str, code: str) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path)
+    path = tmp_path / "source.py"
+    path.write_bytes(b"\xff" if kind == "encoding" else b"x" * (2 * 1024 * 1024 + 1))
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(ToolError) as failure:
+                await manager.arequest(
+                    tmp_path, "python", "textDocument/documentSymbol", {"textDocument": {"uri": path.as_uri()}}, timeout_sec=5,
+                )
+            assert failure.value.code == code
+            assert manager.snapshot()["document_bytes"] == 0
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    assert all(item["method"] != "textDocument/didOpen" for item in manager_notifications(log))
 
 
 def manager_pids(results: list[object]) -> set[int]:
@@ -297,6 +774,44 @@ def test_manager_quarantined_owner_retains_key_and_capacity(tmp_path: Path, monk
 
     asyncio.run(scenario())
     assert process.released
+
+
+@pytest.mark.parametrize("resource", ["cpu", "cpu_error", "wire"])
+def test_manager_document_preparation_keeps_resource_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resource: str,
+) -> None:
+    from tools.language import sessions
+
+    provider, log = manager_provider(tmp_path)
+    path = tmp_path / "source.py"
+    path.write_text("source", encoding="utf-8")
+    manager = sessions.LspSessionManager((provider,), generation="test")
+    original = manager._prepare_documents
+
+    def expensive_preparation(session: Any, message: dict[str, object], deadline: float) -> Any:
+        documents = original(session, message, deadline)
+        if resource.startswith("cpu"):
+            session.cpu_seconds += 31
+            if resource == "cpu_error":
+                raise ToolError("lsp_document_capacity", "fixture")
+        else:
+            session.transport.wire_bytes = sessions._MAX_WIRE_BYTES + 1
+            raise ToolError("lsp_document_capacity", "fixture")
+        return documents
+
+    monkeypatch.setattr(manager, "_prepare_documents", expensive_preparation)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(ToolError) as failure:
+                await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            assert failure.value.code == ("lsp_resource_exceeded" if resource.startswith("cpu") else "lsp_document_capacity")
+            await manager_until(lambda: manager.snapshot()["active"] == 0)
+            assert "dispatch:" not in log.read_text(encoding="utf-8").splitlines()
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("failure", ["unavailable", "rss"])
@@ -568,6 +1083,31 @@ def protocol_transport(data: bytes, **bounds: int) -> tuple[Any, ProtocolProcess
 
 def transport_result(channel: Any) -> dict[str, object]:
     return channel.receive(deadline=time.monotonic() + 2, cancel=threading.Event())
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_transport_preparation_has_one_current_request_budget(overflow: bool) -> None:
+    from tools.language.lsp import _frame
+
+    channel, process = protocol_transport(_frame({"id": 1, "result": "x" * 300}), max_message_bytes=1000, max_request_bytes=1000)
+    try:
+        channel.send({"id": 1, "method": "initialize"})
+        with pytest.raises(ToolError):
+            channel.begin_request()
+        transport_result(channel)
+        channel.begin_request()
+        channel.send({"method": "textDocument/didOpen", "params": {"text": "x" * 500}})
+        request = {"id": 2, "method": "workspace/symbol", "params": {"query": "x" * (500 if overflow else 0)}}
+        if overflow:
+            with pytest.raises(ToolError) as failure:
+                channel.send(request)
+            assert failure.value.code == "lsp_message_too_large"
+        else:
+            channel.send(request)
+            process.stdout.feed(_frame({"id": 2, "result": "second"}))
+            assert transport_result(channel)["result"] == "second"
+    finally:
+        assert channel.close()
 
 
 def test_transport_fragmented_body_and_old_response_correlation() -> None:

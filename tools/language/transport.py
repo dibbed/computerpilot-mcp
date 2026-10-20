@@ -141,6 +141,7 @@ class LspTransport:
         self._last_id = 0
         self._pending: int | None = None
         self._request_bytes = 0
+        self._preparing_request = False
         self._notifications = 0
         self._stale = 0
         self._partial_token: object = None
@@ -197,6 +198,13 @@ class LspTransport:
             if self._failure is not None:
                 raise self._failure
 
+    def begin_request(self) -> None:
+        self._check_owner()
+        if self._pending is not None:
+            raise _protocol_error()
+        self._request_bytes = 0
+        self._preparing_request = True
+
     def send(self, payload: dict[str, object]) -> None:
         self._check_owner()
         if "method" in payload and "id" in payload:
@@ -206,7 +214,9 @@ class LspTransport:
                     raise _protocol_error()
                 self._last_id = request_id
                 self._pending = request_id
-                self._request_bytes = 0
+                if not self._preparing_request:
+                    self._request_bytes = 0
+                self._preparing_request = False
                 self._notifications = 0
                 self._stale = 0
                 params = payload.get("params")

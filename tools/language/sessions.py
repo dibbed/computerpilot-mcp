@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -10,9 +11,11 @@ import queue
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 
 import psutil
@@ -20,6 +23,7 @@ import psutil
 from core.errors import ToolError
 from core.process_ownership import OwnedProcess
 from core.resource_locks import canonical_path
+from tools.language.lsp import _language_id, position_to_offset, uri_to_path
 from tools.language.providers import LspProvider, SessionKey, make_session_key, validate_provider
 from tools.language.requests import validate_request
 from tools.language.transport import LspTransport, close_transport, open_transport
@@ -29,6 +33,62 @@ _SAMPLE_SEC = 0.5
 _MAX_WIRE_BYTES = 64 * 1024 * 1024
 _MAX_RSS_BYTES = 512 * 1024 * 1024
 _MAX_TOTAL_RSS_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
+_MAX_DOCUMENT_TOTAL_BYTES = 16 * 1024 * 1024
+_DOCUMENT_ERRORS = frozenset({
+    "lsp_document_unavailable", "lsp_document_changed", "lsp_document_encoding", "lsp_document_too_large",
+    "lsp_document_capacity", "lsp_position_invalid", "lsp_sync_unsupported", "lsp_path_outside_workspace", "lsp_uri_unsupported",
+})
+
+
+@dataclass
+class DocumentState:
+    uri: str
+    path: Path
+    sha256: str
+    version: int
+    text: str
+    last_used: float
+
+
+class RenameResult(dict[str, object]):
+    """Keep trusted preimages private while preserving the WorkspaceEdit JSON shape."""
+
+    def __init__(self, result: dict[str, object], documents: Mapping[str, DocumentState]) -> None:
+        super().__init__(result)
+        self.snapshot_version: Mapping[str, int] = MappingProxyType({uri: doc.version for uri, doc in documents.items()})
+        self.source_sha256: Mapping[str, str] = MappingProxyType({uri: doc.sha256 for uri, doc in documents.items()})
+
+
+def _disk_document(uri: str, root: Path, deadline: float) -> tuple[Path, str, str, int]:
+    for _attempt in range(3):
+        if time.monotonic() >= deadline:
+            raise _error("lsp_timeout")
+        path = uri_to_path(uri, root)
+        try:
+            before = path.stat()
+            if before.st_size > _MAX_DOCUMENT_BYTES:
+                raise _error("lsp_document_too_large")
+            with path.open("rb") as handle:
+                opened = os.fstat(handle.fileno())
+                data = handle.read(_MAX_DOCUMENT_BYTES + 1)
+                read = os.fstat(handle.fileno())
+            after = path.stat()
+        except OSError:
+            raise _error("lsp_document_unavailable") from None
+        if len(data) > _MAX_DOCUMENT_BYTES:
+            raise _error("lsp_document_too_large")
+        signatures = {(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) for info in (before, opened, read, after)}
+        if len(signatures) != 1 or len(data) != before.st_size or uri_to_path(uri, root) != path:
+            continue
+        try:
+            text = data.decode("utf-8", errors="strict")
+        except UnicodeError:
+            raise _error("lsp_document_encoding") from None
+        if time.monotonic() >= deadline:
+            raise _error("lsp_timeout")
+        return path, hashlib.sha256(data).hexdigest(), text, len(data)
+    raise _error("lsp_document_changed")
 
 
 @dataclass
@@ -53,7 +113,9 @@ class _Session:
     transport: LspTransport | None = None
     current: RequestTicket | None = None
     next_id: int = 1
-    documents: dict[str, object] = field(default_factory=dict)
+    documents: dict[str, DocumentState] = field(default_factory=dict)
+    document_bytes: int = 0
+    pending_document_closes: set[str] = field(default_factory=set)
     capabilities: dict[str, object] = field(default_factory=dict)
     last_activity: float = field(default_factory=time.monotonic)
     rss_bytes: int = 0
@@ -100,9 +162,19 @@ class LspSessionManager:
         if isinstance(timeout_sec, bool) or not math.isfinite(timeout_sec) or not 0 < timeout_sec <= 300:
             raise _error("lsp_timeout_invalid")
         deadline = started + timeout_sec
-        validated = validate_request(root, method, params)
-        provider = validate_provider(root, language_id, providers=self._providers)
+        try:
+            validated = validate_request(root, method, params)
+        except ToolError as error:
+            if error.code == "lsp_document_unavailable":
+                self._forget_missing_document(root, language_id, params)
+            raise
+        try:
+            provider = validate_provider(root, language_id, providers=self._providers)
+        except ToolError:
+            await self._retire_obsolete(root, language_id)
+            raise
         key = make_session_key(root, language_id, provider, self._generation)
+        await self._retire_obsolete(root, language_id, keep=key)
         payload = json.dumps({"method": method, "params": validated}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(payload) > 64 * 1024:
             raise _error("lsp_params_invalid")
@@ -165,6 +237,161 @@ class LspSessionManager:
         if times:
             self._restart_count += 1
         self._starts[key] = [*times, now]
+
+    async def _retire_obsolete(self, root: Path, language_id: str, *, keep: SessionKey | None = None) -> None:
+        canonical = canonical_path(root)
+        with self._lock:
+            obsolete = [
+                session for key, session in self._sessions.items()
+                if key.workspace_root == canonical and key.language_id == language_id and key != keep and session.state != "CLOSED"
+            ]
+            if any(session.stop.is_set() for session in obsolete):
+                raise _error()
+            for session in obsolete:
+                session.stop.set()
+                if session.current is not None:
+                    session.current.cancelled.set()
+                self._fail_queued(session)
+        if obsolete:
+            await asyncio.to_thread(self._drain_sessions, obsolete, 2.0)
+            with self._lock:
+                if any(session.state != "CLOSED" for session in obsolete):
+                    raise _error()
+
+    def _forget_missing_document(self, root: Path, language_id: str, params: dict[str, object]) -> None:
+        document = params.get("textDocument")
+        uri = document.get("uri") if isinstance(document, dict) else None
+        if not isinstance(uri, str):
+            return
+        try:
+            canonical_uri = uri_to_path(uri, root).as_uri()
+            canonical_root = canonical_path(root)
+        except (ToolError, ValueError, OSError):
+            return
+        with self._lock:
+            for key, session in self._sessions.items():
+                if key.workspace_root == canonical_root and key.language_id == language_id and canonical_uri in session.documents:
+                    session.pending_document_closes.intersection_update(session.documents)
+                    session.pending_document_closes.add(canonical_uri)
+
+    def _close_pending_documents(self, session: _Session) -> None:
+        with self._lock:
+            uris = tuple(session.pending_document_closes)
+            session.pending_document_closes.clear()
+        for uri in uris:
+            self._remove_document(session, uri)
+
+    def _remove_document(self, session: _Session, uri: str) -> None:
+        document = session.documents.get(uri)
+        if document is None:
+            return
+        assert session.transport is not None
+        session.transport.send({"jsonrpc": "2.0", "method": "textDocument/didClose", "params": {"textDocument": {"uri": uri}}})
+        size = len(document.text.encode("utf-8"))
+        with self._lock:
+            del session.documents[uri]
+            session.pending_document_closes.discard(uri)
+            session.document_bytes -= size
+
+    def _prepare_document(
+        self, session: _Session, uri: str, deadline: float, *, protected: frozenset[str] = frozenset(),
+    ) -> DocumentState:
+        sync = session.capabilities.get("textDocumentSync")
+        if not isinstance(sync, dict) or sync.get("openClose") is not True or type(sync.get("change")) is not int:
+            raise _error("lsp_sync_unsupported")
+        kind = sync["change"]
+        if kind not in {0, 1, 2}:
+            raise _error("lsp_sync_unsupported")
+        try:
+            path, digest, text, size = _disk_document(uri, Path(session.key.workspace_root), deadline)
+        except ToolError as error:
+            if error.code == "lsp_document_unavailable":
+                self._remove_document(session, uri)
+            raise
+        canonical_uri = path.as_uri()
+        old = session.documents.get(canonical_uri)
+        if old is not None and old.sha256 == digest:
+            old.last_used = time.monotonic()
+            return old
+        old_size = len(old.text.encode("utf-8")) if old is not None else 0
+        while (
+            len(session.documents) + (old is None) > 16
+            or session.document_bytes - old_size + size > _MAX_DOCUMENT_TOTAL_BYTES
+        ):
+            candidates = [doc for key, doc in session.documents.items() if key != canonical_uri and key not in protected]
+            if not candidates:
+                raise _error("lsp_document_capacity")
+            self._remove_document(session, min(candidates, key=lambda doc: doc.last_used).uri)
+        version = old.version + 1 if old is not None else 1
+        assert session.transport is not None
+        channel = session.transport
+        if old is None or kind == 0:
+            if old is not None:
+                self._remove_document(session, canonical_uri)
+                old_size = 0
+            language = _language_id(path)
+            if language == "plaintext":
+                language = session.key.language_id
+            channel.send({
+                "jsonrpc": "2.0", "method": "textDocument/didOpen",
+                "params": {"textDocument": {"uri": canonical_uri, "languageId": language, "version": version, "text": text}},
+            })
+        else:
+            change: dict[str, object] = {"text": text}
+            if kind == 2:
+                lines = old.text.split("\n")
+                change["range"] = {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": len(lines) - 1, "character": len(lines[-1].encode("utf-16-le")) // 2},
+                }
+            channel.send({
+                "jsonrpc": "2.0", "method": "textDocument/didChange",
+                "params": {"textDocument": {"uri": canonical_uri, "version": version}, "contentChanges": [change]},
+            })
+        save = sync.get("save")
+        if old is not None and (save is True or isinstance(save, dict)):
+            params: dict[str, object] = {"textDocument": {"uri": canonical_uri}}
+            if isinstance(save, dict) and save.get("includeText") is True:
+                params["text"] = text
+            channel.send({"jsonrpc": "2.0", "method": "textDocument/didSave", "params": params})
+        document = DocumentState(canonical_uri, path, digest, version, text, time.monotonic())
+        with self._lock:
+            session.documents[canonical_uri] = document
+            session.document_bytes += size - old_size
+        return document
+
+    def _prepare_documents(self, session: _Session, message: dict[str, object], deadline: float) -> dict[str, DocumentState]:
+        params = message.get("params")
+        raw_document = params.get("textDocument") if isinstance(params, dict) else None
+        uri = raw_document.get("uri") if isinstance(raw_document, dict) else None
+        primary_uri: str | None = None
+        if isinstance(raw_document, dict) and isinstance(uri, str):
+            document = self._prepare_document(session, uri, deadline)
+            primary_uri = document.uri
+            raw_document["uri"] = document.uri
+            position = params.get("position") if isinstance(params, dict) else None
+            if isinstance(position, dict):
+                position_to_offset(document.text, position)
+        protected = frozenset(session.documents)
+        for other_uri in list(session.documents):
+            if other_uri != primary_uri:
+                last_used = session.documents[other_uri].last_used
+                refreshed = self._prepare_document(session, other_uri, deadline, protected=protected)
+                refreshed.last_used = last_used
+        return dict(session.documents)
+
+    def _verify_documents(self, session: _Session, documents: Mapping[str, DocumentState], deadline: float) -> None:
+        for uri, document in documents.items():
+            try:
+                _path, digest, _text, _size = _disk_document(uri, Path(session.key.workspace_root), deadline)
+            except ToolError as error:
+                if error.code == "lsp_timeout":
+                    raise
+                if error.code == "lsp_document_unavailable":
+                    self._remove_document(session, uri)
+                raise _error("lsp_result_stale") from None
+            if digest != document.sha256:
+                raise _error("lsp_result_stale")
 
     def _sample(self, session: _Session, *, cpu_baseline: float | None = None) -> None:
         assert session.process is not None
@@ -248,6 +475,9 @@ class LspSessionManager:
                     return
                 session.state = "READY"
             while not session.stop.is_set():
+                if channel.wire_bytes >= _MAX_WIRE_BYTES:
+                    break
+                self._close_pending_documents(session)
                 try:
                     ticket = session.queue.get(timeout=min(_SAMPLE_SEC, 0.5))
                 except queue.Empty:
@@ -255,15 +485,27 @@ class LspSessionManager:
                     if time.monotonic() - session.last_activity >= _IDLE_SEC:
                         break
                     continue
+                self._close_pending_documents(session)
                 session.current = ticket
                 if ticket.cancelled.is_set() or ticket.future.cancelled() or ticket.deadline <= time.monotonic():
                     _finish(ticket, error=_error("lsp_timeout"))
                     session.current = None
                     continue
                 ticket.phase = "preparing"
-                message = json.loads(ticket.payload)
+                channel.begin_request()
                 self._sample(session)
                 cpu_baseline = session.cpu_seconds
+                message = json.loads(ticket.payload)
+                try:
+                    documents = self._prepare_documents(session, message, ticket.deadline)
+                except ToolError as error:
+                    if error.code not in _DOCUMENT_ERRORS:
+                        raise
+                    self._sample(session, cpu_baseline=cpu_baseline)
+                    _finish(ticket, error=_error(error.code))
+                    session.current = None
+                    continue
+                self._sample(session, cpu_baseline=cpu_baseline)
                 if ticket.cancelled.is_set() or session.stop.is_set() or ticket.deadline <= time.monotonic():
                     _finish(ticket, error=_error("lsp_cancelled"))
                     session.current = None
@@ -283,7 +525,17 @@ class LspSessionManager:
                 if "error" in response or response.get("complete") is False:
                     _finish(ticket, error=_error("lsp_request_failed"))
                 else:
-                    _finish(ticket, result=response.get("result"))
+                    try:
+                        self._verify_documents(session, documents, ticket.deadline)
+                    except ToolError as error:
+                        if error.code != "lsp_result_stale":
+                            raise
+                        _finish(ticket, error=_error("lsp_result_stale"))
+                    else:
+                        value = response.get("result")
+                        if message.get("method") == "textDocument/rename" and isinstance(value, dict):
+                            value = RenameResult(value, documents)
+                        _finish(ticket, result=value)
                 session.current = None
                 session.last_activity = time.monotonic()
                 if channel.wire_bytes >= _MAX_WIRE_BYTES:
@@ -326,12 +578,17 @@ class LspSessionManager:
                 session.state = "CLOSED" if closed else "QUARANTINED"
                 if closed:
                     session.rss_bytes = 0
+                    session.documents.clear()
+                    session.document_bytes = 0
+                    session.pending_document_closes.clear()
                 elif not failed:
                     self._failed_count += 1
 
     def _shutdown(self, session: _Session) -> None:
         assert session.transport is not None
         channel = session.transport
+        for uri in list(session.documents):
+            self._remove_document(session, uri)
         session.next_id += 1
         channel.send({"jsonrpc": "2.0", "id": session.next_id, "method": "shutdown", "params": None})
         response = channel.receive(deadline=time.monotonic() + 0.5, cancel=threading.Event())
@@ -351,26 +608,30 @@ class LspSessionManager:
         if not math.isfinite(timeout_sec) or timeout_sec < 0:
             raise ValueError("Close timeout must be finite and non-negative.")
         canonical = canonical_path(root)
-        deadline = time.monotonic() + min(timeout_sec, 2.0)
         with self._lock:
             self._closing_roots.add(canonical)
             sessions = [item for key, item in self._sessions.items() if key.workspace_root == canonical]
+        try:
+            self._drain_sessions(sessions, min(timeout_sec, 2.0))
+        finally:
+            with self._lock:
+                self._closing_roots.discard(canonical)
+
+    def _drain_sessions(self, sessions: list[_Session], timeout_sec: float) -> None:
+        deadline = time.monotonic() + timeout_sec
+        with self._lock:
             for session in sessions:
                 session.stop.set()
                 if session.current is not None:
                     session.current.cancelled.set()
                 self._fail_queued(session)
-        try:
-            for session in sessions:
-                owner = session.owner_thread
-                if owner is not None and owner.ident is not None:
-                    owner.join(max(0, deadline - time.monotonic()))
-                with self._lock:
-                    if owner is not None and owner.is_alive() and session.state != "CLOSED":
-                        session.state = "QUARANTINED"
-        finally:
+        for session in sessions:
+            owner = session.owner_thread
+            if owner is not None and owner.ident is not None:
+                owner.join(max(0, deadline - time.monotonic()))
             with self._lock:
-                self._closing_roots.discard(canonical)
+                if owner is not None and owner.is_alive() and session.state != "CLOSED":
+                    session.state = "QUARANTINED"
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
@@ -384,4 +645,5 @@ class LspSessionManager:
                 "in_flight": sum(item.current is not None for item in sessions),
                 "rss_bytes": sum(item.rss_bytes for item in sessions),
                 "documents": sum(len(item.documents) for item in sessions),
+                "document_bytes": sum(item.document_bytes for item in sessions),
             }
