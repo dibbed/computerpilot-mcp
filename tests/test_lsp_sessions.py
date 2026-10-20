@@ -34,8 +34,11 @@ def manager_provider(root: Path, mode: str = "normal", *, delay: float | None = 
     anchor = '        result: dict[str, object] = {"method": method, "initialized": initialized}'
     assert source.count(anchor) == 1
     source = source.replace(
-        anchor, '        _append_log(log_path, "dispatch:" + str(params.get("query", "")))\n' + anchor[:-1] + ', "pid": os.getpid()}',
+        anchor, anchor[:-1] + ', "pid": os.getpid()}',
     )
+    slow_anchor = '        if mode == "slow":'
+    assert source.count(slow_anchor) == 1
+    source = source.replace(slow_anchor, '        _append_log(log_path, "dispatch:" + str(params.get("query", "")))\n' + slow_anchor)
     arguments = ["--mode", mode, "--log", str(log)]
     source = source.replace("raise SystemExit(main())", f"sys.argv += {arguments!r}\n    raise SystemExit(main())")
     if delay is not None:
@@ -184,7 +187,7 @@ def test_manager_cancel_inflight_retires_without_replay(tmp_path: Path) -> None:
     async def scenario() -> None:
         request = asyncio.create_task(manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "cancel"}, timeout_sec=5))
         try:
-            await manager_until(lambda: manager.snapshot()["in_flight"] == 1)
+            await manager_until(lambda: log.exists() and "dispatch:cancel" in log.read_text(encoding="utf-8").splitlines())
             request.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await request
@@ -198,6 +201,43 @@ def test_manager_cancel_inflight_retires_without_replay(tmp_path: Path) -> None:
 
     asyncio.run(scenario())
     assert "dispatch:never-replay" not in log.read_text(encoding="utf-8")
+
+
+def test_manager_cancel_during_preparation_preserves_warm_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    provider, log = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="test")
+    preparing = threading.Event()
+    release = threading.Event()
+    original_sample = manager._sample
+
+    def hold_preparation(session: Any, *, cpu_baseline: float | None = None) -> None:
+        if session.current is not None and session.current.phase == "preparing" and not release.is_set():
+            preparing.set()
+            assert release.wait(5)
+        original_sample(session, cpu_baseline=cpu_baseline)
+
+    monkeypatch.setattr(manager, "_sample", hold_preparation)
+
+    async def scenario() -> None:
+        request = asyncio.create_task(manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "cancel"}, timeout_sec=5))
+        try:
+            await manager_until(preparing.is_set)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            release.set()
+            result = await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "next"}, timeout_sec=5)
+            assert isinstance(result, dict)
+            assert manager.snapshot()["spawn_count"] == 1
+        finally:
+            release.set()
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    assert "dispatch:cancel" not in log.read_text(encoding="utf-8").splitlines()
+    assert "dispatch:next" in log.read_text(encoding="utf-8").splitlines()
 
 
 def test_manager_crash_fails_queued_without_replay(tmp_path: Path) -> None:
@@ -267,10 +307,12 @@ def test_manager_resource_denial_prevents_business_dispatch(
 
     provider, log = manager_provider(tmp_path)
     if failure == "unavailable":
-        def unavailable(*args: object) -> object:
-            raise sessions.psutil.AccessDenied()
+        real_psutil = sessions.psutil
 
-        monkeypatch.setattr(sessions.psutil, "Process", unavailable)
+        def unavailable(*args: object) -> object:
+            raise real_psutil.AccessDenied()
+
+        monkeypatch.setattr(sessions, "psutil", SimpleNamespace(Process=unavailable, Error=real_psutil.Error))
     else:
         monkeypatch.setattr(sessions, "_MAX_RSS_BYTES", 1)
     manager = sessions.LspSessionManager((provider,), generation="test")
@@ -432,7 +474,7 @@ def test_manager_cpu_budget_retains_consumption_across_tree_changes(
         def num_fds(self) -> int:
             return 1
 
-    monkeypatch.setattr(sessions.psutil, "Process", CpuProbe)
+    monkeypatch.setattr(sessions, "psutil", SimpleNamespace(Process=CpuProbe, Error=sessions.psutil.Error))
     manager = sessions.LspSessionManager((provider,), generation="test")
     key = make_session_key(tmp_path, "python", provider, "test")
     session = sessions._Session(key, provider, process=cast(OwnedProcess, SimpleNamespace(pid=1, poll=lambda: None)))
