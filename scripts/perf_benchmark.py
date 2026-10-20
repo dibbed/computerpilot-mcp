@@ -822,7 +822,8 @@ class _LspSampler:
         queue_depth: Callable[[], int] | None = None,
         interval_sec: float = 0.01,
     ) -> None:
-        self._entrypoint = str(entrypoint)
+        self._entrypoint_real = os.path.realpath(entrypoint)
+        self._entrypoint_name = entrypoint.name
         self._queue_depth = queue_depth
         self._interval_sec = interval_sec
         self._stop = threading.Event()
@@ -833,6 +834,32 @@ class _LspSampler:
         self._pids: set[int] = set()
         self._max_queue = 0
 
+    def _matches_entrypoint(self, argument: str) -> bool:
+        """Match the fixture despite POSIX symlink rewrites such as /var -> /private/var."""
+
+        if not argument:
+            return False
+        try:
+            if os.path.realpath(argument) == self._entrypoint_real:
+                return True
+        except OSError:
+            pass
+        return os.path.basename(argument) == self._entrypoint_name
+
+    @staticmethod
+    def _descends_from(process: psutil.Process, parent_pid: int) -> bool:
+        seen: set[int] = set()
+        try:
+            current = process.ppid()
+            while current not in (0, parent_pid):
+                if current in seen:
+                    return False
+                seen.add(current)
+                current = psutil.Process(current).ppid()
+            return current == parent_pid
+        except psutil.Error:
+            return False
+
     def _sample_once(self) -> None:
         rss = 0
         handles = 0
@@ -842,10 +869,15 @@ class _LspSampler:
         try:
             children = benchmark.children(recursive=True)
         except psutil.Error:
-            children = []
+            try:
+                children = list(psutil.process_iter())
+            except psutil.Error:
+                children = []
         for child in children:
             try:
-                if not any(argument == self._entrypoint for argument in child.cmdline()):
+                if not any(self._matches_entrypoint(argument) for argument in child.cmdline()):
+                    continue
+                if not self._descends_from(child, benchmark_pid):
                     continue
                 if child.ppid() == benchmark_pid:
                     pids.append(child.pid)
@@ -988,9 +1020,11 @@ def _lsp_session_case(requests: int, workspaces: int, persistent: bool) -> dict[
                     for workspace, indices in zip(workspace_roots, assignments, strict=True)
                 ))
 
+            live_rss = 0
             try:
                 try:
                     asyncio.run(run_requests())
+                    live_rss = manager.snapshot()["rss_bytes"]
                 finally:
                     manager.close_all(timeout_sec=5)
             finally:
@@ -1001,7 +1035,7 @@ def _lsp_session_case(requests: int, workspaces: int, persistent: bool) -> dict[
             spawns = snapshot["spawn_count"]
             restarts = snapshot["restart_count"]
             max_queue = sample.max_queue
-            peak_rss = sample.peak_rss_bytes
+            peak_rss = max(sample.peak_rss_bytes, live_rss)
             open_handles = sample.peak_handles
         else:
             spawns = 0

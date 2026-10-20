@@ -109,16 +109,21 @@ def test_lsp_benchmark_reports_spawn_counts_and_cleanup(
     assert warmed["spawns"] == 2
     assert cold["spawns"] == 1
     assert one_shot["spawns"] == 2
-    for case in (persistent, warmed, cold, one_shot):
-        assert set(case) == _LSP_DETAIL_KEYS
-        assert case["errors"] == 0
-        assert case["restarts"] == 0
-        assert cast(float, case["elapsed"]) > 0
-        assert 0 <= cast(float, case["p50"]) <= cast(float, case["p99"])
-        assert 0 <= cast(float, case["p95"]) <= cast(float, case["p99"])
-        assert cast(int, case["max_queue"]) >= 0
-        assert cast(float, case["peak_rss"]) > 0
-        assert cast(int, case["open_handles"]) > 0
+    for name, case in (
+        ("persistent", persistent),
+        ("warmed", warmed),
+        ("cold", cold),
+        ("one_shot", one_shot),
+    ):
+        assert set(case) == _LSP_DETAIL_KEYS, name
+        assert case["errors"] == 0, name
+        assert case["restarts"] == 0, name
+        assert cast(float, case["elapsed"]) > 0, name
+        assert 0 <= cast(float, case["p50"]) <= cast(float, case["p99"]), name
+        assert 0 <= cast(float, case["p95"]) <= cast(float, case["p99"]), name
+        assert cast(int, case["max_queue"]) >= 0, name
+        assert cast(float, case["peak_rss"]) > 0, name
+        assert cast(int, case["open_handles"]) > 0, name
 
 
 def test_lsp_benchmark_fails_closed_on_request_errors(
