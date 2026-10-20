@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -23,6 +24,342 @@ from tools.language.lsp import LspClient
 from tools.language.providers import LspProvider
 
 FIXTURE = Path(__file__).parent / "fixtures" / "persistent_lsp_server.py"
+
+
+def manager_provider(root: Path, mode: str = "normal", *, delay: float | None = None) -> tuple[LspProvider, Path]:
+    entrypoint = root / "managed-fixture.py"
+    log = root / "managed-fixture.log"
+    source = FIXTURE.read_text(encoding="utf-8")
+    anchor = '        result: dict[str, object] = {"method": method, "initialized": initialized}'
+    assert source.count(anchor) == 1
+    source = source.replace(
+        anchor, '        _append_log(log_path, "dispatch:" + str(params.get("query", "")))\n' + anchor[:-1] + ', "pid": os.getpid()}',
+    )
+    arguments = ["--mode", mode, "--log", str(log)]
+    source = source.replace("raise SystemExit(main())", f"sys.argv += {arguments!r}\n    raise SystemExit(main())")
+    if delay is not None:
+        source = source.replace("SLOW_DELAY_SECONDS = 0.2", f"SLOW_DELAY_SECONDS = {delay!r}")
+    entrypoint.write_text(source, encoding="utf-8")
+    executable = Path(sys.executable).resolve()
+    return LspProvider(
+        "pyright", ("python",), executable, hashlib.sha256(executable.read_bytes()).hexdigest(),
+        entrypoint, hashlib.sha256(entrypoint.read_bytes()).hexdigest(), "fixture", (root,),
+    ), log
+
+
+def manager_pids(results: list[object]) -> set[int]:
+    pids: set[int] = set()
+    for result in results:
+        assert isinstance(result, dict)
+        assert type(result["pid"]) is int
+        pids.add(result["pid"])
+    return pids
+
+
+@pytest.mark.parametrize("count", [1, 10, 100])
+def test_manager_warm_requests_reuse_one_real_process(tmp_path: Path, count: int) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path)
+    manager = LspSessionManager((provider,), generation="test")
+    assert manager.snapshot()["spawn_count"] == 0
+    assert not log.exists()
+
+    async def scenario() -> None:
+        try:
+            results = [
+                await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": str(i)}, timeout_sec=5)
+                for i in range(count)
+            ]
+            pids = manager_pids(results)
+            assert len(pids) == 1
+            assert manager.snapshot()["spawn_count"] == 1
+            assert manager.snapshot()["reuse_count"] == count - 1
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+        for pid in pids:
+            _wait_for_exit(pid, timeout=3)
+            assert not _process_alive(pid)
+
+    asyncio.run(scenario())
+    assert log.read_text(encoding="utf-8").splitlines().count("initialize") == 1
+    assert "shutdown" in log.read_text(encoding="utf-8")
+    assert manager.snapshot()["quarantined"] == 0
+
+
+def test_manager_concurrent_first_requests_have_one_owner(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, _log = manager_provider(tmp_path)
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            results = await asyncio.gather(*[
+                manager.arequest(tmp_path, "python", "workspace/symbol", {"query": str(i)}, timeout_sec=5) for i in range(8)
+            ])
+            assert len(manager_pids(results)) == 1
+            assert manager.snapshot()["spawn_count"] == 1
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_manager_different_workspaces_have_distinct_processes(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    roots = [tmp_path / "a", tmp_path / "b"]
+    for root in roots:
+        root.mkdir()
+    providers = tuple(manager_provider(root)[0] for root in roots)
+    manager = LspSessionManager(providers, generation="test")
+
+    async def scenario() -> None:
+        try:
+            results = await asyncio.gather(*[
+                manager.arequest(root, "python", "workspace/symbol", {"query": "x"}, timeout_sec=5) for root in roots
+            ])
+            assert len(manager_pids(results)) == 2
+        finally:
+            for root in roots:
+                await asyncio.to_thread(manager.close_workspace, root)
+
+    asyncio.run(scenario())
+
+
+def test_manager_invalid_request_never_spawns(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path)
+    manager = LspSessionManager((provider,), generation="test")
+    with pytest.raises(ToolError):
+        asyncio.run(manager.arequest(tmp_path, "python", "workspace/executeCommand", {}, timeout_sec=5))
+    assert manager.snapshot()["spawn_count"] == 0
+    assert not log.exists()
+
+
+async def manager_until(predicate: Any) -> None:
+    deadline = time.monotonic() + 5
+    while not predicate():
+        assert time.monotonic() < deadline, "session did not reach the required bounded state"
+        await asyncio.sleep(0.005)
+
+
+def test_manager_cancelled_and_expired_queued_requests_never_dispatch(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, "slow", delay=1)
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        active = asyncio.create_task(manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "active"}, timeout_sec=5))
+        try:
+            await manager_until(lambda: manager.snapshot()["in_flight"] == 1)
+            queued = asyncio.create_task(manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "cancelled"}, timeout_sec=5))
+            await manager_until(lambda: manager.snapshot()["queue_depth"] == 1)
+            queued.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await queued
+            with pytest.raises(asyncio.TimeoutError):
+                await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "expired"}, timeout_sec=0.03)
+            await active
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert "dispatch:active" in lines
+    assert "dispatch:cancelled" not in lines
+    assert "dispatch:expired" not in lines
+
+
+def test_manager_cancel_inflight_retires_without_replay(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, "slow", delay=2)
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        request = asyncio.create_task(manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "cancel"}, timeout_sec=5))
+        try:
+            await manager_until(lambda: manager.snapshot()["in_flight"] == 1)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            await manager_until(lambda: manager.snapshot()["active"] == 0)
+            assert manager.snapshot()["spawn_count"] == 1
+            assert manager.snapshot()["in_flight"] == 0
+            with pytest.raises(ToolError):
+                await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "never-replay"}, timeout_sec=5)
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    assert "dispatch:never-replay" not in log.read_text(encoding="utf-8")
+
+
+def test_manager_crash_fails_queued_without_replay(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, "crash")
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            results = await asyncio.gather(*[
+                manager.arequest(tmp_path, "python", "workspace/symbol", {"query": str(i)}, timeout_sec=5) for i in range(5)
+            ], return_exceptions=True)
+            assert all(isinstance(result, ToolError) for result in results)
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+        assert manager.snapshot()["spawn_count"] == 1
+        assert manager.snapshot()["in_flight"] == 0
+        assert manager.snapshot()["quarantined"] == 0
+
+    asyncio.run(scenario())
+    assert log.read_text(encoding="utf-8").splitlines().count("crash") == 1
+
+
+def test_manager_quarantined_owner_retains_key_and_capacity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    provider, _log = manager_provider(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    process = ProtocolProcess(b"")
+
+    def blocked_open(*args: object) -> OwnedProcess:
+        entered.set()
+        assert release.wait(5)
+        return cast(OwnedProcess, process)
+
+    monkeypatch.setattr(sessions, "open_transport", blocked_open)
+    manager = sessions.LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        request = asyncio.create_task(manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "x"}, timeout_sec=5))
+        try:
+            await manager_until(entered.is_set)
+            manager.close_workspace(tmp_path, timeout_sec=0)
+            assert manager.snapshot()["quarantined"] == 1
+            assert manager.snapshot()["active"] == 1
+            with pytest.raises(ToolError):
+                await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "denied"}, timeout_sec=5)
+            release.set()
+            with pytest.raises(ToolError):
+                await request
+            await manager_until(lambda: manager.snapshot()["active"] == 0)
+        finally:
+            release.set()
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    assert process.released
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "rss"])
+def test_manager_resource_denial_prevents_business_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from tools.language import sessions
+
+    provider, log = manager_provider(tmp_path)
+    if failure == "unavailable":
+        def unavailable(*args: object) -> object:
+            raise sessions.psutil.AccessDenied()
+
+        monkeypatch.setattr(sessions.psutil, "Process", unavailable)
+    else:
+        monkeypatch.setattr(sessions, "_MAX_RSS_BYTES", 1)
+    manager = sessions.LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(ToolError):
+                await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "denied"}, timeout_sec=5)
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+        assert manager.snapshot()["quarantined"] == 0
+
+    asyncio.run(scenario())
+    assert not log.exists() or "dispatch:" not in log.read_text(encoding="utf-8")
+
+
+def test_manager_idle_cleanup_releases_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    provider, log = manager_provider(tmp_path)
+    monkeypatch.setattr(sessions, "_IDLE_SEC", 0.01)
+    monkeypatch.setattr(sessions, "_SAMPLE_SEC", 0.01)
+    manager = sessions.LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        try:
+            result = await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "x"}, timeout_sec=5)
+            assert isinstance(result, dict)
+            await manager_until(lambda: manager.snapshot()["active"] == 0)
+            assert not _process_alive(result["pid"])
+            assert manager.snapshot()["quarantined"] == 0
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    assert "shutdown" in log.read_text(encoding="utf-8")
+
+
+def test_manager_queue_and_session_admission_are_bounded(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, _log = manager_provider(tmp_path, "slow", delay=60)
+    roots = [tmp_path / str(index) for index in range(5)]
+    for root in roots:
+        root.mkdir()
+    manager = LspSessionManager((provider,), generation="test")
+
+    async def scenario() -> None:
+        requests: list[asyncio.Task[object]] = []
+        try:
+            for root in roots[:4]:
+                requests.append(asyncio.create_task(
+                    manager.arequest(root, "python", "workspace/symbol", {"query": "hold"}, timeout_sec=30),
+                ))
+            await manager_until(lambda: manager.snapshot()["in_flight"] == 4)
+            with pytest.raises(ToolError) as failure:
+                await manager.arequest(roots[4], "python", "workspace/symbol", {"query": "fifth"}, timeout_sec=5)
+            assert failure.value.code == "lsp_capacity_exceeded"
+            for root in roots[:4]:
+                for index in range(8):
+                    requests.append(asyncio.create_task(
+                        manager.arequest(root, "python", "workspace/symbol", {"query": str(index)}, timeout_sec=30),
+                    ))
+            await manager_until(lambda: manager.snapshot()["queue_depth"] == 32)
+            with pytest.raises(ToolError) as failure:
+                await manager.arequest(roots[0], "python", "workspace/symbol", {"query": "overflow"}, timeout_sec=5)
+            assert failure.value.code == "lsp_capacity_exceeded"
+            assert manager.snapshot()["spawn_count"] == 4
+        finally:
+            for request in requests:
+                request.cancel()
+            await asyncio.gather(*requests, return_exceptions=True)
+            for root in roots:
+                await asyncio.to_thread(manager.close_workspace, root)
+        assert manager.snapshot()["active"] == 0
+        assert manager.snapshot()["in_flight"] == 0
+        assert manager.snapshot()["queue_depth"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_manager_construction_and_snapshot_do_not_start_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    calls: list[object] = []
+    monkeypatch.setattr(threading.Thread, "start", lambda thread: calls.append(thread))
+    monkeypatch.setattr(sessions, "open_transport", lambda *args: calls.append(args))
+    manager = sessions.LspSessionManager((), generation="test")
+    assert manager.snapshot()["active"] == 0
+    assert calls == []
 
 
 class ProtocolStream(io.BytesIO):

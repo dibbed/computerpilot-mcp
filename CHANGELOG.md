@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-20: Add an inert-by-default LSP session manager with bounded per-workspace queues, a single protocol owner, native process reuse, cancellation without replay, resource monitoring and quarantine on unresolved cleanup. Persistent mode remains disabled pending lifecycle integration and acceptance.
 - 2026-10-19: Share bounded LSP framing and transport between clients, with a single protocol reader, fixed queue and request budgets, monotonic response correlation, bounded notification handling, and explicit denial of server-initiated edits. Persistent-session activation remains disabled.
 - 2026-10-19: Defer runtime directories and durable job recovery to server lifespan; jobs and testing share one thread-safe lazy store. Catalog construction and advisory reads do not launch jobs; health reports unavailable before startup, and startup storage failures remain fail-closed.
 - 2026-10-19: Validate standard LSP method parameters before dispatch, including strict UTF-16 positions, local workspace URIs and bounded JSON/documents. Malformed or nonstandard legacy parameters and unsupported partial-result tokens now fail with fixed safe errors; tool names and valid legacy requests remain supported.
