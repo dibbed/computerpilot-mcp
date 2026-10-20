@@ -20,6 +20,7 @@ from typing import Literal
 
 import psutil
 
+from core.config import resolve_path
 from core.errors import ToolError
 from core.process_ownership import OwnedProcess
 from core.resource_locks import canonical_path
@@ -148,6 +149,7 @@ class LspSessionManager:
         self._lock = threading.RLock()
         self._sessions: dict[SessionKey, _Session] = {}
         self._closed = False
+        self._preparing_count = 0
         self._closing_roots: set[str] = set()
         self._starts: OrderedDict[SessionKey, list[float]] = OrderedDict()
         self._spawn_count = 0
@@ -162,18 +164,32 @@ class LspSessionManager:
         if isinstance(timeout_sec, bool) or not math.isfinite(timeout_sec) or not 0 < timeout_sec <= 300:
             raise _error("lsp_timeout_invalid")
         deadline = started + timeout_sec
+        with self._lock:
+            if self._closed:
+                raise _error()
+            if self._preparing_count + sum(item.queue.qsize() for item in self._sessions.values()) >= 32:
+                raise _error("lsp_capacity_exceeded")
+            self._preparing_count += 1
+
+        async def prepare() -> tuple[dict[str, object], LspProvider, SessionKey]:
+            nonlocal root
+            try:
+                root = await asyncio.to_thread(resolve_path, root)
+                return await asyncio.to_thread(self._prepare_admission, root, language_id, method, params, deadline)
+            finally:
+                with self._lock:
+                    self._preparing_count -= 1
+
+        preparation = asyncio.create_task(prepare())
+        preparation.add_done_callback(lambda done: None if done.cancelled() else done.exception())
         try:
-            validated = validate_request(root, method, params)
+            validated, provider, key = await asyncio.wait_for(
+                asyncio.shield(preparation), timeout=max(0, deadline - time.monotonic()),
+            )
         except ToolError as error:
-            if error.code == "lsp_document_unavailable":
-                self._forget_missing_document(root, language_id, params)
+            if error.code in {"lsp_provider_unavailable", "lsp_provider_ambiguous", "lsp_provider_changed"}:
+                await self._retire_obsolete(root, language_id)
             raise
-        try:
-            provider = validate_provider(root, language_id, providers=self._providers)
-        except ToolError:
-            await self._retire_obsolete(root, language_id)
-            raise
-        key = make_session_key(root, language_id, provider, self._generation)
         await self._retire_obsolete(root, language_id, keep=key)
         payload = json.dumps({"method": method, "params": validated}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(payload) > 64 * 1024:
@@ -190,7 +206,7 @@ class LspSessionManager:
             session = self._sessions.get(key)
             if session is not None and (session.stop.is_set() or session.state not in {"STARTING", "READY"}):
                 raise _error()
-            if sum(item.queue.qsize() for item in self._sessions.values()) >= 32:
+            if self._preparing_count + sum(item.queue.qsize() for item in self._sessions.values()) >= 32:
                 raise _error("lsp_capacity_exceeded")
             if session is None:
                 if len(self._sessions) >= 4:
@@ -222,6 +238,20 @@ class LspSessionManager:
             ticket.cancelled.set()
             raise
 
+    def _prepare_admission(
+        self, root: Path, language_id: str, method: str, params: dict[str, object], deadline: float,
+    ) -> tuple[dict[str, object], LspProvider, SessionKey]:
+        if time.monotonic() >= deadline:
+            raise _error("lsp_timeout")
+        try:
+            validated = validate_request(root, method, params)
+        except ToolError as error:
+            if error.code == "lsp_document_unavailable":
+                self._forget_missing_document(root, language_id, params)
+            raise
+        provider = validate_provider(root, language_id, providers=self._providers)
+        return validated, provider, make_session_key(root, language_id, provider, self._generation)
+
     def _admit_start(self, key: SessionKey, now: float) -> None:
         for old_key, times in list(self._starts.items()):
             retained = [stamp for stamp in times if now - stamp < 60]
@@ -239,7 +269,7 @@ class LspSessionManager:
         self._starts[key] = [*times, now]
 
     async def _retire_obsolete(self, root: Path, language_id: str, *, keep: SessionKey | None = None) -> None:
-        canonical = canonical_path(root)
+        canonical = keep.workspace_root if keep is not None else canonical_path(root)
         with self._lock:
             obsolete = [
                 session for key, session in self._sessions.items()
@@ -604,6 +634,14 @@ class LspSessionManager:
             except queue.Empty:
                 return
 
+    def close_all(self, *, timeout_sec: float = 5.0) -> None:
+        if not math.isfinite(timeout_sec) or timeout_sec < 0:
+            raise ValueError("Close timeout must be finite and non-negative.")
+        with self._lock:
+            self._closed = True
+            sessions = list(self._sessions.values())
+        self._drain_sessions(sessions, min(timeout_sec, 5.0))
+
     def close_workspace(self, root: Path, *, timeout_sec: float = 2.0) -> None:
         if not math.isfinite(timeout_sec) or timeout_sec < 0:
             raise ValueError("Close timeout must be finite and non-negative.")
@@ -625,13 +663,16 @@ class LspSessionManager:
                 if session.current is not None:
                     session.current.cancelled.set()
                 self._fail_queued(session)
-        for session in sessions:
-            owner = session.owner_thread
-            if owner is not None and owner.ident is not None:
-                owner.join(max(0, deadline - time.monotonic()))
+        try:
+            for session in sessions:
+                owner = session.owner_thread
+                if owner is not None and owner.ident is not None:
+                    owner.join(max(0, deadline - time.monotonic()))
+        finally:
             with self._lock:
-                if owner is not None and owner.is_alive() and session.state != "CLOSED":
-                    session.state = "QUARANTINED"
+                for session in sessions:
+                    if session.state != "CLOSED":
+                        session.state = "QUARANTINED"
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
@@ -642,6 +683,7 @@ class LspSessionManager:
                 "ready": sum(item.state == "READY" for item in sessions),
                 "quarantined": sum(item.state == "QUARANTINED" for item in sessions),
                 "queue_depth": sum(item.queue.qsize() for item in sessions),
+                "preparing": self._preparing_count,
                 "in_flight": sum(item.current is not None for item in sessions),
                 "rss_bytes": sum(item.rss_bytes for item in sessions),
                 "documents": sum(len(item.documents) for item in sessions),

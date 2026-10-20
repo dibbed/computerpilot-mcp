@@ -83,6 +83,383 @@ def hover_params(path: Path) -> dict[str, object]:
     return {"textDocument": {"uri": path.as_uri()}, "position": {"line": 0, "character": 0}}
 
 
+@pytest.fixture
+def lsp_runtime_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    from core import audit, config, heartbeat, registry, resource_health
+    from tools.language import registry as language_registry
+
+    settings = replace(config.SETTINGS, state_dir=tmp_path / "state", memory_dir=tmp_path / "memory", persistent_enabled=True,
+                       providers_config=None, extensions_enabled=False, tool_profile="testing")
+    for module in (audit, config, heartbeat, registry, resource_health, language_registry):
+        monkeypatch.setattr(module, "SETTINGS", settings, raising=False)
+    for name in ("MCP_HEARTBEAT_FILE", "MCP_RUNTIME_HEALTH_FILE", "MCP_LIFECYCLE_CONTROL_FILE",
+                 "MCP_LIFECYCLE_STATUS_FILE", "MCP_TOOL_ACTIVITY_FILE", "MCP_RUNTIME_GENERATION_ID"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("schedule_artifact_retention", "schedule_job_history_retention", "schedule_workflow_history_retention"):
+        monkeypatch.setattr(heartbeat, name, lambda **_kwargs: None)
+    monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
+    monkeypatch.setattr(heartbeat.SEARCH_SNAPSHOTS, "cleanup", lambda: None)
+    return settings
+
+
+def test_persistent_registration_requires_explicit_server_manager(lsp_runtime_settings: Any) -> None:
+    from mcp.server import MCPServer
+
+    from tools.language import registry
+
+    with pytest.raises(ToolError) as failure:
+        registry.register(MCPServer("missing-manager"))
+    assert failure.value.code == "lsp_configuration_invalid"
+
+
+def test_core_creates_fresh_inert_lsp_managers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lsp_runtime_settings: Any) -> None:
+    from core import registry
+    from core.health_snapshot import collect_server_health
+
+    monkeypatch.setattr(transport, "spawn_owned_process", lambda *_args, **_kwargs: pytest.fail("LSP started before request"))
+    provider, _log = manager_provider(tmp_path)
+    config_path = tmp_path / "providers.json"
+    config_path.write_text(json.dumps({"schema_version": 1, "providers": [{
+        "provider_id": provider.provider_id, "languages": list(provider.languages), "executable": str(provider.executable),
+        "executable_sha256": provider.executable_sha256, "entrypoint": str(provider.entrypoint),
+        "entrypoint_sha256": provider.entrypoint_sha256, "declared_version": provider.declared_version,
+        "trusted_roots": [str(tmp_path)],
+    }]}), encoding="utf-8")
+    monkeypatch.setattr(registry, "SETTINGS", replace(lsp_runtime_settings, providers_config=str(config_path)))
+    servers = [registry.create_server(), registry.create_server()]
+    managers: list[Any] = [getattr(server, "lsp_manager", None) for server in servers]
+    assert all(manager is not None for manager in managers)
+    assert managers[0] is not managers[1]
+    assert managers[0]._generation != managers[1]._generation
+    for server, manager in zip(servers, managers, strict=True):
+        asyncio.run(server.list_tools())
+        health = asyncio.run(collect_server_health(server, settings=lsp_runtime_settings))
+        assert health["lsp"]["spawn_count"] == health["lsp"]["active"] == 0
+        assert manager.snapshot()["spawn_count"] == manager.snapshot()["active"] == 0
+    assert not _log.exists()
+
+
+def test_mcp_language_requests_share_server_owned_manager(tmp_path: Path, lsp_runtime_settings: Any) -> None:
+    from mcp import Client
+    from mcp.server import MCPServer
+
+    from core.heartbeat import lifespan
+    from tools.language.registry import register
+    from tools.language.sessions import LspSessionManager
+
+    provider, _log = manager_provider(tmp_path)
+    manager = LspSessionManager((provider,), generation="mcp-test")
+    server: Any = MCPServer("persistent-language", lifespan=lifespan)
+    server.lsp_manager = manager
+    register(server, manager=manager)
+
+    async def scenario() -> None:
+        try:
+            results = []
+            async with Client(server, raise_exceptions=True) as client:
+                for query in ("first", "second"):
+                    reply = await client.call_tool("workspace_symbols", {"root": str(tmp_path), "params": {"query": query}})
+                    result = reply.structured_content
+                    assert isinstance(result, dict) and result["ok"] is True
+                    results.append(result["result"])
+                assert len(manager_pids(results)) == 1
+                assert manager.snapshot()["spawn_count"] == 1
+            assert manager.snapshot()["active"] == 0
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_mcp_client_cancellation_reaches_lsp_owner(tmp_path: Path, lsp_runtime_settings: Any) -> None:
+    from mcp import Client
+    from mcp.server import MCPServer
+
+    from core.heartbeat import lifespan
+    from tools.language.registry import register
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, "slow", delay=2)
+    manager = LspSessionManager((provider,), generation="cancel-client")
+    server: Any = MCPServer("cancel-language", lifespan=lifespan)
+    server.lsp_manager = manager
+    register(server, manager=manager)
+
+    async def scenario() -> None:
+        try:
+            async with Client(server, raise_exceptions=True) as client:
+                request = asyncio.create_task(client.call_tool("workspace_symbols", {"root": str(tmp_path), "params": {"query": "cancel"}}))
+                await manager_until(lambda: log.exists() and "dispatch:cancel" in log.read_text(encoding="utf-8").splitlines())
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+                await manager_until(lambda: manager.snapshot()["active"] == 0)
+                assert manager.snapshot()["spawn_count"] == 1
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    assert log.read_text(encoding="utf-8").splitlines().count("dispatch:cancel") == 1
+
+
+def test_persistent_off_and_injected_manager_preserve_language_schemas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lsp_runtime_settings: Any,
+) -> None:
+    from mcp.server import MCPServer
+
+    from tools.language import registry
+    from tools.language.sessions import LspSessionManager
+
+    provider, _log = manager_provider(tmp_path)
+    monkeypatch.setattr(registry, "SETTINGS", replace(lsp_runtime_settings, persistent_enabled=False))
+    legacy = MCPServer("legacy")
+    registry.register(legacy)
+    monkeypatch.setattr(registry, "SETTINGS", lsp_runtime_settings)
+    persistent = MCPServer("persistent")
+    registry.register(persistent, manager=LspSessionManager((provider,), generation="schema"))
+    before = {tool.name: (tool.input_schema, tool.output_schema, tool.annotations) for tool in asyncio.run(legacy.list_tools())}
+    after = {tool.name: (tool.input_schema, tool.output_schema, tool.annotations) for tool in asyncio.run(persistent.list_tools())}
+    assert before == after
+    assert len(before) == 9
+    assert not _log.exists()
+
+
+def test_legacy_lsp_request_keeps_event_loop_responsive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import registry
+
+    entered, release = threading.Event(), threading.Event()
+
+    def request(*_args: Any) -> dict[str, object]:
+        entered.set()
+        assert release.wait(5)
+        return {"legacy": True}
+
+    monkeypatch.setattr(registry.LspClient, "request", request)
+
+    async def scenario() -> None:
+        pending = asyncio.create_task(registry._request(str(tmp_path), 5, "workspace/symbol", {"query": "legacy"}))
+        try:
+            await manager_until(entered.is_set)
+            assert not pending.done()
+        finally:
+            release.set()
+            assert await pending == {"legacy": True}
+
+    asyncio.run(scenario())
+
+
+def test_legacy_lsp_cancellation_scope_waits_for_worker_completion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import anyio
+
+    from tools.language import registry
+
+    finished = threading.Event()
+
+    def request(*_args: Any) -> dict[str, object]:
+        time.sleep(0.15)
+        finished.set()
+        return {"legacy": True}
+
+    monkeypatch.setattr(registry.LspClient, "request", request)
+
+    async def scenario() -> None:
+        with anyio.move_on_after(0.03) as scope:
+            await registry._request(str(tmp_path), 5, "workspace/symbol", {"query": "legacy"})
+        assert scope.cancel_called and finished.is_set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_lsp_validation_does_not_block_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, persistent: bool) -> None:
+    from tools.language import registry, sessions
+
+    provider, _log = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="validation") if persistent else None
+    entered, release, starved = threading.Event(), threading.Event(), threading.Event()
+
+    def validation(*_args: Any) -> Any:
+        entered.set()
+        if not release.wait(2):
+            starved.set()
+        raise ToolError("lsp_params_invalid", "fixture validation denial")
+
+    monkeypatch.setattr(registry, "validate_request", validation)
+    monkeypatch.setattr(sessions, "validate_request", validation)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(registry._request(str(tmp_path), 5, "workspace/symbol", {"query": "validate"}, manager=manager))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            release.set()
+            with pytest.raises(ToolError):
+                await task
+            assert not starved.is_set()
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_count", [0, 2])
+def test_rename_worker_preserves_mutation_scope_until_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lsp_runtime_settings: Any, cancel_count: int,
+) -> None:
+    from mcp.server import MCPServer
+
+    from core import heartbeat, recovery
+    from tools.language import registry
+    from tools.language.sessions import LspSessionManager
+
+    provider, _log = manager_provider(tmp_path)
+    manager = LspSessionManager((provider,), generation="rename-worker")
+    server: Any = MCPServer("rename-worker", lifespan=heartbeat.lifespan)
+    server.lsp_manager = manager
+    registry.register(server, manager=manager)
+    entered, release, starved = threading.Event(), threading.Event(), threading.Event()
+    applied: list[bool] = []
+
+    async def response(*_args: Any, **_kwargs: Any) -> dict[str, object]:
+        return {"changes": {}}
+
+    def prepare(*_args: Any, **_kwargs: Any) -> list[object]:
+        scope = recovery._CURRENT_OPERATION_SCOPE.get()
+        assert scope is not None and scope.active
+        entered.set()
+        if not release.wait(2):
+            starved.set()
+        assert scope.active
+        return []
+
+    def apply(_plan: object) -> dict[str, object]:
+        applied.append(True)
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(registry, "_request", response)
+    monkeypatch.setattr(registry, "prepare_workspace_edit", prepare)
+    monkeypatch.setattr(registry, "apply_workspace_edit", apply)
+
+    async def scenario() -> None:
+        async with heartbeat.lifespan(server):
+            heartbeat.RUNTIME_LIFECYCLE.configure(tmp_path / "control", tmp_path / "status")
+            task = asyncio.create_task(server.call_tool("rename_symbol", {
+                "root": str(tmp_path), "document_uri": (tmp_path / "source.py").as_uri(),
+                "line": 0, "character": 0, "new_name": "renamed", "expected_sha256": {},
+            }))
+            try:
+                assert await asyncio.to_thread(entered.wait, 5)
+                assert heartbeat.RUNTIME_LIFECYCLE.snapshot()["active_mutations"] == 1
+                for _ in range(cancel_count):
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                assert not task.done()
+                assert heartbeat.RUNTIME_LIFECYCLE.snapshot()["active_mutations"] == 1
+                release.set()
+                if cancel_count:
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    await task
+                assert applied == [True] and not starved.is_set()
+                assert heartbeat.RUNTIME_LIFECYCLE.snapshot()["active_mutations"] == 0
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_manager_preparation_is_bounded_and_cancelled_callers_cannot_release_it_early(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.language import sessions
+
+    provider, _log = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="bounded-preparation")
+    entered, release = threading.Event(), threading.Event()
+
+    def validation(*_args: Any) -> Any:
+        entered.set()
+        assert release.wait(5)
+        raise ToolError("lsp_params_invalid", "fixture")
+
+    monkeypatch.setattr(sessions, "validate_request", validation)
+
+    async def scenario() -> None:
+        tasks = [asyncio.create_task(manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "hold"}, timeout_sec=5))
+                 for _ in range(32)]
+        try:
+            await manager_until(lambda: manager.snapshot()["preparing"] == 32 and entered.is_set())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            assert manager.snapshot()["preparing"] == 32
+            with pytest.raises(ToolError) as failure:
+                await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "denied"}, timeout_sec=5)
+            assert failure.value.code == "lsp_capacity_exceeded"
+            assert manager.snapshot()["spawn_count"] == 0
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await manager_until(lambda: manager.snapshot()["preparing"] == 0)
+            await asyncio.to_thread(manager.close_all)
+
+    asyncio.run(scenario())
+
+
+def test_manager_preparation_deadline_denies_late_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    provider, _log = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="preparation-deadline")
+    release = threading.Event()
+
+    def validation(*_args: Any) -> Any:
+        assert release.wait(5)
+        raise ToolError("lsp_params_invalid", "fixture")
+
+    monkeypatch.setattr(sessions, "validate_request", validation)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "expires"}, timeout_sec=0.03)
+            assert manager.snapshot()["preparing"] == 1
+        finally:
+            release.set()
+            await manager_until(lambda: manager.snapshot()["preparing"] == 0)
+            await asyncio.to_thread(manager.close_all)
+        assert manager.snapshot()["spawn_count"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_manager_close_all_stops_admission_and_drains_workspaces(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, _log = manager_provider(tmp_path)
+    manager = LspSessionManager((provider,), generation="close-test")
+    roots = [tmp_path / "one", tmp_path / "two"]
+    for root in roots:
+        root.mkdir()
+
+    async def scenario() -> None:
+        try:
+            for root in roots:
+                await manager.arequest(root, "python", "workspace/symbol", {"query": "start"}, timeout_sec=5)
+            await asyncio.to_thread(manager.close_all, timeout_sec=5)
+            assert manager.snapshot()["active"] == 0
+            with pytest.raises(ToolError):
+                await manager.arequest(roots[0], "python", "workspace/symbol", {"query": "denied"}, timeout_sec=5)
+        finally:
+            for root in roots:
+                await asyncio.to_thread(manager.close_workspace, root)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("sync_kind", [0, 1, 2])
 def test_manager_document_sync_versions_and_utf16_range(tmp_path: Path, sync_kind: int) -> None:
     from tools.language.sessions import LspSessionManager
@@ -936,9 +1313,13 @@ def test_manager_restart_backoff_starts_after_validation(tmp_path: Path, monkeyp
             clock[0] += 6
         return original(*args, **kwargs)
 
+    original_start = threading.Thread.start
+
     def fail_start(thread: threading.Thread) -> None:
-        starts.append(clock[0])
-        raise RuntimeError("fixture start unavailable")
+        if thread.name == "lsp-session-owner":
+            starts.append(clock[0])
+            raise RuntimeError("fixture start unavailable")
+        original_start(thread)
 
     monkeypatch.setattr(sessions, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     monkeypatch.setattr(sessions, "validate_provider", slow_validation)

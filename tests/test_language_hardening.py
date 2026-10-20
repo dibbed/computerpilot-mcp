@@ -124,7 +124,7 @@ def test_language_invalid_request_never_spawns(
     monkeypatch.setattr(registry.LspClient, "request", deny_dispatch)
     monkeypatch.setattr("tools.language.transport.spawn_owned_process", deny_dispatch)
     with pytest.raises(ToolError) as failure:
-        registry._request(str(tmp_path), 5, method, params)
+        asyncio.run(registry._request(str(tmp_path), 5, method, params))
     assert "canary-private" not in str(failure.value)
     assert failure.value.code in {
         "lsp_params_invalid", "lsp_method_unsupported", "lsp_uri_unsupported",
@@ -151,7 +151,7 @@ def test_language_valid_utf16_request_dispatches_once(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(registry.LspClient, "request", request)
     params = {"textDocument": {"uri": target.as_uri()}, "position": {"line": 0, "character": 3}}
-    assert registry._request(str(tmp_path), 5, "textDocument/hover", params) == {"contents": "valid"}
+    assert asyncio.run(registry._request(str(tmp_path), 5, "textDocument/hover", params)) == {"contents": "valid"}
     assert calls == [("textDocument/hover", params)]
 
 
@@ -198,9 +198,9 @@ def test_language_symlink_or_junction_escape_never_dispatches(
     try:
         assert link.resolve() == outside.resolve()
         with pytest.raises(ToolError) as failure:
-            registry._request(str(root), 5, "textDocument/hover", {
+            asyncio.run(registry._request(str(root), 5, "textDocument/hover", {
                 "textDocument": {"uri": (link / "secret.py").as_uri()}, "position": {"line": 0, "character": 0},
-            })
+            }))
         assert failure.value.code == "lsp_path_outside_workspace"
     finally:
         link.rmdir() if os.name == "nt" else link.unlink()

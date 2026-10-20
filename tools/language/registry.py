@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Annotated, Any
 
+import anyio
 from mcp.server import MCPServer
 from pydantic import Field
 
 from core.audit import audit_action
-from core.config import resolve_path
+from core.config import SETTINGS, resolve_path
+from core.errors import ToolError
 from core.tooling import MUTATING, OPEN_WORLD_READ, compact_errors
 from tools.language.edits import apply_workspace_edit, prepare_workspace_edit
 from tools.language.lsp import LspClient
 from tools.language.requests import validate_request
+from tools.language.sessions import LspSessionManager
 
 
 def _command() -> list[str]:
@@ -24,23 +30,60 @@ def _command() -> list[str]:
     return [discovered or "pyright-langserver", "--stdio"]
 
 
-def _request(root: str, timeout_sec: float, method: str, params: dict[str, Any]) -> Any:
-    workspace = resolve_path(root)
-    validated = validate_request(workspace, method, params)
-    return LspClient(_command(), workspace, timeout_sec=timeout_sec).request(method, validated)
+async def _run_sync(call: Callable[[], Any]) -> Any:
+    cancelled = False
+    try:
+        with anyio.CancelScope(shield=True):
+            worker = asyncio.create_task(anyio.to_thread.run_sync(call, abandon_on_cancel=False))
+            while True:
+                try:
+                    return await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    if worker.cancelled():
+                        raise
+                    cancelled = True
+    finally:
+        if cancelled:
+            raise asyncio.CancelledError
 
 
-def register(mcp: MCPServer) -> None:
-    def common(method: str, operation: str) -> Callable[..., dict[str, Any]]:
+async def _request(
+    root: str, timeout_sec: float, method: str, params: dict[str, Any], *,
+    manager: LspSessionManager | None = None, language_id: str | None = None,
+) -> Any:
+    deadline = time.monotonic() + timeout_sec
+    if manager is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ToolError("lsp_timeout", "Language request deadline expired before dispatch.")
+        return await manager.arequest(Path(root), language_id or "python", method, params, timeout_sec=remaining)
+
+    def legacy_request() -> Any:
+        workspace = resolve_path(root)
+        validated = validate_request(workspace, method, params)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ToolError("lsp_timeout", "Language request deadline expired before dispatch.")
+        return LspClient(_command(), workspace, timeout_sec=remaining).request(method, validated)
+
+    return await _run_sync(legacy_request)
+
+
+def register(mcp: MCPServer, *, manager: LspSessionManager | None = None) -> None:
+    if SETTINGS.persistent_enabled and manager is None:
+        raise ToolError("lsp_configuration_invalid", "Persistent language tools require a server-owned session manager.")
+
+    def common(method: str, operation: str) -> Callable[..., Awaitable[dict[str, Any]]]:
         @mcp.tool(name=operation, annotations=OPEN_WORLD_READ, structured_output=True)
         @compact_errors(operation)
-        def tool(
+        async def tool(
             root: Annotated[str, Field(min_length=1, max_length=32_767)],
             params: Annotated[dict[str, Any], Field(max_length=100)],
             timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
         ) -> dict[str, Any]:
             """Run one bounded request through the trusted discovered language server."""
-            return {"ok": True, "method": method, "result": _request(root, timeout_sec, method, params)}
+            result = await _request(root, timeout_sec, method, params, manager=manager)
+            return {"ok": True, "method": method, "result": result}
 
         return tool
 
@@ -54,7 +97,7 @@ def register(mcp: MCPServer) -> None:
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("rename_symbol")
-    def rename_symbol(
+    async def rename_symbol(
         root: Annotated[str, Field(min_length=1, max_length=32_767)],
         document_uri: Annotated[str, Field(min_length=1, max_length=32_767)],
         line: Annotated[int, Field(ge=0)],
@@ -65,8 +108,8 @@ def register(mcp: MCPServer) -> None:
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
     ) -> dict[str, Any]:
         """Rename a symbol with required per-file SHA-256 guards and transactionally apply its workspace edit."""
-        workspace = resolve_path(root)
-        edit = _request(
+        workspace = await _run_sync(lambda: resolve_path(root))
+        edit = await _request(
             workspace.as_posix(),
             timeout_sec,
             "textDocument/rename",
@@ -75,17 +118,21 @@ def register(mcp: MCPServer) -> None:
                 "position": {"line": line, "character": character},
                 "newName": new_name,
             },
+            manager=manager,
         )
-        plan = prepare_workspace_edit(
-            workspace,
-            edit,
-            expected_sha256=expected_sha256,
-            require_expected_sha256=True,
-        )
-        audit_action("rename_symbol", target=workspace, details={"file_count": len(plan), "dry_run": dry_run})
-        if dry_run:
-            return {"ok": True, "dry_run": True, "file_count": len(plan), "files": [str(item.path) for item in plan]}
-        return {**apply_workspace_edit(plan), "dry_run": False}
+        def apply_rename() -> dict[str, Any]:
+            plan = prepare_workspace_edit(
+                workspace,
+                edit,
+                expected_sha256=expected_sha256,
+                require_expected_sha256=True,
+            )
+            audit_action("rename_symbol", target=workspace, details={"file_count": len(plan), "dry_run": dry_run})
+            if dry_run:
+                return {"ok": True, "dry_run": True, "file_count": len(plan), "files": [str(item.path) for item in plan]}
+            return {**apply_workspace_edit(plan), "dry_run": False}
+
+        return await _run_sync(apply_rename)
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("apply_code_action")

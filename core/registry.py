@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
+from uuid import uuid4
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict
 
 from core.config import SETTINGS
+from core.errors import ToolError
 from core.execution_models import ExecutionIntent, ExternalRouteMetadata
 from core.execution_router import ExecutionRouter
 from core.extensions.bridge import ExtensionMCPServer
@@ -31,6 +34,8 @@ from tools.filesystem import register as register_filesystem
 from tools.git import register as register_git
 from tools.jobs import register as register_jobs
 from tools.language import register as register_language
+from tools.language.providers import load_lsp_providers
+from tools.language.sessions import LspSessionManager
 from tools.memory import register as register_memory
 from tools.process import register as register_process
 from tools.project import register as register_project
@@ -96,6 +101,12 @@ def create_server() -> MCPServer:
                 register_testing(server, background_enabled="jobs" in active_domains, store_getter=store_getter)
             elif domain == "jobs":
                 register_jobs(server, store_getter=store_getter)
+            elif domain == "language" and SETTINGS.persistent_enabled:
+                if not SETTINGS.providers_config:
+                    raise ToolError("lsp_configuration_invalid", "Persistent language tools require a provider configuration.")
+                manager = LspSessionManager(load_lsp_providers(Path(SETTINGS.providers_config)), generation=uuid4().hex)
+                cast(Any, server).lsp_manager = manager
+                register_language(server, manager=manager)
             else:
                 registrar(server)
 

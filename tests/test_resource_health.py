@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from collections.abc import Iterator
@@ -165,3 +166,37 @@ def test_resource_health_exposes_semantic_browser_counters() -> None:
     assert metrics["browser_semantic_action_failure"] == 2
     assert metrics["browser_stale_ref_failures"] == 1
     assert metrics["browser_download_bytes"] == 4096
+
+
+def test_lsp_health_is_bounded_counter_only(tmp_path: Path) -> None:
+    from core.health_snapshot import collect_server_health
+    from core.workflow_store import WorkflowStore
+
+    class Server:
+        lsp_manager = SimpleNamespace(snapshot=lambda: {
+            "active": 1, "ready": 1, "quarantined": 1, "spawn_count": 2**100,
+            "documents": -1, "queue_depth": "canary-private-source", "roots": ["canary-private-root"],
+        })
+
+        async def list_tools(self) -> list[object]:
+            return []
+
+    class Browser:
+        async def stats(self) -> dict[str, int]:
+            return {}
+
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    settings = replace(Settings(), state_dir=tmp_path)
+    result = asyncio.run(collect_server_health(
+        Server(), settings=settings, browser_manager=Browser(),
+        resource_collector=lambda _stats: {"budgets": {}, "resource_pressure": "normal"},
+        recovery=SimpleNamespace(summary=lambda **_kwargs: {"uncertain_count": 0, "pending_count": 0}),
+        workflow_store_factory=lambda _path: store,
+    ))
+    health = result["lsp"]
+    assert health["enabled"] is True and health["available"] is True
+    assert health["active"] == 1 and health["quarantined"] == 1
+    assert 0 <= health["spawn_count"] <= 2**63 - 1
+    assert health["documents"] == health["queue_depth"] == 0
+    assert "canary-private" not in str(health)
+    assert "lsp_ownership_unresolved" in result["degraded_reasons"]

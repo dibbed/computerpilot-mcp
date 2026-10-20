@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+import anyio
+
 from core.artifact_retention import schedule_artifact_retention
 from core.audit import flush_audit
 from core.backups import BACKUP_RETENTION
@@ -118,37 +120,61 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
         if hasattr(server, "__dict__"):
             server.runtime_started = False
         RUNTIME_LIFECYCLE.mark_stopping()
-        if extension_manager is not None:
-            try:
-                await extension_manager.drain_and_stop(timeout_sec=5.0)
-            except Exception:
-                pass
-        if extension_task:
-            extension_task.cancel()
+        lsp_manager = getattr(server, "lsp_manager", None)
+        if lsp_manager is not None:
+            # Seal admission before a busy worker pool can delay bounded draining.
+            with suppress(Exception):
+                lsp_manager.close_all(timeout_sec=0)
+
+        async def finish_lifespan() -> None:
+            if lsp_manager is not None:
+                with suppress(Exception):
+                    await asyncio.wait_for(asyncio.to_thread(lsp_manager.close_all, timeout_sec=5.0), timeout=5.25)
+            if extension_manager is not None:
+                try:
+                    await extension_manager.drain_and_stop(timeout_sec=5.0)
+                except Exception:
+                    pass
+            if extension_task:
+                extension_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await extension_task
+            if lifecycle_task:
+                lifecycle_task.cancel()
+            maintenance_task.cancel()
+            if lifecycle_task:
+                with suppress(asyncio.CancelledError):
+                    await lifecycle_task
             with suppress(asyncio.CancelledError):
-                await extension_task
-        if lifecycle_task:
-            lifecycle_task.cancel()
-        maintenance_task.cancel()
-        if lifecycle_task:
-            with suppress(asyncio.CancelledError):
-                await lifecycle_task
-        with suppress(asyncio.CancelledError):
-            await maintenance_task
-        if health_task:
-            health_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await health_task
-        if task:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        flush_audit()
-        # Preserve the published STOPPING acknowledgement on disk while keeping
-        # repeated in-process MCP server instances isolated from the old lifecycle.
-        OPERATION_RECOVERY.configure(None, None)
-        RUNTIME_LIFECYCLE.configure(None, None)
-        TOOL_ACTIVITY.configure(None, None)
-        if config_owned_manager and hasattr(server, "__dict__"):
-            # A reused server must validate current configuration on its next startup.
-            server.extension_manager = None
+                await maintenance_task
+            if health_task:
+                health_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await health_task
+            if task:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            flush_audit()
+            # Preserve the published STOPPING acknowledgement on disk while keeping
+            # repeated in-process MCP server instances isolated from the old lifecycle.
+            OPERATION_RECOVERY.configure(None, None)
+            RUNTIME_LIFECYCLE.configure(None, None)
+            TOOL_ACTIVITY.configure(None, None)
+            if config_owned_manager and hasattr(server, "__dict__"):
+                # A reused server must validate current configuration on its next startup.
+                server.extension_manager = None
+
+        cleanup = asyncio.create_task(finish_lifespan())
+        cancelled = False
+        with anyio.CancelScope(shield=True):
+            while True:
+                try:
+                    await asyncio.shield(cleanup)
+                    break
+                except asyncio.CancelledError:
+                    if cleanup.cancelled():
+                        raise
+                    cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
