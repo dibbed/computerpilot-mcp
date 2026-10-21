@@ -339,7 +339,11 @@ class _RenameSnapshotManager:
         self.closed.append(Path(root))
 
 
-def test_rename_rejects_document_changes_without_server_snapshot(tmp_path: Path) -> None:
+@pytest.mark.parametrize("shape", ["documentChanges", "changes", "mixed", "plain"])
+def test_rename_rejects_unsnapshot_targets_in_any_workspace_edit_shape(
+    tmp_path: Path,
+    shape: str,
+) -> None:
     import hashlib
 
     primary = tmp_path / "primary.py"
@@ -348,31 +352,97 @@ def test_rename_rejects_document_changes_without_server_snapshot(tmp_path: Path)
     secondary.write_text("old\n", encoding="utf-8")
     primary_hash = hashlib.sha256(primary.read_bytes()).hexdigest()
     secondary_hash = hashlib.sha256(secondary.read_bytes()).hexdigest()
-    response = {
-        "documentChanges": [
-            {
-                "textDocument": {"uri": primary.as_uri(), "version": 1},
-                "edits": [
-                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "new"}
-                ],
-            },
-            {
-                "textDocument": {"uri": secondary.as_uri()},
-                "edits": [
-                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "new"}
-                ],
-            },
-        ]
+    replacement = {
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+        "newText": "new",
     }
-    snapshot = _RenameSnapshot(
-        response,
-        {primary.as_uri(): 1},
-        {primary.as_uri(): primary_hash},
+    primary_document = {"textDocument": {"uri": primary.as_uri(), "version": 1}, "edits": [replacement]}
+    secondary_document = {"textDocument": {"uri": secondary.as_uri()}, "edits": [replacement]}
+    if shape == "documentChanges":
+        response: dict[str, Any] = {"documentChanges": [primary_document, secondary_document]}
+    elif shape == "changes":
+        response = {
+            "changes": {
+                primary.as_uri(): [replacement],
+                secondary.as_uri(): [replacement],
+            }
+        }
+    elif shape == "mixed":
+        response = {
+            "documentChanges": [primary_document],
+            "changes": {secondary.as_uri(): [replacement]},
+        }
+    else:
+        response = {
+            "changes": {
+                primary.as_uri(): [replacement],
+                secondary.as_uri(): [replacement],
+            }
+        }
+    snapshot = (
+        response
+        if shape == "plain"
+        else _RenameSnapshot(response, {primary.as_uri(): 1}, {primary.as_uri(): primary_hash})
     )
     manager = _RenameSnapshotManager(snapshot)
 
     async def scenario() -> None:
         server = MCPServer("rename-snapshot")
+        register(server, manager=cast(Any, manager))
+        async with Client(server, raise_exceptions=True) as client:
+            result = _structured(
+                await client.call_tool(
+                    "rename_symbol",
+                    {
+                        "root": str(tmp_path),
+                        "document_uri": primary.as_uri(),
+                        "line": 0,
+                        "character": 0,
+                        "new_name": "new",
+                        "expected_sha256": {
+                            "primary.py": primary_hash,
+                            "secondary.py": secondary_hash,
+                        },
+                    },
+                )
+            )
+            assert result["ok"] is False
+            assert result["error"] == "lsp_result_stale"
+
+    asyncio.run(scenario())
+    assert primary.read_text(encoding="utf-8") == "old\n"
+    assert secondary.read_text(encoding="utf-8") == "old\n"
+    assert manager.closed == []
+
+
+def test_rename_requires_each_target_in_both_snapshot_maps(tmp_path: Path) -> None:
+    import hashlib
+
+    primary = tmp_path / "primary.py"
+    secondary = tmp_path / "secondary.py"
+    primary.write_text("old\n", encoding="utf-8")
+    secondary.write_text("old\n", encoding="utf-8")
+    primary_hash = hashlib.sha256(primary.read_bytes()).hexdigest()
+    secondary_hash = hashlib.sha256(secondary.read_bytes()).hexdigest()
+    replacement = {
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+        "newText": "new",
+    }
+    response = {
+        "documentChanges": [
+            {"textDocument": {"uri": primary.as_uri(), "version": 1}, "edits": [replacement]},
+            {"textDocument": {"uri": secondary.as_uri(), "version": 1}, "edits": [replacement]},
+        ]
+    }
+    snapshot = _RenameSnapshot(
+        response,
+        {primary.as_uri(): 1, secondary.as_uri(): 1},
+        {primary.as_uri(): primary_hash},
+    )
+    manager = _RenameSnapshotManager(snapshot)
+
+    async def scenario() -> None:
+        server = MCPServer("rename-snapshot-one-map")
         register(server, manager=cast(Any, manager))
         async with Client(server, raise_exceptions=True) as client:
             result = _structured(

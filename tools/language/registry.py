@@ -247,7 +247,7 @@ def register(mcp: MCPServer, *, manager: LspSessionManager | None = None) -> Non
         source_sha256 = getattr(edit, "source_sha256", None)
 
         def apply_rename() -> dict[str, Any]:
-            if document_versions is not None or source_sha256 is not None:
+            if manager is not None or document_versions is not None or source_sha256 is not None:
                 if not isinstance(document_versions, Mapping) or not isinstance(source_sha256, Mapping):
                     raise ToolError("lsp_result_stale", "The language-server rename snapshot is incomplete.")
                 snapshot_versions: dict[Path, int] = {}
@@ -268,23 +268,29 @@ def register(mcp: MCPServer, *, manager: LspSessionManager | None = None) -> Non
                     if previous_hash is not None and previous_hash.casefold() != digest.casefold():
                         raise ToolError("lsp_result_stale", "The language-server rename snapshot has conflicting hashes.")
                     snapshot_hashes[source] = digest
-                operations = edit.get("documentChanges") if isinstance(edit, dict) else None
-                if isinstance(operations, list):
-                    for operation in operations:
-                        document = operation.get("textDocument") if isinstance(operation, dict) else None
-                        uri = document.get("uri") if isinstance(document, dict) else None
-                        if not isinstance(uri, str):
-                            continue
-                        source = uri_to_path(uri, workspace)
-                        if source not in snapshot_versions or source not in snapshot_hashes:
-                            relative = source.relative_to(workspace).as_posix()
-                            raise ToolError(
-                                "lsp_result_stale",
-                                f"Rename edit targets {relative} without a server snapshot.",
-                            )
-                for source, digest in snapshot_hashes.items():
+                touched: set[Path] = set()
+                if isinstance(edit, dict):
+                    raw_changes = edit.get("changes")
+                    if isinstance(raw_changes, dict):
+                        for uri in raw_changes:
+                            if isinstance(uri, str):
+                                touched.add(uri_to_path(uri, workspace))
+                    operations = edit.get("documentChanges")
+                    if isinstance(operations, list):
+                        for operation in operations:
+                            document = operation.get("textDocument") if isinstance(operation, dict) else None
+                            uri = document.get("uri") if isinstance(document, dict) else None
+                            if isinstance(uri, str):
+                                touched.add(uri_to_path(uri, workspace))
+                for source in touched:
                     relative = source.relative_to(workspace).as_posix()
+                    if source not in snapshot_versions or source not in snapshot_hashes:
+                        raise ToolError(
+                            "lsp_result_stale",
+                            f"Rename edit targets {relative} without a server snapshot.",
+                        )
                     wanted = expected_sha256.get(relative)
+                    digest = snapshot_hashes[source]
                     if wanted is not None and wanted.casefold() != digest.casefold():
                         raise ToolError("lsp_result_stale", f"The language-server rename snapshot is stale for {relative}.")
             plan = prepare_workspace_edit(
