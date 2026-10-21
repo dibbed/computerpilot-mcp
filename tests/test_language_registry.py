@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from core.errors import ToolError
 from tools.language import registry
+from tools.language.edits import prepare_workspace_edit
 from tools.language.registry import register
 from tools.language.requests import (
     DiagnosticRequest,
@@ -468,3 +469,31 @@ def test_rename_requires_each_target_in_both_snapshot_maps(tmp_path: Path) -> No
     assert primary.read_text(encoding="utf-8") == "old\n"
     assert secondary.read_text(encoding="utf-8") == "old\n"
     assert manager.closed == []
+
+def test_prepare_rejects_malformed_uri_nul_version_and_surrogate(tmp_path: Path) -> None:
+    target = tmp_path / "sample.py"
+    target.write_text("old\n", encoding="utf-8")
+    replacement = {
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+        "newText": "new",
+    }
+
+    with pytest.raises(ToolError) as malformed:
+        prepare_workspace_edit(tmp_path, {"changes": {"file://[::1": [replacement]}})
+    assert malformed.value.code == "lsp_edit_unsupported"
+
+    with pytest.raises(ToolError) as nul_version:
+        prepare_workspace_edit(
+            tmp_path,
+            {"changes": {target.as_uri(): [replacement]}},
+            document_versions={"\x00": 1},
+        )
+    assert nul_version.value.code == "lsp_edit_unsupported"
+
+    with pytest.raises(ToolError) as surrogate:
+        prepare_workspace_edit(
+            tmp_path,
+            {"changes": {target.as_uri(): [{**replacement, "newText": "\ud800"}]}},
+        )
+    assert surrogate.value.code == "lsp_edit_unsupported"
+    assert target.read_text(encoding="utf-8") == "old\n"

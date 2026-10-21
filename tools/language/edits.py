@@ -52,12 +52,14 @@ def _budget(message: str) -> ToolError:
 def _version_path(key: str, root: Path) -> Path:
     candidate = Path(key)
     try:
-        path = candidate.resolve(strict=False) if candidate.is_absolute() else None
-        scheme = urlsplit(key).scheme if path is None else ""
+        if candidate.is_absolute():
+            path = candidate.resolve(strict=False)
+        elif urlsplit(key).scheme:
+            path = _uri_path(key, root)
+        else:
+            path = (root / key).resolve(strict=False)
     except ValueError as exc:
         raise _unsupported("Workspace edit contains an invalid version URI.") from exc
-    if path is None:
-        path = _uri_path(key, root) if scheme else (root / key).resolve(strict=False)
     try:
         path.relative_to(root)
     except ValueError as exc:

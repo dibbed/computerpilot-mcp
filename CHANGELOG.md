@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-21: Persist bounded workspace-edit evidence and exclusive verified backups before multi-file writes, roll back only byte-identical postimages, keep unknown outcomes uncertain without replay, and protect unresolved backups from retention; direct in-process edits now require the supervised recovery journal.
 - 2026-10-21: Require LSP document versions and server snapshots for versioned workspace edits, reject duplicate or oversized edit plans before dispatch, and invalidate Python/context caches plus LSP sessions after successful writes.
 - 2026-10-20: Add optional typed request models and suffix-derived language selection to the seven read-only LSP tools; legacy `params`, tool names, read-only annotations and response envelopes remain unchanged, and language/suffix mismatches fail before dispatch.
 - 2026-10-20: Connect opt-in persistent LSP requests to server lifecycle and bounded health counters; keep blocking language work off the MCP loop and retain mutation admission until writes finish. Persistent mode remains disabled by default pending acceptance.
