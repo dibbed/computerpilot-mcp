@@ -307,7 +307,8 @@ import sys
 from pathlib import Path
 
 state_dir, journal_path, root = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
-os.environ["MCP_STATE_DIR"] = str(state_dir)
+from core.config import SETTINGS
+object.__setattr__(SETTINGS, "state_dir", state_dir)
 from core import recovery
 from tools.language import edits
 from tools.language.edits import prepare_workspace_edit
@@ -351,6 +352,7 @@ edits.apply_workspace_edit(plan)
     assert operation["workspace_edit"]["dispatch_stage"] == "may_dispatch"
     protected = recovered.protected_workspace_backups()
     assert len(protected) == 2
+    assert all(path.is_relative_to(state_dir) for path in protected)
     assert {path.read_bytes() for path in protected} == {b"one", b"two"}
     assert first.read_bytes() == b"new"
     assert second.read_bytes() == b"two"
@@ -372,7 +374,8 @@ import sys
 from pathlib import Path
 
 state_dir, journal_path, root = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
-os.environ["MCP_STATE_DIR"] = str(state_dir)
+from core.config import SETTINGS
+object.__setattr__(SETTINGS, "state_dir", state_dir)
 from core import recovery
 from tools.language import edits
 from tools.language.edits import prepare_workspace_edit
@@ -415,6 +418,7 @@ edits.apply_workspace_edit(plan)
     assert operation["state"] == "failed"
     assert operation["workspace_edit"]["dispatch_stage"] == "prepared"
     assert all(Path(item["backup_path"]).is_file() for item in operation["workspace_edit"]["files"])
+    assert all(Path(item["backup_path"]).is_relative_to(state_dir) for item in operation["workspace_edit"]["files"])
     assert recovered.protected_workspace_backups() == set()
 
 
@@ -544,7 +548,10 @@ def test_valid_lsp_positions(text: str, line: int, character: int, offset: int) 
     assert position_to_offset(text, {"line": line, "character": character}) == offset
 
 
-@pytest.mark.parametrize("text,line,character", [("abc", 0, -1), ("a\U0001f600b", 0, 2)])
+@pytest.mark.parametrize("text,line,character", [
+    ("abc", 0, -1), ("a\U0001f600b", 0, 2),
+    ("abc", False, 0), ("abc", True, 0), ("abc", 0, False), ("abc", 0, True),
+])
 def test_invalid_lsp_positions(text: str, line: int, character: int) -> None:
     with pytest.raises(ToolError):
         position_to_offset(text, {"line": line, "character": character})

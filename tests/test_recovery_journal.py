@@ -180,7 +180,7 @@ def test_workspace_edit_mutation_reuses_owning_task_in_worker_thread(tmp_path: P
 
         async def scenario() -> str:
             with recovery.operation_recovery_context(outer):
-                return await asyncio.to_thread(use_workspace_edit)
+                return await asyncio.to_thread(recovery.bind_operation_recovery(use_workspace_edit))
 
         worker_id = asyncio.run(scenario())
         recovery.OPERATION_RECOVERY.finish(outer, known_result="ok")
@@ -190,6 +190,47 @@ def test_workspace_edit_mutation_reuses_owning_task_in_worker_thread(tmp_path: P
     assert worker_id == outer.operation_id
     begins = [record for record in _records(path) if record.get("type") == "begin"]
     assert [record["operation_id"] for record in begins] == [outer.operation_id]
+
+
+@pytest.mark.parametrize("bind_in_child", [False, True])
+def test_child_task_offload_cannot_reuse_parent_recovery(
+    tmp_path: Path, bind_in_child: bool,
+) -> None:
+    path = tmp_path / "child-offload.jsonl"
+    recovery.OPERATION_RECOVERY.configure(path, "child-runtime")
+    try:
+        outer = recovery.OPERATION_RECOVERY.begin("rename_symbol")
+        assert outer is not None
+
+        def mutate() -> str:
+            with recovery.workspace_edit_mutation((tmp_path / "child.txt",)) as handle:
+                return handle.operation_id
+
+        async def child() -> str:
+            call = recovery.bind_operation_recovery(mutate) if bind_in_child else mutate
+            return await asyncio.to_thread(call)
+
+        async def scenario() -> str:
+            with recovery.operation_recovery_context(outer):
+                return await asyncio.create_task(child())
+
+        child_id = asyncio.run(scenario())
+        assert child_id != outer.operation_id
+        recovery.OPERATION_RECOVERY.finish(outer, known_result="ok")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+    begins = [record for record in _records(path) if record.get("type") == "begin"]
+    assert {record["operation_id"] for record in begins} == {outer.operation_id, child_id}
+
+
+def test_bound_recovery_worker_rejects_finished_scope(tmp_path: Path) -> None:
+    calls: list[bool] = []
+    with recovery.operation_recovery_context(None):
+        call = recovery.bind_operation_recovery(lambda: calls.append(True))
+    with pytest.raises(ToolError) as raised:
+        call()
+    assert raised.value.code == "invalid_operation_handle"
+    assert calls == []
 
 
 def test_workspace_edit_mutation_denies_when_unresolved_quota_is_exhausted(

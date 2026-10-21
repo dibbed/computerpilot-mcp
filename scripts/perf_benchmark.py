@@ -943,6 +943,34 @@ def _lsp_case_details(
     }
 
 
+def _one_shot_request(
+    provider: LspProvider,
+    workspace: Path,
+    index: int,
+    sampler: _LspSampler,
+) -> tuple[bool, float]:
+    """Run one one-shot request while sampling its short-lived child from this thread."""
+    started = time.perf_counter()
+    outcome: list[bool] = []
+
+    def run() -> None:
+        try:
+            LspClient(list(command_for(provider)), workspace, timeout_sec=30).request(
+                "workspace/symbol", {"query": f"benchmark-{index}"},
+            )
+            outcome.append(True)
+        except Exception:
+            outcome.append(False)
+
+    worker = threading.Thread(target=run, name="lsp-one-shot-request", daemon=True)
+    worker.start()
+    while worker.is_alive():
+        sampler._sample_once()
+        worker.join(timeout=0.002)
+    worker.join()
+    return (outcome[0] if outcome else False), (time.perf_counter() - started) * 1_000
+
+
 def _lsp_session_case(requests: int, workspaces: int, persistent: bool) -> dict[str, object]:
     """Measure the reviewed local fixture only; this is not real-provider coverage.
 
@@ -1043,18 +1071,13 @@ def _lsp_session_case(requests: int, workspaces: int, persistent: bool) -> dict[
                 workspace = workspace_roots[index % workspaces]
                 sampler = _LspSampler(entrypoint)
                 sampler.start()
-                request_started = time.perf_counter()
-                succeeded = True
                 try:
-                    LspClient(list(command_for(provider)), workspace, timeout_sec=30).request(
-                        "workspace/symbol", {"query": f"benchmark-{index}"},
-                    )
-                except Exception:
-                    errors += 1
-                    succeeded = False
+                    succeeded, elapsed_ms = _one_shot_request(provider, workspace, index, sampler)
                 finally:
-                    latencies_ms.append((time.perf_counter() - request_started) * 1_000)
                     sample = sampler.stop()
+                latencies_ms.append(elapsed_ms)
+                if not succeeded:
+                    errors += 1
                 peak_rss = max(peak_rss, sample.peak_rss_bytes)
                 open_handles = max(open_handles, sample.peak_handles)
                 if succeeded:

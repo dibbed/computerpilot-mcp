@@ -5,9 +5,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -34,6 +35,7 @@ from scripts.perf_benchmark import (
     _job_wait_timeout_once,
     _launcher_validation_once,
     _lsp_session_case,
+    _one_shot_request,
     _output_once,
     _prepare_python_fixture,
     _prepare_workflow_history_fixture,
@@ -124,6 +126,35 @@ def test_lsp_benchmark_reports_spawn_counts_and_cleanup(
         assert cast(int, case["max_queue"]) >= 0, name
         assert cast(float, case["peak_rss"]) > 0, name
         assert cast(int, case["open_handles"]) > 0, name
+
+
+def test_one_shot_request_samples_while_request_is_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    release = threading.Event()
+
+    class FakeClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def request(self, *_args: object, **_kwargs: object) -> object:
+            assert release.wait(2)
+            return {}
+
+    def sample() -> None:
+        calls.append(1)
+        if len(calls) >= 2:
+            release.set()
+
+    monkeypatch.setattr(perf_benchmark, "LspClient", FakeClient)
+    monkeypatch.setattr(perf_benchmark, "command_for", lambda _provider: ["python"])
+    sampler: Any = SimpleNamespace(_sample_once=sample)
+    succeeded, elapsed_ms = _one_shot_request(cast(Any, object()), tmp_path, 0, sampler)
+
+    assert succeeded is True
+    assert elapsed_ms > 0
+    assert len(calls) >= 2
 
 
 def test_lsp_benchmark_fails_closed_on_request_errors(

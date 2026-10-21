@@ -21,7 +21,7 @@ _MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 def position_to_offset(text: str, position: dict[str, int]) -> int:
     line = position.get("line")
     target = position.get("character")
-    if not isinstance(line, int) or not isinstance(target, int) or line < 0 or target < 0:
+    if type(line) is not int or type(target) is not int or line < 0 or target < 0:
         raise ToolError("lsp_position_invalid", "LSP line and character must be non-negative integers.")
 
     # LSP line boundaries are LF or CRLF. Python str.splitlines() is broader

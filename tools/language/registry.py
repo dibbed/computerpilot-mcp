@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from core.audit import audit_action
 from core.config import SETTINGS, resolve_path
 from core.errors import ToolError
+from core.recovery import bind_operation_recovery
 from core.tooling import MUTATING, OPEN_WORLD_READ, compact_errors
 from tools.language.edits import apply_workspace_edit, prepare_workspace_edit
 from tools.language.lsp import LspClient, uri_to_path
@@ -42,6 +43,7 @@ def _command() -> list[str]:
 
 
 async def _run_sync(call: Callable[[], Any]) -> Any:
+    call = bind_operation_recovery(call)
     cancelled = False
     try:
         with anyio.CancelScope(shield=True):

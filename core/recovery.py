@@ -11,13 +11,13 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from core.errors import ToolError
 from core.file_lock import exclusive_file_lock
@@ -344,6 +344,7 @@ _CURRENT_OPERATION_SCOPE: ContextVar[_OperationRecoveryScope | None] = ContextVa
     "current_operation_recovery_scope",
     default=None,
 )
+_T = TypeVar("_T")
 
 
 @contextmanager
@@ -355,6 +356,21 @@ def operation_recovery_context(handle: OperationHandle | None) -> Iterator[_Oper
     finally:
         scope.active = False
         _CURRENT_OPERATION_SCOPE.reset(token)
+
+
+def bind_operation_recovery(call: Callable[[], _T]) -> Callable[[], _T]:
+    """Explicitly transfer the current owning call's recovery context to a worker."""
+    scope = _CURRENT_OPERATION_SCOPE.get()
+    if scope is None or not scope.active or scope.owner != _execution_owner():
+        return call
+
+    def run() -> _T:
+        if not scope.active:
+            raise ToolError("invalid_operation_handle", "The enclosing recovery operation has finished.")
+        with operation_recovery_context(scope.handle):
+            return call()
+
+    return run
 
 
 def _parse_iso_utc(value: Any) -> datetime | None:
@@ -1871,10 +1887,6 @@ def workspace_edit_mutation(paths: tuple[Path, ...]) -> Iterator[OperationHandle
     scope = _CURRENT_OPERATION_SCOPE.get()
     owner = _execution_owner()
     owned = scope is None or not scope.active or scope.owner != owner
-    if owned and scope is not None and scope.active and owner[1] is None and scope.owner[1] is not None:
-        # anyio/asyncio offloads a synchronous tool body into a worker thread with
-        # a copied context; that worker is still the same admitted tool call.
-        owned = False
     admission = RUNTIME_LIFECYCLE.mutation("workspace_edit") if owned else nullcontext()
     with admission:
         handle = scope.handle if scope is not None and not owned else None

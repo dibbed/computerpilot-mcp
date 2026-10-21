@@ -478,6 +478,63 @@ def test_pin_paths_rejects_paths_outside_backup_directory(tmp_path: Path) -> Non
     assert raised.value.code == "backup_path_invalid"
 
 
+def test_pin_publication_cannot_race_an_already_started_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release_cleanup = threading.Event()
+    published = threading.Event()
+    release_pin = threading.Event()
+    failures: list[BaseException] = []
+    original = backups.cleanup_backups
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    reserved = directory / "reserved.bak"
+    newest = directory / "newest.bak"
+    manager = BackupRetentionManager(directory, _policy(max_count=1, recent_grace_sec=0))
+
+    def paused_cleanup(
+        directory: Path,
+        policy: BackupPolicy,
+        *,
+        now: float | None = None,
+        protected_paths: set[Path] | None = None,
+    ) -> BackupCleanupResult:
+        entered.set()
+        assert release_cleanup.wait(5)
+        return original(directory, policy, now=now, protected_paths=protected_paths)
+
+    def publish() -> None:
+        try:
+            with manager.pin_paths((reserved,)):
+                _backup(reserved, 10, 100)
+                _backup(newest, 10, 200)
+                published.set()
+                assert release_pin.wait(5)
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(backups, "cleanup_backups", paused_cleanup)
+    manager.schedule()
+    assert entered.wait(5)
+    publisher = threading.Thread(target=publish)
+    publisher.start()
+    try:
+        # A cleanup that already captured protection must finish before new publication.
+        published.wait(0.5)
+        release_cleanup.set()
+        assert manager.flush(5)
+        assert published.wait(5)
+        assert reserved.is_file()
+        assert newest.is_file()
+    finally:
+        release_cleanup.set()
+        release_pin.set()
+        publisher.join(5)
+    assert not publisher.is_alive()
+    assert not failures
+
+
 def test_retention_skips_cleanup_when_recovery_journal_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

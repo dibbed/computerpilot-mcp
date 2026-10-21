@@ -240,6 +240,7 @@ class BackupRetentionManager:
         self.directory = directory
         self.policy = policy
         self._lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._dirty = False
         self._protected: set[Path] = set()
@@ -265,7 +266,7 @@ class BackupRetentionManager:
             if candidate not in seen:
                 normalized.append(candidate)
                 seen.add(candidate)
-        with self._lock:
+        with self._cleanup_lock, self._lock:
             new_paths = [path for path in normalized if path not in self._pins]
             if len(self._pins) + len(new_paths) > _MAX_PINNED_BACKUPS:
                 raise ToolError("backup_pin_limit", "Too many backups are awaiting publication.")
@@ -274,7 +275,7 @@ class BackupRetentionManager:
         try:
             yield
         finally:
-            with self._lock:
+            with self._cleanup_lock, self._lock:
                 for path in normalized:
                     remaining = self._pins.get(path, 0) - 1
                     if remaining <= 0:
@@ -303,30 +304,32 @@ class BackupRetentionManager:
                 delay = max(0.0, self.policy.cleanup_interval_sec - (time.monotonic() - self._last_run))
             if delay:
                 time.sleep(delay)
-            with self._lock:
-                protected |= self._protected
-                self._protected.clear()
-                pinned = set(self._pins)
-            try:
-                from core.recovery import OPERATION_RECOVERY
+            # Pin publication and release-to-journal handoff cannot cross a cleanup snapshot.
+            with self._cleanup_lock:
+                with self._lock:
+                    protected |= self._protected
+                    self._protected.clear()
+                    pinned = set(self._pins)
+                try:
+                    from core.recovery import OPERATION_RECOVERY
 
-                journal_protected = OPERATION_RECOVERY.protected_workspace_backups()
-            except Exception as exc:  # never delete while unresolved recovery evidence is unreadable
-                with self._lock:
-                    self._last_error = f"recovery_unavailable: {type(exc).__name__}"
-                    self._last_run = time.monotonic()
-                continue
-            try:
-                result = cleanup_backups(
-                    self.directory,
-                    self.policy,
-                    protected_paths=protected | pinned | journal_protected,
-                )
-            except Exception as exc:  # maintenance must never fail a successful user write
-                with self._lock:
-                    self._last_error = f"{type(exc).__name__}: {exc}"
-                    self._last_run = time.monotonic()
-                continue
+                    journal_protected = OPERATION_RECOVERY.protected_workspace_backups()
+                except Exception as exc:  # never delete while unresolved recovery evidence is unreadable
+                    with self._lock:
+                        self._last_error = f"recovery_unavailable: {type(exc).__name__}"
+                        self._last_run = time.monotonic()
+                    continue
+                try:
+                    result = cleanup_backups(
+                        self.directory,
+                        self.policy,
+                        protected_paths=protected | pinned | journal_protected,
+                    )
+                except Exception as exc:  # maintenance must never fail a successful user write
+                    with self._lock:
+                        self._last_error = f"{type(exc).__name__}: {exc}"
+                        self._last_run = time.monotonic()
+                    continue
             with self._lock:
                 self._last_result = result
                 self._last_error = None
