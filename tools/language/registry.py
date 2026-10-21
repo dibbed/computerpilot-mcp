@@ -247,11 +247,42 @@ def register(mcp: MCPServer, *, manager: LspSessionManager | None = None) -> Non
         source_sha256 = getattr(edit, "source_sha256", None)
 
         def apply_rename() -> dict[str, Any]:
-            if isinstance(source_sha256, Mapping):
+            if document_versions is not None or source_sha256 is not None:
+                if not isinstance(document_versions, Mapping) or not isinstance(source_sha256, Mapping):
+                    raise ToolError("lsp_result_stale", "The language-server rename snapshot is incomplete.")
+                snapshot_versions: dict[Path, int] = {}
+                for uri, version in document_versions.items():
+                    if not isinstance(uri, str) or type(version) is not int or version < 0:
+                        raise ToolError("lsp_result_stale", "The language-server rename snapshot is invalid.")
+                    source = uri_to_path(uri, workspace)
+                    previous = snapshot_versions.get(source)
+                    if previous is not None and previous != version:
+                        raise ToolError("lsp_document_version_conflict", "The language-server rename snapshot has conflicting versions.")
+                    snapshot_versions[source] = version
+                snapshot_hashes: dict[Path, str] = {}
                 for uri, digest in source_sha256.items():
                     if not isinstance(uri, str) or not isinstance(digest, str):
                         raise ToolError("lsp_result_stale", "The language-server rename snapshot is invalid.")
                     source = uri_to_path(uri, workspace)
+                    previous_hash = snapshot_hashes.get(source)
+                    if previous_hash is not None and previous_hash.casefold() != digest.casefold():
+                        raise ToolError("lsp_result_stale", "The language-server rename snapshot has conflicting hashes.")
+                    snapshot_hashes[source] = digest
+                operations = edit.get("documentChanges") if isinstance(edit, dict) else None
+                if isinstance(operations, list):
+                    for operation in operations:
+                        document = operation.get("textDocument") if isinstance(operation, dict) else None
+                        uri = document.get("uri") if isinstance(document, dict) else None
+                        if not isinstance(uri, str):
+                            continue
+                        source = uri_to_path(uri, workspace)
+                        if source not in snapshot_versions or source not in snapshot_hashes:
+                            relative = source.relative_to(workspace).as_posix()
+                            raise ToolError(
+                                "lsp_result_stale",
+                                f"Rename edit targets {relative} without a server snapshot.",
+                            )
+                for source, digest in snapshot_hashes.items():
                     relative = source.relative_to(workspace).as_posix()
                     wanted = expected_sha256.get(relative)
                     if wanted is not None and wanted.casefold() != digest.casefold():
