@@ -310,7 +310,7 @@ def test_rename_worker_preserves_mutation_scope_until_completion(
 
     from core import heartbeat, recovery
     from tools.language import registry
-    from tools.language.sessions import LspSessionManager
+    from tools.language.sessions import LspSessionManager, RenameResult
 
     provider, _log = manager_provider(tmp_path)
     manager = LspSessionManager((provider,), generation="rename-worker")
@@ -321,7 +321,7 @@ def test_rename_worker_preserves_mutation_scope_until_completion(
     applied: list[bool] = []
 
     async def response(*_args: Any, **_kwargs: Any) -> dict[str, object]:
-        return {"changes": {}}
+        return RenameResult({"changes": {}}, {})
 
     def prepare(*_args: Any, **_kwargs: Any) -> list[object]:
         scope = recovery._CURRENT_OPERATION_SCOPE.get()
