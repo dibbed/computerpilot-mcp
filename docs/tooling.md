@@ -8,6 +8,7 @@ Available profiles:
 
 - `minimal`
 - `coding`
+- `coding_core` (unreleased opt-in; model UX pilot pending)
 - `git`
 - `testing`
 - `documents`
@@ -23,6 +24,8 @@ MCP_TOOL_PROFILE=<profile>
 ```
 
 `discover_tool_domains` reports the requested/active domains and platform capabilities. `recommend_tools` searches only the tools actually registered in the active profile and attaches shared execution metadata when known.
+
+`coding_core` uses the coding domains with an exact 43-tool native catalog covering discovery, files, project/LSP context, verification, Git, recovery and job observation/cancellation. Set it before startup and restart; clients can cache the catalog for the whole session. Choose `coding` or `full` and restart when broader capabilities are needed. Hidden native tools are rejected before dispatch, and extensions need explicit `coding_core` profile eligibility. Profiles are capability filters, not security sandboxes; visible mutations keep their existing policy, lifecycle and recovery guards. Static SDK journeys pass, but the separately budgeted live-model UX comparison is unverified; this profile does not change the default.
 
 ## Adaptive execution routing
 

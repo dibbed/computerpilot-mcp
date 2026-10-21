@@ -18,6 +18,8 @@ This page highlights the settings most users are likely to change.
 
 Named tool profiles are `minimal`, `coding`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, and `full`. The `documents` profile keeps filesystem, native document, recovery, and workflow domains together. Router candidate generation always uses the tools actually registered in the selected profile; catalog metadata does not bypass profile or platform filtering. Unsupported router policy names fail closed only when router APIs/routed steps are invoked and do not prevent the MCP server from starting.
 
+Unreleased opt-in `coding_core` keeps a fixed 43-tool subset of the coding catalog. Set `MCP_TOOL_PROFILE=coding_core` before startup and restart to select it; switch back to `coding`/`full` with another restart. Extensions require explicit eligibility for the new profile. Its live-model UX pilot is pending separate budget/authorization; `full` remains the default. See [profiles](tooling.md#profiles).
+
 ## Managed tunnel runtime
 
 | Variable | Purpose | Default |

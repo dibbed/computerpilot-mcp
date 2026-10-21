@@ -4,7 +4,7 @@ This guide describes the native implementation, including unreleased language-to
 
 ## Registration and caller contract
 
-`core/registry.py:create_server` detects capabilities, resolves one of the nine profiles, filters domains, and invokes `REGISTRARS`. A domain exports its `register(MCPServer)` through `tools/<domain>/__init__.py`. Add a tool in its existing domain, with the same decorator order as its neighbours:
+`core/registry.py:create_server` detects capabilities, resolves a named profile, filters domains, and invokes `REGISTRARS`. A domain exports its `register(MCPServer)` through `tools/<domain>/__init__.py`. Add a tool in its existing domain, with the same decorator order as its neighbours:
 
 ```python
 @mcp.tool(annotations=READ_ONLY, structured_output=True)
@@ -16,6 +16,8 @@ def read_file(path: PathArg, ...) -> dict[str, Any]:
 This excerpt shows the existing `tools/filesystem/registry.py` pattern, not a runnable replacement. `functools.wraps` in `compact_errors` preserves the typed signature. `create_server` sets the installed SDK's native `ArgModelBase` to `extra="forbid"`; unknown arguments must be rejected before the body runs. Preserve caller-visible names, defaults, schema, result shape, and concise descriptions. Reuse bounded aliases in `core/tooling.py` and Pydantic `Annotated[..., Field(...)]` for actual input limits. Avoid default coercion or broad dictionaries where a typed contract already exists.
 
 The live registry owns availability. Add required deterministic metadata to `core/tool_catalog.py` for discovery and routing, using the existing native risk/recoverability taxonomy. Metadata does not register the tool. `PROFILE_DOMAINS` in `core/tool_profiles.py` filters native domains; it is not authorization. Platform-specific imports and registration follow `core/platform` capability gates.
+
+The unreleased `coding_core` profile also supplies a fixed native allowlist. `ExtensionMCPServer.add_tool` preserves the public SDK registration signature and metadata while excluding other native names; startup requires the complete allowlist, and `call_tool` rejects hidden native names before dispatch. Other profiles retain `native_allowlist=None`. Keep registrations synchronous and inert, and use the existing external policy's explicit profile eligibility. This static capability filter is not a sandbox or a model-quality claim; the live-model UX pilot remains gated separately.
 
 ## Classification, lifecycle and recovery
 

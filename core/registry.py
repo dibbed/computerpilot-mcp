@@ -76,6 +76,7 @@ def create_server() -> MCPServer:
     store_getter = lazy_job_store(lambda: JobStore()) if {"jobs", "testing"}.intersection(active_domains) else None
     server = ExtensionMCPServer(
         tool_profile=profile.name,
+        native_allowlist=profile.native_allowlist,
         name=SETTINGS.server_name,
         title="ComputerPilot MCP",
         description="Cross-platform computer-use and developer-automation MCP backend with structured output.",
@@ -304,4 +305,6 @@ def create_server() -> MCPServer:
             workflow_store_factory=workflow_store,
         )
 
+    if profile.native_allowlist is not None and server.native_registered_names != profile.native_allowlist:
+        raise ToolError("profile_invalid", "The static profile's native tool registrations are incomplete.")
     return server

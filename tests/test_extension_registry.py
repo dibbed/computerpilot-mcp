@@ -60,6 +60,24 @@ def _make_tool(
     )
 
 
+@pytest.mark.parametrize("profiles,allowed", [
+    ((), False), (("coding",), False), (("full", "coding"), False), (("coding_core",), True),
+])
+def test_coding_core_extension_needs_explicit_profile_eligibility(profiles: tuple[str, ...], allowed: bool) -> None:
+    policy = ToolPolicy(
+        remote_name="query", domain="testing", allow_call=True,
+        mutation_class=MutationClass.READ_ONLY, profiles=profiles,
+    )
+    tool = _make_tool("ext_a", "query", policy=policy)
+    registry = ExtensionRegistry()
+    snapshot = registry.publish_extension_catalog("ext_a", 1, [tool])
+    result = evaluate_tool_eligibility(
+        tool, snapshot=snapshot, definition=_make_def(), active_profile="coding_core", platform="windows",
+    )
+    assert result.eligible is allowed
+    assert result.rejection_code == (None if allowed else "profile_mismatch")
+
+
 def test_empty_registry_and_snapshot_defaults() -> None:
     registry = ExtensionRegistry()
     snapshot = registry.active_snapshot
