@@ -1,3 +1,8 @@
+import hashlib
+import json
+import os
+import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -7,6 +12,32 @@ import pytest
 from core.errors import ToolError
 from tools.language.edits import apply_workspace_edit, prepare_workspace_edit
 from tools.language.lsp import position_to_offset
+
+
+@pytest.fixture(autouse=True)
+def _workspace_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    from types import SimpleNamespace
+
+    from core import recovery
+    from core.backups import BackupPolicy, BackupRetentionManager
+    from tools.filesystem import service
+    from tools.language import edits
+
+    journal = tmp_path / "runtime" / "operation-recovery.jsonl"
+    journal.parent.mkdir()
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setattr(edits, "SETTINGS", SimpleNamespace(backup_dir=backup_dir))
+    monkeypatch.setattr(edits, "BACKUP_RETENTION", BackupRetentionManager(
+        backup_dir, BackupPolicy(max_bytes=0, max_age_sec=0, cleanup_interval_sec=0, recent_grace_sec=0),
+    ))
+    monkeypatch.setattr(service, "SETTINGS", SimpleNamespace(backup_dir=backup_dir))
+    monkeypatch.setattr(service, "ensure_runtime_dirs", lambda: None)
+    recovery.OPERATION_RECOVERY.configure(journal, "workspace-edit-regressions")
+    try:
+        yield recovery.OPERATION_RECOVERY
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
 
 
 def edit(start: int, end: int, replacement: str) -> dict[str, Any]:
@@ -114,6 +145,234 @@ def test_duplicate_edit_denied_without_double_insert(tmp_path: Path) -> None:
         prepare_workspace_edit(tmp_path, payload)
     assert raised.value.code == "lsp_edit_duplicate"
     assert path.read_bytes() == b"abc"
+
+
+def test_apply_rechecks_hash_after_prepare(tmp_path: Path) -> None:
+    path = tmp_path / "sample.txt"
+    path.write_bytes(b"before")
+    plan = prepare_workspace_edit(tmp_path, {"changes": {path.as_uri(): [edit(0, 6, "after")]}})
+    path.write_bytes(b"changed")
+
+    with pytest.raises(ToolError) as raised:
+        apply_workspace_edit(plan)
+    assert raised.value.code == "hash_conflict"
+    assert path.read_bytes() == b"changed"
+
+
+def test_workspace_edit_persists_backups_and_stage_evidence(tmp_path: Path) -> None:
+    from core.recovery import OPERATION_RECOVERY
+
+    path = tmp_path / "sample.txt"
+    path.write_bytes(b"before")
+    plan = prepare_workspace_edit(tmp_path, {"changes": {path.as_uri(): [edit(0, 6, "after")]}})
+
+    apply_workspace_edit(plan)
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "runtime" / "operation-recovery.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    checkpoints = [record for record in records if record.get("type") == "checkpoint"]
+    assert checkpoints[-1]["workspace_edit"]["dispatch_stage"] == "may_dispatch"
+    evidence = checkpoints[-1]["workspace_edit"]["files"][0]
+    backup = Path(evidence["backup_path"])
+    assert backup.read_bytes() == b"before"
+    assert evidence["before_sha256"] == hashlib.sha256(b"before").hexdigest()
+    assert evidence["after_sha256"] == hashlib.sha256(b"after").hexdigest()
+    assert OPERATION_RECOVERY.protected_workspace_backups() == set()
+
+
+def test_workspace_edit_rolls_back_every_written_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.recovery import OPERATION_RECOVERY
+    from tools.language import edits
+
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    plan = prepare_workspace_edit(tmp_path, {
+        "changes": {
+            first.as_uri(): [edit(0, 3, "new")],
+            second.as_uri(): [edit(0, 3, "new")],
+        }
+    })
+    real_write = edits._write_bytes
+    calls = 0
+
+    def fail_second(path: Path, data: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated write failure")
+        real_write(path, data)
+
+    monkeypatch.setattr(edits, "_write_bytes", fail_second)
+    with pytest.raises(OSError, match="simulated"):
+        apply_workspace_edit(plan)
+
+    assert first.read_bytes() == b"one"
+    assert second.read_bytes() == b"two"
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "runtime" / "operation-recovery.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    operation_id = next(record["operation_id"] for record in records if record.get("type") == "begin")
+    assert OPERATION_RECOVERY.inspect(operation_id)["state"] == "failed"
+
+
+def test_workspace_edit_restore_conflict_stays_uncertain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.recovery import OPERATION_RECOVERY
+    from tools.language import edits
+
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    plan = prepare_workspace_edit(tmp_path, {
+        "changes": {
+            first.as_uri(): [edit(0, 3, "new")],
+            second.as_uri(): [edit(0, 3, "new")],
+        }
+    })
+    real_write = edits._write_bytes
+    calls = 0
+
+    def conflicting_write(path: Path, data: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            real_write(path, b"foreign")
+        elif calls == 2:
+            raise OSError("simulated write failure")
+        else:
+            real_write(path, data)
+
+    monkeypatch.setattr(edits, "_write_bytes", conflicting_write)
+    with pytest.raises(ToolError) as raised:
+        apply_workspace_edit(plan)
+
+    assert raised.value.code == "workspace_edit_outcome_uncertain"
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "runtime" / "operation-recovery.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    operation_id = next(record["operation_id"] for record in records if record.get("type") == "begin")
+    assert OPERATION_RECOVERY.inspect(operation_id)["state"] == "uncertain"
+    assert OPERATION_RECOVERY.protected_workspace_backups()
+
+
+def test_workspace_edit_backup_failure_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.recovery import OPERATION_RECOVERY
+    from tools.filesystem import service
+
+    path = tmp_path / "sample.txt"
+    path.write_bytes(b"before")
+    plan = prepare_workspace_edit(tmp_path, {"changes": {path.as_uri(): [edit(0, 6, "after")]}})
+
+    def fail_backup(*_args: object, **_kwargs: object) -> str:
+        raise ToolError("backup_write_failed", "simulated backup storage failure")
+
+    monkeypatch.setattr(service, "_backup_file", fail_backup)
+    with pytest.raises(ToolError) as raised:
+        apply_workspace_edit(plan)
+    assert raised.value.code == "backup_write_failed"
+    assert path.read_bytes() == b"before"
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "runtime" / "operation-recovery.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    operation_id = next(record["operation_id"] for record in records if record.get("type") == "begin")
+    operation = OPERATION_RECOVERY.inspect(operation_id)
+    assert operation["state"] == "failed"
+    assert "workspace_edit" not in operation
+
+
+def test_workspace_edit_mid_batch_crash_preserves_backups_and_uncertainty(tmp_path: Path) -> None:
+    from core.recovery import OperationRecoveryJournal
+
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    journal_path = tmp_path / "crash" / "operation-recovery.jsonl"
+    journal_path.parent.mkdir()
+    state_dir = tmp_path / "crash-state"
+    script = r"""
+import os
+import sys
+from pathlib import Path
+
+state_dir, journal_path, root = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+os.environ["MCP_STATE_DIR"] = str(state_dir)
+from core import recovery
+from tools.language import edits
+from tools.language.edits import prepare_workspace_edit
+
+recovery.OPERATION_RECOVERY.configure(journal_path, "crash-runtime")
+first, second = root / "first.txt", root / "second.txt"
+change = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "new"}
+plan = prepare_workspace_edit(root, {"changes": {first.as_uri(): [change], second.as_uri(): [change]}})
+real_write = edits._write_bytes
+
+def crash_after_first(path, data):
+    real_write(path, data)
+    if path == first:
+        os._exit(23)
+
+edits._write_bytes = crash_after_first
+edits.apply_workspace_edit(plan)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(state_dir), str(journal_path), str(tmp_path)],
+        cwd=Path.cwd(),
+        env={**os.environ, "PYTHONPATH": str(Path.cwd())},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 23, completed.stderr
+    assert first.read_bytes() == b"new"
+    assert second.read_bytes() == b"two"
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(journal_path, "after-crash")
+    records = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    operation_id = next(record["operation_id"] for record in records if record.get("type") == "begin")
+    operation = recovered.inspect(operation_id)
+    assert operation["state"] == "uncertain"
+    assert operation["workspace_edit"]["dispatch_stage"] == "may_dispatch"
+    protected = recovered.protected_workspace_backups()
+    assert len(protected) == 2
+    assert {path.read_bytes() for path in protected} == {b"one", b"two"}
+    assert first.read_bytes() == b"new"
+    assert second.read_bytes() == b"two"
+
+
+def test_workspace_edit_rejects_oversized_evidence_before_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core import recovery
+    from tools.language import edits
+
+    path = tmp_path / "sample.txt"
+    path.write_bytes(b"before")
+    plan = prepare_workspace_edit(tmp_path, {"changes": {path.as_uri(): [edit(0, 6, "after")]}})
+    existing = set(edits.SETTINGS.backup_dir.glob("*.bak"))
+    monkeypatch.setattr(recovery, "_MAX_WORKSPACE_EVIDENCE_BYTES", 1)
+
+    with pytest.raises(ToolError) as raised:
+        apply_workspace_edit(plan)
+    assert raised.value.code == "lsp_edit_evidence_too_large"
+    assert path.read_bytes() == b"before"
+    assert set(edits.SETTINGS.backup_dir.glob("*.bak")) == existing
 
 
 @pytest.mark.parametrize(

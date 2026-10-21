@@ -3,13 +3,25 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from core.backups import BACKUP_RETENTION
+from core.config import SETTINGS
 from core.errors import ToolError
+from core.recovery import (
+    OPERATION_RECOVERY,
+    WorkspaceEditEvidence,
+    WorkspaceEditFile,
+    mark_workspace_edit_rolled_back,
+    validate_workspace_edit_evidence,
+    workspace_edit_mutation,
+)
 from core.resource_claims import managed_path_claims
 from core.resource_locks import RESOURCE_LOCKS
 from tools.filesystem.patches import _write_bytes
@@ -39,17 +51,25 @@ def _budget(message: str) -> ToolError:
 
 def _version_path(key: str, root: Path) -> Path:
     candidate = Path(key)
-    if candidate.is_absolute():
-        path = candidate.resolve(strict=False)
-    elif urlsplit(key).scheme:
-        path = uri_to_path(key, root)
-    else:
-        path = (root / key).resolve(strict=False)
+    try:
+        path = candidate.resolve(strict=False) if candidate.is_absolute() else None
+        scheme = urlsplit(key).scheme if path is None else ""
+    except ValueError as exc:
+        raise _unsupported("Workspace edit contains an invalid version URI.") from exc
+    if path is None:
+        path = _uri_path(key, root) if scheme else (root / key).resolve(strict=False)
     try:
         path.relative_to(root)
     except ValueError as exc:
         raise ToolError("lsp_path_outside_workspace", "Workspace edit path is outside the workspace.") from exc
     return path
+
+
+def _uri_path(uri: str, root: Path) -> Path:
+    try:
+        return uri_to_path(uri, root)
+    except (UnicodeError, ValueError) as exc:
+        raise _unsupported("Workspace edit contains an invalid URI.") from exc
 
 
 def _document_versions(root: Path, versions: Mapping[str, int] | None) -> dict[Path, int]:
@@ -116,7 +136,11 @@ def prepare_workspace_edit(
             replacement = candidate["newText"]
             if len(replacement) > _MAX_REPLACEMENT_BYTES:
                 raise _budget("Workspace edit replacement text exceeds the 2 MiB limit.")
-            replacement_bytes += len(replacement.encode("utf-8"))
+            try:
+                encoded_replacement = replacement.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise _unsupported("Workspace edit newText must be valid UTF-8.") from exc
+            replacement_bytes += len(encoded_replacement)
             if replacement_bytes > _MAX_REPLACEMENT_BYTES:
                 raise _budget("Workspace edit replacement text exceeds the 2 MiB limit.")
             parsed.append(candidate)
@@ -127,6 +151,8 @@ def prepare_workspace_edit(
     if raw_changes is not None:
         if not isinstance(raw_changes, dict):
             raise _unsupported("Workspace edit changes must be an object.")
+        if len(raw_changes) > _MAX_EDITS:
+            raise _budget("Workspace edit exceeds the URI alias limit.")
         for uri, raw_edits in raw_changes.items():
             append_edits(uri, raw_edits)
 
@@ -134,6 +160,8 @@ def prepare_workspace_edit(
     if document_changes is not None:
         if not isinstance(document_changes, list):
             raise _unsupported("Workspace edit documentChanges must be a list.")
+        if len(document_changes) > _MAX_EDITS:
+            raise _budget("Workspace edit exceeds the operation limit.")
         for operation in document_changes:
             document = operation.get("textDocument") if isinstance(operation, dict) else None
             raw_document_edits = operation.get("edits") if isinstance(operation, dict) else None
@@ -158,7 +186,7 @@ def prepare_workspace_edit(
 
     files: dict[Path, list[dict[str, Any]]] = {}
     for uri, raw_edits in changes.items():
-        path = uri_to_path(uri, root)
+        path = _uri_path(uri, root)
         files.setdefault(path, []).extend(raw_edits)
     if len(files) > _MAX_EDIT_FILES:
         raise _budget(f"Workspace edit exceeds the {_MAX_EDIT_FILES} file limit.")
@@ -166,7 +194,7 @@ def prepare_workspace_edit(
     normalized_versions = _document_versions(root, document_versions)
     versioned_paths: dict[Path, int] = {}
     for uri, version in versions.items():
-        path = uri_to_path(uri, root)
+        path = _uri_path(uri, root)
         previous = versioned_paths.get(path)
         if previous is not None and previous != version:
             raise ToolError("lsp_document_version_conflict", "Workspace document versions conflict.")
@@ -216,22 +244,115 @@ def prepare_workspace_edit(
     return tuple(planned)
 
 
+def _invalidate_paths(paths: tuple[Path, ...]) -> None:
+    for path in paths:
+        PYTHON_METADATA_CACHE.invalidate(path)
+        CONTEXT_CACHE.invalidate(path)
+
+
 def apply_workspace_edit(plan: tuple[PlannedFile, ...]) -> dict[str, Any]:
     paths = tuple(item.path for item in plan)
+    if not paths:
+        return {"ok": True, "file_count": 0, "files": []}
     with managed_path_claims(*paths, category="native.workspace_edit"), RESOURCE_LOCKS.sync(*paths):
-        written = []
-        try:
-            for item in plan:
-                if item.path.read_bytes() != item.before:
-                    raise ToolError("hash_conflict", f"Workspace edit precondition failed for {item.path}.")
-            for item in plan:
-                _write_bytes(item.path, item.after)
-                written.append(item)
-        except BaseException:
-            for item in reversed(written):
-                _write_bytes(item.path, item.before)
-            raise
         for item in plan:
-            PYTHON_METADATA_CACHE.invalidate(item.path)
-            CONTEXT_CACHE.invalidate(item.path)
+            if item.path.read_bytes() != item.before:
+                raise ToolError("hash_conflict", f"Workspace edit precondition failed for {item.path}.")
+        with workspace_edit_mutation(paths) as handle:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            reserved = tuple(
+                SETTINGS.backup_dir / f"{stamp}_{uuid.uuid4().hex}.bak"
+                for _ in plan
+            )
+            evidence = WorkspaceEditEvidence(files=tuple(
+                WorkspaceEditFile(
+                    path=str(item.path.resolve(strict=False)),
+                    before_sha256=hashlib.sha256(item.before).hexdigest(),
+                    after_sha256=hashlib.sha256(item.after).hexdigest(),
+                    backup_path=str(destination.resolve(strict=False)),
+                )
+                for item, destination in zip(plan, reserved, strict=True)
+            ))
+            validate_workspace_edit_evidence(evidence)
+            with BACKUP_RETENTION.pin_paths(reserved):
+                from tools.filesystem.service import _backup_file
+
+                for item, destination, item_evidence in zip(plan, reserved, evidence.files, strict=True):
+                    backup = Path(_backup_file(
+                        item.path,
+                        item_evidence.before_sha256,
+                        destination=destination,
+                    ))
+                    try:
+                        backup_digest = hashlib.sha256(backup.read_bytes()).hexdigest()
+                    except OSError as exc:
+                        raise ToolError(
+                            "backup_verification_failed",
+                            f"Workspace edit backup could not be verified for {item.path}.",
+                        ) from exc
+                    if backup_digest != item_evidence.before_sha256:
+                        raise ToolError(
+                            "backup_verification_failed",
+                            f"Workspace edit backup changed while copying {item.path}.",
+                        )
+                OPERATION_RECOVERY.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+                OPERATION_RECOVERY.checkpoint_workspace_edit(handle, evidence, stage="may_dispatch")
+                try:
+                    for item in plan:
+                        _write_bytes(item.path, item.after)
+                    for item, item_evidence in zip(plan, evidence.files, strict=True):
+                        try:
+                            actual = hashlib.sha256(item.path.read_bytes()).hexdigest()
+                        except OSError as exc:
+                            raise ToolError(
+                                "workspace_edit_verification_failed",
+                                f"Workspace edit result could not be verified for {item.path}.",
+                            ) from exc
+                        if actual != item_evidence.after_sha256:
+                            raise ToolError(
+                                "workspace_edit_verification_failed",
+                                f"Workspace edit result changed during verification for {item.path}.",
+                            )
+                except BaseException as error:
+                    changed: list[PlannedFile] = []
+                    restored = True
+                    for item in plan:
+                        try:
+                            current = item.path.read_bytes()
+                        except OSError:
+                            restored = False
+                            break
+                        if current == item.after and current != item.before:
+                            changed.append(item)
+                        elif current != item.before:
+                            restored = False
+                            break
+                    if restored:
+                        try:
+                            for item in reversed(changed):
+                                _write_bytes(item.path, item.before)
+                            for item in plan:
+                                if item.path.read_bytes() != item.before:
+                                    restored = False
+                                    break
+                        except Exception:
+                            restored = False
+                    _invalidate_paths(paths)
+                    if restored:
+                        mark_workspace_edit_rolled_back()
+                        try:
+                            OPERATION_RECOVERY.finish(handle, known_result="returned_error")
+                        except Exception:
+                            pass  # A prepared checkpoint still recovers as failed without replay.
+                        raise
+                    try:
+                        OPERATION_RECOVERY.mark_uncertain(handle, "workspace_edit_outcome_uncertain")
+                    except Exception:
+                        pass  # The durable may_dispatch checkpoint remains for reconciliation.
+                    raise ToolError(
+                        "workspace_edit_outcome_uncertain",
+                        "The workspace edit may have partially applied; do not replay it.",
+                        hint=f"Inspect recovery operation {handle.operation_id} and restore from its backups.",
+                    ) from error
+        _invalidate_paths(paths)
     return {"ok": True, "file_count": len(plan), "files": [str(item.path) for item in plan]}

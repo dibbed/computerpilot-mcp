@@ -6,14 +6,18 @@ import os
 import stat
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from core.config import SETTINGS, Settings
+from core.errors import ToolError
 from core.state_paths import unlinked_directory_tree
 
 BACKUP_RECENT_GRACE_SEC = 60.0
+_MAX_PINNED_BACKUPS = 10_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,9 +243,44 @@ class BackupRetentionManager:
         self._thread: threading.Thread | None = None
         self._dirty = False
         self._protected: set[Path] = set()
+        self._pins: dict[Path, int] = {}
         self._last_run = 0.0
         self._last_result: BackupCleanupResult | None = None
         self._last_error: str | None = None
+
+    @contextmanager
+    def pin_paths(self, paths: tuple[Path, ...] | list[Path]) -> Iterator[None]:
+        """Keep reserved backup paths alive until their durable checkpoint is published."""
+
+        root = self.directory.resolve(strict=False)
+        normalized: list[Path] = []
+        seen: set[Path] = set()
+        for path in paths:
+            original = Path(path)
+            if original.is_symlink():
+                raise ToolError("backup_path_invalid", "Pinned backup paths must not be symlinks.")
+            candidate = original.resolve(strict=False)
+            if candidate.parent != root:
+                raise ToolError("backup_path_invalid", "Pinned backups must be direct children of the backup directory.")
+            if candidate not in seen:
+                normalized.append(candidate)
+                seen.add(candidate)
+        with self._lock:
+            new_paths = [path for path in normalized if path not in self._pins]
+            if len(self._pins) + len(new_paths) > _MAX_PINNED_BACKUPS:
+                raise ToolError("backup_pin_limit", "Too many backups are awaiting publication.")
+            for path in normalized:
+                self._pins[path] = self._pins.get(path, 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                for path in normalized:
+                    remaining = self._pins.get(path, 0) - 1
+                    if remaining <= 0:
+                        self._pins.pop(path, None)
+                    else:
+                        self._pins[path] = remaining
 
     def schedule(self, protected_path: Path | None = None) -> None:
         with self._lock:
@@ -261,12 +300,28 @@ class BackupRetentionManager:
                     return
                 self._dirty = False
                 protected = set(self._protected)
-                self._protected.clear()
                 delay = max(0.0, self.policy.cleanup_interval_sec - (time.monotonic() - self._last_run))
             if delay:
                 time.sleep(delay)
+            with self._lock:
+                protected |= self._protected
+                self._protected.clear()
+                pinned = set(self._pins)
             try:
-                result = cleanup_backups(self.directory, self.policy, protected_paths=protected)
+                from core.recovery import OPERATION_RECOVERY
+
+                journal_protected = OPERATION_RECOVERY.protected_workspace_backups()
+            except Exception as exc:  # never delete while unresolved recovery evidence is unreadable
+                with self._lock:
+                    self._last_error = f"recovery_unavailable: {type(exc).__name__}"
+                    self._last_run = time.monotonic()
+                continue
+            try:
+                result = cleanup_backups(
+                    self.directory,
+                    self.policy,
+                    protected_paths=protected | pinned | journal_protected,
+                )
             except Exception as exc:  # maintenance must never fail a successful user write
                 with self._lock:
                     self._last_error = f"{type(exc).__name__}: {exc}"
@@ -298,6 +353,7 @@ class BackupRetentionManager:
                 "dirty": self._dirty,
                 "last_result": None if self._last_result is None else self._last_result.to_dict(),
                 "last_error": self._last_error,
+                "pinned": len(self._pins),
             }
 
 

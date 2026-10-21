@@ -14,6 +14,31 @@ from tools.language import edits, registry
 from tools.language.edits import apply_workspace_edit, prepare_workspace_edit
 
 
+@pytest.fixture(autouse=True)
+def _workspace_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    from types import SimpleNamespace
+
+    from core import recovery
+    from core.backups import BackupPolicy, BackupRetentionManager
+    from tools.filesystem import service
+
+    journal = tmp_path / "runtime" / "operation-recovery.jsonl"
+    journal.parent.mkdir()
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setattr(edits, "SETTINGS", SimpleNamespace(backup_dir=backup_dir))
+    monkeypatch.setattr(edits, "BACKUP_RETENTION", BackupRetentionManager(
+        backup_dir, BackupPolicy(max_bytes=0, max_age_sec=0, cleanup_interval_sec=0, recent_grace_sec=0),
+    ))
+    monkeypatch.setattr(service, "SETTINGS", SimpleNamespace(backup_dir=backup_dir))
+    monkeypatch.setattr(service, "ensure_runtime_dirs", lambda: None)
+    recovery.OPERATION_RECOVERY.configure(journal, "workspace-edit-tests")
+    try:
+        yield recovery.OPERATION_RECOVERY
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+
 def _edit(path: Path) -> dict[str, object]:
     return {
         "changes": {
