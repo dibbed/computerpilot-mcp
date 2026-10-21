@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-21: Add versioned internal project-evidence models and bounded manifest inventory with caller-root containment, duplicate-key denial, Python 3.10 TOML marker fallback and consumption-time hash checks. Reject raced directory evidence without exposing unverified names; existing AST APIs and tool catalogs stay unchanged.
 - 2026-10-21: Add an opt-in 43-tool `coding_core` catalog with public-SDK registration filtering, pre-dispatch hidden-tool denial and explicit extension eligibility; preserve full/coding descriptors and require restart for profile changes. Static SDK journeys pass; the separately authorized live-model UX pilot remains pending.
 - 2026-10-21: Serialize backup pin publication with retention, bind recovery reuse explicitly to the owning mutation when offloading language work, reject boolean LSP positions, isolate crash-test backup storage, and document typed/legacy compatibility plus fail-closed rename snapshot limits. Sample one-shot benchmark children during requests to avoid missing short-lived processes.
 - 2026-10-21: Persist bounded workspace-edit evidence and exclusive verified backups before multi-file writes, roll back only byte-identical postimages, keep unknown outcomes uncertain without replay, and protect unresolved backups from retention; direct in-process edits now require the supervised recovery journal.
