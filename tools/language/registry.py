@@ -18,7 +18,7 @@ from core.config import SETTINGS, resolve_path
 from core.errors import ToolError
 from core.tooling import MUTATING, OPEN_WORLD_READ, compact_errors
 from tools.language.edits import apply_workspace_edit, prepare_workspace_edit
-from tools.language.lsp import LspClient
+from tools.language.lsp import LspClient, uri_to_path
 from tools.language.requests import (
     DiagnosticRequest,
     DocumentRequest,
@@ -243,17 +243,33 @@ def register(mcp: MCPServer, *, manager: LspSessionManager | None = None) -> Non
             },
             manager=manager,
         )
+        document_versions = getattr(edit, "snapshot_version", None)
+        source_sha256 = getattr(edit, "source_sha256", None)
+
         def apply_rename() -> dict[str, Any]:
+            if isinstance(source_sha256, Mapping):
+                for uri, digest in source_sha256.items():
+                    if not isinstance(uri, str) or not isinstance(digest, str):
+                        raise ToolError("lsp_result_stale", "The language-server rename snapshot is invalid.")
+                    source = uri_to_path(uri, workspace)
+                    relative = source.relative_to(workspace).as_posix()
+                    wanted = expected_sha256.get(relative)
+                    if wanted is not None and wanted.casefold() != digest.casefold():
+                        raise ToolError("lsp_result_stale", f"The language-server rename snapshot is stale for {relative}.")
             plan = prepare_workspace_edit(
                 workspace,
                 edit,
                 expected_sha256=expected_sha256,
                 require_expected_sha256=True,
+                document_versions=document_versions,
             )
             audit_action("rename_symbol", target=workspace, details={"file_count": len(plan), "dry_run": dry_run})
             if dry_run:
                 return {"ok": True, "dry_run": True, "file_count": len(plan), "files": [str(item.path) for item in plan]}
-            return {**apply_workspace_edit(plan), "dry_run": False}
+            result = apply_workspace_edit(plan)
+            if manager is not None:
+                manager.close_workspace(workspace)
+            return {**result, "dry_run": False}
 
         return await _run_sync(apply_rename)
 
@@ -264,6 +280,7 @@ def register(mcp: MCPServer, *, manager: LspSessionManager | None = None) -> Non
         action: Annotated[dict[str, Any], Field(max_length=200)],
         expected_sha256: Annotated[dict[str, str] | None, Field(max_length=500)] = None,
         dry_run: bool = False,
+        document_versions: Annotated[dict[str, int] | None, Field(max_length=500)] = None,
     ) -> dict[str, Any]:
         """Apply only the workspace edit from an LSP code action; returned commands are never executed."""
         workspace = resolve_path(root)
@@ -275,7 +292,11 @@ def register(mcp: MCPServer, *, manager: LspSessionManager | None = None) -> Non
             edit,
             expected_sha256=expected_sha256,
             require_expected_sha256=True,
+            document_versions=document_versions,
         )
         if dry_run:
             return {"ok": True, "dry_run": True, "file_count": len(plan), "command_ignored": bool(action.get("command"))}
-        return {**apply_workspace_edit(plan), "dry_run": False, "command_ignored": bool(action.get("command"))}
+        result = apply_workspace_edit(plan)
+        if manager is not None:
+            manager.close_workspace(workspace)
+        return {**result, "dry_run": False, "command_ignored": bool(action.get("command"))}
