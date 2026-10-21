@@ -34,6 +34,7 @@ JOURNAL_SCHEMA_VERSION = 1
 EXTERNAL_METADATA_VERSION = 1
 COMPACT_AFTER_RECORDS = 4_096
 MAX_UNRESOLVED_EXTERNAL_OPERATIONS = 128
+MAX_UNRESOLVED_WORKSPACE_EDITS = 64
 MAX_EXTERNAL_TERMINAL_HISTORY = 1_000
 MAX_EXTERNAL_TERMINAL_DAYS = 30
 _MAX_LINE_BYTES = 32_768
@@ -516,6 +517,7 @@ class OperationRecoveryJournal:
         self,
         *,
         max_unresolved_external: int = MAX_UNRESOLVED_EXTERNAL_OPERATIONS,
+        max_unresolved_workspace: int = MAX_UNRESOLVED_WORKSPACE_EDITS,
         max_external_terminal_history: int = MAX_EXTERNAL_TERMINAL_HISTORY,
         max_external_terminal_days: int = MAX_EXTERNAL_TERMINAL_DAYS,
     ) -> None:
@@ -528,6 +530,7 @@ class OperationRecoveryJournal:
         self._hmac_key: bytes = os.urandom(32)
         self._hmac_key_id: str = os.urandom(8).hex()
         self._max_unresolved_external = max_unresolved_external
+        self._max_unresolved_workspace = max_unresolved_workspace
         self._max_external_terminal_history = max_external_terminal_history
         self._max_external_terminal_days = max_external_terminal_days
         self._cached_stat_key: tuple[int, int] | None = None
@@ -645,6 +648,44 @@ class OperationRecoveryJournal:
                 raise
         finally:
             self._lock.release()
+
+    @staticmethod
+    def _is_unresolved_workspace_item(item: Mapping[str, Any]) -> bool:
+        begin = item.get("begin")
+        if not isinstance(begin, dict):
+            return False
+        if item.get("result") is not None or item.get("reconciliation") is not None or item.get("acknowledged") is not None:
+            return False
+        checkpoint = item.get("checkpoint")
+        if isinstance(checkpoint, dict) and "workspace_edit" in checkpoint:
+            return True
+        return begin.get("operation_type") == "workspace_edit"
+
+    def unresolved_workspace_count(self) -> int:
+        with self._lock:
+            if not self._enabled or self._path is None:
+                return 0
+            state = self._state(self._load_locked())
+            return sum(1 for item in state.values() if self._is_unresolved_workspace_item(item))
+
+    def has_workspace_edit_capacity(self) -> bool:
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if not self._enabled or self._path is None:
+                return False
+            return self.unresolved_workspace_count() < self._max_unresolved_workspace
+        finally:
+            self._lock.release()
+
+    def ensure_workspace_edit_capacity(self) -> None:
+        if not self._enabled:
+            return
+        if not self.has_workspace_edit_capacity():
+            raise ToolError(
+                "workspace_edit_limit",
+                f"Unresolved workspace-edit limit ({self._max_unresolved_workspace}) reached; reconcile before retrying.",
+            )
 
     def _append_unlocked_file(self, record: dict[str, Any]) -> None:
         path = self._path
@@ -1542,7 +1583,8 @@ class OperationRecoveryJournal:
                     "Workspace edits require an enabled operation recovery journal.",
                 )
             with self._journal_transaction(operation_id=handle.operation_id) as records:
-                current = self._state(records).get(handle.operation_id)
+                state = self._state(records)
+                current = state.get(handle.operation_id)
                 begin = current.get("begin") if current else None
                 if (
                     not begin or handle.runtime_id != self._runtime_id
@@ -1566,6 +1608,17 @@ class OperationRecoveryJournal:
                         raise ToolError("operation_checkpoint_conflict", "Workspace edit checkpoint stage changed.")
                 elif record["dispatch_stage"] != "prepared":
                     raise ToolError("operation_checkpoint_conflict", "Prepare workspace edit evidence before dispatch.")
+                if existing is None and record["dispatch_stage"] == "prepared":
+                    unresolved = sum(
+                        1
+                        for operation_id, item in self._state(self._load_locked()).items()
+                        if operation_id != handle.operation_id and self._is_unresolved_workspace_item(item)
+                    )
+                    if unresolved >= self._max_unresolved_workspace:
+                        raise ToolError(
+                            "workspace_edit_limit",
+                            f"Unresolved workspace-edit limit ({self._max_unresolved_workspace}) reached; reconcile before retrying.",
+                        )
                 self._append_unlocked_file({
                     **previous,
                     "schema_version": JOURNAL_SCHEMA_VERSION,
@@ -1814,6 +1867,7 @@ def workspace_edit_mutation(paths: tuple[Path, ...]) -> Iterator[OperationHandle
 
     if not paths or len(paths) > _MAX_WORKSPACE_EDIT_FILES or any(not isinstance(path, Path) for path in paths):
         raise ToolError("invalid_workspace_edit_evidence", "Invalid workspace edit recovery paths.")
+    OPERATION_RECOVERY.ensure_workspace_edit_capacity()
     scope = _CURRENT_OPERATION_SCOPE.get()
     owner = _execution_owner()
     owned = scope is None or not scope.active or scope.owner != owner

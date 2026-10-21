@@ -356,6 +356,68 @@ edits.apply_workspace_edit(plan)
     assert second.read_bytes() == b"two"
 
 
+def test_workspace_edit_prepared_process_crash_does_not_write_or_replay(tmp_path: Path) -> None:
+    from core.recovery import OperationRecoveryJournal
+
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    journal_path = tmp_path / "prepared-crash" / "operation-recovery.jsonl"
+    journal_path.parent.mkdir()
+    state_dir = tmp_path / "prepared-crash-state"
+    script = r"""
+import os
+import sys
+from pathlib import Path
+
+state_dir, journal_path, root = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+os.environ["MCP_STATE_DIR"] = str(state_dir)
+from core import recovery
+from tools.language import edits
+from tools.language.edits import prepare_workspace_edit
+
+recovery.OPERATION_RECOVERY.configure(journal_path, "prepared-crash-runtime")
+first, second = root / "first.txt", root / "second.txt"
+change = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "new"}
+plan = prepare_workspace_edit(root, {"changes": {first.as_uri(): [change], second.as_uri(): [change]}})
+real_checkpoint = recovery.OPERATION_RECOVERY.checkpoint_workspace_edit
+
+def crash_after_prepared(handle, evidence, *, stage):
+    real_checkpoint(handle, evidence, stage=stage)
+    if stage == "prepared":
+        os._exit(24)
+
+recovery.OPERATION_RECOVERY.checkpoint_workspace_edit = crash_after_prepared
+edits.apply_workspace_edit(plan)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(state_dir), str(journal_path), str(tmp_path)],
+        cwd=Path.cwd(),
+        env={**os.environ, "PYTHONPATH": str(Path.cwd())},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 24, completed.stderr
+    assert first.read_bytes() == b"one"
+    assert second.read_bytes() == b"two"
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(journal_path, "after-prepared-crash")
+    records = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    operation_id = next(record["operation_id"] for record in records if record.get("type") == "begin")
+    operation = recovered.inspect(operation_id)
+    assert operation["state"] == "failed"
+    assert operation["workspace_edit"]["dispatch_stage"] == "prepared"
+    assert all(Path(item["backup_path"]).is_file() for item in operation["workspace_edit"]["files"])
+    assert recovered.protected_workspace_backups() == set()
+
+
 def test_workspace_edit_rejects_oversized_evidence_before_backup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -192,6 +192,43 @@ def test_workspace_edit_mutation_reuses_owning_task_in_worker_thread(tmp_path: P
     assert [record["operation_id"] for record in begins] == [outer.operation_id]
 
 
+def test_workspace_edit_mutation_denies_when_unresolved_quota_is_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "workspace.jsonl"
+    recovery.OPERATION_RECOVERY.configure(path, "quota-runtime")
+    monkeypatch.setattr(recovery.OPERATION_RECOVERY, "_max_unresolved_workspace", 0)
+    try:
+        with pytest.raises(ToolError) as raised:
+            with recovery.workspace_edit_mutation((tmp_path / "denied.txt",)):
+                pytest.fail("workspace edit admission must be denied before any operation starts")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+    assert raised.value.code == "workspace_edit_limit"
+    assert not path.exists() or not any(record.get("type") == "begin" for record in _records(path))
+
+
+def test_workspace_edit_checkpoint_denies_second_unresolved_operation(tmp_path: Path) -> None:
+    journal = OperationRecoveryJournal(max_unresolved_workspace=1)
+    path = tmp_path / "workspace.jsonl"
+    journal.configure(path, "quota-runtime")
+    try:
+        first = journal.begin("workspace_edit")
+        assert first is not None
+        evidence = _workspace_evidence(tmp_path)
+        journal.checkpoint_workspace_edit(first, evidence, stage="prepared")
+        second = journal.begin("workspace_edit")
+        assert second is not None
+
+        with pytest.raises(ToolError) as raised:
+            journal.checkpoint_workspace_edit(second, evidence, stage="prepared")
+        assert raised.value.code == "workspace_edit_limit"
+        assert journal.workspace_edit_stage(second) is None
+    finally:
+        journal.configure(None, None)
+
+
 def test_old_journal_records_and_new_checkpoint_compact_without_loss(tmp_path: Path) -> None:
     path = tmp_path / "workspace.jsonl"
     journal = OperationRecoveryJournal()
