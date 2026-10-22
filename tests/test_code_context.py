@@ -292,6 +292,7 @@ def test_context_depth_zero_one_two(tmp_path: Path) -> None:
     assert depth0["total"] == 0
     assert depth0["relationships_truncated"] is False
     assert depth0["complete"] is True
+    assert depth0["completeness_by_relation"] == {"definition": True}
     assert all(depth0[category] == [] for category in _RELATIONSHIP_CATEGORIES)
 
     depth1 = lookup_code_context(tmp_path, "a.start", max_depth=1)
@@ -455,3 +456,86 @@ def test_context_index_refreshes_after_source_changes_and_singleflights_builds(
     refreshed = context.lookup_code_context(tmp_path, "app.service.remove")
     assert refreshed["definitions"][0]["qualified_name"] == "app.service.remove"
     assert calls == 2
+
+
+@pytest.mark.parametrize("metadata", ["package.json", ".git"])
+def test_context_snapshot_tracks_manifest_and_worktree_identity(tmp_path: Path, metadata: str) -> None:
+    import os
+
+    from tools.project import context
+
+    (tmp_path / "a.py").write_bytes(b"def alpha():\n    return 1\n")
+    target = tmp_path / metadata
+    target.write_bytes(b'{"name":"one"}' if metadata == "package.json" else b"gitdir: one\n")
+    first = context.lookup_code_context(tmp_path, "alpha")
+    before = target.stat()
+    target.write_bytes(b'{"name":"two"}' if metadata == "package.json" else b"gitdir: two\n")
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    second = context.lookup_code_context(tmp_path, "alpha")
+    assert first["snapshot_id"] != second["snapshot_id"]
+    assert first["definitions"][0]["qualified_name"] == second["definitions"][0]["qualified_name"]
+
+
+def test_ast_context_adds_explicit_evidence_without_inventing_utf16_columns(tmp_path: Path) -> None:
+    import hashlib
+
+    from tools.project.context import lookup_code_context
+
+    source = tmp_path / "a.py"
+    source.write_bytes(b"def alpha():\n    return 1\n")
+    result = lookup_code_context(tmp_path, "alpha", max_depth=0)
+    assert result["backend"] == "ast" and result["language_id"] == "python"
+    row = result["definitions"][0]
+    assert row["line"] == 1 and row["source_kind"] == "python_ast"
+    assert row["symbol_key"]["coordinate_system"] == "python_legacy"
+    assert row["symbol_key"]["start_line"] == 1 and row["symbol_key"]["start_character"] is None
+    assert row["snapshot"]["document_digest"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert row["snapshot"]["source_kind"] == "ast" and row["snapshot"]["document_version"] is None
+    assert result["snapshot"] == row["snapshot"]
+    assert result["semantic_complete"] is False and result["fallback_reason"] is None
+
+
+def test_context_evidence_reuses_verified_versions_without_rehashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.project import context
+
+    source = tmp_path / "a.py"
+    source.write_bytes(b"".join(f"def alpha{index}():\n    return {index}\n\n".encode() for index in range(12)))
+    context.build_context_index(tmp_path)
+    calls: list[Path] = []
+    original = context.file_version
+
+    def counted(path: Path) -> Any:
+        calls.append(path)
+        return original(path)
+
+    monkeypatch.setattr(context, "file_version", counted)
+    result = context.lookup_code_context(tmp_path, "alpha", match="contains", max_depth=0, include_source=False)
+    assert len(result["definitions"]) == 12
+    assert len(calls) <= 2
+
+
+def test_file_only_context_uses_the_parent_workspace_identity(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    first_source = tmp_path / "a.py"
+    second_source = tmp_path / "b.py"
+    first_source.write_bytes(b"def alpha():\n    return 1\n")
+    second_source.write_bytes(b"def alpha():\n    return 2\n")
+    first = lookup_code_context(first_source, "alpha", max_depth=0)["definitions"][0]
+    second = lookup_code_context(second_source, "alpha", max_depth=0)["definitions"][0]
+    assert first["symbol_key"]["canonical_workspace"] == second["symbol_key"]["canonical_workspace"]
+    assert first["snapshot"]["worktree_id"] == second["snapshot"]["worktree_id"]
+    assert (first["symbol_key"]["relative_uri"], second["symbol_key"]["relative_uri"]) == ("a.py", "b.py")
+
+
+def test_file_only_context_does_not_scan_sibling_project_inputs(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    source = tmp_path / "a.py"
+    source.write_bytes(b"def alpha():\n    return 1\n")
+    (tmp_path / "package.json").write_bytes(b"invalid sibling manifest")
+    result = lookup_code_context(source, "alpha", max_depth=0)
+    assert result["complete"] and result["definitions"][0]["symbol_key"]["relative_uri"] == "a.py"
+    assert not result["missing_inputs"]

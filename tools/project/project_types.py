@@ -25,12 +25,15 @@ from tools.project.service import EXCLUDED_DIRS
 
 _MAX_MANIFESTS = 256
 _MAX_MANIFEST_BYTES = 256 * 1024
+_MAX_SOURCE_FILE_BYTES = 2 * 1024 * 1024
+_MAX_SOURCE_BYTES = 16 * 1024 * 1024
 _MAX_ENTRIES = 10_000
 _MAX_DEPTH = 32
 _INVENTORY_SECONDS = 5.0
 _MANIFESTS: dict[str, Literal["python", "node", "php"]] = {
     "pyproject.toml": "python", "package.json": "node", "composer.json": "php",
 }
+_FINGERPRINT_FILES = frozenset({"tsconfig.json", "jsconfig.json"})
 _LANGUAGES: dict[str, LanguageId] = {
     ".py": "python", ".pyi": "python", ".ts": "typescript", ".tsx": "typescriptreact",
     ".js": "javascript", ".jsx": "javascriptreact", ".mjs": "javascript", ".cjs": "javascript", ".php": "php",
@@ -63,6 +66,7 @@ class ProjectInventory:
     complete: bool
     missing_inputs: tuple[str, ...]
     version: Literal[1] = 1
+    source_fingerprint: str | None = None
 
 
 def language_for_path(path: Path) -> LanguageId | Literal["unsupported"]:
@@ -186,9 +190,11 @@ def _directory_identity(path: Path, root: Path, expected: tuple[int, int, int] |
     return identity
 
 
-def detect_project_types(root: Path, *, max_manifests: int = 256) -> ProjectInventory:
+def detect_project_types(root: Path, *, max_manifests: int = 256, fingerprint_sources: bool = False) -> ProjectInventory:
     if type(max_manifests) is not int or not 1 <= max_manifests <= _MAX_MANIFESTS:
         raise ToolError("inventory_limit", "Manifest admission must be between 1 and 256.")
+    if type(fingerprint_sources) is not bool:
+        raise ToolError("inventory_limit", "Source fingerprint selection must be a boolean.")
     root = resolve_path(root)
     if not root.is_dir():
         raise ToolError("project_scope_escape", "The selected project root must be an existing directory.")
@@ -203,6 +209,10 @@ def detect_project_types(root: Path, *, max_manifests: int = 256) -> ProjectInve
     missing: list[str] = []
     visited = 0
     manifests = 0
+    fingerprint_available = fingerprint_sources
+    source_bytes = 0
+    fingerprint_entries: list[tuple[str, str, str]] = []
+    scanned_directories: list[tuple[Path, tuple[int, int, int], int, int]] = []
 
     def incomplete(code: str, path: Path) -> None:
         if len(missing) < 1_000:
@@ -226,6 +236,9 @@ def detect_project_types(root: Path, *, max_manifests: int = 256) -> ProjectInve
             with os.scandir(current) as scanner:
                 # Revalidate after open before consuming names from a raced directory alias.
                 _directory_identity(current, root, identity)
+                if fingerprint_available:
+                    scanned = current.stat()
+                    scanned_directories.append((current, identity, scanned.st_mtime_ns, scanned.st_ctime_ns))
                 for entry in scanner:
                     _directory_identity(current, root, identity)
                     visited += 1
@@ -277,6 +290,32 @@ def detect_project_types(root: Path, *, max_manifests: int = 256) -> ProjectInve
                 language = language_for_path(path)
                 if language != "unsupported":
                     languages.add(language)
+                    if fingerprint_available:
+                        try:
+                            data = _read_bytes(path, root, min(_MAX_SOURCE_FILE_BYTES, _MAX_SOURCE_BYTES - source_bytes))
+                            data.decode("utf-8", errors="strict")
+                            source_bytes += len(data)
+                            fingerprint_entries.append(("source", path.relative_to(root).as_posix(), hashlib.sha256(data).hexdigest()))
+                            if time.monotonic() >= deadline:
+                                fingerprint_available = False
+                                incomplete("inventory_limit", current)
+                        except (OSError, RuntimeError, ToolError, UnicodeError):
+                            # Optional cache evidence must not hide otherwise usable package metadata.
+                            fingerprint_available = False
+                if path.name in _FINGERPRINT_FILES:
+                    if fingerprint_available:
+                        try:
+                            data = _read_bytes(path, root, _MAX_MANIFEST_BYTES)
+                        except (OSError, RuntimeError, ToolError):
+                            fingerprint_available = False
+                        else:
+                            fingerprint_entries.append(
+                                ("config", path.relative_to(root).as_posix(), hashlib.sha256(data).hexdigest())
+                            )
+                            if time.monotonic() >= deadline:
+                                fingerprint_available = False
+                                incomplete("inventory_limit", current)
+                    continue
                 if path.name not in _MANIFESTS:
                     continue
                 manifests += 1
@@ -286,6 +325,8 @@ def detect_project_types(root: Path, *, max_manifests: int = 256) -> ProjectInve
                     break
                 manifest, reason = _manifest(path, root)
                 packages.setdefault(path.parent, []).append(manifest)
+                if fingerprint_available:
+                    fingerprint_entries.append(("manifest", path.relative_to(root).as_posix(), manifest.sha256))
                 if manifest.kind == "python":
                     languages.add("python")
                 elif manifest.kind == "php":
@@ -297,6 +338,46 @@ def detect_project_types(root: Path, *, max_manifests: int = 256) -> ProjectInve
                 incomplete("invalid_project_manifest", current)
             except ToolError as error:
                 incomplete(error.code, path)
+    source_fingerprint = None
+    if fingerprint_available and not missing:
+        try:
+            _directory_identity(root, root, root_identity)
+            verified_source_bytes = 0
+            # Re-read known inputs, never re-enumerate; each of two source passes has a 16 MiB budget.
+            for kind, relative, expected_digest in fingerprint_entries:
+                if time.monotonic() >= deadline:
+                    fingerprint_available = False
+                    break
+                maximum = (
+                    min(_MAX_SOURCE_FILE_BYTES, _MAX_SOURCE_BYTES - verified_source_bytes)
+                    if kind == "source" else _MAX_MANIFEST_BYTES
+                )
+                data = _read_bytes(root / relative, root, maximum)
+                if kind == "source":
+                    verified_source_bytes += len(data)
+                if hashlib.sha256(data).hexdigest() != expected_digest or time.monotonic() >= deadline:
+                    fingerprint_available = False
+                    break
+            for directory, identity, modified, changed in scanned_directories:
+                if not fingerprint_available:
+                    break
+                _directory_identity(directory, root, identity)
+                current_info = directory.stat()
+                if (current_info.st_mtime_ns, current_info.st_ctime_ns) != (modified, changed) or time.monotonic() >= deadline:
+                    fingerprint_available = False
+                    break
+            if fingerprint_available and _worktree_identity(root) == worktree_id and time.monotonic() < deadline:
+                digest = hashlib.sha256()
+                # Length-prefixed fields keep root, identity, paths and hashes unambiguous.
+                for fields in [("root", canonical_path(root), worktree_id), *sorted(fingerprint_entries)]:
+                    for field in fields:
+                        encoded = field.encode("utf-8", errors="strict")
+                        digest.update(len(encoded).to_bytes(8, "big"))
+                        digest.update(encoded)
+                if time.monotonic() < deadline:
+                    source_fingerprint = digest.hexdigest()
+        except (OSError, RuntimeError, ToolError, UnicodeError):
+            pass
     return ProjectInventory(
         root=root,
         packages=tuple(PackageInfo(path, tuple(items)) for path, items in sorted(packages.items())),
@@ -304,6 +385,7 @@ def detect_project_types(root: Path, *, max_manifests: int = 256) -> ProjectInve
         language_ids=tuple(sorted(languages)),
         complete=not missing,
         missing_inputs=tuple(missing),
+        source_fingerprint=source_fingerprint,
     )
 
 

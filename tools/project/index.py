@@ -313,6 +313,7 @@ class PythonMetadataCache:
             raise ValueError("Python metadata cache budgets must be positive.")
         self._loader = loader
         self._lock = threading.RLock()
+        self._invalidation_epoch = 0
         self._entries: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._bytes = 0
         self._path_generations: dict[str, int] = {}
@@ -399,6 +400,7 @@ class PythonMetadataCache:
         prefix = key.rstrip("\\/") + os.sep
         removed = 0
         with self._lock:
+            self._invalidation_epoch += 1
             candidates = set(self._entries) | set(self._active_loads)
             if recursive:
                 affected = [candidate for candidate in candidates if candidate == key or candidate.startswith(prefix)]
@@ -416,10 +418,17 @@ class PythonMetadataCache:
 
     def clear(self) -> None:
         with self._lock:
+            self._invalidation_epoch += 1
             for key in self._active_loads:
                 self._path_generations[key] = self._path_generations.get(key, 0) + 1
             self._entries.clear()
             self._bytes = 0
+
+    @property
+    def invalidation_epoch(self) -> int:
+        """Fence consumers even when a native write touched an uncached/non-Python path."""
+        with self._lock:
+            return self._invalidation_epoch
 
     def stats(self) -> dict[str, int]:
         with self._lock:

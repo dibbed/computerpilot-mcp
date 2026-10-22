@@ -257,8 +257,9 @@ def test_worktree_marker_distinguishes_roots_without_following_its_pointer(tmp_p
 
 
 @pytest.mark.parametrize("moment", ["before_open", "during_enumeration", "after_enumeration", "aba", "aba_metadata"])
+@pytest.mark.parametrize("fingerprint_sources", [False, True])
 def test_queued_directory_swap_does_not_enumerate_or_disclose_outside_names(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, moment: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, moment: str, fingerprint_sources: bool,
 ) -> None:
     root, outside = tmp_path / "root", tmp_path / "outside"
     root.mkdir()
@@ -336,7 +337,7 @@ def test_queued_directory_swap_does_not_enumerate_or_disclose_outside_names(
 
     monkeypatch.setattr(Path, "lstat", race_metadata)
     try:
-        inventory = detect_project_types(root)
+        inventory = detect_project_types(root, fingerprint_sources=fingerprint_sources)
         assert swapped
         assert not inventory.complete
         if moment == "before_open":
@@ -358,8 +359,9 @@ def test_queued_directory_swap_does_not_enumerate_or_disclose_outside_names(
     assert (outside / private_name).read_text(encoding="utf-8") == "private fixture"
 
 
+@pytest.mark.parametrize("fingerprint_sources", [False, True])
 def test_queued_directory_replacement_within_root_discards_the_new_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fingerprint_sources: bool,
 ) -> None:
     queued = tmp_path / "queued"
     queued.mkdir()
@@ -378,7 +380,206 @@ def test_queued_directory_replacement_within_root_discards_the_new_identity(
             yield scanner
 
     monkeypatch.setattr(project_types.os, "scandir", replace_at_open)
-    inventory = detect_project_types(tmp_path)
+    inventory = detect_project_types(tmp_path, fingerprint_sources=fingerprint_sources)
     assert not inventory.complete
     assert not inventory.packages
     assert inventory.missing_inputs == ("invalid_project_manifest:queued",)
+
+
+def test_source_fingerprint_is_opt_in_and_tracks_unreturned_same_stat_edits(tmp_path: Path) -> None:
+    source = tmp_path / "unreturned.ts"
+    source.write_bytes(b"export const x = 1;\n")
+    assert detect_project_types(tmp_path).source_fingerprint is None
+    first = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert first.complete and first.source_fingerprint is not None
+    original = source.stat()
+    source.write_bytes(b"export const x = 2;\n")
+    os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
+    second = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert second.source_fingerprint != first.source_fingerprint
+    assert second.source_fingerprint == detect_project_types(tmp_path, fingerprint_sources=True).source_fingerprint
+
+
+def test_source_fingerprint_tracks_source_set_and_manifest_bytes(tmp_path: Path) -> None:
+    source = tmp_path / "a.py"
+    source.write_bytes(b"pass\n")
+    first = detect_project_types(tmp_path, fingerprint_sources=True).source_fingerprint
+    added = tmp_path / "b.php"
+    added.write_bytes(b"<?php\n")
+    second = detect_project_types(tmp_path, fingerprint_sources=True).source_fingerprint
+    assert first is not None and second is not None and first != second
+    added.unlink()
+    assert detect_project_types(tmp_path, fingerprint_sources=True).source_fingerprint == first
+    source.rename(tmp_path / "renamed.py")
+    renamed = detect_project_types(tmp_path, fingerprint_sources=True).source_fingerprint
+    assert renamed is not None and renamed != first
+    manifest = tmp_path / "package.json"
+    manifest.write_bytes(b"{}")
+    manifest_first = detect_project_types(tmp_path, fingerprint_sources=True).source_fingerprint
+    manifest.write_bytes(b"{ }")
+    assert detect_project_types(tmp_path, fingerprint_sources=True).source_fingerprint != manifest_first
+
+
+def test_source_fingerprint_tracks_typescript_config_bytes_without_parsing(tmp_path: Path) -> None:
+    (tmp_path / "app.ts").write_bytes(b"export {};\n")
+    config = tmp_path / "tsconfig.json"
+    config.write_bytes(b'{"x":1}')
+    baseline = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert baseline.complete and baseline.source_fingerprint is not None
+    assert not baseline.packages
+    original = config.stat()
+    config.write_bytes(b'{"x":2}')
+    os.utime(config, ns=(original.st_atime_ns, original.st_mtime_ns))
+    changed = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert changed.complete and changed.source_fingerprint != baseline.source_fingerprint
+    jsconfig = tmp_path / "jsconfig.json"
+    jsconfig.write_bytes(b'{"y":1}')
+    added = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert added.complete and added.source_fingerprint != changed.source_fingerprint
+    jsconfig.write_bytes(b'{"y":2}')
+    edited = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert edited.complete and edited.source_fingerprint != added.source_fingerprint
+    assert not edited.packages
+
+
+def test_source_fingerprint_separates_roots_and_skips_unknown_and_excluded(tmp_path: Path) -> None:
+    first, second = tmp_path / "one", tmp_path / "two"
+    for root in (first, second):
+        root.mkdir()
+        (root / "app.mjs").write_bytes(b"export {};\n")
+    baseline = detect_project_types(first, fingerprint_sources=True).source_fingerprint
+    assert baseline is not None
+    assert detect_project_types(second, fingerprint_sources=True).source_fingerprint != baseline
+    (first / "secret.unknown").write_bytes(b"private content")
+    excluded = first / "node_modules"
+    excluded.mkdir()
+    (excluded / "app.py").write_bytes(b"private content")
+    assert detect_project_types(first, fingerprint_sources=True).source_fingerprint == baseline
+
+
+@pytest.mark.parametrize("payload", [b"\xff", b"x" * (2 * 1024 * 1024 + 1)], ids=["invalid-utf8", "oversized"])
+def test_source_fingerprint_read_limit_preserves_normal_inventory(tmp_path: Path, payload: bytes) -> None:
+    (tmp_path / "app.ts").write_bytes(payload)
+    (tmp_path / "package.json").write_bytes(b"{}")
+    inventory = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert inventory.complete and inventory.language_ids == ("typescript",)
+    assert len(inventory.packages) == 1
+    assert inventory.source_fingerprint is None
+    assert not inventory.missing_inputs
+
+
+def test_source_fingerprint_total_limit_never_returns_partial_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "a.py").write_bytes(b"pass\n")
+    (tmp_path / "b.py").write_bytes(b"pass\n")
+    monkeypatch.setattr(project_types, "_MAX_SOURCE_BYTES", 8)
+    inventory = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert inventory.complete
+    assert inventory.source_fingerprint is None
+
+
+def test_source_fingerprint_checks_worktree_marker_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    marker = tmp_path / ".git"
+    marker.write_bytes(b"gitdir: one")
+    (tmp_path / "app.py").write_bytes(b"pass\n")
+    original = project_types._read_bytes
+
+    def change_marker(path: Path, root: Path, maximum: int = 256 * 1024) -> bytes:
+        result = original(path, root, maximum)
+        if path.name == "app.py":
+            marker.write_bytes(b"gitdir: two")
+        return result
+
+    monkeypatch.setattr(project_types, "_read_bytes", change_marker)
+    inventory = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert inventory.source_fingerprint is None
+
+
+def test_source_fingerprint_read_failure_and_deadline_never_admit_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "app.py").write_bytes(b"pass\n")
+    original = project_types._read_bytes
+
+    def fail_read(path: Path, root: Path, maximum: int = 256 * 1024) -> bytes:
+        if path.name == "app.py":
+            raise OSError("private payload")
+        return original(path, root, maximum)
+
+    monkeypatch.setattr(project_types, "_read_bytes", fail_read)
+    inventory = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert inventory.source_fingerprint is None
+    assert "private payload" not in repr(inventory)
+    monkeypatch.setattr(project_types, "_read_bytes", original)
+    monkeypatch.setattr(project_types, "_INVENTORY_SECONDS", 0.0)
+    inventory = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert not inventory.complete and inventory.source_fingerprint is None
+
+
+def test_source_fingerprint_rejects_source_added_after_directory_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "app.py").write_bytes(b"pass\n")
+    original = project_types._read_bytes
+
+    def add_source(path: Path, root: Path, maximum: int = 256 * 1024) -> bytes:
+        result = original(path, root, maximum)
+        if path.name == "app.py":
+            (root / "late.py").write_bytes(b"pass\n")
+        return result
+
+    monkeypatch.setattr(project_types, "_read_bytes", add_source)
+    inventory = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert inventory.complete and inventory.source_fingerprint is None
+
+
+def test_source_fingerprint_deadline_includes_the_final_source_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "app.py").write_bytes(b"pass\n")
+    original = project_types._read_bytes
+    clock = [0.0]
+    monkeypatch.setattr(project_types.time, "monotonic", lambda: clock[0])
+
+    def slow_read(path: Path, root: Path, maximum: int = 256 * 1024) -> bytes:
+        result = original(path, root, maximum)
+        clock[0] = 10.0
+        return result
+
+    monkeypatch.setattr(project_types, "_read_bytes", slow_read)
+    inventory = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert not inventory.complete and inventory.source_fingerprint is None
+    assert inventory.missing_inputs == ("inventory_limit:.",)
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_source_fingerprint_selector_is_a_strict_boolean(tmp_path: Path, value: object) -> None:
+    with pytest.raises(ToolError) as invalid:
+        detect_project_types(tmp_path, fingerprint_sources=value)  # type: ignore[arg-type]
+    assert invalid.value.code == "inventory_limit"
+
+
+@pytest.mark.parametrize("earlier", ["a.py", "package.json"])
+def test_source_fingerprint_revalidates_earlier_content_after_later_source_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, earlier: str,
+) -> None:
+    target = tmp_path / earlier
+    target.write_bytes(b"{}" if earlier.endswith("json") else b"x=1\n")
+    (tmp_path / "z.py").write_bytes(b"pass\n")
+    before = target.stat()
+    original = project_types._read_bytes
+    changed = False
+
+    def change_earlier(path: Path, root: Path, maximum: int = 256 * 1024) -> bytes:
+        nonlocal changed
+        result = original(path, root, maximum)
+        if path.name == "z.py" and not changed:
+            changed = True
+            target.write_bytes(b"[]" if earlier.endswith("json") else b"x=2\n")
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return result
+
+    monkeypatch.setattr(project_types, "_read_bytes", change_earlier)
+    inventory = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert changed and target.stat().st_mtime_ns == before.st_mtime_ns
+    assert inventory.complete
+    assert inventory.source_fingerprint is None

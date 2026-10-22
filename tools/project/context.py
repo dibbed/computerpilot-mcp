@@ -7,9 +7,12 @@ import os
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
+
+from pydantic import ValidationError
 
 from core.errors import ToolError
 from core.resource_locks import canonical_path
@@ -23,6 +26,8 @@ from tools.project.index import (
     _deep_size,
     file_version,
 )
+from tools.project.intelligence_models import SnapshotEvidence, SymbolKey
+from tools.project.project_types import ProjectInventory, detect_project_types
 
 Evidence = Literal["exact_qualified", "import_bound", "same_module", "name_only"]
 EVIDENCE_RANK: dict[Evidence, int] = {
@@ -85,6 +90,7 @@ class ContextIndex:
     deadline_exceeded: bool = False
     snapshot_id: str = ""
     freshness: str = "current"
+    inventory: ProjectInventory | None = None
 
 
 @dataclass(slots=True)
@@ -94,12 +100,27 @@ class _ContextEntry:
     estimated_bytes: int
 
 
-def _file_signature(files: tuple[Path, ...]) -> SourceSignature:
+def _file_signature(files: tuple[Path, ...], root: Path) -> tuple[SourceSignature, ProjectInventory]:
     rows: list[tuple[str, int, int, str]] = []
     for path in files:
         version = file_version(path)
         rows.append((canonical_path(path), version.mtime_ns, version.size, version.content_sha256))
-    return tuple(rows)
+    if root.is_file():
+        # File-only callers retain their original scope; project markers need a directory scope.
+        inventory = ProjectInventory(root.parent, (), hashlib.sha256(canonical_path(root.parent).encode()).hexdigest(),
+                                     ("python",) if files else (), True, ())
+    else:
+        inventory = detect_project_types(root)
+    metadata = [
+        (manifest.path.relative_to(inventory.root).as_posix(), 0, 0, manifest.sha256)
+        for package in inventory.packages for manifest in package.manifests
+    ]
+    metadata.extend((
+        ("<worktree>", 0, 0, inventory.worktree_id),
+        ("<inventory>", int(inventory.complete), 0, hashlib.sha256("\0".join(inventory.missing_inputs).encode("utf-8")).hexdigest()),
+    ))
+    rows.append(("<project_metadata>", 0, 0, _snapshot_id(canonical_path(root), tuple(metadata), 0)))
+    return tuple(rows), inventory
 
 
 def _snapshot_id(root: str, signature: SourceSignature, max_files: int) -> str:
@@ -285,7 +306,7 @@ class ContextIndexCache:
         discovered, truncated = service.iter_python_files(resolved, max_files)
         files = tuple(sorted(discovered, key=lambda path: canonical_path(path)))
         try:
-            signature = _file_signature(files)
+            signature, inventory = _file_signature(files, resolved)
         except ToolError:
             raise
         except OSError as exc:
@@ -293,7 +314,7 @@ class ContextIndexCache:
         entry_key = (canonical_path(resolved), max_files)
         with self._lock:
             entry = self._entries.get(entry_key)
-            if entry is not None and entry.signature == signature:
+            if inventory.complete and entry is not None and entry.signature == signature:
                 self._entries.move_to_end(entry_key)
                 return entry.index
         self._begin_build(entry_key)
@@ -337,7 +358,7 @@ class ContextIndexCache:
             if index.deadline_exceeded:
                 return replace(index, freshness="stale")
             try:
-                after = _file_signature(files)
+                after, inventory = _file_signature(files, resolved)
             except ToolError as exc:
                 if exc.code == "project_file_too_large":
                     raise
@@ -346,11 +367,14 @@ class ContextIndexCache:
             except OSError:
                 last_error = ToolError("context_stale", "Project sources changed while the context index was built.")
                 continue
-            if after != current_signature:
+            if after != current_signature and (inventory.complete or after[:-1] != current_signature[:-1]):
                 current_signature = after
                 last_error = None
                 continue
-            index = replace(index, snapshot_id=_snapshot_id(entry_key[0], after, max_files), freshness="current")
+            index = replace(index, snapshot_id=_snapshot_id(entry_key[0], after, max_files),
+                            freshness="current" if inventory.complete else "stale", inventory=inventory)
+            if not inventory.complete:
+                return index
             estimated = _deep_size(index) + CACHE_ENTRY_OVERHEAD_BYTES + 2 * len(entry_key[0])
             with self._lock:
                 if self._generations.get(entry_key, 0) != generation:
@@ -623,6 +647,7 @@ def lookup_code_context(
     *,
     match: Literal["exact", "contains"] = "exact",
     file_filter: str | None = None,
+    file_filter_exact: bool = False,
     include_source: bool = True,
     include_callers: bool = True,
     include_callees: bool = True,
@@ -639,10 +664,15 @@ def lookup_code_context(
         raise ValueError("max_depth must be an integer between 0 and 2")
     index = build_context_index(root, max_files)
     query = symbol.casefold()
+    exact_filter = file_filter.casefold().replace("\\", "/") if file_filter and file_filter_exact else None
 
     def matches(item: Definition) -> bool:
-        if file_filter and file_filter.casefold() not in item.file.casefold():
-            return False
+        if file_filter:
+            if exact_filter is not None:
+                if item.file.casefold().replace("\\", "/") != exact_filter:
+                    return False
+            elif file_filter.casefold() not in item.file.casefold():
+                return False
         full = item.qualified_name.casefold()
         local = item.local_name.casefold()
         short = item.qualified_name.rsplit(".", 1)[-1].casefold()
@@ -799,7 +829,38 @@ def lookup_code_context(
     for _category, row in page:
         confidence = str(row.get("confidence", "inferred"))
         confidence_summary[confidence] = confidence_summary.get(confidence, 0) + 1
+    missing_inputs = list(index.inventory.missing_inputs) if index.inventory is not None else []
+    indexed_files = {file.relative: file for file in index.files}
+    root_digest = hashlib.sha256(canonical_path(index.root).encode("utf-8")).hexdigest()
+    for row, definition in zip(definition_rows, selected, strict=True):
+        indexed = indexed_files[definition.file]
+        try:
+            relative_uri = indexed.path.relative_to(index.inventory.root).as_posix() if index.inventory else definition.file
+            row["symbol_key"] = asdict(SymbolKey(
+                canonical_workspace=canonical_path(index.inventory.root if index.inventory else index.root), language_id="python",
+                relative_uri=quote(relative_uri, safe="/"),
+                qualified_name=definition.qualified_name,
+                kind=definition.kind, start_line=definition.line, start_character=None,
+                content_digest=indexed.version.content_sha256, coordinate_system="python_legacy",
+            ))
+            row["snapshot"] = asdict(SnapshotEvidence(
+                source_sha=None,
+                worktree_id=index.inventory.worktree_id if index.inventory else root_digest,
+                document_digest=indexed.version.content_sha256, document_version=None,
+                index_generation=index.snapshot_id or root_digest,
+                provider_id=None, source_kind="ast",
+            ))
+        except ValidationError:
+            row["symbol_key"] = row["snapshot"] = None
+            missing_inputs.append("symbol_identity_unavailable")
+            incomplete_reasons.append("symbol_identity_unavailable")
     complete = not incomplete_reasons
+    requested_relations: dict[str, bool] = {"definition": True}
+    if max_depth >= 1:
+        requested_relations.update({
+            "caller": include_callers, "callee": include_callees, "reference": include_references,
+            "import": include_imports, "related_test": include_tests,
+        })
     return {
         "ok": True,
         "root": str(index.root),
@@ -823,6 +884,13 @@ def lookup_code_context(
         "freshness": index.freshness,
         # Static AST evidence cannot prove runtime dispatch, so semantic completeness stays false until LSP evidence exists.
         "semantic_complete": False,
+        "language_id": "python",
+        "backend": "ast",
+        "snapshot": definition_rows[0].get("snapshot") if len(definition_rows) == 1 else None,
+        "completeness_by_relation": {kind: complete for kind, requested in requested_relations.items() if requested},
+        "missing_inputs": sorted(set(missing_inputs)),
+        "fallback_reason": None,
+        "version": 1,
         "confidence_summary": confidence_summary,
         "parse_errors": list(index.parse_errors),
         "count": len(page),

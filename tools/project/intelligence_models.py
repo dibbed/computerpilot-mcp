@@ -51,6 +51,14 @@ class SymbolKey:
         return self
 
 
+class CodePosition(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    line: Annotated[StrictInt, Field(ge=0, le=2**31 - 1)]
+    character: Annotated[StrictInt, Field(ge=0, le=2**31 - 1)]
+    path: Annotated[str, Field(min_length=1, max_length=32_767)]
+
+
 @dataclass(frozen=True, slots=True, config=ConfigDict(extra="forbid"))
 class SnapshotEvidence:
     source_sha: Annotated[str, Field(strict=True, pattern=r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")] | None

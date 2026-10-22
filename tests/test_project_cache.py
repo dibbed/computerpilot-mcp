@@ -20,6 +20,17 @@ from tools.testing.impact import select_affected_tests
 ToolFunction = Callable[..., dict[str, Any]]
 
 
+def test_metadata_invalidation_epoch_covers_absent_non_python_and_clear(tmp_path: Path) -> None:
+    cache = PythonMetadataCache()
+    initial = cache.invalidation_epoch
+    assert cache.invalidate(tmp_path / "new.ts") == 0
+    assert cache.invalidation_epoch == initial + 1
+    assert cache.invalidate(tmp_path / "unknown", recursive=True) == 0
+    assert cache.invalidation_epoch == initial + 2
+    cache.clear()
+    assert cache.invalidation_epoch == initial + 3
+
+
 class ToolCapture:
     def __init__(self) -> None:
         self.functions: dict[str, ToolFunction] = {}

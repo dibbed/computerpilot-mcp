@@ -4,45 +4,59 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import time
 from collections import deque
+from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
+import anyio
 from pydantic import Field, ValidationError
 
+from core.config import resolve_path
 from core.errors import ToolError
 from core.resource_locks import canonical_path
 from tools.language.lsp import position_to_offset
-from tools.language.requests import HierarchyItem, Position, Range, _document_path, validate_request
-from tools.language.sessions import LspSessionManager, SessionReply, _disk_document
-from tools.project.intelligence_models import ContextEvidence, EvidenceEdge, LanguageId, RelationKind, SnapshotEvidence, SymbolKey
-from tools.project.project_types import language_for_path
+from tools.language.requests import HierarchyItem, Range, _document_path, validate_request
+from tools.language.sessions import LspSessionManager, SessionReply, _disk_document, session_generation
+from tools.project.intelligence_models import (
+    CodePosition,
+    ContextEvidence,
+    EvidenceEdge,
+    LanguageId,
+    RelationKind,
+    SnapshotEvidence,
+    SymbolKey,
+)
+from tools.project.project_types import detect_project_types, language_for_path
 
 _LANGUAGES = frozenset({"python", "typescript", "typescriptreact", "javascript", "javascriptreact", "php"})
 _RELATIONS: tuple[RelationKind, ...] = ("definition", "reference", "import", "caller", "callee", "inheritance", "related_test")
 
 
-class CodePosition(Position):
-    path: Annotated[str, Field(min_length=1, max_length=32_767)]
+class SemanticSnapshot(ContextEvidence):
+    edges: Annotated[list[EvidenceEdge], Field(max_length=10_000)] = Field(default_factory=list)
+    cache_generation: Annotated[str | None, Field(pattern=r"^[0-9a-f]{64}$", exclude=True)] = None
 
 
 def _error(code: str = "lsp_result_invalid") -> ToolError:
     return ToolError(code, "Semantic context is unavailable or its evidence could not be validated.")
 
 
-def _empty(language_id: str, reason: str, *, offset: int = 0) -> ContextEvidence:
-    return ContextEvidence(
+def _empty(language_id: str, reason: str) -> SemanticSnapshot:
+    return SemanticSnapshot(
         language_id=cast(LanguageId, language_id) if language_id in _LANGUAGES else "unsupported",
         backend="lsp" if language_id in _LANGUAGES else "unsupported", fallback_reason=reason,
-        missing_inputs=[reason], completeness_by_relation={kind: False for kind in _RELATIONS}, offset=offset,
+        missing_inputs=[reason], completeness_by_relation={kind: False for kind in _RELATIONS},
     )
 
 
 class _Batch:
-    def __init__(self, manager: LspSessionManager, root: Path, language: LanguageId, deadline: float) -> None:
+    def __init__(self, manager: LspSessionManager, root: Path, language: LanguageId, deadline: float, file_limit: int) -> None:
         self.manager, self.root, self.language, self.deadline = manager, root, language, deadline
         self.reply: SessionReply | None = None
         self.files: dict[str, tuple[str, int | None, int]] = {}
@@ -52,6 +66,7 @@ class _Batch:
         self.missing: set[str] = set()
         self.completeness: dict[RelationKind, bool] = {}
         self.limited = False
+        self.file_limit = file_limit
 
     def remaining(self) -> float:
         remaining = self.deadline - time.monotonic()
@@ -82,7 +97,9 @@ class _Batch:
             raise _error("lsp_snapshot_changed")
         if previous is not None and version is not None and previous[1] is not None and previous[1] != version:
             raise _error("lsp_snapshot_changed")
-        if previous is None and (len(self.files) >= 1000 or sum(row[2] for row in self.files.values()) + size > 16 * 1024 * 1024):
+        if previous is None and (
+            len(self.files) >= self.file_limit or sum(row[2] for row in self.files.values()) + size > 16 * 1024 * 1024
+        ):
             raise _error("lsp_evidence_capacity")
         self.files[canonical_uri] = (digest, version if version is not None else previous[1] if previous else None, size)
         self.remaining()
@@ -97,6 +114,8 @@ class _Batch:
         reply = await self.manager.arequest_with_evidence(
             self.root, self.language, method, params, timeout_sec=min(300.0, self.remaining()),
         )
+        if self.reply is None:
+            self.deadline = min(self.deadline, time.monotonic() + 5)
         self.remaining()
         if self.reply is not None and (self.reply.key, self.reply.incarnation) != (reply.key, reply.incarnation):
             raise _error("lsp_snapshot_changed")
@@ -164,12 +183,12 @@ class _Batch:
         if self.reply is None:
             raise _error()
         uri = next(identity[0] for identity, value in self.symbols.items() if value == key)
-        identity = repr((self.reply.key, self.reply.incarnation)).encode("utf-8")
         return SnapshotEvidence(
             source_sha=None, worktree_id=hashlib.sha256(
                 (canonical_path(self.root) + "\0" + self.reply.key.worktree_marker_digest).encode("utf-8")
             ).hexdigest(), document_digest=key.content_digest, document_version=self.files[uri][1],
-            index_generation=hashlib.sha256(identity).hexdigest(), provider_id=self.reply.key.provider_id, source_kind="lsp",
+            index_generation=session_generation(self.reply.key, self.reply.incarnation),
+            provider_id=self.reply.key.provider_id, source_kind="lsp",
         )
 
     def position_params(self, key: SymbolKey) -> dict[str, object]:
@@ -265,12 +284,26 @@ class _Batch:
         self.completeness[kind] = self.completeness.get(kind, True) and complete and not self.limited
 
 
-def _matches(name: object, container: object, symbol: str) -> bool:
-    return isinstance(name, str) and (name == symbol or (isinstance(container, str) and container + "." + name == symbol))
+def _matches(name: object, container: object, symbol: str, match: Literal["exact", "contains"]) -> bool:
+    if not isinstance(name, str):
+        return False
+    qualified = container + "." + name if isinstance(container, str) and container else name
+    return symbol.casefold() in qualified.casefold() if match == "contains" else symbol in {name, qualified}
 
 
-async def _select(batch: _Batch, symbol: str, anchor: CodePosition | None) -> list[SymbolKey]:
+def _file_matches(relative: str, needle: str | None, exact: bool) -> bool:
+    if not needle:
+        return True
+    normalized = relative.replace("\\", "/").casefold()
+    return normalized == needle if exact else needle in normalized
+
+
+async def _select(
+    batch: _Batch, symbol: str, anchor: CodePosition | None, match: Literal["exact", "contains"], file_filter: str | None,
+    *, file_filter_exact: bool = False,
+) -> list[SymbolKey]:
     candidates: list[SymbolKey] = []
+    needle = file_filter.replace("\\", "/").casefold() if file_filter else None
     if anchor is None:
         response = await batch.request("workspace/symbol", {"query": symbol})
         if not batch.supports("workspaceSymbolProvider", "definition"):
@@ -278,11 +311,14 @@ async def _select(batch: _Batch, symbol: str, anchor: CodePosition | None) -> li
         for item in batch.rows(response):
             if not isinstance(item, dict):
                 raise _error()
-            if not _matches(item.get("name"), item.get("containerName"), symbol):
+            if not _matches(item.get("name"), item.get("containerName"), symbol, match):
                 continue
             location = item.get("location")
             if not isinstance(location, dict) or not isinstance(location.get("uri"), str) or "range" not in location:
                 raise _error("lsp_symbol_unresolved")
+            path = _document_path(location["uri"], batch.root)
+            if not _file_matches(path.relative_to(batch.root).as_posix(), needle, file_filter_exact):
+                continue
             container = item.get("containerName")
             name = container + "." + item["name"] if isinstance(container, str) and container else item["name"]
             candidates.append(await batch.key(location["uri"], location["range"], name, item.get("kind")))
@@ -308,7 +344,7 @@ async def _select(batch: _Batch, symbol: str, anchor: CodePosition | None) -> li
             location = item.get("location")
             uri = location.get("uri") if isinstance(location, dict) else path.as_uri()
             raw_range = location.get("range") if isinstance(location, dict) else item.get("selectionRange")
-            if _matches(name, item.get("containerName", container), symbol):
+            if _matches(name, item.get("containerName", container), symbol, match):
                 selected = Range.model_validate(raw_range)
                 point = anchor.line, anchor.character
                 start, end = (selected.start.line, selected.start.character), (selected.end.line, selected.end.character)
@@ -333,30 +369,34 @@ async def _select(batch: _Batch, symbol: str, anchor: CodePosition | None) -> li
                     )
         if queue:
             batch.limit("symbol_limit")
+    if file_filter:
+        candidates = [key for key in candidates if _file_matches(unquote(key.relative_uri), needle, file_filter_exact)]
     return list(dict.fromkeys(candidates))
 
 
-async def lookup_semantic_context(
+async def lookup_semantic_snapshot(
     manager: LspSessionManager, root: Path, symbol: str, *, language_id: str, anchor: CodePosition | None,
-    max_depth: int, max_relationships: int, offset: int, deadline: float,
-) -> ContextEvidence:
+    max_depth: int, deadline: float, match: Literal["exact", "contains"] = "exact", file_filter: str | None = None,
+    file_filter_exact: bool = False, max_files: int = 1000,
+) -> SemanticSnapshot:
     """Read one provider/session snapshot; never guess a candidate or replay on failure."""
     if (
         not isinstance(symbol, str) or not symbol or len(symbol) > 500
         or type(max_depth) is not int or not 0 <= max_depth <= 2
-        or type(max_relationships) is not int or not 1 <= max_relationships <= 1000
-        or type(offset) is not int or offset < 0
         or type(deadline) not in {float, int} or not math.isfinite(deadline)
+        or match not in {"exact", "contains"} or type(max_files) is not int or not 1 <= max_files <= 50_000
+        or type(file_filter_exact) is not bool
+        or (file_filter is not None and (not isinstance(file_filter, str) or len(file_filter) > 32_767))
     ):
         raise _error("invalid_argument")
     if language_id not in _LANGUAGES:
-        return _empty(language_id, "unsupported_language", offset=offset)
-    batch = _Batch(manager, root.resolve(), cast(LanguageId, language_id), min(deadline, time.monotonic() + 5))
+        return _empty(language_id, "unsupported_language")
+    batch = _Batch(manager, root.resolve(), cast(LanguageId, language_id), min(deadline, time.monotonic() + 30), min(max_files, 1000))
     try:
-        candidates = await _select(batch, symbol, anchor)
+        candidates = await _select(batch, symbol, anchor, match, file_filter, file_filter_exact=file_filter_exact)
         if len(candidates) != 1 or batch.limited:
             reason = "ambiguous_symbol" if candidates or batch.limited else next(iter(sorted(batch.missing)), "not_found")
-            result = _empty(language_id, reason, offset=offset)
+            result = _empty(language_id, reason)
             await batch.check_files()
             return result.model_copy(update={
                 "definitions": candidates[:100], "missing_inputs": sorted(batch.missing | set(result.missing_inputs)),
@@ -385,7 +425,7 @@ async def lookup_semantic_context(
             batch.completeness["definition"] = not batch.limited
             if len(definitions) != 1 or batch.limited:
                 await batch.check_files()
-                return _empty(language_id, "ambiguous_symbol", offset=offset).model_copy(update={"definitions": definitions[:100]})
+                return _empty(language_id, "ambiguous_symbol").model_copy(update={"definitions": definitions[:100]})
             selected = definitions[0]
             params = batch.position_params(selected)
         if max_depth >= 1:
@@ -426,18 +466,304 @@ async def lookup_semantic_context(
             edge.to_symbol.start_character or 0, edge.from_symbol.qualified_name, edge.from_symbol.kind,
             edge.to_symbol.qualified_name, edge.to_symbol.kind,
         ))
-        page = edges[offset:offset + max_relationships]
-        truncated = batch.limited or offset + len(page) < len(edges)
-        semantic_complete = not truncated and all(
+        semantic_complete = not batch.limited and all(
             value for kind, value in batch.completeness.items() if kind not in {"import", "related_test"}
         )
-        return ContextEvidence(
-            language_id=batch.language, backend="lsp", definitions=definitions, edges=page, snapshot=batch.evidence(selected),
+        return SemanticSnapshot(
+            language_id=batch.language, backend="lsp", definitions=definitions, edges=edges, snapshot=batch.evidence(selected),
             completeness_by_relation=batch.completeness, missing_inputs=sorted(batch.missing),
             complete=semantic_complete and all(batch.completeness.values()), semantic_complete=semantic_complete,
-            offset=offset, total=len(edges), total_exact=not batch.limited, truncated=truncated,
+            total=len(edges), total_exact=not batch.limited, truncated=batch.limited,
+            cache_generation=session_generation(batch.reply.key, batch.reply.incarnation, batch.reply.documents) if batch.reply else None,
         )
     except ToolError as exc:
-        return _empty(language_id, exc.code, offset=offset)
+        return _empty(language_id, exc.code)
     except (ValidationError, ValueError, TypeError, KeyError):
-        return _empty(language_id, "lsp_result_invalid", offset=offset)
+        return _empty(language_id, "lsp_result_invalid")
+
+
+async def lookup_semantic_context(
+    manager: LspSessionManager, root: Path, symbol: str, *, language_id: str, anchor: CodePosition | None,
+    max_depth: int, max_relationships: int, offset: int, deadline: float,
+) -> ContextEvidence:
+    if type(max_relationships) is not int or not 1 <= max_relationships <= 1000 or type(offset) is not int or offset < 0:
+        raise _error("invalid_argument")
+    snapshot = await lookup_semantic_snapshot(
+        manager, root, symbol, language_id=language_id, anchor=anchor, max_depth=max_depth, deadline=deadline,
+    )
+    page = snapshot.edges[offset:offset + max_relationships]
+    truncated = snapshot.truncated or offset + len(page) < snapshot.total
+    return ContextEvidence.model_validate({
+        **snapshot.model_dump(), "edges": page, "offset": offset, "truncated": truncated,
+        "complete": snapshot.complete and not truncated, "semantic_complete": snapshot.semantic_complete and not truncated,
+    })
+
+
+async def _offload(call: Any) -> Any:
+    return await anyio.to_thread.run_sync(call, abandon_on_cancel=False)
+
+
+def _family(language: str) -> str:
+    return {"typescriptreact": "typescript", "javascriptreact": "javascript"}.get(language, language)
+
+
+def _semantic_row(key: SymbolKey, evidence: SnapshotEvidence | None) -> dict[str, Any]:
+    return {
+        "file": unquote(key.relative_uri), "module": None, "qualified_name": key.qualified_name,
+        "kind": {"5": "class", "6": "method", "12": "function"}.get(key.kind, key.kind),
+        "line": key.start_line + 1, "end_line": None, "signature": None,
+        "evidence": "lsp", "confidence": "semantic_reported", "source_kind": "lsp",
+        "symbol_key": asdict(key), "snapshot": asdict(evidence) if evidence else None,
+    }
+
+
+def _ast_supplement(root: Path, selected: SymbolKey, options: dict[str, Any], offset: int) -> dict[str, Any] | None:
+    from tools.project.context import build_context_index, lookup_code_context
+
+    index = build_context_index(root, options["max_files"])
+    candidates = [definition for definition in index.definitions if (
+        definition.file == unquote(selected.relative_uri)
+        and definition.qualified_name.rsplit(".", 1)[-1] == selected.qualified_name.rsplit(".", 1)[-1]
+        and definition.line <= selected.start_line + 1 <= (definition.end_line or definition.line)
+    )]
+    if len(candidates) != 1:
+        return None
+    return lookup_code_context(
+        root, candidates[0].qualified_name, file_filter=unquote(selected.relative_uri), file_filter_exact=True,
+        include_callers=False, include_callees=False, include_references=False,
+        include_imports=options["include_imports"], include_tests=options["include_tests"], include_source=options["include_source"],
+        max_files=options["max_files"], max_depth=options["max_depth"], source_max_chars=options["source_max_chars"],
+        max_relationships=options["max_relationships"], offset=offset,
+    )
+
+
+async def _render_context(
+    snapshot: SemanticSnapshot, root: Path, symbol: str, options: dict[str, Any],
+) -> dict[str, Any]:
+    groups: dict[str, list[dict[str, Any]]] = {name: [] for name in (
+        "callers", "callees", "references", "imports", "tests", "inheritance",
+    )}
+    for edge in snapshot.edges:
+        if edge.kind not in {"caller", "callee", "reference", "inheritance"}:
+            continue
+        category = {"caller": "callers", "callee": "callees", "reference": "references", "inheritance": "inheritance"}[edge.kind]
+        if category != "inheritance" and not options["include_" + category]:
+            continue
+        key = edge.from_symbol if edge.direction == "incoming" else edge.to_symbol
+        row = _semantic_row(key, edge.evidence)
+        row.update(depth=edge.depth, direction=edge.direction, semantic_edge=edge.model_dump(mode="json", by_alias=True))
+        if category == "references":
+            row.update(name=key.qualified_name, column=key.start_character, coordinate_system="lsp_utf16")
+        if category == "callers":
+            row["call"] = edge.to_symbol.qualified_name
+        groups[category].append(row)
+    primary = [(kind, row) for kind in ("callers", "callees", "references") for row in groups[kind]]
+    offset, limit = options["offset"], options["max_relationships"]
+    missing = set(snapshot.missing_inputs)
+    supplement = None
+    if snapshot.language_id == "python" and len(snapshot.definitions) == 1 and any(
+        options[name] for name in ("include_imports", "include_tests", "include_source")
+    ):
+        supplement = await _offload(partial(_ast_supplement, root, snapshot.definitions[0], options, max(0, offset - len(primary))))
+        if supplement is None:
+            missing.add("ast_symbol_unresolved")
+    ast_total = supplement["total"] if supplement else 0
+    supplement_incomplete: set[str] = set()
+    if supplement:
+        supplement_incomplete = set(supplement["incomplete_reasons"]) & {
+            "scan_truncated", "relationships_truncated", "parse_errors",
+            "symlink_outside_root", "index_deadline", "context_stale",
+        }
+        if supplement["freshness"] != "current":
+            supplement_incomplete.add("context_stale")
+        if supplement["scan_truncated"]:
+            supplement_incomplete.add("scan_truncated")
+        if supplement["parse_errors"]:
+            supplement_incomplete.add("parse_errors")
+        if not supplement["total_exact"] or supplement["traversal_truncated"]:
+            supplement_incomplete.add("relationships_truncated")
+        missing.update(supplement_incomplete)
+    page = primary[offset:offset + limit]
+    if supplement:
+        ast_page = [(kind, row) for kind in ("imports", "tests") for row in supplement[kind]]
+        page.extend(ast_page[:max(0, limit - len(page))])
+    inheritance_offset = max(0, offset - len(primary) - ast_total)
+    page.extend(("inheritance", row) for row in groups["inheritance"][inheritance_offset:inheritance_offset + max(0, limit - len(page))])
+    total = len(primary) + ast_total + len(groups["inheritance"])
+    paged: dict[str, list[dict[str, Any]]] = {name: [] for name in groups}
+    for category, row in page:
+        paged[category].append(row)
+    definitions = [_semantic_row(key, snapshot.snapshot if len(snapshot.definitions) == 1 else None) for key in snapshot.definitions]
+    source_remaining = options["source_max_chars"]
+    source_incomplete = False
+    if options["include_source"]:
+        ast_rows = supplement["definitions"] if supplement else []
+        for row, key in zip(definitions, snapshot.definitions, strict=True):
+            known = next((item for item in ast_rows if item["file"] == row["file"]), None)
+            if known is not None:
+                for field in ("source", "source_truncated", "end_line", "signature", "module"):
+                    if field in known:
+                        row[field] = known[field]
+            else:
+                path = root / unquote(key.relative_uri)
+                _, digest, text, _size = await _offload(partial(_disk_document, path.as_uri(), root, time.monotonic() + 5))
+                if digest != key.content_digest:
+                    raise _error("lsp_snapshot_changed")
+                lines = text.split("\n")
+                excerpt = lines[key.start_line] if key.start_line < len(lines) else ""
+                row.update(source=excerpt[:source_remaining], source_truncated=True)
+                source_remaining = max(0, source_remaining - len(row["source"]))
+            source_incomplete |= bool(row.get("source_truncated"))
+    if source_incomplete:
+        missing.add("source_extent_unavailable")
+    requested: dict[RelationKind, bool] = {"definition": True}
+    if options["max_depth"]:
+        requested.update({"caller": options["include_callers"], "callee": options["include_callees"],
+                          "reference": options["include_references"], "import": options["include_imports"],
+                          "related_test": options["include_tests"], "inheritance": True})
+    completeness = {kind: snapshot.completeness_by_relation.get(kind, False) for kind, active in requested.items() if active}
+    for relation, flag in (("import", "include_imports"), ("related_test", "include_tests")):
+        if not options[flag] or options["max_depth"] == 0:
+            missing.discard("unsupported_relation:" + relation)
+        elif supplement:
+            missing.discard("unsupported_relation:" + relation)
+            completeness[cast(RelationKind, relation)] = not supplement_incomplete
+    if not options["include_callers"] and not options["include_callees"]:
+        missing.discard("capability_missing:callHierarchyProvider")
+    if not options["include_references"]:
+        missing.discard("capability_missing:referencesProvider")
+    truncated = snapshot.truncated or offset + len(page) < total
+    total_exact = snapshot.total_exact and (supplement["total_exact"] if supplement else not (
+        snapshot.language_id == "python" and options["max_depth"] > 0 and (options["include_imports"] or options["include_tests"])
+    ))
+    semantic_complete = not truncated and all(value for kind, value in completeness.items() if kind not in {"import", "related_test"})
+    confidence: dict[str, int] = {}
+    for _category, row in page:
+        label = str(row.get("confidence", "inferred"))
+        confidence[label] = confidence.get(label, 0) + 1
+    reasons = sorted(missing | ({"relationships_truncated"} if truncated else set()))
+    freshness = "current" if snapshot.snapshot else "unverified"
+    if supplement is not None and supplement["freshness"] != "current":
+        freshness = str(supplement["freshness"])
+    return {
+        "ok": True, "root": str(root), "symbol": symbol, "ambiguous": snapshot.fallback_reason == "ambiguous_symbol",
+        "definitions": definitions, **paged, "count": len(page), "offset": offset, "limit": limit, "total": total,
+        "files_scanned": len({key.relative_uri for key in snapshot.definitions} | {
+            key.relative_uri for edge in snapshot.edges for key in (edge.from_symbol, edge.to_symbol)
+        }), "scan_truncated": snapshot.truncated, "relationships_truncated": truncated,
+        "traversal_truncated": snapshot.truncated, "query_depth": options["max_depth"], "total_exact": total_exact,
+        "complete": bool(completeness) and all(completeness.values()) and not reasons,
+        "semantic_complete": semantic_complete, "freshness": freshness,
+        "snapshot_id": snapshot.snapshot.index_generation if snapshot.snapshot else "",
+        "snapshot": asdict(snapshot.snapshot) if snapshot.snapshot else None, "language_id": snapshot.language_id,
+        "backend": "lsp", "completeness_by_relation": completeness, "missing_inputs": sorted(missing),
+        "fallback_reason": snapshot.fallback_reason, "incomplete_reasons": reasons,
+        "confidence_summary": confidence, "parse_errors": supplement["parse_errors"] if supplement else [], "version": 1,
+    }
+
+
+async def lookup_project_context(
+    path: str, symbol: str, *, language_id: str | None, backend: Literal["auto", "ast", "semantic"],
+    anchor: CodePosition | None, manager: LspSessionManager | None, options: dict[str, Any],
+) -> dict[str, Any]:
+    from tools.project.context import lookup_code_context
+    from tools.project.index import PYTHON_METADATA_CACHE
+
+    target, is_file = await _offload(lambda: (resolve_path(path), resolve_path(path).is_file()))
+    root = target.parent if is_file else target
+    selected_language = language_id or ("auto" if anchor else "python")
+    anchor_language = None
+    if anchor:
+        anchor_path = resolve_path(anchor.path, base=root)
+        _document_path(anchor_path.as_uri(), root)
+        anchor_language = language_for_path(anchor_path)
+    if selected_language == "auto":
+        if anchor_language is not None or is_file:
+            selected_language = anchor_language or language_for_path(target)
+        else:
+            inventory = await _offload(partial(detect_project_types, root))
+            if not inventory.complete:
+                raise _error("language_required")
+            languages = {_family(language) for language in inventory.language_ids}
+            if len(languages) > 1:
+                raise _error("language_required")
+            selected_language = next(iter(languages), "unsupported")
+    if selected_language not in _LANGUAGES:
+        raise _error("unsupported_language")
+    if anchor_language is not None:
+        if _family(anchor_language) != _family(selected_language):
+            raise _error("lsp_language_mismatch")
+        selected_language = anchor_language
+    if backend == "ast" and selected_language != "python":
+        raise _error("unsupported_language")
+    if backend == "ast" or (backend == "auto" and selected_language == "python" and anchor is None):
+        return cast(dict[str, Any], await _offload(partial(lookup_code_context, target, symbol, **options)))
+    semantic_options = dict(options)
+    if is_file:
+        semantic_options["file_filter"] = target.relative_to(root).as_posix()
+        semantic_options["file_filter_exact"] = True
+    else:
+        semantic_options["file_filter_exact"] = False
+    fingerprint_missing = False
+    last_fingerprint: str | None = None
+
+    async def fingerprint() -> str | None:
+        nonlocal fingerprint_missing, last_fingerprint
+
+        def scan() -> str | None:
+            before = PYTHON_METADATA_CACHE.invalidation_epoch
+            current = detect_project_types(root, fingerprint_sources=True)
+            after = PYTHON_METADATA_CACHE.invalidation_epoch
+            if before != after or current.source_fingerprint is None:
+                return None
+            return hashlib.sha256(f"{before}:{current.source_fingerprint}".encode("ascii")).hexdigest()
+
+        try:
+            last_fingerprint = await _offload(scan)
+        except (ToolError, OSError, RuntimeError):
+            last_fingerprint = None
+        fingerprint_missing |= last_fingerprint is None
+        return last_fingerprint
+
+    async def build() -> tuple[bytes, str | None]:
+        value = await lookup_semantic_snapshot(
+            cast(LspSessionManager, manager), root, symbol, language_id=selected_language, anchor=anchor,
+            max_depth=semantic_options["max_depth"], deadline=time.monotonic() + 30,
+            match=semantic_options["match"], file_filter=semantic_options["file_filter"],
+            file_filter_exact=semantic_options["file_filter_exact"], max_files=semantic_options["max_files"],
+        )
+        return value.model_dump_json().encode("utf-8"), value.cache_generation
+
+    reason = "language_session_unavailable"
+    if manager is not None:
+        query = {key: semantic_options[key] for key in ("match", "file_filter", "file_filter_exact", "max_depth", "max_files")}
+        query.update(symbol=symbol, anchor=anchor.model_dump() if anchor else None, language_id=selected_language)
+        request_key = hashlib.sha256(json.dumps(query, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
+        try:
+            payload = await manager.acontext_result(root, selected_language, request_key, fingerprint=fingerprint, build=build)
+            snapshot = SemanticSnapshot.model_validate_json(payload)
+            fingerprint_at_build = last_fingerprint
+            result = await _render_context(snapshot, root, symbol, options)
+            final_fingerprint = await fingerprint()
+            if fingerprint_at_build is not None and final_fingerprint != fingerprint_at_build:
+                raise _error("lsp_snapshot_changed")
+            if fingerprint_missing:
+                result.update(complete=False, semantic_complete=False, freshness="unverified")
+                result["missing_inputs"] = sorted(set(result["missing_inputs"]) | {"workspace_fingerprint_unavailable"})
+                result["incomplete_reasons"] = sorted(set(result["incomplete_reasons"]) | {"workspace_fingerprint_unavailable"})
+            if snapshot.fallback_reason is None or selected_language != "python":
+                return result
+            reason = snapshot.fallback_reason
+        except ToolError as exc:
+            reason = exc.code
+        except (ValidationError, ValueError, TypeError):
+            reason = "lsp_result_invalid"
+    if selected_language == "python":
+        result = await _offload(partial(lookup_code_context, target, symbol, **options))
+        result.update(fallback_reason=reason, semantic_complete=False, complete=False)
+        result["missing_inputs"] = sorted(set(result["missing_inputs"]) | {reason})
+        result["incomplete_reasons"] = sorted(set(result["incomplete_reasons"]) | {reason})
+        return cast(dict[str, Any], result)
+    result = await _render_context(_empty(selected_language, reason), root, symbol, options)
+    result["hint"] = "Configure a pinned local language provider and enable persistent sessions through local operator settings."
+    return result

@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +37,9 @@ _MAX_RSS_BYTES = 512 * 1024 * 1024
 _MAX_TOTAL_RSS_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 _MAX_DOCUMENT_TOTAL_BYTES = 16 * 1024 * 1024
+_CONTEXT_MAX_RESULTS = 32
+_CONTEXT_MAX_BYTES = 16 * 1024 * 1024
+_CONTEXT_TTL_SEC = 30.0
 _EVIDENCE_CAPABILITIES = (
     "workspaceSymbolProvider", "documentSymbolProvider", "definitionProvider",
     "referencesProvider", "callHierarchyProvider", "typeHierarchyProvider",
@@ -109,6 +112,30 @@ class SessionReply:
     documents: tuple[tuple[str, int, str], ...]
 
 
+def session_generation(
+    key: SessionKey, incarnation: str, documents: tuple[tuple[str, int, str], ...] | None = None,
+) -> str:
+    """Project the exact owner identity without inspecting or activating a session."""
+    identity = (key, incarnation) if documents is None else (key, incarnation, documents)
+    return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
+
+
+_ContextKey = tuple[str, str, SessionKey | None, str, str | None, int, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ContextEntry:
+    payload: bytes
+    generation: str
+    expires: float
+
+
+@dataclass
+class _ContextFlight:
+    result: Future[tuple[bytes, str | None]] = field(default_factory=Future)
+    task: asyncio.Task[None] | None = None
+
+
 @dataclass
 class RequestTicket:
     request_id: int
@@ -175,6 +202,226 @@ class LspSessionManager:
         self._reuse_count = 0
         self._failed_count = 0
         self._restart_count = 0
+        self._context_results: OrderedDict[_ContextKey, _ContextEntry] = OrderedDict()
+        self._context_bytes = 0
+        self._context_epoch = 0
+        self._context_preparing = 0
+        self._context_flights: dict[_ContextKey, _ContextFlight] = {}
+
+    def _invalidate_context_locked(self) -> None:
+        self._context_epoch += 1
+        self._context_results.clear()
+        self._context_bytes = 0
+
+    def _cancel_context_tasks(self, root: str | None = None) -> None:
+        with self._lock:
+            tasks = tuple(flight.task for key, flight in self._context_flights.items() if root is None or key[0] == root)
+        for task in tasks:
+            if task is not None:
+                try:
+                    task.get_loop().call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    # A closed producer loop has already run task cancellation/finally.
+                    pass
+
+    def _context_generation_live(self, key: SessionKey | None, generation: str | None) -> bool:
+        # Caller holds the manager lock. A result's identity comes from its owner reply.
+        session = self._sessions.get(key) if key is not None else None
+        return bool(
+            not self._closed and key is not None and key.workspace_root not in self._closing_roots
+            and session is not None and session.state == "READY" and not session.stop.is_set()
+            and generation == session_generation(
+                key, session.incarnation,
+                tuple(sorted((uri, doc.version, doc.sha256) for uri, doc in session.documents.items())),
+            )
+        )
+
+    def _context_provider_key(self, root: Path, language_id: str) -> SessionKey | None:
+        try:
+            provider = validate_provider(root, language_id, providers=self._providers)
+            return make_session_key(root, language_id, provider, self._generation)
+        except ToolError:
+            # The builder owns explicit incomplete/fallback output for unavailable providers.
+            return None
+
+    async def acontext_result(
+        self, root: Path, language_id: str, request_key: str, *,
+        fingerprint: Callable[[], Awaitable[str | None]],
+        build: Callable[[], Awaitable[tuple[bytes, str | None]]], timeout_sec: float = 35,
+    ) -> bytes:
+        """Share/cache bounded semantic bytes, fenced by full-source and owner evidence."""
+        if not isinstance(request_key, str) or len(request_key) != 64 or any(c not in "0123456789abcdef" for c in request_key):
+            raise _error("lsp_params_invalid")
+        if isinstance(timeout_sec, bool) or not math.isfinite(timeout_sec) or not 0 < timeout_sec <= 300:
+            raise _error("lsp_timeout_invalid")
+        try:
+            return await asyncio.wait_for(
+                self._context_result(root, language_id, request_key, fingerprint, build, timeout_sec), timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            raise _error("lsp_timeout") from None
+        except ToolError:
+            raise
+        except Exception:
+            raise _error("lsp_context_failed") from None
+
+    async def _context_result(
+        self, root: Path, language_id: str, request_key: str,
+        fingerprint: Callable[[], Awaitable[str | None]],
+        build: Callable[[], Awaitable[tuple[bytes, str | None]]], timeout_sec: float,
+    ) -> bytes:
+        with self._lock:
+            if self._closed:
+                raise _error()
+            if self._context_preparing + len(self._context_flights) >= _CONTEXT_MAX_RESULTS:
+                raise _error("lsp_capacity_exceeded")
+            self._context_preparing += 1
+            epoch = self._context_epoch
+
+        async def prepare() -> tuple[Path, SessionKey | None, str | None]:
+            try:
+                resolved = await asyncio.to_thread(resolve_path, root)
+                prepared_key = await asyncio.to_thread(self._context_provider_key, resolved, language_id)
+                digest = await fingerprint()
+                if digest is not None and (not isinstance(digest, str) or len(digest) > 256):
+                    raise _error("lsp_params_invalid")
+                return resolved, prepared_key, digest
+            finally:
+                with self._lock:
+                    self._context_preparing -= 1
+
+        preparation = asyncio.create_task(asyncio.wait_for(prepare(), timeout_sec))
+        preparation.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        root, provider_key, before = await asyncio.shield(preparation)
+        canonical = canonical_path(root)
+        result: tuple[bytes, str | None]
+        with self._lock:
+            if self._closed or canonical in self._closing_roots:
+                raise _error()
+            if epoch != self._context_epoch:
+                raise _error("lsp_document_changed")
+            now = time.monotonic()
+            for old_key, old_entry in tuple(self._context_results.items()):
+                if old_entry.expires <= now:
+                    self._context_bytes -= len(self._context_results.pop(old_key).payload)
+            cache_key: _ContextKey = (canonical, language_id, provider_key, request_key, before, epoch,
+                                      "" if before is not None else uuid.uuid4().hex)
+            entry = self._context_results.get(cache_key)
+            if entry is not None and not self._context_generation_live(provider_key, entry.generation):
+                self._context_bytes -= len(self._context_results.pop(cache_key).payload)
+                entry = None
+            if entry is not None:
+                self._context_results.move_to_end(cache_key)
+                result = (entry.payload, entry.generation)
+                flight = None
+                owns = False
+            else:
+                session = self._sessions.get(provider_key) if provider_key is not None else None
+                owner_snapshot = "" if session is None else session_generation(
+                    session.key, session.incarnation,
+                    tuple(sorted((uri, doc.version, doc.sha256) for uri, doc in session.documents.items())),
+                ) + ":" + session.state
+                flight_key: _ContextKey = (
+                    canonical, language_id, provider_key, request_key, before, epoch,
+                    owner_snapshot if before is not None else cache_key[6],
+                )
+                flight = self._context_flights.get(flight_key)
+                owns = flight is None
+                if flight is None:
+                    if len(self._context_flights) >= _CONTEXT_MAX_RESULTS:
+                        raise _error("lsp_capacity_exceeded")
+                    flight = _ContextFlight()
+                    self._context_flights[flight_key] = flight
+        if owns:
+            assert flight is not None
+            task = asyncio.create_task(self._produce_context(flight_key, flight, fingerprint, build, timeout_sec))
+            task.add_done_callback(lambda _done: self._finish_context_flight(flight_key, flight))
+            with self._lock:
+                flight.task = task
+        if flight is not None:
+            # Each bridge is local to its waiter's event loop; cancellation cannot poison peers.
+            result = await self._await_context_flight(flight)
+        after = await fingerprint()
+        fresh_key = await asyncio.to_thread(self._context_provider_key, root, language_id)
+        with self._lock:
+            if self._closed or epoch != self._context_epoch or before != after or fresh_key != provider_key:
+                raise _error("lsp_document_changed")
+            if result[1] is not None and not self._context_generation_live(provider_key, result[1]):
+                raise _error("lsp_document_changed")
+        return result[0]
+
+    async def _await_context_flight(self, flight: _ContextFlight) -> tuple[bytes, str | None]:
+        loop = asyncio.get_running_loop()
+        bridge: asyncio.Future[tuple[bytes, str | None]] = loop.create_future()
+
+        def complete(shared: Future[tuple[bytes, str | None]]) -> None:
+            def publish() -> None:
+                if bridge.done():
+                    return
+                try:
+                    bridge.set_result(shared.result())
+                except BaseException as error:
+                    bridge.set_exception(error)
+                    # Observe now: a shutting-down loop may not run another callback turn.
+                    bridge.exception()
+            try:
+                loop.call_soon_threadsafe(publish)
+            except RuntimeError:
+                pass  # The waiter's loop closed; other loops still receive the shared result.
+
+        flight.result.add_done_callback(complete)
+        try:
+            return await asyncio.shield(bridge)
+        finally:
+            bridge.cancel()  # This local bridge has no cancellation link to the shared Future.
+
+    def _finish_context_flight(self, key: _ContextKey, flight: _ContextFlight) -> None:
+        # Also runs if a task was cancelled before its coroutine entered its try/finally.
+        if not flight.result.done():
+            flight.result.set_exception(_error("lsp_context_failed"))
+        with self._lock:
+            if self._context_flights.get(key) is flight:
+                self._context_flights.pop(key)
+
+    async def _produce_context(
+        self, key: _ContextKey, flight: _ContextFlight,
+        fingerprint: Callable[[], Awaitable[str | None]],
+        build: Callable[[], Awaitable[tuple[bytes, str | None]]], timeout_sec: float,
+    ) -> None:
+        try:
+            async def produce() -> tuple[bytes, str | None]:
+                with self._lock:
+                    if self._closed or key[5] != self._context_epoch:
+                        raise _error("lsp_document_changed")
+                payload, generation = await build()
+                if not isinstance(payload, bytes) or (generation is not None and not isinstance(generation, str)):
+                    raise _error("lsp_params_invalid")
+                after = await fingerprint()
+                fresh_key = await asyncio.to_thread(self._context_provider_key, Path(key[0]), key[1])
+                with self._lock:
+                    if self._closed or key[5] != self._context_epoch or key[4] != after or key[2] != fresh_key:
+                        raise _error("lsp_document_changed")
+                    if generation is not None and not self._context_generation_live(key[2], generation):
+                        raise _error("lsp_document_changed")
+                    if key[4] is not None and len(payload) <= _CONTEXT_MAX_BYTES and generation is not None:
+                        entry_key: _ContextKey = (key[0], key[1], key[2], key[3], key[4], key[5], "")
+                        old_entry = self._context_results.pop(entry_key, None)
+                        if old_entry is not None:
+                            self._context_bytes -= len(old_entry.payload)
+                        self._context_results[entry_key] = _ContextEntry(payload, generation, time.monotonic() + _CONTEXT_TTL_SEC)
+                        self._context_bytes += len(payload)
+                        while len(self._context_results) > _CONTEXT_MAX_RESULTS or self._context_bytes > _CONTEXT_MAX_BYTES:
+                            _, old = self._context_results.popitem(last=False)
+                            self._context_bytes -= len(old.payload)
+                return payload, generation
+
+            result = await asyncio.wait_for(produce(), timeout_sec)
+            flight.result.set_result(result)
+        except BaseException as error:
+            # Always wake cross-loop waiters, including when the producer loop shuts down.
+            flight.result.set_exception(error if isinstance(error, ToolError) else _error("lsp_context_failed"))
+        finally:
+            self._finish_context_flight(key, flight)
 
     async def arequest(
         self, root: Path, language_id: str, method: str, params: dict[str, object], *, timeout_sec: float,
@@ -301,12 +548,15 @@ class LspSessionManager:
             ]
             if any(session.stop.is_set() for session in obsolete):
                 raise _error()
+            if obsolete:
+                self._invalidate_context_locked()
             for session in obsolete:
                 session.stop.set()
                 if session.current is not None:
                     session.current.cancelled.set()
                 self._fail_queued(session)
         if obsolete:
+            self._cancel_context_tasks(canonical)
             await asyncio.to_thread(self._drain_sessions, obsolete, 2.0)
             with self._lock:
                 if any(session.state != "CLOSED" for session in obsolete):
@@ -344,6 +594,8 @@ class LspSessionManager:
         size = len(document.text.encode("utf-8"))
         with self._lock:
             del session.documents[uri]
+            self._context_results.clear()
+            self._context_bytes = 0
             session.pending_document_closes.discard(uri)
             session.document_bytes -= size
 
@@ -410,6 +662,9 @@ class LspSessionManager:
             channel.send({"jsonrpc": "2.0", "method": "textDocument/didSave", "params": params})
         document = DocumentState(canonical_uri, path, digest, version, text, time.monotonic())
         with self._lock:
+            if old is not None:
+                self._context_results.clear()
+                self._context_bytes = 0
             session.documents[canonical_uri] = document
             session.document_bytes += size - old_size
         return document
@@ -677,7 +932,9 @@ class LspSessionManager:
             raise ValueError("Close timeout must be finite and non-negative.")
         with self._lock:
             self._closed = True
+            self._invalidate_context_locked()
             sessions = list(self._sessions.values())
+        self._cancel_context_tasks()
         self._drain_sessions(sessions, min(timeout_sec, 5.0))
 
     def close_workspace(self, root: Path, *, timeout_sec: float = 2.0) -> None:
@@ -686,7 +943,9 @@ class LspSessionManager:
         canonical = canonical_path(root)
         with self._lock:
             self._closing_roots.add(canonical)
+            self._invalidate_context_locked()
             sessions = [item for key, item in self._sessions.items() if key.workspace_root == canonical]
+        self._cancel_context_tasks(canonical)
         try:
             self._drain_sessions(sessions, min(timeout_sec, 2.0))
         finally:

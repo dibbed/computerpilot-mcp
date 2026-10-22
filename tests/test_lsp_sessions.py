@@ -28,6 +28,538 @@ from tools.language.providers import LspProvider
 FIXTURE = Path(__file__).parent / "fixtures" / "persistent_lsp_server.py"
 
 
+def test_context_results_share_build_without_waiter_cancellation_poison(tmp_path: Path) -> None:
+    from tools.language import sessions
+
+    provider, _ = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="context-cache")
+    key = sessions.make_session_key(tmp_path, "python", provider, "context-cache")
+    session = sessions._Session(key, provider, state="READY")
+    manager._sessions[key] = session
+
+    async def scenario() -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+        builds = 0
+
+        async def fingerprint() -> str:
+            return "workspace-one"
+
+        async def build() -> tuple[bytes, str]:
+            nonlocal builds
+            builds += 1
+            entered.set()
+            await release.wait()
+            return b'{"edges":[]}', sessions.session_generation(key, session.incarnation, ())
+
+        first = asyncio.create_task(manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build))
+        await entered.wait()
+        second = asyncio.create_task(manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build))
+        await asyncio.sleep(0.05)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        release.set()
+        assert await second == b'{"edges":[]}'
+        assert await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build) == b'{"edges":[]}'
+        assert builds == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["fingerprint", "generation", "none", "close"])
+def test_context_results_reject_stale_or_uncacheable_results(tmp_path: Path, change: str) -> None:
+    from tools.language import sessions
+
+    provider, _ = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="context-cache")
+    key = sessions.make_session_key(tmp_path, "python", provider, "context-cache")
+    session = sessions._Session(key, provider, state="READY")
+    manager._sessions[key] = session
+
+    async def scenario() -> None:
+        fingerprint_value: str | None = "one"
+        builds = 0
+
+        async def fingerprint() -> str | None:
+            return fingerprint_value
+
+        async def build() -> tuple[bytes, str | None]:
+            nonlocal builds
+            builds += 1
+            generation = None if session.stop.is_set() else sessions.session_generation(key, session.incarnation, ())
+            return str(builds).encode(), generation
+
+        assert await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build) == b"1"
+        if change == "fingerprint":
+            fingerprint_value = "two"
+        elif change == "generation":
+            session.incarnation = "replacement"
+        elif change == "none":
+            fingerprint_value = None
+        else:
+            manager.close_workspace(tmp_path, timeout_sec=0)
+        value = await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build)
+        assert value == b"2"
+        if change in {"none", "close"}:
+            assert await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build) == b"3"
+
+    asyncio.run(scenario())
+
+
+def test_context_result_fingerprint_change_during_build_is_not_delivered(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    manager = LspSessionManager((), generation="context-cache")
+    current = ["before"]
+
+    async def fingerprint() -> str:
+        return current[0]
+
+    async def build() -> tuple[bytes, None]:
+        current[0] = "after"
+        return b"stale", None
+
+    async def scenario() -> None:
+        with pytest.raises(ToolError) as failure:
+            await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build)
+        assert failure.value.code == "lsp_document_changed"
+
+    # No provider is needed to return an uncached, safely incomplete result.
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("limit", ["count", "bytes", "ttl", "oversize"])
+def test_context_cache_evicts_bounded_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: str) -> None:
+    from tools.language import sessions
+
+    provider, _ = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="context-cache")
+    key = sessions.make_session_key(tmp_path, "python", provider, "context-cache")
+    session = sessions._Session(key, provider, state="READY")
+    manager._sessions[key] = session
+    builds: list[str] = []
+    clock = [0.0]
+    real_clock = time.monotonic
+    monkeypatch.setattr(sessions, "time", SimpleNamespace(monotonic=lambda: real_clock() + clock[0]))
+
+    async def fingerprint() -> str:
+        return "workspace"
+
+    async def call(number: int, size: int = 1) -> bytes:
+        request_key = f"{number:064x}"
+
+        async def build() -> tuple[bytes, str]:
+            builds.append(request_key)
+            return b"x" * size, sessions.session_generation(key, session.incarnation, ())
+
+        return await manager.acontext_result(tmp_path, "python", request_key, fingerprint=fingerprint, build=build)
+
+    async def scenario() -> None:
+        if limit == "count":
+            for number in range(32):
+                await call(number)
+            await call(0)  # LRU touch keeps oldest request alive.
+            await call(32)
+            assert len(manager._context_results) == 32
+            await call(0)
+            assert len(builds) == 33
+            await call(1)
+            assert len(builds) == 34
+        elif limit == "bytes":
+            await call(0, 9 * 1024 * 1024)
+            await call(1, 9 * 1024 * 1024)
+            assert len(manager._context_results) == 1
+            assert manager._context_bytes == 9 * 1024 * 1024
+            await call(0)
+            assert len(builds) == 3
+        elif limit == "ttl":
+            await call(0)
+            clock[0] = 31
+            await call(0)
+            assert len(builds) == 2
+        else:
+            await call(0, 16 * 1024 * 1024 + 1)
+            assert manager._context_bytes == 0
+            assert not manager._context_results
+            await call(0)
+            assert len(builds) == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_context_cache_uses_exact_returned_document_view(tmp_path: Path, stale: bool) -> None:
+    from tools.language import sessions
+
+    provider, _ = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="context-cache")
+    key = sessions.make_session_key(tmp_path, "python", provider, "context-cache")
+    session = sessions._Session(key, provider, state="READY")
+    manager._sessions[key] = session
+    path = tmp_path / "source.py"
+    document = sessions.DocumentState(path.as_uri(), path, "a" * 64, 1, "pass", 0)
+
+    async def fingerprint() -> str:
+        return "workspace"
+
+    async def build() -> tuple[bytes, str]:
+        old = sessions.session_generation(key, session.incarnation, ())
+        session.documents[document.uri] = document
+        generation = old if stale else sessions.session_generation(key, session.incarnation, ((document.uri, 1, "a" * 64),))
+        return b"result", generation
+
+    async def scenario() -> None:
+        if stale:
+            with pytest.raises(ToolError) as failure:
+                await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build)
+            assert failure.value.code == "lsp_document_changed"
+            assert not manager._context_results
+        else:
+            assert await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build) == b"result"
+            assert len(manager._context_results) == 1
+
+    asyncio.run(scenario())
+
+
+def test_context_cache_close_cancels_producer_and_releases_capacity(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    manager = LspSessionManager((), generation="context-cache")
+
+    async def scenario() -> None:
+        entered, cleaned = asyncio.Event(), asyncio.Event()
+
+        async def fingerprint() -> str:
+            return "workspace"
+
+        async def build() -> tuple[bytes, None]:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+            return b"unreachable", None
+
+        caller = asyncio.create_task(manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build))
+        await entered.wait()
+        manager.close_workspace(tmp_path, timeout_sec=0)
+        with pytest.raises(ToolError):
+            await asyncio.wait_for(caller, 2)
+        assert cleaned.is_set()
+        assert not manager._context_flights
+        assert not manager._context_results
+
+    asyncio.run(scenario())
+
+
+def test_context_cache_cross_loop_shutdown_wakes_surviving_waiter(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    manager = LspSessionManager((), generation="context-cache")
+    entered, joined = threading.Event(), threading.Event()
+    failures: list[str] = []
+
+    async def fingerprint() -> str:
+        return "workspace"
+
+    async def build() -> tuple[bytes, None]:
+        entered.set()
+        await asyncio.Event().wait()
+        return b"unreachable", None
+
+    def leader() -> None:
+        async def scenario() -> None:
+            caller = asyncio.create_task(manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build))
+            assert await asyncio.to_thread(joined.wait, 3)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+        asyncio.run(scenario())
+
+    def follower() -> None:
+        async def scenario() -> None:
+            assert await asyncio.to_thread(entered.wait, 3)
+            caller = asyncio.create_task(manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build))
+            await asyncio.sleep(0.1)
+            joined.set()
+            try:
+                await asyncio.wait_for(caller, 3)
+            except ToolError as error:
+                failures.append(error.code)
+        asyncio.run(scenario())
+
+    workers = [threading.Thread(target=leader), threading.Thread(target=follower)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(5)
+        assert not worker.is_alive()
+    assert failures == ["lsp_context_failed"]
+    assert not manager._context_flights
+
+
+def test_context_cache_caps_producers_and_fails_private_errors_safely(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    manager = LspSessionManager((), generation="context-cache")
+
+    async def scenario() -> None:
+        entered = 0
+        all_entered, release = asyncio.Event(), asyncio.Event()
+
+        async def fingerprint() -> str:
+            return "workspace"
+
+        async def build() -> tuple[bytes, None]:
+            nonlocal entered
+            entered += 1
+            if entered == 32:
+                all_entered.set()
+            await release.wait()
+            raise ValueError("private-payload-canary")
+
+        callers = [asyncio.create_task(manager.acontext_result(
+            tmp_path, "python", f"{number:064x}", fingerprint=fingerprint, build=build,
+        )) for number in range(32)]
+        await asyncio.wait_for(all_entered.wait(), 3)
+        assert len(manager._context_flights) == 32
+        with pytest.raises(ToolError) as capacity:
+            await manager.acontext_result(tmp_path, "python", "f" * 64, fingerprint=fingerprint, build=build)
+        assert capacity.value.code == "lsp_capacity_exceeded"
+        release.set()
+        results = await asyncio.gather(*callers, return_exceptions=True)
+        assert all(isinstance(result, ToolError) and "private-payload-canary" not in str(result) for result in results)
+        assert not manager._context_flights
+        assert manager._context_preparing == 0
+
+    asyncio.run(scenario())
+
+
+def test_context_cache_none_fingerprint_never_coalesces(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    manager = LspSessionManager((), generation="context-cache")
+
+    async def scenario() -> None:
+        builds = 0
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def fingerprint() -> None:
+            return None
+
+        async def build() -> tuple[bytes, None]:
+            nonlocal builds
+            builds += 1
+            if builds == 2:
+                entered.set()
+            await release.wait()
+            return b"incomplete", None
+
+        callers = [asyncio.create_task(manager.acontext_result(
+            tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build,
+        )) for _ in range(2)]
+        await asyncio.wait_for(entered.wait(), 3)
+        release.set()
+        assert await asyncio.gather(*callers) == [b"incomplete", b"incomplete"]
+        assert not manager._context_results
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mutation", ["provider", "worktree"])
+def test_context_cache_revalidates_provider_and_worktree_on_warm_result(tmp_path: Path, mutation: str) -> None:
+    from tools.language import sessions
+
+    provider, _ = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="context-cache")
+    key = sessions.make_session_key(tmp_path, "python", provider, "context-cache")
+    session = sessions._Session(key, provider, state="READY")
+    manager._sessions[key] = session
+    builds = 0
+
+    async def fingerprint() -> str:
+        return "workspace"
+
+    async def build() -> tuple[bytes, str]:
+        nonlocal builds
+        builds += 1
+        return b"result", sessions.session_generation(key, session.incarnation, ())
+
+    async def scenario() -> None:
+        await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build)
+        if mutation == "provider":
+            assert provider.entrypoint is not None
+            provider.entrypoint.write_text("changed", encoding="utf-8")
+        else:
+            (tmp_path / ".git").write_text("gitdir: new-worktree", encoding="utf-8")
+        with pytest.raises(ToolError) as failure:
+            await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build)
+        assert failure.value.code == "lsp_document_changed"
+        assert builds == 2
+
+    asyncio.run(scenario())
+
+
+def test_warm_result_cannot_cross_worktree(tmp_path: Path) -> None:
+    from tools.language import sessions
+
+    provider, _ = manager_provider(tmp_path)
+    provider = replace(provider, trusted_roots=(tmp_path,))
+    first_root, second_root = tmp_path / "first-worktree", tmp_path / "second-worktree"
+    first_root.mkdir()
+    second_root.mkdir()
+    manager = sessions.LspSessionManager((provider,), generation="context-cache")
+    for root in (first_root, second_root):
+        key = sessions.make_session_key(root, "python", provider, "context-cache")
+        manager._sessions[key] = sessions._Session(key, provider, state="READY")
+    builds: list[Path] = []
+
+    async def fingerprint() -> str:
+        return "workspace"
+
+    async def build(root: Path) -> tuple[bytes, str]:
+        builds.append(root)
+        key = sessions.make_session_key(root, "python", provider, "context-cache")
+        session = manager._sessions[key]
+        return root.name.encode("utf-8"), sessions.session_generation(key, session.incarnation, ())
+
+    async def scenario() -> None:
+        first = await manager.acontext_result(
+            first_root, "python", "a" * 64, fingerprint=fingerprint, build=lambda: build(first_root),
+        )
+        second = await manager.acontext_result(
+            second_root, "python", "a" * 64, fingerprint=fingerprint, build=lambda: build(second_root),
+        )
+        assert (first, second) == (b"first-worktree", b"second-worktree")
+        assert builds == [first_root, second_root]
+        assert await manager.acontext_result(
+            first_root, "python", "a" * 64, fingerprint=fingerprint, build=lambda: build(first_root),
+        ) == b"first-worktree"
+        assert builds == [first_root, second_root]
+
+    asyncio.run(scenario())
+
+
+def test_context_cache_timeout_cleans_producer_without_poisoning_retry(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    manager = LspSessionManager((), generation="context-cache")
+
+    async def fingerprint() -> str:
+        return "workspace"
+
+    async def scenario() -> None:
+        cleaned = asyncio.Event()
+
+        async def slow() -> tuple[bytes, None]:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+            return b"unreachable", None
+
+        with pytest.raises(ToolError):
+            await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=slow, timeout_sec=0.05)
+        await asyncio.wait_for(cleaned.wait(), 2)
+        await asyncio.sleep(0)
+        assert not manager._context_flights
+
+        async def quick() -> tuple[bytes, None]:
+            return b"retry", None
+
+        assert await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=quick) == b"retry"
+
+    asyncio.run(scenario())
+
+
+def test_context_cache_close_fences_in_progress_preparation(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    manager = LspSessionManager((), generation="context-cache")
+
+    async def scenario() -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def fingerprint() -> str:
+            entered.set()
+            await release.wait()
+            return "workspace"
+
+        async def build() -> tuple[bytes, None]:
+            pytest.fail("pre-close preparation activated a post-close builder")
+
+        caller = asyncio.create_task(manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build))
+        await entered.wait()
+        manager.close_workspace(tmp_path, timeout_sec=0)
+        release.set()
+        with pytest.raises(ToolError) as failure:
+            await caller
+        assert failure.value.code == "lsp_document_changed"
+
+    asyncio.run(scenario())
+
+
+def test_context_cache_different_live_owner_snapshots_do_not_share_flight(tmp_path: Path) -> None:
+    from tools.language import sessions
+
+    provider, _ = manager_provider(tmp_path)
+    manager = sessions.LspSessionManager((provider,), generation="context-cache")
+    key = sessions.make_session_key(tmp_path, "python", provider, "context-cache")
+    session = sessions._Session(key, provider, state="READY")
+    manager._sessions[key] = session
+
+    async def scenario() -> None:
+        builds = 0
+        first_entered, both_entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def fingerprint() -> str:
+            return "workspace"
+
+        async def build() -> tuple[bytes, str]:
+            nonlocal builds
+            builds += 1
+            payload = str(builds).encode()
+            generation = sessions.session_generation(key, session.incarnation, ())
+            first_entered.set()
+            if builds == 2:
+                both_entered.set()
+            await release.wait()
+            return payload, generation
+
+        first = asyncio.create_task(manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build))
+        await first_entered.wait()
+        session.incarnation = "replacement"
+        second = asyncio.create_task(manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build))
+        try:
+            await asyncio.wait_for(both_entered.wait(), 0.5)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            release.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert builds == 2
+        assert isinstance(results[0], ToolError)
+        assert results[1] == b"2"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("request_key,timeout", [("invalid", 35), ("A" * 64, 35), ("a" * 64, 0), ("a" * 64, float("inf"))])
+def test_context_cache_denies_invalid_admission_without_callbacks(tmp_path: Path, request_key: str, timeout: float) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    manager = LspSessionManager((), generation="context-cache")
+
+    async def fingerprint() -> None:
+        pytest.fail("invalid request reached fingerprint")
+
+    async def build() -> tuple[bytes, None]:
+        pytest.fail("invalid request reached producer")
+
+    with pytest.raises(ToolError):
+        asyncio.run(manager.acontext_result(tmp_path, "python", request_key, fingerprint=fingerprint, build=build, timeout_sec=timeout))
+
+
 def manager_provider(
     root: Path, mode: str = "normal", *, delay: float | None = None, sync_kind: int = 1, open_close: bool = True,
 ) -> tuple[LspProvider, Path]:

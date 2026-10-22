@@ -123,6 +123,105 @@ def semantic_context(manager: SemanticManager, *, symbol: str = "alpha", **kwarg
     return asyncio.run(lookup_semantic_context(cast(LspSessionManager, manager), manager.root, symbol, **options))
 
 
+def _context_options(**changes: Any) -> dict[str, Any]:
+    options: dict[str, Any] = dict(
+        match="exact", file_filter=None, include_source=False, include_callers=True, include_callees=True,
+        include_references=True, include_imports=True, include_tests=True, max_depth=1, max_files=5_000,
+        max_relationships=100, source_max_chars=20_000, offset=0,
+    )
+    options.update(changes)
+    return options
+
+
+def _render_python_supplement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **changes: Any) -> dict[str, Any]:
+    from tools.project import context, intelligence
+    from tools.project.intelligence import SemanticSnapshot
+    from tools.project.intelligence_models import SnapshotEvidence, SymbolKey
+
+    source = tmp_path / "alpha.py"
+    source.write_bytes(b"def alpha():\n    return 1\n")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    key = SymbolKey(
+        canonical_workspace=canonical_path(tmp_path), language_id="python", relative_uri="alpha.py",
+        qualified_name="alpha.alpha", kind="function", start_line=0, start_character=None,
+        content_digest=digest, coordinate_system="python_legacy",
+    )
+    snapshot = SemanticSnapshot(
+        language_id="python", backend="lsp", definitions=[key],
+        snapshot=SnapshotEvidence(
+            source_sha=None, worktree_id=hashlib.sha256(canonical_path(tmp_path).encode()).hexdigest(),
+            document_digest=digest, document_version=1, index_generation="generation",
+            provider_id=None, source_kind="lsp",
+        ),
+        completeness_by_relation={
+            "definition": True, "reference": True, "caller": True, "callee": True,
+            "inheritance": True, "import": True, "related_test": True,
+        },
+        total=0, total_exact=True,
+    )
+    supplement = context.lookup_code_context(
+        tmp_path, "alpha", include_callers=False, include_callees=False, include_references=False,
+        include_source=False, max_depth=1,
+    )
+    supplement.update(changes)
+    monkeypatch.setattr(intelligence, "_ast_supplement", lambda *args: supplement)
+    return asyncio.run(intelligence._render_context(snapshot, tmp_path, "alpha", _context_options()))
+
+
+@pytest.mark.parametrize("changes,reason", [
+    ({"freshness": "stale"}, "context_stale"),
+    ({"traversal_truncated": True, "total_exact": False}, "relationships_truncated"),
+    ({"scan_truncated": True}, "scan_truncated"),
+    ({"parse_errors": [{"file": "alpha.py", "error": "invalid"}]}, "parse_errors"),
+    ({"incomplete_reasons": ["symlink_outside_root"]}, "symlink_outside_root"),
+])
+def test_ast_supplement_truncation_or_staleness_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changes: dict[str, Any], reason: str,
+) -> None:
+    result = _render_python_supplement(tmp_path, monkeypatch, **changes)
+    assert result["completeness_by_relation"]["import"] is False
+    assert result["completeness_by_relation"]["related_test"] is False
+    assert reason in result["incomplete_reasons"]
+    assert result["complete"] is False
+    if changes.get("freshness") == "stale":
+        assert result["freshness"] == "stale"
+
+
+def test_clean_ast_supplement_keeps_import_and_test_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _render_python_supplement(tmp_path, monkeypatch)
+    assert result["completeness_by_relation"]["import"] is True
+    assert result["completeness_by_relation"]["related_test"] is True
+    assert result["complete"] is True and result["incomplete_reasons"] == []
+
+
+def test_ast_supplement_uses_an_exact_file_scope(tmp_path: Path) -> None:
+    from tools.project.context import build_context_index
+    from tools.project.intelligence import _ast_supplement
+    from tools.project.intelligence_models import SymbolKey
+
+    source = tmp_path / "src"
+    source.mkdir()
+    target = source / "a.py"
+    target.write_bytes(b"from x import one\n\ndef alpha():\n    return 1\n")
+    (source / "a.pyi").write_bytes(b"from y import two\n\ndef alpha() -> int: ...\n")
+    definition = next(item for item in build_context_index(tmp_path, 100).definitions if item.file == "src/a.py")
+    key = SymbolKey(
+        canonical_workspace=canonical_path(tmp_path), language_id="python", relative_uri="src/a.py",
+        qualified_name=definition.qualified_name, kind="function", start_line=definition.line - 1,
+        start_character=None, content_digest=hashlib.sha256(target.read_bytes()).hexdigest(),
+        coordinate_system="python_legacy",
+    )
+    result = _ast_supplement(tmp_path, key, {
+        "max_files": 5_000, "include_imports": True, "include_tests": True, "include_source": False,
+        "max_depth": 1, "source_max_chars": 20_000, "max_relationships": 100, "offset": 0,
+    }, 0)
+    assert result is not None
+    assert {row["file"] for row in result["definitions"]} == {"src/a.py"}
+    assert result["complete"] is True
+
+
 def test_ambiguous_symbol_requires_anchor(tmp_path: Path) -> None:
     manager = SemanticManager(tmp_path)
     other = hierarchy_item(tmp_path / "bravo.ts")
@@ -338,3 +437,34 @@ def test_ambiguous_definitions_do_not_guess_hierarchy_root(tmp_path: Path) -> No
     result = semantic_context(manager)
     assert result.fallback_reason == "ambiguous_symbol" and not result.edges
     assert all("Hierarchy" not in call[0] for call in manager.calls)
+
+
+def test_full_snapshot_precedes_public_pagination(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+    from tools.project.intelligence import lookup_semantic_snapshot
+
+    manager = SemanticManager(tmp_path)
+    manager.responses["callHierarchy/outgoingCalls"] = [{"to": manager.bravo, "fromRanges": []}]
+    snapshot = asyncio.run(lookup_semantic_snapshot(
+        cast(LspSessionManager, manager), tmp_path, "alpha", language_id="typescript", anchor=None,
+        max_depth=1, deadline=time.monotonic() + 5,
+    ))
+    assert len(snapshot.edges) == snapshot.total == 1 and snapshot.offset == 0
+    assert snapshot.cache_generation is not None
+    assert "cache_generation" not in snapshot.model_dump()
+
+
+def test_cold_readiness_then_five_second_batch_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.project import intelligence
+
+    manager = SemanticManager(tmp_path)
+    clock = [0.0]
+
+    def advance(_method: str) -> None:
+        clock[0] += 10 if len(manager.calls) == 1 else 1
+
+    manager.hook = advance
+    monkeypatch.setattr(intelligence.time, "monotonic", lambda: clock[0])
+    result = semantic_context(manager, deadline=30, max_depth=0)
+    assert result.fallback_reason is None
+    assert manager.calls[0][2] == 30 and manager.calls[1][2] <= 5
