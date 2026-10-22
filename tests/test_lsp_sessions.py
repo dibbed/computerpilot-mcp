@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -820,6 +820,223 @@ def test_manager_rename_carries_private_immutable_snapshot(tmp_path: Path) -> No
             assert "snapshot_version" not in json.loads(json.dumps(result))
             with pytest.raises(TypeError):
                 cast(dict[str, int], result.snapshot_version)[path.as_uri()] = 2
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_manager_reply_keeps_owner_evidence_immutable_and_raw_results_compatible(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager, RenameResult, SessionReply
+
+    provider, _log = manager_provider(tmp_path)
+    assert provider.entrypoint is not None
+    source = provider.entrypoint.read_text(encoding="utf-8")
+    source = source.replace(
+        '"hoverProvider": True,',
+        '"hoverProvider": True, "workspaceSymbolProvider": {}, '
+        '"documentSymbolProvider": {"private": "capability-prose-canary"}, "typeHierarchyProvider": False, '
+        '"unrecognizedProvider": {"private": "unrecognized-prose-canary"},',
+    )
+    provider.entrypoint.write_text(source, encoding="utf-8")
+    provider = replace(provider, entrypoint_sha256=hashlib.sha256(provider.entrypoint.read_bytes()).hexdigest())
+    path = tmp_path / "source.py"
+    path.write_bytes(b"before\n")
+    before_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    manager = LspSessionManager((provider,), generation="reply-evidence")
+
+    async def scenario() -> None:
+        try:
+            reply = await manager.arequest_with_evidence(
+                tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5,
+            )
+            assert isinstance(reply, SessionReply)
+            assert reply.key.provider_id == "pyright"
+            assert reply.key.runtime_generation == "reply-evidence"
+            assert reply.capabilities == frozenset({
+                "workspaceSymbolProvider", "documentSymbolProvider", "definitionProvider",
+                "referencesProvider", "callHierarchyProvider",
+            })
+            assert "canary" not in repr(reply.capabilities)
+            assert reply.documents == ((path.as_uri(), 1, before_digest),)
+            with pytest.raises(FrozenInstanceError):
+                reply.incarnation = "changed"  # type: ignore[misc]
+            with pytest.raises(AttributeError):
+                cast(Any, reply.capabilities).add("anotherProvider")
+            raw = await manager.arequest(tmp_path, "python", "textDocument/hover", hover_params(path), timeout_sec=5)
+            assert isinstance(raw, dict) and not isinstance(raw, SessionReply)
+            assert set(raw) == {"method", "initialized", "pid", "uri", "version"}
+            path.write_bytes(b"after\n")
+            renamed = await manager.arequest_with_evidence(
+                tmp_path, "python", "textDocument/rename", {**hover_params(path), "newName": "updated"}, timeout_sec=5,
+            )
+            assert isinstance(renamed.value, RenameResult)
+            assert renamed.value.snapshot_version == {path.as_uri(): 2}
+            assert renamed.documents == ((path.as_uri(), 2, hashlib.sha256(path.read_bytes()).hexdigest()),)
+            assert renamed.key == reply.key and renamed.incarnation == reply.incarnation
+            assert reply.documents == ((path.as_uri(), 1, before_digest),)
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("capability", [None, False, 0, 1, "true", [], True, {}])
+def test_manager_reply_projects_only_declared_capability_shapes(tmp_path: Path, capability: object) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, _log = manager_provider(tmp_path)
+    assert provider.entrypoint is not None
+    source = provider.entrypoint.read_text(encoding="utf-8").replace(
+        '"definitionProvider": True,', f'"definitionProvider": {capability!r},',
+    )
+    provider.entrypoint.write_text(source, encoding="utf-8")
+    provider = replace(provider, entrypoint_sha256=hashlib.sha256(provider.entrypoint.read_bytes()).hexdigest())
+    manager = LspSessionManager((provider,), generation="capability-shapes")
+
+    async def scenario() -> None:
+        try:
+            reply = await manager.arequest_with_evidence(tmp_path, "python", "workspace/symbol", {"query": ""}, timeout_sec=5)
+            assert ("definitionProvider" in reply.capabilities) is (capability is True or isinstance(capability, dict))
+            assert len(reply.capabilities) <= 6
+            assert reply.documents == ()
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_manager_same_key_restart_gets_a_new_incarnation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    provider, _log = manager_provider(tmp_path)
+    real_clock = time.monotonic
+    advance = [0.0]
+    monkeypatch.setattr(sessions, "time", SimpleNamespace(monotonic=lambda: real_clock() + advance[0]))
+    manager = sessions.LspSessionManager((provider,), generation="stable-generation")
+
+    async def scenario() -> None:
+        try:
+            first = await manager.arequest_with_evidence(tmp_path, "python", "workspace/symbol", {"query": "first"}, timeout_sec=5)
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+            advance[0] = 6.0
+            second = await manager.arequest_with_evidence(tmp_path, "python", "workspace/symbol", {"query": "second"}, timeout_sec=5)
+            assert first.key == second.key
+            assert first.incarnation != second.incarnation
+            assert len(first.incarnation) == len(second.incarnation) == 32
+            assert manager.snapshot()["spawn_count"] == 2
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls",
+                                   "typeHierarchy/supertypes", "typeHierarchy/subtypes"])
+def test_manager_hierarchy_item_is_synchronized_and_included_in_reply(tmp_path: Path, method: str) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path)
+    path = tmp_path / "hierarchy.py"
+    path.write_text("example = 1\n", encoding="utf-8")
+    position = {"line": 0, "character": 0}
+    span = {"start": position, "end": position}
+    params: dict[str, object] = {"item": {
+        "name": "example", "kind": 12, "uri": path.as_uri(), "range": span, "selectionRange": span,
+    }}
+    manager = LspSessionManager((provider,), generation="item-sync")
+
+    async def scenario() -> None:
+        try:
+            reply = await manager.arequest_with_evidence(tmp_path, "python", method, params, timeout_sec=5)
+            assert reply.documents == ((path.as_uri(), 1, hashlib.sha256(path.read_bytes()).hexdigest()),)
+            opened = [item for item in manager_notifications(log) if item["method"] == "textDocument/didOpen"]
+            assert [item["params"]["textDocument"]["uri"] for item in opened] == [path.as_uri()]
+            assert log.read_text(encoding="utf-8").splitlines().count("dispatch:") == 1
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_manager_evidence_request_cancellation_never_publishes_or_replays(tmp_path: Path) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, log = manager_provider(tmp_path, "slow", delay=2)
+    manager = LspSessionManager((provider,), generation="cancel-evidence")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(manager.arequest_with_evidence(
+            tmp_path, "python", "workspace/symbol", {"query": "once"}, timeout_sec=5,
+        ))
+        try:
+            await manager_until(lambda: log.exists() and "dispatch:once" in log.read_text(encoding="utf-8").splitlines())
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await manager_until(lambda: manager.snapshot()["active"] == 0)
+            assert task.cancelled()
+            assert manager.snapshot()["spawn_count"] == 1
+            assert log.read_text(encoding="utf-8").splitlines().count("dispatch:once") == 1
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+
+
+def test_manager_hierarchy_item_scope_denial_never_starts_a_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language.sessions import LspSessionManager
+
+    provider, _log = manager_provider(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("pass", encoding="utf-8")
+    position = {"line": 0, "character": 0}
+    span = {"start": position, "end": position}
+    manager = LspSessionManager((provider,), generation="item-denial")
+    monkeypatch.setattr(transport, "spawn_owned_process", lambda *_args, **_kwargs: pytest.fail("Denied item started a provider"))
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(ToolError) as denied:
+                await manager.arequest_with_evidence(workspace, "python", "callHierarchy/incomingCalls", {"item": {
+                    "name": "example", "kind": 12, "uri": outside.as_uri(), "range": span, "selectionRange": span,
+                }}, timeout_sec=5)
+            assert denied.value.code == "lsp_path_outside_workspace"
+            assert manager.snapshot()["spawn_count"] == 0
+        finally:
+            await asyncio.to_thread(manager.close_workspace, workspace)
+
+    asyncio.run(scenario())
+
+
+def test_manager_rechecks_hierarchy_ranges_after_document_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    provider, log = manager_provider(tmp_path)
+    path = tmp_path / "hierarchy.py"
+    path.write_text("first\nsecond\n", encoding="utf-8")
+    position = {"line": 1, "character": 0}
+    span = {"start": position, "end": position}
+    original = sessions.validate_request
+
+    def change_after_validation(root: Path, method: str, params: Any) -> dict[str, object]:
+        result = original(root, method, params)
+        path.write_text("short", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(sessions, "validate_request", change_after_validation)
+    manager = sessions.LspSessionManager((provider,), generation="item-stale-range")
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(ToolError) as stale:
+                await manager.arequest_with_evidence(tmp_path, "python", "callHierarchy/incomingCalls", {"item": {
+                    "name": "example", "kind": 12, "uri": path.as_uri(), "range": span, "selectionRange": span,
+                }}, timeout_sec=5)
+            assert stale.value.code == "lsp_position_invalid"
+            assert "dispatch:" not in log.read_text(encoding="utf-8").splitlines()
         finally:
             await asyncio.to_thread(manager.close_workspace, tmp_path)
 

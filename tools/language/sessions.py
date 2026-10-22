@@ -10,6 +10,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Mapping
 from concurrent.futures import Future, InvalidStateError
@@ -36,6 +37,13 @@ _MAX_RSS_BYTES = 512 * 1024 * 1024
 _MAX_TOTAL_RSS_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 _MAX_DOCUMENT_TOTAL_BYTES = 16 * 1024 * 1024
+_EVIDENCE_CAPABILITIES = (
+    "workspaceSymbolProvider", "documentSymbolProvider", "definitionProvider",
+    "referencesProvider", "callHierarchyProvider", "typeHierarchyProvider",
+)
+_HIERARCHY_ITEM_METHODS = frozenset({
+    "callHierarchy/incomingCalls", "callHierarchy/outgoingCalls", "typeHierarchy/supertypes", "typeHierarchy/subtypes",
+})
 _DOCUMENT_ERRORS = frozenset({
     "lsp_document_unavailable", "lsp_document_changed", "lsp_document_encoding", "lsp_document_too_large",
     "lsp_document_capacity", "lsp_position_invalid", "lsp_sync_unsupported", "lsp_path_outside_workspace", "lsp_uri_unsupported",
@@ -92,13 +100,22 @@ def _disk_document(uri: str, root: Path, deadline: float) -> tuple[Path, str, st
     raise _error("lsp_document_changed")
 
 
+@dataclass(frozen=True, slots=True)
+class SessionReply:
+    value: object
+    key: SessionKey
+    incarnation: str
+    capabilities: frozenset[str]
+    documents: tuple[tuple[str, int, str], ...]
+
+
 @dataclass
 class RequestTicket:
     request_id: int
     payload: bytes
     deadline: float
     cancelled: threading.Event
-    future: Future[object]
+    future: Future[SessionReply]
     phase: Literal["queued", "preparing", "may_dispatch", "completed"] = "queued"
 
 
@@ -106,6 +123,7 @@ class RequestTicket:
 class _Session:
     key: SessionKey
     provider: LspProvider
+    incarnation: str = field(default_factory=lambda: uuid.uuid4().hex)
     state: str = "STARTING"
     queue: queue.Queue[RequestTicket] = field(default_factory=lambda: queue.Queue(maxsize=8))
     stop: threading.Event = field(default_factory=threading.Event)
@@ -128,12 +146,13 @@ def _error(code: str = "lsp_session_failed") -> ToolError:
     return ToolError(code, "The language session is unavailable or its request could not complete safely.")
 
 
-def _finish(ticket: RequestTicket, *, result: object = None, error: ToolError | None = None) -> None:
+def _finish(ticket: RequestTicket, *, result: SessionReply | None = None, error: ToolError | None = None) -> None:
     ticket.phase = "completed"
     if ticket.future.done():
         return
     try:
         if error is None:
+            assert result is not None
             ticket.future.set_result(result)
         else:
             ticket.future.set_exception(error)
@@ -160,6 +179,11 @@ class LspSessionManager:
     async def arequest(
         self, root: Path, language_id: str, method: str, params: dict[str, object], *, timeout_sec: float,
     ) -> object:
+        return (await self.arequest_with_evidence(root, language_id, method, params, timeout_sec=timeout_sec)).value
+
+    async def arequest_with_evidence(
+        self, root: Path, language_id: str, method: str, params: dict[str, object], *, timeout_sec: float,
+    ) -> SessionReply:
         started = time.monotonic()
         if isinstance(timeout_sec, bool) or not math.isfinite(timeout_sec) or not 0 < timeout_sec <= 300:
             raise _error("lsp_timeout_invalid")
@@ -393,6 +417,8 @@ class LspSessionManager:
     def _prepare_documents(self, session: _Session, message: dict[str, object], deadline: float) -> dict[str, DocumentState]:
         params = message.get("params")
         raw_document = params.get("textDocument") if isinstance(params, dict) else None
+        if message.get("method") in _HIERARCHY_ITEM_METHODS and isinstance(params, dict):
+            raw_document = params.get("item")
         uri = raw_document.get("uri") if isinstance(raw_document, dict) else None
         primary_uri: str | None = None
         if isinstance(raw_document, dict) and isinstance(uri, str):
@@ -402,6 +428,10 @@ class LspSessionManager:
             position = params.get("position") if isinstance(params, dict) else None
             if isinstance(position, dict):
                 position_to_offset(document.text, position)
+            if message.get("method") in _HIERARCHY_ITEM_METHODS:
+                for span_name in ("range", "selectionRange"):
+                    for endpoint in ("start", "end"):
+                        position_to_offset(document.text, raw_document[span_name][endpoint])
         protected = frozenset(session.documents)
         for other_uri in list(session.documents):
             if other_uri != primary_uri:
@@ -565,7 +595,15 @@ class LspSessionManager:
                         value = response.get("result")
                         if message.get("method") == "textDocument/rename" and isinstance(value, dict):
                             value = RenameResult(value, documents)
-                        _finish(ticket, result=value)
+                        capabilities = frozenset(
+                            name for name in _EVIDENCE_CAPABILITIES
+                            if session.capabilities.get(name) is True or isinstance(session.capabilities.get(name), dict)
+                        )
+                        reply = SessionReply(
+                            value, session.key, session.incarnation, capabilities,
+                            tuple(sorted((uri, document.version, document.sha256) for uri, document in documents.items())),
+                        )
+                        _finish(ticket, result=reply)
                 session.current = None
                 session.last_activity = time.monotonic()
                 if channel.wire_bytes >= _MAX_WIRE_BYTES:

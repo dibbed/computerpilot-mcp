@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import unquote_to_bytes, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError, model_validator
 
 from core.errors import ToolError
 from tools.language.lsp import position_to_offset, uri_to_path
@@ -38,6 +38,44 @@ class DocumentRequest(_Request):
 
 class PositionRequest(DocumentRequest):
     position: Position
+
+
+class Range(_Request):
+    start: Position
+    end: Position
+
+    @model_validator(mode="after")
+    def ordered(self) -> Range:
+        if (self.start.line, self.start.character) > (self.end.line, self.end.character):
+            raise ValueError("Range endpoints must be ordered")
+        return self
+
+
+class HierarchyItem(_Request):
+    name: Annotated[str, Field(min_length=1, max_length=500)]
+    kind: Annotated[StrictInt, Field(ge=1, le=26)]
+    uri: Annotated[str, Field(min_length=1, max_length=32_767)]
+    range: Range
+    selectionRange: Range
+    detail: Annotated[str | None, Field(max_length=500)] = None
+    tags: Annotated[list[Annotated[StrictInt, Field(ge=1, le=1)]] | None, Field(max_length=1)] = None
+    data: Any = None
+
+    @model_validator(mode="after")
+    def contained(self) -> HierarchyItem:
+        def position(p: Position) -> tuple[int, int]:
+            return p.line, p.character
+
+        if not (
+            position(self.range.start) <= position(self.selectionRange.start)
+            <= position(self.selectionRange.end) <= position(self.range.end)
+        ):
+            raise ValueError("Selection must stay within its symbol range")
+        return self
+
+
+class HierarchyItemRequest(_Request):
+    item: HierarchyItem
 
 
 class ReferenceContext(_Request):
@@ -111,6 +149,11 @@ _MODELS: dict[str, type[_Request]] = {
     "textDocument/prepareCallHierarchy": PositionRequest,
     "textDocument/diagnostic": DiagnosticRequest,
     "textDocument/rename": RenameRequest,
+    "textDocument/prepareTypeHierarchy": PositionRequest,
+    "callHierarchy/incomingCalls": HierarchyItemRequest,
+    "callHierarchy/outgoingCalls": HierarchyItemRequest,
+    "typeHierarchy/supertypes": HierarchyItemRequest,
+    "typeHierarchy/subtypes": HierarchyItemRequest,
 }
 
 
@@ -194,10 +237,21 @@ def validate_request(root: Path, method: str, params: Mapping[str, object]) -> d
     except ValidationError:
         raise _invalid() from None
     result = request.model_dump(exclude_none=True)
-    if isinstance(request, DocumentRequest):
-        path = _document_path(request.textDocument.uri, root)
-        result["textDocument"] = {"uri": path.as_uri()}
+    positions: list[Position] = []
+    if isinstance(request, (DocumentRequest, HierarchyItemRequest)):
+        uri = request.textDocument.uri if isinstance(request, DocumentRequest) else request.item.uri
+        path = _document_path(uri, root)
+        if isinstance(request, DocumentRequest):
+            result["textDocument"] = {"uri": path.as_uri()}
+        else:
+            result["item"]["uri"] = path.as_uri()
+            positions = [
+                request.item.range.start, request.item.range.end,
+                request.item.selectionRange.start, request.item.selectionRange.end,
+            ]
         if isinstance(request, PositionRequest):
+            positions.append(request.position)
+        if positions:
             try:
                 with path.open("rb") as handle:
                     data = handle.read(_MAX_DOCUMENT_BYTES + 1)
@@ -209,5 +263,6 @@ def validate_request(root: Path, method: str, params: Mapping[str, object]) -> d
                 text = data.decode("utf-8", errors="strict")
             except UnicodeError:
                 raise ToolError("lsp_document_encoding", "Language-server documents must be UTF-8.") from None
-            position_to_offset(text, {"line": request.position.line, "character": request.position.character})
+            for position in positions:
+                position_to_offset(text, {"line": position.line, "character": position.character})
     return result
