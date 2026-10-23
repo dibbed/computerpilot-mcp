@@ -593,7 +593,8 @@ def _php_spec(reader: _BoundedReader, root: Path, package: PackageInfo) -> list[
     if version is None:
         missing.append("installed_metadata_missing" if not installed_versions else "dependency_not_installed")
     else:
-        evidence.append("installed:vendor/composer/installed.json")
+        installed_path = (package.root / "vendor" / "composer" / "installed.json").relative_to(root).as_posix()
+        evidence.append(f"installed:{installed_path}")
     binary = package.root / "vendor" / "bin" / ("pest" if runner == "pest" else "phpunit")
     entrypoint = _php_entrypoint(reader, package.root, binary)
     if entrypoint is not None:

@@ -313,8 +313,9 @@ def register(
         max_results: Annotated[int, Field(ge=1, le=5_000)] = 500,
         include_changed_tests: bool = True,
         fallback_policy: Literal["report", "select_full_suite"] = "report",
+        test_backend: Literal["python", "auto"] = "python",
     ) -> dict[str, Any]:
-        """Select tests affected by changed Python modules and report conservative full-suite fallbacks."""
+        """Select Python tests; opt into package runner plans with explicit multilingual coverage gaps."""
         return select_affected_tests(
             _cwd(repo),
             changed_paths=changed_paths,
@@ -324,6 +325,7 @@ def register(
             max_results=max_results,
             include_changed_tests=include_changed_tests,
             fallback_policy=fallback_policy,
+            test_backend=test_backend,
         )
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)

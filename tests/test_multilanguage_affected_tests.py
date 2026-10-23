@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from pathlib import Path
@@ -678,3 +679,319 @@ def test_python_dependency_metadata_types_are_validated(tmp_path: Path, document
         _discover(tmp_path)
 
     assert error.value.code == "invalid_project_manifest"
+
+
+@pytest.mark.parametrize("backend", ["python", "auto"])
+def test_javascript_change_without_edges_requires_full_suite(tmp_path: Path, backend: str) -> None:
+    _write_node_package(tmp_path, dependencies={"jest": "^29"}, installed=("jest",))
+    (tmp_path / "app.js").write_text("export const value = 1;\n", encoding="utf-8")
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["app.js"], test_backend=backend)  # type: ignore[arg-type]
+
+    assert result["decision"] == "full_suite"
+    assert result["unknown_coverage"]
+    assert not result["complete"]
+    assert result["missing_inputs"]
+    if backend == "auto":
+        selection = result["package_selections"][0]
+        assert selection["runner"] == "jest"
+        assert selection["package_root"] == "."
+        assert selection["full_suite"]
+        assert selection["fallback_reason"]
+
+
+def test_deleted_php_file_selects_package_suite(tmp_path: Path) -> None:
+    package = tmp_path / "plugin"
+    _write_composer_package(package, installed=("phpunit/phpunit",))
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["plugin/deleted.php"], test_backend="auto")
+
+    selection = result["package_selections"][0]
+    assert selection["package_root"] == "plugin"
+    assert selection["runner"] == "phpunit"
+    assert "changed_path:plugin/deleted.php" in selection["evidence"]
+    assert selection["full_suite"]
+
+
+def test_renamed_file_marks_old_and_new_packages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("old", "new"):
+        _write_node_package(tmp_path / name, dependencies={"jest": "^29"}, installed=("jest",))
+    from tools.testing import impact
+
+    monkeypatch.setattr(impact, "discover_changed_paths", lambda *_args, **_kwargs: impact.ChangedPaths(
+        (impact.ChangedPath("new/app.js", "R100", "old/app.js"),), None,
+    ))
+
+    result = impact.select_affected_tests(tmp_path, test_backend="auto")
+
+    assert {item["package_root"] for item in result["package_selections"]} == {"old", "new"}
+    assert result["changed_paths"] == ["new/app.js"]
+    assert set(result["touched_paths"]) == {"old/app.js", "new/app.js"}
+
+
+def test_cross_package_dynamic_import_broadens_scope(tmp_path: Path) -> None:
+    for name in ("consumer", "provider"):
+        _write_node_package(tmp_path / name, dependencies={"vitest": "^3"}, installed=("vitest",))
+    (tmp_path / "consumer" / "load.ts").write_text("export const load = (name: string) => import(name);\n", encoding="utf-8")
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["consumer/load.ts"], test_backend="auto")
+
+    assert {item["package_root"] for item in result["package_selections"]} == {"consumer", "provider"}
+    assert "cross_package_dependencies_unknown" in result["missing_inputs"]
+    assert all(item["full_suite"] for item in result["package_selections"])
+
+
+def test_unknown_runner_never_returns_all_ok(tmp_path: Path) -> None:
+    _write_json(tmp_path / "package.json", {"name": "unknown"})
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["app.ts"], test_backend="auto")
+
+    assert not result["complete"]
+    assert result["decision"] == "full_suite"
+    assert result["package_selections"][0]["runner"] == "unknown"
+    assert "runner_required" in result["missing_inputs"]
+
+
+def test_stale_snapshot_not_used(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_node_package(tmp_path, dependencies={"jest": "^29"}, installed=("jest",))
+    source = tmp_path / "app.js"
+    source.write_text("export const value = 1;\n", encoding="utf-8")
+    from tools.testing import impact
+
+    detect = detect_project_types
+    calls = 0
+
+    def raced_inventory(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        inventory = detect(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            source.write_text("export const value = 2;\n", encoding="utf-8")
+        return inventory
+
+    monkeypatch.setattr(impact, "detect_project_types", raced_inventory)
+
+    result = impact.select_affected_tests(tmp_path, changed_paths=["app.js"], test_backend="auto")
+
+    assert not result["complete"]
+    assert result["source_fingerprint"] is None
+    assert "stale_snapshot" in result["missing_inputs"]
+    assert result["decision"] == "full_suite"
+
+
+def test_doc_only_remains_none(tmp_path: Path) -> None:
+    _write_node_package(tmp_path, dependencies={"jest": "^29"}, installed=())
+    (tmp_path / "README.md").write_text("Documentation only.\n", encoding="utf-8")
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["README.md"], test_backend="auto")
+
+    assert result["decision"] == "none"
+    assert result["complete"]
+    assert not result["unknown_coverage"]
+    assert not result["package_selections"]
+
+
+@pytest.mark.parametrize("path", ["../escape.php", "..\\escape.php"])
+def test_explicit_changed_path_outside_is_denied(tmp_path: Path, path: str) -> None:
+    from tools.testing.impact import select_affected_tests
+
+    with pytest.raises(ToolError) as error:
+        select_affected_tests(tmp_path, changed_paths=[path], test_backend="auto")
+
+    assert error.value.code == "project_scope_escape"
+
+
+def test_package_selection_result_limit_is_global(tmp_path: Path) -> None:
+    for name in ("a", "b"):
+        _write_node_package(tmp_path / name, dependencies={"jest": "^29"}, installed=("jest",))
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["a/app.js"], test_backend="auto", max_results=1)
+
+    assert len(result["tests"]) + len(result["package_selections"]) == 1
+    assert result["results_truncated"]
+    assert not result["complete"]
+    assert result["missing_inputs"]
+
+
+def test_deleted_paths_are_in_source_fingerprint(tmp_path: Path) -> None:
+    _write_node_package(tmp_path, dependencies={"jest": "^29"}, installed=())
+    from tools.testing.impact import select_affected_tests
+
+    first = select_affected_tests(tmp_path, changed_paths=["a.js"], test_backend="auto")
+    second = select_affected_tests(tmp_path, changed_paths=["b.js"], test_backend="auto")
+
+    assert first["source_fingerprint"] is not None
+    assert first["source_fingerprint"] != second["source_fingerprint"]
+
+
+def test_default_python_backend_reports_foreign_coverage_unknown(tmp_path: Path) -> None:
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["app.php"])
+
+    assert result["test_backend"] == "python"
+    assert result["decision"] == "full_suite"
+    assert result["unknown_coverage"]
+    assert not result["complete"]
+
+
+def test_php_xml_config_and_excluded_source_are_fingerprinted(tmp_path: Path) -> None:
+    _write_composer_package(tmp_path, installed=("phpunit/phpunit",))
+    config = tmp_path / "phpunit.xml"
+    config.write_text('<phpunit name="first"/>', encoding="utf-8")
+    source = tmp_path / ".worktrees" / "app.php"
+    source.parent.mkdir()
+    source.write_text("<?php $a = 1;\n", encoding="utf-8")
+    from tools.testing.impact import select_affected_tests
+
+    first = select_affected_tests(tmp_path, changed_paths=[".worktrees/app.php"], test_backend="auto")
+    config.write_text('<phpunit name="other"/>', encoding="utf-8")
+    second = select_affected_tests(tmp_path, changed_paths=[".worktrees/app.php"], test_backend="auto")
+    source.write_text("<?php $a = 2;\n", encoding="utf-8")
+    third = select_affected_tests(tmp_path, changed_paths=[".worktrees/app.php"], test_backend="auto")
+
+    fingerprints = {item["source_fingerprint"] for item in (first, second, third)}
+    assert None not in fingerprints
+    assert len(fingerprints) == 3
+
+
+def test_public_affected_tests_auto_is_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    from mcp import Client
+    from mcp.server import MCPServer
+
+    from core import audit
+    from tools.testing import registry
+
+    _write_node_package(tmp_path, dependencies={"jest": "^29"}, installed=("jest",))
+    monkeypatch.setattr(audit, "SETTINGS", replace(audit.SETTINGS, state_dir=tmp_path / "audit"))
+    server = MCPServer("readonly-selection")
+    registry.register(server)
+
+    def fail_spawn(*args: object, **kwargs: object) -> None:
+        raise AssertionError("selection must never spawn project code or an LSP provider")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_spawn)
+
+    async def run() -> None:
+        async with Client(server) as client:
+            result = await client.call_tool("affected_tests", {
+                "repo": str(tmp_path), "changed_paths": ["app.js"], "test_backend": "auto",
+            })
+        assert isinstance(result.structured_content, dict)
+        assert result.structured_content["decision"] == "full_suite"
+        assert result.structured_content["package_selections"][0]["runner"] == "jest"
+
+    asyncio.run(run())
+
+
+def test_deleted_python_test_is_not_selected_as_existing_test(tmp_path: Path) -> None:
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["tests/test_deleted.py"])
+
+    assert result["tests"] == []
+    assert result["decision"] == "full_suite"
+    assert "deleted_test_changed" in result["full_suite_reasons"]
+
+
+def test_root_python_config_broadens_auto_to_all_packages(tmp_path: Path) -> None:
+    _write_python_package(tmp_path)
+    _write_node_package(tmp_path / "web", dependencies={"jest": "^29"}, installed=("jest",))
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["pytest.ini"], test_backend="auto")
+
+    assert {item["package_root"] for item in result["package_selections"]} == {".", "web"}
+    assert all(item["full_suite"] for item in result["package_selections"])
+
+
+def test_reverse_selected_python_test_owner_is_in_package_plan(tmp_path: Path) -> None:
+    for name in ("a", "b"):
+        _write_python_package(tmp_path / name, name=name)
+    (tmp_path / "a" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "b" / "tests" / "test_other.py").write_text("from a import app\n", encoding="utf-8")
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["a/app.py"], test_backend="auto")
+
+    assert "b/tests/test_other.py" in {row["path"] for row in result["tests"]}
+    assert "b" in {item["package_root"] for item in result["package_selections"]}
+
+
+def test_dependency_depth_cutoff_reports_unknown_coverage(tmp_path: Path) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "middle.py").write_text("import app\n", encoding="utf-8")
+    (tmp_path / "tests" / "test_direct.py").write_text("import app\n", encoding="utf-8")
+    (tmp_path / "tests" / "test_deep.py").write_text("import middle\n", encoding="utf-8")
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["app.py"], max_depth=1)
+
+    assert not result["complete"]
+    assert result["unknown_coverage"]
+    assert "dependency_depth_truncated" in result["missing_inputs"]
+    assert result["decision"] == "full_suite"
+
+
+def test_nested_installed_php_metadata_is_in_fingerprint(tmp_path: Path) -> None:
+    _write_composer_package(tmp_path / "plugin", installed=("phpunit/phpunit",))
+    from tools.testing.impact import select_affected_tests
+
+    first = select_affected_tests(tmp_path, changed_paths=["plugin/app.php"], test_backend="auto")
+    _write_json(tmp_path / "plugin" / "vendor" / "composer" / "installed.json", {"packages": [
+        {"name": "phpunit/phpunit", "version": "12.0.0"},
+    ]})
+    second = select_affected_tests(tmp_path, changed_paths=["plugin/app.php"], test_backend="auto")
+
+    assert first["source_fingerprint"] is not None
+    assert second["source_fingerprint"] is not None
+    assert first["source_fingerprint"] != second["source_fingerprint"]
+
+
+def test_stale_python_snapshot_invalidates_package_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("a", "b"):
+        _write_python_package(tmp_path / name, name=name)
+    (tmp_path / "a" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "a" / "tests" / "test_direct.py").write_text("from a import app\n", encoding="utf-8")
+    other_test = tmp_path / "b" / "tests" / "test_new.py"
+    other_test.write_text("VALUE = 1\n", encoding="utf-8")
+    from tools.testing import impact
+
+    calls = 0
+
+    def raced_inventory(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            other_test.write_text("from a import app\n", encoding="utf-8")
+        return detect_project_types(*args, **kwargs)
+
+    monkeypatch.setattr(impact, "detect_project_types", raced_inventory)
+
+    result = impact.select_affected_tests(tmp_path, changed_paths=["a/app.py"], test_backend="auto")
+
+    assert "stale_snapshot" in result["missing_inputs"]
+    assert result["source_fingerprint"] is None
+    assert {"a", "b"} <= {item["package_root"] for item in result["package_selections"]}
+    assert all(item["full_suite"] for item in result["package_selections"])
+
+
+def test_cross_package_fallback_includes_manifestless_root_runner(tmp_path: Path) -> None:
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    _write_node_package(tmp_path / "web", dependencies={"jest": "^29"}, installed=("jest",))
+    from tools.testing.impact import select_affected_tests
+
+    result = select_affected_tests(tmp_path, changed_paths=["web/app.js"], test_backend="auto")
+
+    assert {(".", "pytest"), ("web", "jest")} <= {
+        (item["package_root"], item["runner"]) for item in result["package_selections"]
+    }

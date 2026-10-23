@@ -132,6 +132,16 @@ Testing tools integrate:
 - change-aware verification;
 - durable validation watches.
 
+`affected_tests` keeps Python selection by default and accepts `test_backend="auto"` for read-only package runner plans.
+JavaScript, TypeScript, PHP and other executable or unclassified changes always report unknown coverage, including in the
+default Python mode. Auto mode uses bounded package/runner metadata and source fingerprints; it recommends package full
+suites and broadens across packages when dependency coverage is unavailable. It never starts an LSP provider or executes
+package scripts/configuration. `package_selections`, `missing_inputs`, `source_fingerprint`, Git/worktree identity and
+`total_exact` describe the evidence and its limits. Renames preserve destination-only `changed_paths` and expose both
+paths through `touched_paths`; deleted tests are not suggested as runnable files. The result cap applies across flat
+Python tests and package selections. A full-suite recommendation or `tests=[]` with incomplete evidence is not test success.
+Runner execution through verification is a separate integration step; existing verification entrypoints still use Python.
+
 Recommended code-change loop:
 
 ```text
