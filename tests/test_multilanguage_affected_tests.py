@@ -957,7 +957,16 @@ def test_nested_installed_php_metadata_is_in_fingerprint(tmp_path: Path) -> None
     assert first["source_fingerprint"] != second["source_fingerprint"]
 
 
-def test_stale_python_snapshot_invalidates_package_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("without_toml", [False, True], ids=["host-default", "without-toml"])
+def test_stale_python_snapshot_invalidates_package_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, without_toml: bool,
+) -> None:
+    from tools.project import project_types
+    from tools.testing import project_runners
+
+    if without_toml:
+        monkeypatch.setattr(project_types, "_toml", None)
+        monkeypatch.setattr(project_runners, "_toml", None)
     for name in ("a", "b"):
         _write_python_package(tmp_path / name, name=name)
     (tmp_path / "a" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -979,7 +988,11 @@ def test_stale_python_snapshot_invalidates_package_scope(tmp_path: Path, monkeyp
 
     result = impact.select_affected_tests(tmp_path, changed_paths=["a/app.py"], test_backend="auto")
 
-    assert "stale_snapshot" in result["missing_inputs"]
+    reason = "source_fingerprint_unavailable" if project_types._toml is None else "stale_snapshot"
+    assert reason in result["missing_inputs"]
+    if project_types._toml is None:
+        assert "toml_parser_unavailable" in result["missing_inputs"]
+    assert not result["complete"]
     assert result["source_fingerprint"] is None
     assert {"a", "b"} <= {item["package_root"] for item in result["package_selections"]}
     assert all(item["full_suite"] for item in result["package_selections"])
