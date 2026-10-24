@@ -18,6 +18,12 @@ from mcp.client.stdio import stdio_client
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 HEALTH_TOTAL_TIMEOUT_SEC = 90.0
 HEALTH_REQUEST_TIMEOUT_SEC = 30.0
+_SERVER_BOOTSTRAP = (
+    "import runpy,sys;from pathlib import Path;from dataclasses import replace;"
+    "sys.path.insert(0,sys.argv[1]);from core import config;"
+    "config.SETTINGS=replace(config.SETTINGS,state_dir=Path(sys.argv[2])/'state',memory_dir=Path(sys.argv[2])/'memory');"
+    "target=sys.argv[3];sys.argv=[target];runpy.run_path(target,run_name='__main__')"
+)
 REQUIRED_TOOLS = {
     "view_image",
     "read_file",
@@ -152,11 +158,6 @@ def _structured(result: Any, operation: str) -> dict[str, Any]:
 
 async def run_checks() -> dict[str, Any]:
     checks: dict[str, bool] = {"import": True}
-    parameters = StdioServerParameters(
-        command=sys.executable,
-        args=[str(PROJECT_ROOT / "local_pc_mcp.py")],
-        cwd=PROJECT_ROOT,
-    )
     phase = "mcp_startup"
 
     def begin(name: str) -> None:
@@ -165,7 +166,16 @@ async def run_checks() -> dict[str, Any]:
         print(f"RUN health {name}", file=sys.stderr, flush=True)
 
     try:
-        with anyio.fail_after(HEALTH_TOTAL_TIMEOUT_SEC) as deadline_scope:
+        with (
+            anyio.fail_after(HEALTH_TOTAL_TIMEOUT_SEC) as deadline_scope,
+            tempfile.TemporaryDirectory(prefix="computerpilot-health-runtime-") as runtime,
+        ):
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-I", "-c", _SERVER_BOOTSTRAP, str(Path(__file__).resolve().parent.parent), runtime,
+                      str(PROJECT_ROOT / "local_pc_mcp.py")],
+                cwd=PROJECT_ROOT,
+            )
             begin("mcp_startup")
             async with Client(stdio_client(parameters), read_timeout_seconds=HEALTH_REQUEST_TIMEOUT_SEC) as client:
                 checks["mcp_startup"] = True

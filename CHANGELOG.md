@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-24: Initialize the health probe server with disposable state and memory before importing the runtime, preserving real native smoke checks without opening operator job/workflow stores or running their queued work.
 - 2026-10-24: Bound Startup Doctor checks with native process-tree ownership, capped output and flushed progress. Give the MCP health smoke request and total deadlines with safe phase diagnostics, and bound bootstrap cache/full-Doctor watchdogs so inherited pipes or stalled startup cannot wait indefinitely.
 - 2026-10-24: Unify opt-in multilingual verification across direct `verify_changes`, durable `start_verification` and workflow actions. Omitted or previously stored requests keep the Python backend; `test_backend="auto"` adds only validated package runners under the existing claims, shared analyzer capacity and deadlines. Runner pins stay separate from the repository snapshot, stale inputs are rejected before dispatch, and a possibly executed test run with an unknown outcome is never retried or reported as passed.
 - 2026-10-24: Add internal direct test-runner execution with pinned runtime/workspace/entrypoint identity, fixed versioned argv, bounded private reports, secret-safe results and owned process-tree cleanup. Preserve Python virtual-environment invocation and native verification defaults; multilingual verification integration remains separate.

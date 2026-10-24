@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -80,3 +82,24 @@ def test_shielded_shutdown_past_deadline_cannot_succeed(monkeypatch: pytest.Monk
     monkeypatch.setattr(health_check, "HEALTH_TOTAL_TIMEOUT_SEC", 0.05)
     with pytest.raises(RuntimeError, match="shutdown"):
         asyncio.run(health_check.run_checks())
+
+
+def test_stdio_probe_uses_disposable_runtime_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source_root = Path(health_check.__file__).resolve().parent.parent
+    marker = tmp_path / "settings.json"
+    (tmp_path / "local_pc_mcp.py").write_text(
+        "import sys,json,time\nfrom pathlib import Path\n"
+        f"sys.path.insert(0,{str(source_root)!r})\n"
+        "from core.config import SETTINGS\n"
+        f"Path({str(marker)!r}).write_text(json.dumps([str(SETTINGS.state_dir),str(SETTINGS.memory_dir)]))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(health_check, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(health_check, "HEALTH_REQUEST_TIMEOUT_SEC", 1)
+    with pytest.raises(RuntimeError, match="mcp_startup"):
+        asyncio.run(health_check.run_checks())
+    state, memory = (Path(value) for value in json.loads(marker.read_text()))
+    assert state != source_root / ".agent_state"
+    assert memory != source_root / "memory"
+    assert not state.parent.exists(), "Disposable state outlived its owned probe"
