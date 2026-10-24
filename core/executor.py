@@ -244,6 +244,7 @@ def run_bounded(
     stdin_text: str | None = None,
     encoding: str | None = None,
     delivery: Delivery = "inline",
+    require_native: bool = False,
 ) -> dict[str, Any]:
     """Execute without shell expansion and optionally limit each output stream."""
 
@@ -266,7 +267,7 @@ def run_bounded(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 creationflags=_creation_flags(),
-                require_native=resource_requires_native_ownership(),
+                require_native=resource_requires_native_ownership() or require_native,
             )
         stdout_thread = threading.Thread(target=_read_pipe, args=(process.stdout, stdout), daemon=True)
         stderr_thread = threading.Thread(target=_read_pipe, args=(process.stderr, stderr), daemon=True)

@@ -11,10 +11,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import anyio
 from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+HEALTH_TOTAL_TIMEOUT_SEC = 90.0
+HEALTH_REQUEST_TIMEOUT_SEC = 30.0
 REQUIRED_TOOLS = {
     "view_image",
     "read_file",
@@ -138,13 +141,12 @@ else:
 
 def _structured(result: Any, operation: str) -> dict[str, Any]:
     if result.is_error:
-        text = result.content[0].text if result.content else "unknown tool error"
-        raise RuntimeError(f"{operation} returned an MCP error: {text}")
+        raise RuntimeError(f"{operation} returned an MCP error")
     data = result.structured_content
     if not isinstance(data, dict):
         raise RuntimeError(f"{operation} did not return structured content")
     if not data.get("ok"):
-        raise RuntimeError(f"{operation} failed: {data.get('message', data)}")
+        raise RuntimeError(f"{operation} failed")
     return data
 
 
@@ -155,46 +157,53 @@ async def run_checks() -> dict[str, Any]:
         args=[str(PROJECT_ROOT / "local_pc_mcp.py")],
         cwd=PROJECT_ROOT,
     )
-    async with Client(stdio_client(parameters)) as client:
-        checks["mcp_startup"] = True
-        listing = await client.list_tools()
-        names = {tool.name for tool in listing.tools}
-        missing = sorted(REQUIRED_TOOLS - names)
-        if missing:
-            raise RuntimeError(f"Missing required tools: {missing}")
-        checks["tool_registration"] = len(names) == len(listing.tools)
-        health = _structured(await client.call_tool("server_health", {}), "server_health")
-        workflow_health = health["workflow_health"]
-        with tempfile.TemporaryDirectory(prefix="ali-mcp-health-") as temp_dir:
-            probe = Path(temp_dir) / "probe.txt"
-            _structured(await client.call_tool("create_file", {"path": str(probe), "content": "alpha\n"}), "create_file")
-            read = _structured(await client.call_tool("read_file", {"path": str(probe), "max_chars": 100}), "read_file")
-            if read.get("content") != "alpha\n":
-                raise RuntimeError("read_file returned unexpected content")
-            _structured(
-                await client.call_tool(
-                    "replace_exact",
-                    {"path": str(probe), "old": "alpha", "new": "beta", "backup": False},
-                ),
-                "replace_exact",
-            )
-            checks["filesystem"] = probe.read_text(encoding="utf-8") == "beta\n"
-            terminal = _structured(
-                await client.call_tool(
-                    "run_process",
-                    {
-                        "executable": sys.executable,
-                        "args": ["-c", "print('MCP_TERMINAL_OK')"],
-                        "cwd": temp_dir,
-                        "timeout_sec": 15,
-                        "stdout_limit": 1_000,
-                        "stderr_limit": 1_000,
-                    },
-                ),
-                "run_process",
-            )
-            checks["terminal"] = terminal.get("exit_code") == 0 and "MCP_TERMINAL_OK" in terminal.get("stdout", {}).get("text", "")
-            _structured(await client.call_tool("delete_file", {"path": str(probe)}), "delete_file")
+    phase = "mcp_startup"
+
+    def begin(name: str) -> None:
+        nonlocal phase
+        phase = name
+        print(f"RUN health {name}", file=sys.stderr, flush=True)
+
+    try:
+        with anyio.fail_after(HEALTH_TOTAL_TIMEOUT_SEC) as deadline_scope:
+            begin("mcp_startup")
+            async with Client(stdio_client(parameters), read_timeout_seconds=HEALTH_REQUEST_TIMEOUT_SEC) as client:
+                checks["mcp_startup"] = True
+                begin("tool_registration")
+                listing = await client.list_tools()
+                names = {tool.name for tool in listing.tools}
+                if REQUIRED_TOOLS - names:
+                    raise RuntimeError("Missing required tools")
+                checks["tool_registration"] = len(names) == len(listing.tools)
+                begin("server_health")
+                health = _structured(await client.call_tool("server_health", {}), "server_health")
+                workflow_health = health["workflow_health"]
+                with tempfile.TemporaryDirectory(prefix="ali-mcp-health-") as temp_dir:
+                    probe = Path(temp_dir) / "probe.txt"
+                    begin("create_file")
+                    _structured(await client.call_tool("create_file", {"path": str(probe), "content": "alpha\n"}), "create_file")
+                    begin("read_file")
+                    read = _structured(await client.call_tool("read_file", {"path": str(probe), "max_chars": 100}), "read_file")
+                    if read.get("content") != "alpha\n":
+                        raise RuntimeError("Unexpected file content")
+                    begin("replace_exact")
+                    _structured(await client.call_tool("replace_exact", {
+                        "path": str(probe), "old": "alpha", "new": "beta", "backup": False,
+                    }), "replace_exact")
+                    checks["filesystem"] = probe.read_text(encoding="utf-8") == "beta\n"
+                    begin("run_process")
+                    terminal = _structured(await client.call_tool("run_process", {
+                        "executable": sys.executable, "args": ["-c", "print('MCP_TERMINAL_OK')"], "cwd": temp_dir,
+                        "timeout_sec": 15, "stdout_limit": 1_000, "stderr_limit": 1_000,
+                    }), "run_process")
+                    checks["terminal"] = terminal.get("exit_code") == 0 and "MCP_TERMINAL_OK" in terminal.get("stdout", {}).get("text", "")
+                    begin("delete_file")
+                    _structured(await client.call_tool("delete_file", {"path": str(probe)}), "delete_file")
+                begin("shutdown")
+        if anyio.current_time() >= deadline_scope.deadline:
+            raise TimeoutError("Health deadline expired during cleanup")
+    except Exception as exc:
+        raise RuntimeError(f"Health check {phase}: {type(exc).__name__}; no retry was attempted") from None
     if not all(checks.values()):
         raise RuntimeError(f"One or more checks failed: {checks}")
     return {"ok": True, "checks": checks, "tool_count": len(names), "workflow_health": workflow_health}

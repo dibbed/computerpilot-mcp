@@ -1,11 +1,76 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from scripts import bootstrap
+
+
+def test_doctor_watchdog_retains_tree_ownership_on_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import process_ownership
+
+    closed: list[bool] = []
+
+    class Process:
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout == 0.1
+            raise subprocess.TimeoutExpired(["secret-canary"], timeout)
+
+        def close_ownership(self) -> None:
+            closed.append(True)
+
+    def spawn(*args: object, **kwargs: object) -> Process:
+        assert kwargs["require_native"] is True
+        assert kwargs["stdout"] is None and kwargs["stderr"] is None
+        return Process()
+
+    monkeypatch.setattr(process_ownership, "spawn_owned_process", spawn)
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    with pytest.raises(bootstrap.BootstrapError) as error:
+        bootstrap._run(["fixture"], timeout=0.1)
+    assert closed == [True] and "secret-canary" not in str(error.value)
+
+
+def test_cache_and_full_doctor_have_explicit_watchdogs(monkeypatch: pytest.MonkeyPatch) -> None:
+    budgets: list[float | None] = []
+
+    def run(command: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        budgets.append(timeout)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(bootstrap, "_run", run)
+    assert bootstrap._doctor_check("local-http", "default")
+    bootstrap._full_doctor("local-http", "default")
+    assert budgets == [30, 900]
+
+
+def test_cache_probe_cleanup_failure_stops_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import process_ownership
+    from core.errors import ToolError
+
+    class Process:
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def close_ownership(self) -> None:
+            raise ToolError("process_cleanup_incomplete", "secret-canary")
+
+    monkeypatch.setenv("MCP_START_MODE", "local-http")
+    monkeypatch.setattr(bootstrap, "imports_healthy", lambda: True)
+    monkeypatch.setattr(process_ownership, "spawn_owned_process", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(bootstrap, "_ensure_dependencies", lambda: pytest.fail("continued after uncertain cleanup"))
+    with pytest.raises(bootstrap.BootstrapError) as error:
+        bootstrap.validate()
+    assert "secret-canary" not in str(error.value)
+
+
+def test_cache_probe_defers_missing_dependencies_to_installer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bootstrap, "imports_healthy", lambda: False)
+    monkeypatch.setattr(bootstrap, "_run", lambda *args, **kwargs: pytest.fail("spawned without required imports"))
+    assert not bootstrap._doctor_check("local-http", "default")
 
 
 def test_requirements_fingerprint_includes_nested_files(tmp_path: Path) -> None:

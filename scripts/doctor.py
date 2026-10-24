@@ -6,12 +6,15 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import sysconfig
 import tempfile
+import time
 from pathlib import Path
 
 from core.file_lock import exclusive_file_lock
@@ -80,15 +83,28 @@ def cache_matches(root: Path, current: str) -> bool:
         return False
 
 
-def _run(root: Path, label: str, command: list[str], timeout: int = 120) -> None:
+def _run(root: Path, label: str, command: list[str], timeout: float = 120) -> None:
     """Do not echo subprocess output: tunnel diagnostics can include credentials."""
+    if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+        raise RuntimeError(f"{label}: timeout must be finite and positive")
+    print(f"RUN {label} (timeout {timeout:g}s)", flush=True)
+    started = time.perf_counter()
     try:
-        result = subprocess.run(command, cwd=root, capture_output=True, timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"{label}: {type(exc).__name__}; run the check directly for details") from exc
-    if result.returncode:
-        raise RuntimeError(f"{label}: exit {result.returncode}; run the check directly for details")
-    print(f"PASS {label}")
+        # Keep fingerprint/cache probes independent of executor dependencies.
+        from core.executor import run_bounded
+
+        result = run_bounded(
+            command, cwd=root, timeout_sec=timeout, stdout_limit=0, stderr_limit=0, require_native=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"{label}: {type(exc).__name__}; run the check directly for details") from None
+    if result["timed_out"]:
+        raise RuntimeError(f"{label}: TimeoutExpired after {timeout:g}s; owned process tree stopped")
+    if not result["capture_complete"]:
+        raise RuntimeError(f"{label}: incomplete output drain; run the check directly for details")
+    if not result["ok"]:
+        raise RuntimeError(f"{label}: exit {result['exit_code']}; run the check directly for details")
+    print(f"PASS {label} ({time.perf_counter() - started:.2f}s)", flush=True)
 
 
 def search_backend_diagnostics() -> dict[str, str | None]:
@@ -102,12 +118,25 @@ def search_backend_diagnostics() -> dict[str, str | None]:
             "ripgrep_version": None,
         }
     try:
-        result = subprocess.run([rg, "--version"], capture_output=True, text=True, timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"ripgrep backend: {type(exc).__name__}") from exc
-    if result.returncode:
-        raise RuntimeError(f"ripgrep backend: exit {result.returncode}")
-    first_line = next((line.strip() for line in result.stdout.splitlines() if line.strip()), None)
+        from core.executor import run_bounded
+
+        result = run_bounded(
+            [rg, "--version"], cwd=ROOT, timeout_sec=10, stdout_limit=4096, stderr_limit=0,
+            output_mode="head", encoding="utf-8", require_native=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"ripgrep backend: {type(exc).__name__}") from None
+    if result["timed_out"]:
+        raise RuntimeError("ripgrep backend: TimeoutExpired after 10s; owned process tree stopped")
+    if not result["capture_complete"]:
+        raise RuntimeError("ripgrep backend: incomplete output drain")
+    if not result["ok"]:
+        raise RuntimeError(f"ripgrep backend: exit {result['exit_code']}")
+    first_line = next((line.strip() for line in result["stdout"]["text"].splitlines() if line.strip()), "")
+    if result["stdout"]["truncated"] or re.fullmatch(
+        r"ripgrep [0-9]+\.[0-9]+\.[0-9]+(?: \(rev [0-9a-f]{7,40}\))?", first_line,
+    ) is None:
+        raise RuntimeError("ripgrep backend: invalid or truncated version response")
     return {
         "content_search_backend": "ripgrep",
         "ripgrep_path": rg,
