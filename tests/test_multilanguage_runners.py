@@ -226,6 +226,8 @@ def test_report_symlink_denied(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_report_hardlink_denied(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Hard links require the report and fixture target to share a filesystem.
+    monkeypatch.setattr(runners.tempfile, "tempdir", str(tmp_path))
     spec = _node(tmp_path, monkeypatch)
     outside = tmp_path / "outside.json"
     outside.write_bytes(_GOOD_JSON + b'}')
