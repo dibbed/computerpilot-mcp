@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tools.testing import verification
+
+
+@pytest.fixture(autouse=True)
+def _isolated_runtime_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import config
+
+    settings = replace(config.SETTINGS, state_dir=tmp_path / "runtime-state")
+    monkeypatch.setattr(config, "SETTINGS", settings)
+    monkeypatch.setattr(verification, "SETTINGS", settings)
 
 
 def _result(*, ok: bool = True, timed_out: bool = False) -> dict[str, Any]:

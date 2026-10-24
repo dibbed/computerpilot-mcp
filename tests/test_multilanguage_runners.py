@@ -95,7 +95,7 @@ def test_missing_report_is_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     spec.entrypoint.write_text("pass\n", encoding="utf-8")
     spec = project_runners.bind_runner_runtime(replace(spec, runtime=None, entrypoint_sha256=None), workspace_root=tmp_path)
     result = _run(spec)
-    assert not result["ok"] and result["required_unknown"]
+    assert not result["ok"] and result["required_unknown"] and result["execution_uncertain"]
 
 
 def test_unbound_spec_denied_before_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -319,7 +319,7 @@ def test_expired_deadline_never_dispatches(tmp_path: Path, monkeypatch: pytest.M
     spec = _node(tmp_path, monkeypatch)
     monkeypatch.setattr(runners, "run_bounded", lambda *a, **k: pytest.fail("dispatched expired stage"))
     result = runners.run_project_tests(spec, targets=[], deadline=time.monotonic() - 1, diagnostic_cap=30)
-    assert result["timed_out"] and result["required_unknown"]
+    assert result["timed_out"] and result["required_unknown"] and not result["execution_uncertain"]
 
 
 def _alive(pid: int) -> bool:

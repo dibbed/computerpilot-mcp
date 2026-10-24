@@ -18,7 +18,9 @@ from typing import Any, Literal
 from core.artifacts import deliver_text
 from core.errors import ToolError
 from core.executor import run_bounded
-from core.resource_claims import managed_path_claims
+from core.process_ownership import NativeOwnershipRequiredError
+from core.recovery import mark_native_test_dispatch, run_native_operation
+from core.resource_claims import managed_path_claims, resource_requires_native_ownership
 from core.response import bounded_text
 from tools.testing.diagnostics import Diagnostic
 from tools.testing.project_runners import RunnerSpec, _reject_constant, _unique_object, validate_runner_execution
@@ -470,12 +472,23 @@ def run_project_tests(
     ):
         raise _runner_error("invalid_test_runner_budget")
     deadline = min(deadline, started + 600)
+    return run_native_operation("verify_changes", str(spec.package_root), lambda: _run_project_tests(
+        spec, targets=targets, deadline=deadline, diagnostic_cap=diagnostic_cap, started=started,
+    ))
+
+
+def _run_project_tests(
+    spec: RunnerSpec, *, targets: list[Path], deadline: float, diagnostic_cap: int, started: float,
+) -> dict[str, Any]:
     validate_runner_execution(spec)
     selected = _runner_targets(spec, targets)
     # PHP CLIs differ on multiple path operands; run each explicitly without inventing regex filters.
     batches = [[path] for path in selected] if spec.runner in {"phpunit", "pest"} and selected else [selected]
     totals = {"passed": 0, "failed": 0, "errors": 0, "skipped": 0}
-    response: dict[str, Any] = {"ok": True, "exit_code": None, "timed_out": False, "required_unknown": False, "diagnostics": []}
+    response: dict[str, Any] = {
+        "ok": True, "exit_code": None, "timed_out": False, "required_unknown": False,
+        "execution_uncertain": False, "diagnostics": [],
+    }
     with managed_path_claims(
         spec.package_root, category="native.testing.project", scope="subtree", timeout_sec=max(0.001, deadline - started),
     ):
@@ -491,6 +504,8 @@ def run_project_tests(
                 if remaining <= 0:
                     response.update(ok=False, timed_out=True, required_unknown=True)
                     break
+                resource_requires_native_ownership()
+                mark_native_test_dispatch()
                 try:
                     result = run_bounded(
                         command, cwd=spec.package_root, timeout_sec=min(600, remaining),
@@ -500,11 +515,14 @@ def run_project_tests(
                     if isinstance(exc, ToolError) and exc.code == "process_cleanup_incomplete":
                         raise ToolError("process_cleanup_incomplete", "Test process cleanup could not be confirmed.") from None
                     # Provider/OS exceptions can contain credentials and arbitrary project text.
-                    response.update(ok=False, exit_code=None, required_unknown=True)
+                    response.update(
+                        ok=False, exit_code=None, required_unknown=True,
+                        execution_uncertain=not isinstance(exc, NativeOwnershipRequiredError),
+                    )
                     break
                 response["exit_code"] = result["exit_code"] if response["exit_code"] in {None, 0} else response["exit_code"]
                 if result["timed_out"] or not result.get("capture_complete", True):
-                    response.update(ok=False, timed_out=bool(result["timed_out"]), required_unknown=True)
+                    response.update(ok=False, timed_out=bool(result["timed_out"]), required_unknown=True, execution_uncertain=True)
                     break
                 try:
                     if spec.runner == "unittest":
@@ -534,7 +552,7 @@ def run_project_tests(
                     if sum(counts.values()) == 0:
                         raise ValueError
                 except (ToolError, ValueError, TypeError, RecursionError, UnicodeError, ET.ParseError, OverflowError):
-                    response.update(ok=False, required_unknown=True)
+                    response.update(ok=False, required_unknown=True, execution_uncertain=True)
                     break
                 for key in totals:
                     totals[key] += counts[key]

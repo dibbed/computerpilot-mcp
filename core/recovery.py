@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -330,6 +330,8 @@ class _OperationRecoveryScope:
     owner: tuple[int, int | None]
     active: bool = True
     rolled_back: bool = False
+    parent: _OperationRecoveryScope | None = None
+    native_test_dispatch: threading.Event = field(default_factory=threading.Event)
 
 
 def _execution_owner() -> tuple[int, int | None]:
@@ -347,9 +349,20 @@ _CURRENT_OPERATION_SCOPE: ContextVar[_OperationRecoveryScope | None] = ContextVa
 _T = TypeVar("_T")
 
 
+def _scope_live(scope: _OperationRecoveryScope) -> bool:
+    current: _OperationRecoveryScope | None = scope
+    while current is not None:
+        if not current.active:
+            return False
+        current = current.parent
+    return True
+
+
 @contextmanager
-def operation_recovery_context(handle: OperationHandle | None) -> Iterator[_OperationRecoveryScope]:
-    scope = _OperationRecoveryScope(handle, _execution_owner())
+def operation_recovery_context(
+    handle: OperationHandle | None, *, _parent: _OperationRecoveryScope | None = None,
+) -> Iterator[_OperationRecoveryScope]:
+    scope = _OperationRecoveryScope(handle, _execution_owner(), parent=_parent)
     token = _CURRENT_OPERATION_SCOPE.set(scope)
     try:
         yield scope
@@ -361,16 +374,60 @@ def operation_recovery_context(handle: OperationHandle | None) -> Iterator[_Oper
 def bind_operation_recovery(call: Callable[[], _T]) -> Callable[[], _T]:
     """Explicitly transfer the current owning call's recovery context to a worker."""
     scope = _CURRENT_OPERATION_SCOPE.get()
-    if scope is None or not scope.active or scope.owner != _execution_owner():
+    if scope is None or not _scope_live(scope) or scope.owner != _execution_owner():
         return call
 
     def run() -> _T:
-        if not scope.active:
+        if not _scope_live(scope):
             raise ToolError("invalid_operation_handle", "The enclosing recovery operation has finished.")
-        with operation_recovery_context(scope.handle):
+        with operation_recovery_context(scope.handle, _parent=scope):
             return call()
 
     return run
+
+
+def native_test_dispatched() -> bool:
+    scope = _CURRENT_OPERATION_SCOPE.get()
+    if scope is None or not _scope_live(scope) or scope.owner != _execution_owner():
+        raise ToolError("invalid_operation_handle", "Native test dispatch requires a live owning recovery scope.")
+    return scope.native_test_dispatch.is_set()
+
+
+def mark_native_test_dispatch() -> None:
+    """Record possible dispatch in this owned attempt and its explicitly bound ancestors."""
+    native_test_dispatched()
+    scope = _CURRENT_OPERATION_SCOPE.get()
+    while scope is not None:
+        scope.native_test_dispatch.set()
+        scope = scope.parent
+    native_test_dispatched()
+
+
+def run_native_operation(operation: str, target: str | None, call: Callable[[], _T]) -> _T:
+    """Guard native verification while retaining an enclosing mutation's admission."""
+    from core.lifecycle import RUNTIME_LIFECYCLE
+
+    parent = _CURRENT_OPERATION_SCOPE.get()
+    reuse = parent is not None and parent.owner == _execution_owner()
+    if reuse and parent is not None and not _scope_live(parent):
+        raise ToolError("invalid_operation_handle", "The enclosing recovery operation has finished.")
+    with nullcontext() if reuse else RUNTIME_LIFECYCLE.mutation(operation):
+        handle = parent.handle if reuse and parent is not None else OPERATION_RECOVERY.begin(operation, target)
+        with operation_recovery_context(handle, _parent=parent if reuse else None) as current:
+            try:
+                result = call()
+            except BaseException:
+                try:
+                    if handle is not None and handle.operation_type == "verify_changes" and current.native_test_dispatch.is_set():
+                        OPERATION_RECOVERY.mark_uncertain(handle, "native_test_execution_outcome_unknown")
+                    elif not reuse:
+                        OPERATION_RECOVERY.finish(handle, known_result="raised")
+                except Exception:
+                    pass  # Leave the begin pending if uncertain settlement cannot be persisted.
+                raise
+        if not reuse:
+            OPERATION_RECOVERY.finish_returned(handle, result)
+        return result
 
 
 def _parse_iso_utc(value: Any) -> datetime | None:
@@ -1763,6 +1820,12 @@ class OperationRecoveryJournal:
             self._maybe_compact_locked()
 
     def finish_returned(self, handle: OperationHandle | None, result: Any) -> None:
+        if (
+            handle is not None and handle.operation_type == "verify_changes"
+            and isinstance(result, dict) and result.get("execution_uncertain") is True
+        ):
+            self.mark_uncertain(handle, "native_test_execution_outcome_unknown")
+            return
         if isinstance(result, dict) and isinstance(result.get("ok"), bool):
             known_result = "ok" if result["ok"] else "returned_error"
         else:

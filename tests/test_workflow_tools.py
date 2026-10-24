@@ -1,15 +1,81 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from mcp import Client
+from mcp.server import MCPServer
 
 from core import heartbeat
 from core.registry import create_server
 from tools.workflows import registry as workflow_registry
+
+
+def test_cancelled_workflow_keeps_test_worker_admitted_until_settled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import lifecycle, recovery, tooling
+
+    runtime = lifecycle.RuntimeLifecycle()
+    runtime.configure(tmp_path / "control.json", tmp_path / "status.json")
+    journal = recovery.OperationRecoveryJournal()
+    journal_path = tmp_path / "recovery.jsonl"
+    journal.configure(journal_path, "cancelled-workflow")
+    monkeypatch.setattr(lifecycle, "RUNTIME_LIFECYCLE", runtime)
+    monkeypatch.setattr(tooling, "RUNTIME_LIFECYCLE", runtime)
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+    monkeypatch.setattr(tooling, "OPERATION_RECOVERY", journal)
+    entered, release = threading.Event(), threading.Event()
+    effects: list[str] = []
+
+    class Store:
+        def get(self, workflow_id: str) -> dict[str, int]:
+            return {"version": 1}
+
+    class Executor:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def execute(self, *args: object, **kwargs: object) -> dict[str, str]:
+            recovery.mark_native_test_dispatch()
+            entered.set()
+            assert release.wait(5)
+            effects.append("test")
+            return {"state": "completed"}
+
+    monkeypatch.setattr(workflow_registry, "workflow_store", lambda path: Store())
+    monkeypatch.setattr(workflow_registry, "WorkflowExecutor", Executor)
+    monkeypatch.setattr(workflow_registry, "build_route_planner", lambda **kwargs: None)
+    monkeypatch.setattr(workflow_registry, "detect_capabilities", lambda: None)
+    monkeypatch.setattr(workflow_registry, "audit_action", lambda *args, **kwargs: None)
+    server = MCPServer("cancelled-workflow")
+    workflow_registry.register(server)
+    tool = server._tool_manager.get_tool("workflow_execute")
+    assert tool is not None
+
+    async def scenario() -> None:
+        task = asyncio.create_task(tool.fn(workflow_id="fixture", expected_version=1))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+                assert runtime.snapshot()["active_mutations"] == 1
+                records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+                assert all(record["type"] != "result" for record in records)
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert effects == ["test"]
+        assert runtime.snapshot()["active_mutations"] == 0
+        assert len(journal.list_operations(state="uncertain")["items"]) == 1
+
+    asyncio.run(scenario())
 
 
 def test_workflow_lifecycle_tools_persist_and_cancel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -104,6 +170,62 @@ def test_each_mcp_execution_attempt_has_a_distinct_lease_owner() -> None:
 
     assert first != second
     assert first.startswith("mcp-") and second.startswith("mcp-")
+
+
+@pytest.mark.parametrize("mode", ["sequential", "dag"])
+def test_admitted_workflow_transfers_verification_admission_during_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    from core import lifecycle, recovery, tooling, workflow_actions, workflow_executor
+    from core.resource_claims import resource_requires_native_ownership
+
+    settings = replace(workflow_registry.SETTINGS, state_dir=tmp_path, workflow_dag_enabled=mode == "dag")
+    for module in (workflow_registry, workflow_actions, workflow_executor, heartbeat):
+        monkeypatch.setattr(module, "SETTINGS", settings)
+    runtime = lifecycle.RuntimeLifecycle()
+    control = tmp_path / "control.json"
+    runtime.configure(control, tmp_path / "status.json")
+    monkeypatch.setattr(lifecycle, "RUNTIME_LIFECYCLE", runtime)
+    monkeypatch.setattr(tooling, "RUNTIME_LIFECYCLE", runtime)
+    journal = recovery.OperationRecoveryJournal()
+    journal.configure(tmp_path / "recovery.jsonl", "workflow-testing")
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+    monkeypatch.setattr(tooling, "OPERATION_RECOVERY", journal)
+    calls: list[bool] = []
+
+    def verify(repo: Path, **kwargs: object) -> dict[str, object]:
+        control.write_text(json.dumps(lifecycle.lifecycle_control_request("drain", "workflow-test", time.time() + 5)))
+        assert runtime.poll_control() == "DRAINING"
+
+        def admitted() -> dict[str, object]:
+            assert resource_requires_native_ownership()
+            recovery.mark_native_test_dispatch()
+            calls.append(True)
+            return {"ok": True, "required_unknown": False, "execution_uncertain": False}
+
+        return recovery.run_native_operation("verify_changes", str(repo), admitted)
+
+    monkeypatch.setattr(workflow_actions, "verify_changed_repository", verify)
+    server = MCPServer("workflow-testing-admission")
+    workflow_registry.register(server)
+
+    async def scenario() -> None:
+        async with Client(server) as client:
+            step: dict[str, object] = {
+                "name": "tests", "action": "verify_changes", "arguments": {"cwd": str(tmp_path), "checks": ["pytest"]},
+            }
+            if mode == "dag":
+                step.update(step_id="tests", depends_on=[])
+            definition = {"name": "verify", "execution_mode": mode, "steps": [step]}
+            started = (await client.call_tool("workflow_start", {"definition": definition})).structured_content
+            assert started and "workflow_id" in started, started
+            result = (await client.call_tool("workflow_execute", {
+                "workflow_id": started["workflow_id"], "expected_version": started["version"],
+            })).structured_content
+            assert result and result.get("state") == "completed", result
+
+    asyncio.run(scenario())
+    assert calls == [True]
 
 
 def test_workflow_execute_and_operations_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

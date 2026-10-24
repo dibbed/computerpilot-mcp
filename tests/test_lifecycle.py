@@ -33,6 +33,64 @@ def test_mutation_guard_set_matches_mcp_annotations() -> None:
     assert annotated_mutations == MUTATING_TOOL_OPERATIONS & names
 
 
+def test_direct_project_runner_denied_during_drain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.project.project_types import detect_project_types
+    from tools.testing import project_runners, runners
+
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    spec = project_runners.discover_test_runners(tmp_path, detect_project_types(tmp_path)).runners[0]
+    bound = project_runners.bind_runner_runtime(spec, workspace_root=tmp_path)
+    control = tmp_path / "control.json"
+    lifecycle = RuntimeLifecycle()
+    lifecycle.configure(control, tmp_path / "status.json")
+    _write_control(control, "drain", "runner-drain", time.time() + 5)
+    assert lifecycle.poll_control() == "DRAINING"
+    monkeypatch.setattr(lifecycle_module, "RUNTIME_LIFECYCLE", lifecycle)
+    monkeypatch.setattr(runners, "run_bounded", lambda *a, **k: pytest.fail("dispatched during drain"))
+    with pytest.raises(ToolError) as error:
+        runners.run_project_tests(bound, targets=[], deadline=time.monotonic() + 2, diagnostic_cap=10)
+    assert error.value.code == "runtime_draining"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_admitted_native_verification_reuses_during_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    from core import recovery, tooling
+
+    lifecycle = RuntimeLifecycle()
+    control = tmp_path / "control.json"
+    lifecycle.configure(control, tmp_path / "status.json")
+    journal = recovery.OperationRecoveryJournal()
+    path = tmp_path / "journal.jsonl"
+    journal.configure(path if enabled else None, "fixture" if enabled else None)
+    monkeypatch.setattr(lifecycle_module, "RUNTIME_LIFECYCLE", lifecycle)
+    monkeypatch.setattr(tooling, "RUNTIME_LIFECYCLE", lifecycle)
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+    monkeypatch.setattr(tooling, "OPERATION_RECOVERY", journal)
+
+    @tooling.compact_errors("verify_changes")
+    async def execute() -> dict[str, bool]:
+        _write_control(control, "drain", "admitted-verifier", time.time() + 5)
+        assert lifecycle.poll_control() == "DRAINING"
+
+        def work() -> dict[str, bool]:
+            assert lifecycle.snapshot()["active_mutations"] == 1
+            recovery.mark_native_test_dispatch()
+            return {"ok": True}
+
+        return await asyncio.to_thread(recovery.bind_operation_recovery(
+            lambda: recovery.run_native_operation("verify_changes", None, work),
+        ))
+
+    assert asyncio.run(execute()) == {"ok": True}
+    assert lifecycle.snapshot()["active_mutations"] == 0
+    if enabled:
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        assert sum(row.get("type") == "begin" for row in records) == 1
+        assert sum(row.get("type") == "result" for row in records) == 1
+
+
 def test_runtime_lifecycle_drains_active_mutation_and_rejects_new_work(tmp_path: Path) -> None:
     control = tmp_path / "control.json"
     status = tmp_path / "status.json"

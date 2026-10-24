@@ -140,7 +140,7 @@ package scripts/configuration. `package_selections`, `missing_inputs`, `source_f
 `total_exact` describe the evidence and its limits. Renames preserve destination-only `changed_paths` and expose both
 paths through `touched_paths`; deleted tests are not suggested as runnable files. The result cap applies across flat
 Python tests and package selections. A full-suite recommendation or `tests=[]` with incomplete evidence is not test success.
-Runner execution through verification is a separate integration step; existing verification entrypoints still use Python.
+Verification entrypoints keep Python selection by default and accept opt-in `test_backend="auto"` to add the selected package runners after the Python pytest scope. Auto mode validates the plan and every runner identity before dispatch, never installs dependencies or runs package scripts, and reports unknown coverage when a required runner is unavailable or the plan is incomplete.
 
 Internal runner helpers bind the current workspace, installed entrypoint and host runtime to hashes, then revalidate
 them under managed package claims before each direct invocation. They use fixed argv for Jest 29, Vitest 3,
@@ -162,12 +162,13 @@ affected_tests
 verify_changes
 ```
 
-`verify_changes` can run syntax, Ruff, mypy, and the narrowest sound pytest scope. Shared/repository-wide changes can fall back to the full suite. Foreground verification stays serial by default with `max_parallel_checks=1`. Read-only analyzer work can opt into capacity 2–3 only with `fail_fast=false` and `ruff_fix=false`; incompatible combinations are rejected before planning or analyzer dispatch. Parallel foreground verification is synchronous and non-durable, so client disconnects do not turn it into a background job. `stage_timeout_sec` remains a per-stage ceiling while `total_timeout_sec` bounds the verification run but is not a hard thread-kill deadline, and participating analyzer invocations also consume the shared MCP_MAX_RUNNING_ANALYZERS budget; unrelated external processes remain outside that cooperative limit.
+`verify_changes` can run syntax, Ruff, mypy, and the narrowest sound pytest scope. Shared/repository-wide changes can fall back to the full suite. Omitted `test_backend` remains `"python"`; opt-in `test_backend="auto"` also dispatches the selected package runners under the same resource claims, shared analyzer capacity, and deadlines. A required runner that is unavailable or a package plan that cannot be completed makes the result unknown rather than passed. Foreground verification stays serial by default with `max_parallel_checks=1`. Read-only analyzer work can opt into capacity 2–3 only with `fail_fast=false` and `ruff_fix=false`; incompatible combinations are rejected before planning or analyzer dispatch. Parallel foreground verification is synchronous and non-durable, so client disconnects do not turn it into a background job. `stage_timeout_sec` remains a per-stage ceiling while `total_timeout_sec` bounds the verification run but is not a hard thread-kill deadline, and participating analyzer invocations also consume the shared MCP_MAX_RUNNING_ANALYZERS budget; unrelated external processes remain outside that cooperative limit.
 
 `collect_diagnostics` also stays serial by default. Set `max_parallel_checks` to 2 or 3 to run independent Ruff, mypy, and pytest backends concurrently while preserving request-order stages and the existing deterministic merged diagnostic ordering. `timeout_sec` remains a per-backend ceiling. Optional `total_timeout_sec` (up to 10800 seconds) includes queue time and clamps each backend's effective timeout; a backend that has not started before the total deadline is reported timed out and `required_unknown=true`. Backend exceptions are isolated as unavailable stages so successful sibling diagnostics are retained. Thread cleanup can outlive the exact deadline while an already-running owned analyzer is terminating, so the total deadline is a scheduling/result bound rather than a promise to kill Python threads at that instant.
 
 For long checks, `start_verification` accepts the verification inputs plus a required `idempotency_key`, optional
-`queue_timeout_sec`, and `max_parallel_checks` (1–3, default 1). It is available when both testing and jobs domains are
+`queue_timeout_sec`, and `max_parallel_checks` (1–3, default 1). The inputs include `test_backend`; omitted or previously
+stored requests without it continue to run Python verification. It is available when both testing and jobs domains are
 active, including `coding` and `full`; existing profiles and foreground response contracts are unchanged.
 
 Start the job, retain its ID, and continue independent work. Collect `job_wait`/`job_output` when the result is needed.
@@ -180,7 +181,7 @@ Output uses schema version 1 events: `started`, `stage_started`, `stage_finished
 interpreter; analyzers select the target project's interpreter. Test caches and temporary directories are isolated per run.
 
 Input snapshots hash a conservative tree excluding standard dependency/runtime/cache directories, bounded to 10,000 files,
-64 MiB and 10 seconds per snapshot. Explicit changed files are included even inside an excluded directory; missing explicit paths are also bound so creating them invalidates the snapshot. The same limits apply to these inputs. Inaccessible inputs, symlinks, changing files and exhausted bounds fail closed.
+64 MiB and 10 seconds per snapshot. Explicit changed files are included even inside an excluded directory; missing explicit paths are also bound so creating them invalidates the snapshot. The same limits apply to these inputs. Inaccessible inputs, symlinks, changing files and exhausted bounds fail closed. Auto verification also records bounded runner identities separately from the repository snapshot; the worker revalidates those pins and the input fingerprint before dispatch, and a changed manifest, runner configuration or entrypoint rejects the run as stale instead of replaying it.
 Requests are limited to 64 KiB and the native Windows command-line limit. Use a new idempotency key after changing the
 request or input revision. Deduplication lasts only as long as the existing job record is retained.
 

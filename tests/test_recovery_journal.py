@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -231,6 +232,132 @@ def test_bound_recovery_worker_rejects_finished_scope(tmp_path: Path) -> None:
         call()
     assert raised.value.code == "invalid_operation_handle"
     assert calls == []
+
+
+@pytest.mark.parametrize("dispatch,unknown,ok,expected", [
+    (True, True, False, "uncertain"), (False, True, False, "failed"),
+    (True, False, True, "succeeded"), (True, False, False, "failed"),
+])
+def test_native_test_guard_preserves_execution_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dispatch: bool, unknown: bool, ok: bool, expected: str,
+) -> None:
+    journal = OperationRecoveryJournal()
+    path = tmp_path / "testing.jsonl"
+    journal.configure(path, "native-testing")
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+
+    def execute() -> dict[str, bool]:
+        if dispatch:
+            recovery.mark_native_test_dispatch()
+        return {"ok": ok, "required_unknown": unknown, "execution_uncertain": dispatch and unknown}
+
+    result = recovery.run_native_operation("verify_changes", None, execute)
+    assert result["execution_uncertain"] is (dispatch and unknown)
+    begins = [row for row in _records(path) if row.get("type") == "begin"]
+    assert len(begins) == 1
+    assert journal.inspect(str(begins[0]["operation_id"]))["state"] == expected
+
+
+@pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
+def test_native_test_guard_keeps_postdispatch_exception_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[BaseException],
+) -> None:
+    journal = OperationRecoveryJournal()
+    journal.configure(tmp_path / "testing.jsonl", "native-testing")
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+
+    def execute() -> None:
+        recovery.mark_native_test_dispatch()
+        raise error("fixture")
+
+    with pytest.raises(error):
+        recovery.run_native_operation("verify_changes", None, execute)
+    assert journal.summary()["uncertain_count"] == 1
+
+
+def test_bound_native_dispatch_propagates_without_finishing_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    journal = OperationRecoveryJournal()
+    journal.configure(tmp_path / "testing.jsonl", "native-testing")
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+    outer = journal.begin("verify_changes")
+    assert outer is not None
+    with recovery.operation_recovery_context(outer):
+        def execute() -> dict[str, bool]:
+            recovery.mark_native_test_dispatch()
+            return {"ok": True}
+
+        bound = recovery.bind_operation_recovery(lambda: recovery.run_native_operation("verify_changes", None, execute))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(bound).result() == {"ok": True}
+        assert recovery.native_test_dispatched()
+        assert journal.inspect(outer.operation_id)["state"] == "running"
+    journal.finish_returned(outer, {"ok": True})
+
+
+def test_native_dispatch_rejects_unbound_copied_scope() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+
+    with recovery.operation_recovery_context(None), ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(copy_context().run, recovery.mark_native_test_dispatch)
+        with pytest.raises(ToolError, match="owning"):
+            future.result()
+
+
+def test_bound_native_dispatch_rejects_parent_ended_while_worker_waited() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered, release = threading.Event(), threading.Event()
+    dispatched: list[bool] = []
+
+    def work() -> None:
+        entered.set()
+        assert release.wait(5)
+        recovery.mark_native_test_dispatch()
+        dispatched.append(True)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            with recovery.operation_recovery_context(None):
+                future = pool.submit(recovery.bind_operation_recovery(work))
+                assert entered.wait(5)
+        finally:
+            release.set()
+        with pytest.raises(ToolError, match="owning"):
+            future.result()
+    assert not dispatched
+
+
+def test_compact_native_test_error_never_completes_after_uncertain_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core import tooling
+
+    journal = OperationRecoveryJournal()
+    path = tmp_path / "testing.jsonl"
+    journal.configure(path, "native-testing")
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+    monkeypatch.setattr(tooling, "OPERATION_RECOVERY", journal)
+
+    def denied(*args: object, **kwargs: object) -> None:
+        raise OSError("fixture journal failure")
+
+    monkeypatch.setattr(journal, "mark_uncertain", denied)
+
+    @tooling.compact_errors("verify_changes")
+    def execute() -> dict[str, bool]:
+        recovery.mark_native_test_dispatch()
+        raise RuntimeError("fixture")
+
+    assert not execute()["ok"]
+    assert not any(row.get("type") == "result" for row in _records(path))
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after-restart")
+    assert recovered.summary()["uncertain_count"] == 1
 
 
 def test_workspace_edit_mutation_denies_when_unresolved_quota_is_exhausted(

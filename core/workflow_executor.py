@@ -7,12 +7,14 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from functools import partial
 from typing import Any
 
 from core.config import SETTINGS
 from core.errors import ToolError
 from core.execution_models import ExecutionIntent
 from core.reconcilers import evaluate_postcondition
+from core.recovery import bind_operation_recovery
 from core.recovery_models import Postcondition
 from core.resource_claims import make_resource_capability, resource_capability
 from core.workflow_actions import (
@@ -625,7 +627,7 @@ class WorkflowExecutor:
                                 owner_token=resource_owner_token,
                                 attempt_token=str(reserved["attempt_token"]),
                             )
-                            future = pool.submit(
+                            future = pool.submit(bind_operation_recovery(partial(
                                 self._run_dag_attempt,
                                 workflow_id,
                                 str(operation["operation_id"]),
@@ -636,7 +638,7 @@ class WorkflowExecutor:
                                 resource_owner_token,
                                 deadline,
                                 stop_signal,
-                            )
+                            )))
                             futures[future] = index
                             resource_waits.pop(index, None)
                             claimed_any = True

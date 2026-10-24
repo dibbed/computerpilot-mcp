@@ -150,12 +150,19 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                                     target,
                                     native_uia_protocol=uses_native_uia_dispatch_protocol(operation),
                                 )
+                                recovery_scope = None
                                 try:
-                                    with operation_recovery_context(handle):
+                                    with operation_recovery_context(handle) as recovery_scope:
                                         result = await fn(*args, **kwargs)
                                 except BaseException:
                                     try:
-                                        OPERATION_RECOVERY.finish(handle, known_result="raised")
+                                        if (
+                                            recovery_scope is not None
+                                            and recovery_scope.native_test_dispatch.is_set()
+                                        ):
+                                            OPERATION_RECOVERY.mark_uncertain(handle, "native_test_execution_outcome_unknown")
+                                        else:
+                                            OPERATION_RECOVERY.finish(handle, known_result="raised")
                                     except Exception:
                                         pass
                                     raise
@@ -179,12 +186,19 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                                 target,
                                 native_uia_protocol=uses_native_uia_dispatch_protocol(operation),
                             )
+                            recovery_scope = None
                             try:
-                                with operation_recovery_context(handle):
+                                with operation_recovery_context(handle) as recovery_scope:
                                     result = fn(*args, **kwargs)
                             except BaseException:
                                 try:
-                                    OPERATION_RECOVERY.finish(handle, known_result="raised")
+                                    if (
+                                        recovery_scope is not None
+                                        and recovery_scope.native_test_dispatch.is_set()
+                                    ):
+                                        OPERATION_RECOVERY.mark_uncertain(handle, "native_test_execution_outcome_unknown")
+                                    else:
+                                        OPERATION_RECOVERY.finish(handle, known_result="raised")
                                 except Exception:
                                     pass
                                 raise

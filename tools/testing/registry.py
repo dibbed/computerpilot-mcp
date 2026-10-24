@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +55,7 @@ def register(
             changed_paths: Annotated[list[str] | None, Field(max_length=1_000)] = None,
             base: Annotated[str | None, Field(min_length=1, max_length=500)] = None,
             checks: Annotated[list[Check] | None, Field(max_length=4)] = None,
+            test_backend: Literal["python", "auto"] = "python",
             affected_only: bool = True,
             fallback_policy: Literal["report", "select_full_suite"] = "select_full_suite",
             fail_fast: bool = True,
@@ -72,6 +74,7 @@ def register(
             working = _cwd(repo)
             request = VerificationRequest(
                 repo=str(working), changed_paths=changed_paths, base=base, checks=checks,
+                test_backend=test_backend,
                 affected_only=affected_only, fallback_policy=fallback_policy, fail_fast=fail_fast,
                 maxfail=maxfail, stage_timeout_sec=stage_timeout_sec, total_timeout_sec=total_timeout_sec,
                 ruff_fix=ruff_fix, diagnostic_cap=diagnostic_cap, max_parallel_checks=max_parallel_checks,
@@ -335,6 +338,7 @@ def register(
         changed_paths: Annotated[list[str] | None, Field(max_length=1_000)] = None,
         base: Annotated[str | None, Field(min_length=1, max_length=500)] = None,
         checks: Annotated[list[Check] | None, Field(max_length=4)] = None,
+        test_backend: Literal["python", "auto"] = "python",
         affected_only: bool = True,
         fallback_policy: Literal["report", "select_full_suite"] = "select_full_suite",
         fail_fast: bool = True,
@@ -347,6 +351,11 @@ def register(
         delivery: Literal["inline", "file", "auto"] = "inline",
     ) -> dict[str, Any]:
         """Verify changed Python code with syntax, Ruff, mypy, and the narrowest sound pytest scope."""
+        if any(not math.isfinite(value) or value <= 0 for value in (stage_timeout_sec, total_timeout_sec)):
+            raise ValueError("Verification deadlines must be positive finite values")
+        if test_backend == "auto" and (stage_timeout_sec > 600 or total_timeout_sec > 1800):
+            raise ValueError("auto verification requires stage_timeout_sec<=600 and total_timeout_sec<=1800")
+        deadline = time.monotonic() + total_timeout_sec
         working = _cwd(repo)
         audit_action(
             "verify_changes",
@@ -359,25 +368,32 @@ def register(
                 "requested_parallel_checks": max_parallel_checks,
             },
         )
+        admission_budget = deadline - time.monotonic()
+        if admission_budget <= 0:
+            raise TimeoutError("Verification deadline expired before resource admission.")
         with managed_resource_claims(
             [
                 coordination_claim(),
                 path_claim(working, "write", scope="subtree"),
             ],
             category="native.testing.verify",
-            timeout_sec=total_timeout_sec,
+            timeout_sec=admission_budget,
         ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Verification deadline expired during resource admission.")
             response = verify_changed_repository(
                 working,
                 changed_paths=changed_paths,
                 base=base,
                 checks=checks,
+                test_backend=test_backend,
                 affected_only=affected_only,
                 fallback_policy=fallback_policy,
                 fail_fast=fail_fast,
                 maxfail=maxfail,
                 stage_timeout_sec=stage_timeout_sec,
-                total_timeout_sec=total_timeout_sec,
+                total_timeout_sec=remaining,
                 ruff_fix=ruff_fix,
                 diagnostic_cap=diagnostic_cap,
                 max_parallel_checks=max_parallel_checks,
