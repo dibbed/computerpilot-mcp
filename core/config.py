@@ -40,6 +40,8 @@ class Settings:
     tool_profile: str = os.getenv("MCP_TOOL_PROFILE", "full")
     extensions_enabled: bool = os.getenv("MCP_EXTENSIONS_ENABLED", "").strip().casefold() in {"1", "true", "yes", "on"}
     extensions_config: str | None = os.getenv("MCP_EXTENSIONS_CONFIG")
+    persistent_enabled: bool = _env_bool("MCP_LSP_PERSISTENT_ENABLED", False)
+    providers_config: str | None = os.getenv("MCP_LSP_PROVIDERS_CONFIG")
     execution_router_enabled: bool = _env_bool("MCP_EXECUTION_ROUTER_ENABLED", True)
     execution_router_policy: str = os.getenv("MCP_EXECUTION_ROUTER_POLICY", "deterministic-v1").strip().casefold() or "deterministic-v1"
     execution_router_explain: bool = _env_bool("MCP_EXECUTION_ROUTER_EXPLAIN", True)

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 from mcp import types
@@ -19,13 +19,23 @@ from core.errors import ToolError
 from core.extensions.manager import ExtensionLifecycleManager
 from core.extensions.models import LIMITS
 from core.extensions.output import ExtensionResult, ResultLimits, finalize_envelope, public_tool_descriptor
+from core.response import failure
 
 _EXTERNAL_VISIBLE: ContextVar[bool] = ContextVar("external_catalog_visible", default=True)
 
+if TYPE_CHECKING:
+    from core.jobs import JobStore
+
 
 class ExtensionMCPServer(MCPServer):
-    def __init__(self, *args: Any, tool_profile: str = "full", **kwargs: Any) -> None:
+    def __init__(
+        self, *args: Any, tool_profile: str = "full", native_allowlist: frozenset[str] | None = None, **kwargs: Any,
+    ) -> None:
         self.tool_profile = tool_profile
+        self.native_allowlist = native_allowlist
+        self.native_registered_names: set[str] = set()
+        self.job_store_getter: Callable[[], JobStore] | None = None
+        self.runtime_started = False
         self.extension_manager: ExtensionLifecycleManager | None = None
         subscriptions = kwargs.pop("subscriptions", None)
         self.catalog_subscriptions = subscriptions if subscriptions is not None else InMemorySubscriptionBus()
@@ -53,6 +63,27 @@ class ExtensionMCPServer(MCPServer):
     @property
     def external_catalog_visible(self) -> bool:
         return _EXTERNAL_VISIBLE.get()
+
+    def add_tool(
+        self,
+        fn: Callable[..., Any],
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        annotations: types.ToolAnnotations | None = None,
+        icons: list[types.Icon] | None = None,
+        meta: dict[str, Any] | None = None,
+        structured_output: bool | None = None,
+    ) -> None:
+        effective_name = name or fn.__name__
+        if self.native_allowlist is not None and effective_name not in self.native_allowlist:
+            return
+        super().add_tool(
+            fn, name=name, title=title, description=description, annotations=annotations,
+            icons=icons, meta=meta, structured_output=structured_output,
+        )
+        if self.native_allowlist is not None:
+            self.native_registered_names.add(effective_name)
 
     async def observe_client(self, ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
         visible = True
@@ -118,6 +149,14 @@ class ExtensionMCPServer(MCPServer):
         self, name: str, arguments: dict[str, Any], context: Context[Any, Any] | None = None,
     ) -> types.CallToolResult | types.InputRequiredResult:
         if not name.startswith("external."):
+            if self.native_allowlist is not None and name not in self.native_allowlist:
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text="The native tool is unavailable under this profile.")],
+                    structured_content=failure(
+                        name, ToolError("hidden_tool_unavailable", "The native tool is unavailable under this profile."),
+                    ),
+                    is_error=True,
+                )
             return await super().call_tool(name, arguments, context)
         manager = self.extension_manager
         visible = {tool.name for tool in self.external_tools()}

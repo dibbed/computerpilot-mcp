@@ -195,10 +195,23 @@ def _hash_path(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _backup_file(path: Path, digest: str) -> str:
+def _backup_file(path: Path, digest: str, *, destination: Path | None = None) -> str:
     ensure_runtime_dirs()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    backup = SETTINGS.backup_dir / f"{stamp}_{digest[:12]}_{path.name}.bak"
+    exclusive = destination is not None
+    if destination is None:
+        backup = SETTINGS.backup_dir / f"{stamp}_{digest[:12]}_{path.name}.bak"
+    else:
+        backup = Path(destination)
+        root = SETTINGS.backup_dir.resolve(strict=False)
+        if not backup.is_absolute() or backup.is_symlink():
+            raise ToolError("backup_path_invalid", "Reserved backups must be absolute direct children of the backup directory.")
+        resolved = backup.resolve(strict=False)
+        if resolved.parent != root:
+            raise ToolError("backup_path_invalid", "Reserved backups must be direct children of the backup directory.")
+        backup = resolved
+        if backup.exists():
+            raise ToolError("backup_conflict", "Reserved backup destination already exists.")
     descriptor, temp_name = tempfile.mkstemp(prefix=f".{backup.name}.", suffix=".tmp", dir=str(SETTINGS.backup_dir))
     os.close(descriptor)
     temp = Path(temp_name)
@@ -207,7 +220,15 @@ def _backup_file(path: Path, digest: str) -> str:
         with temp.open("rb+") as handle:
             handle.flush()
             os.fsync(handle.fileno())
-        _replace_with_retry(temp, backup)
+        if exclusive:
+            try:
+                os.link(temp, backup)
+            except FileExistsError as exc:
+                raise ToolError("backup_conflict", "Reserved backup destination already exists.") from exc
+            except OSError as exc:
+                raise ToolError("backup_publish_failed", "Reserved backup could not be published atomically.") from exc
+        else:
+            _replace_with_retry(temp, backup)
     finally:
         temp.unlink(missing_ok=True)
     return str(backup)

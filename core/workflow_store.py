@@ -174,6 +174,12 @@ class WorkflowStore:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout=10000")
             if setup_wal:
+                version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                if version > SCHEMA_VERSION:
+                    raise ToolError(
+                        "workflow_schema_too_new",
+                        f"Workflow database schema {version} is newer than supported version {SCHEMA_VERSION}.",
+                    )
                 for attempt in range(50):
                     try:
                         connection.execute("PRAGMA journal_mode=WAL")
@@ -189,7 +195,9 @@ class WorkflowStore:
             raise
 
     def _initialize(self) -> None:
-        with self._lock, closing(self._connect(setup_wal=True)) as connection:
+        # Serialize the guard before journal changes, base DDL and migrations.
+        with self._lock, exclusive_file_lock(self.path.with_name(f"{self.path.name}.migration.lock")), \
+                closing(self._connect(setup_wal=True)) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS workflows (
@@ -224,43 +232,39 @@ class WorkflowStore:
             )
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version < SCHEMA_VERSION:
-                # executescript commits its caller's transaction; serialize the
-                # version check and all migration stages across processes.
-                with exclusive_file_lock(self.path.with_name(f"{self.path.name}.migration.lock")):
-                    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-                    if version < 1:
-                        self._migrate_v1(connection)
-                        version = 1
-                    if version < 2:
-                        self._migrate_v2(connection)
-                        version = 2
-                    if version < 3:
-                        self._migrate_v3(connection)
-                        version = 3
-                    if version < 4:
-                        self._migrate_v4(connection)
-                        version = 4
-                    if version < 5:
-                        self._migrate_v5(connection)
-                        version = 5
-                    if version < 6:
-                        self._migrate_v6(connection)
-                        version = 6
-                    if version < 7:
-                        self._migrate_v7(connection)
-                        version = 7
-                    if version < 8:
-                        self._migrate_v8(connection)
-                        version = 8
-                    if version < 9:
-                        self._migrate_v9(connection)
-                        version = 9
-                    if version < 10:
-                        self._migrate_v10(connection)
-                        version = 10
-                    if version < 11:
-                        self._migrate_v11(connection)
-                        version = 11
+                if version < 1:
+                    self._migrate_v1(connection)
+                    version = 1
+                if version < 2:
+                    self._migrate_v2(connection)
+                    version = 2
+                if version < 3:
+                    self._migrate_v3(connection)
+                    version = 3
+                if version < 4:
+                    self._migrate_v4(connection)
+                    version = 4
+                if version < 5:
+                    self._migrate_v5(connection)
+                    version = 5
+                if version < 6:
+                    self._migrate_v6(connection)
+                    version = 6
+                if version < 7:
+                    self._migrate_v7(connection)
+                    version = 7
+                if version < 8:
+                    self._migrate_v8(connection)
+                    version = 8
+                if version < 9:
+                    self._migrate_v9(connection)
+                    version = 9
+                if version < 10:
+                    self._migrate_v10(connection)
+                    version = 10
+                if version < 11:
+                    self._migrate_v11(connection)
+                    version = 11
             if version > SCHEMA_VERSION:
                 raise ToolError(
                     "workflow_schema_too_new",

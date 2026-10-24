@@ -28,6 +28,26 @@ from tools.browser.manager import MANAGER as BROWSER_MANAGER
 _HEALTH_SYNC_LOCK = threading.Lock()
 MAX_RUNTIME_HEALTH_BYTES = 512 * 1024
 RUNTIME_HEALTH_MAX_AGE_SEC = 30.0
+_LSP_COUNTERS = (
+    "spawn_count", "reuse_count", "failed", "restart_count", "active", "ready", "quarantined", "queue_depth",
+    "in_flight", "rss_bytes", "documents", "document_bytes", "preparing",
+)
+
+
+def _lsp_snapshot(server: Any) -> dict[str, Any]:
+    manager = getattr(server, "lsp_manager", None)
+    available = True
+    try:
+        observed = manager.snapshot() if manager is not None else {}
+        if not isinstance(observed, dict):
+            observed, available = {}, False
+    except Exception:
+        observed, available = {}, False
+    return {
+        "enabled": manager is not None, "available": available,
+        **{name: min(max(observed.get(name, 0), 0), 2**63 - 1) if type(observed.get(name, 0)) is int else 0
+           for name in _LSP_COUNTERS},
+    }
 
 
 def bound_runtime_health(payload: dict[str, Any]) -> dict[str, Any]:
@@ -46,7 +66,7 @@ def bound_runtime_health(payload: dict[str, Any]) -> dict[str, Any]:
         "queued_workflows", "running_workflows", "uncertain_workflows", "unresolved_workflow_operations", "resource_pressure",
     }
     summary = {key: value for key, value in result.items() if key in keep}
-    for key in ("operation_recovery", "workflow_health", "execution_router"):
+    for key in ("operation_recovery", "workflow_health", "execution_router", "lsp"):
         value = result.get(key)
         if isinstance(value, dict):
             summary[key] = {name: item for name, item in value.items() if item is None or isinstance(item, (int, float, bool))}
@@ -113,6 +133,7 @@ async def collect_server_health(
     active_domains = available_domains(profile.domains, capabilities)
     browser_stats = await browser_manager.stats()
     router_snapshot = router_metrics.snapshot()
+    lsp_snapshot = _lsp_snapshot(server)
     extension_manager = getattr(server, "extension_manager", None)
 
     def collect_durable_metrics() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], int]:
@@ -147,6 +168,10 @@ async def collect_server_health(
     )
     resource_usage = resources.pop("budgets")
     degraded_reasons: list[str] = []
+    if lsp_snapshot["quarantined"]:
+        degraded_reasons.append("lsp_ownership_unresolved")
+    if not lsp_snapshot["available"]:
+        degraded_reasons.append("lsp_snapshot_unavailable")
     if extensions["config_error_code"]:
         degraded_reasons.append("extension_config_invalid")
     if int(operation_recovery["uncertain_count"]) > 0:
@@ -194,6 +219,7 @@ async def collect_server_health(
             "policy_version": settings.execution_router_policy,
             **router_snapshot,
         },
+        "lsp": lsp_snapshot,
         "operation_recovery": operation_recovery,
         "extensions": extensions,
         "snapshot_schema_version": 1,

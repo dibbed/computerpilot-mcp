@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 import sys
 import threading
@@ -20,12 +21,17 @@ from core.singleflight import SingleFlight
 
 CACHE_ENTRY_OVERHEAD_BYTES = 256
 MAX_PARSE_VERSION_RETRIES = 3
+MAX_SOURCE_BYTES = 2 * 1024 * 1024
+SOURCE_READ_CHUNK_BYTES = 64 * 1024
+PROJECT_FILE_TOO_LARGE_MESSAGE = "Python source exceeds the 2 MiB analysis limit"
+PROJECT_FILE_CHANGED_MESSAGE = "Python source changed while being read"
 
 
 @dataclass(frozen=True, slots=True)
 class FileVersion:
     mtime_ns: int
     size: int
+    content_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,12 +120,56 @@ def _dotted_name(node: ast.AST, *, max_parts: int = 32) -> str | None:
     return ".".join(reversed(parts))
 
 
+def file_version(path: Path) -> FileVersion:
+    """Return a stat+content version, bounded to the safe analysis size."""
+
+    before = path.stat()
+    if before.st_size > MAX_SOURCE_BYTES:
+        raise ToolError("project_file_too_large", PROJECT_FILE_TOO_LARGE_MESSAGE)
+    digest = hashlib.sha256()
+    read = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(SOURCE_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            read += len(chunk)
+            if read > MAX_SOURCE_BYTES:
+                raise ToolError("project_file_too_large", PROJECT_FILE_TOO_LARGE_MESSAGE)
+            digest.update(chunk)
+    after = path.stat()
+    if read != before.st_size or after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns:
+        raise ToolError("project_file_changed_during_parse", PROJECT_FILE_CHANGED_MESSAGE)
+    return FileVersion(mtime_ns=before.st_mtime_ns, size=before.st_size, content_sha256=digest.hexdigest())
+
+
 def build_python_metadata(path: Path) -> PythonFileMetadata:
     """Parse one Python file into compact metadata instead of retaining its AST."""
 
     try:
+        if path.stat().st_size > MAX_SOURCE_BYTES:
+            return PythonFileMetadata(
+                path=str(path),
+                functions=(),
+                classes=(),
+                imports=(),
+                references=(),
+                calls=(),
+                parse_error=f"Cannot parse {path}: {PROJECT_FILE_TOO_LARGE_MESSAGE}",
+            )
         with tokenize.open(path) as handle:
-            tree = ast.parse(handle.read(), filename=str(path))
+            source = handle.read(MAX_SOURCE_BYTES + 1)
+        if len(source) > MAX_SOURCE_BYTES:
+            return PythonFileMetadata(
+                path=str(path),
+                functions=(),
+                classes=(),
+                imports=(),
+                references=(),
+                calls=(),
+                parse_error=f"Cannot parse {path}: {PROJECT_FILE_TOO_LARGE_MESSAGE}",
+            )
+        tree = ast.parse(source, filename=str(path))
     except (SyntaxError, UnicodeError, OSError) as exc:
         return PythonFileMetadata(
             path=str(path),
@@ -263,6 +313,7 @@ class PythonMetadataCache:
             raise ValueError("Python metadata cache budgets must be positive.")
         self._loader = loader
         self._lock = threading.RLock()
+        self._invalidation_epoch = 0
         self._entries: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._bytes = 0
         self._path_generations: dict[str, int] = {}
@@ -271,8 +322,13 @@ class PythonMetadataCache:
 
     @staticmethod
     def _version(path: Path) -> FileVersion:
-        stat = path.stat()
-        return FileVersion(mtime_ns=stat.st_mtime_ns, size=stat.st_size)
+        for _attempt in range(MAX_PARSE_VERSION_RETRIES - 1):
+            try:
+                return file_version(path)
+            except ToolError as exc:
+                if exc.code != "project_file_changed_during_parse":
+                    raise
+        return file_version(path)
 
     def _cached_locked(self, key: str, version: FileVersion) -> PythonFileMetadata | None:
         cached = self._entries.get(key)
@@ -288,11 +344,6 @@ class PythonMetadataCache:
     def get(self, path: Path) -> PythonFileMetadata:
         target = path.resolve(strict=False)
         key = canonical_path(target)
-        version = self._version(target)
-        with self._lock:
-            cached = self._cached_locked(key, version)
-            if cached is not None:
-                return cached
         return self._flights.run(key, lambda: self._load_stable(target, key))
 
     def _load_stable(self, target: Path, key: str) -> PythonFileMetadata:
@@ -349,6 +400,7 @@ class PythonMetadataCache:
         prefix = key.rstrip("\\/") + os.sep
         removed = 0
         with self._lock:
+            self._invalidation_epoch += 1
             candidates = set(self._entries) | set(self._active_loads)
             if recursive:
                 affected = [candidate for candidate in candidates if candidate == key or candidate.startswith(prefix)]
@@ -366,10 +418,17 @@ class PythonMetadataCache:
 
     def clear(self) -> None:
         with self._lock:
+            self._invalidation_epoch += 1
             for key in self._active_loads:
                 self._path_generations[key] = self._path_generations.get(key, 0) + 1
             self._entries.clear()
             self._bytes = 0
+
+    @property
+    def invalidation_epoch(self) -> int:
+        """Fence consumers even when a native write touched an uncached/non-Python path."""
+        with self._lock:
+            return self._invalidation_epoch
 
     def stats(self) -> dict[str, int]:
         with self._lock:

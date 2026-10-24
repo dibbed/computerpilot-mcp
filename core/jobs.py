@@ -7,8 +7,10 @@ import hashlib
 import json
 import math
 import sqlite3
+import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Literal
@@ -64,6 +66,21 @@ def same_process(pid: int | None, created: float | None) -> bool:
         return abs(process.create_time() - created) < 0.01 and process.is_running()
     except psutil.Error:
         return False
+
+
+def lazy_job_store(factory: Callable[[], JobStore]) -> Callable[[], JobStore]:
+    """Share one store per owner, without touching disk during registration."""
+    lock = threading.Lock()
+    store: JobStore | None = None
+
+    def get_store() -> JobStore:
+        nonlocal store
+        with lock:
+            if store is None:
+                store = factory()
+            return store
+
+    return get_store
 
 
 class JobStore:

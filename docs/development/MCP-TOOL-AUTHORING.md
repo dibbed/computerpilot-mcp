@@ -1,10 +1,10 @@
 # Native MCP tool authoring
 
-This guide describes the current native implementation at the stable v0.8.0 boundary. The [agent contract](../../AGENTS.md) owns execution rules; [architecture](../architecture.md) owns runtime boundaries, and [release process](../release-process.md) owns publication.
+This guide describes the native implementation, including unreleased language-tool changes since stable v0.8.0. The [agent contract](../../AGENTS.md) owns execution rules; [architecture](../architecture.md) owns runtime boundaries, and [release process](../release-process.md) owns publication.
 
 ## Registration and caller contract
 
-`core/registry.py:create_server` detects capabilities, resolves one of the nine profiles, filters domains, and invokes `REGISTRARS`. A domain exports its `register(MCPServer)` through `tools/<domain>/__init__.py`. Add a tool in its existing domain, with the same decorator order as its neighbours:
+`core/registry.py:create_server` detects capabilities, resolves a named profile, filters domains, and invokes `REGISTRARS`. A domain exports its `register(MCPServer)` through `tools/<domain>/__init__.py`. Add a tool in its existing domain, with the same decorator order as its neighbours:
 
 ```python
 @mcp.tool(annotations=READ_ONLY, structured_output=True)
@@ -16,6 +16,8 @@ def read_file(path: PathArg, ...) -> dict[str, Any]:
 This excerpt shows the existing `tools/filesystem/registry.py` pattern, not a runnable replacement. `functools.wraps` in `compact_errors` preserves the typed signature. `create_server` sets the installed SDK's native `ArgModelBase` to `extra="forbid"`; unknown arguments must be rejected before the body runs. Preserve caller-visible names, defaults, schema, result shape, and concise descriptions. Reuse bounded aliases in `core/tooling.py` and Pydantic `Annotated[..., Field(...)]` for actual input limits. Avoid default coercion or broad dictionaries where a typed contract already exists.
 
 The live registry owns availability. Add required deterministic metadata to `core/tool_catalog.py` for discovery and routing, using the existing native risk/recoverability taxonomy. Metadata does not register the tool. `PROFILE_DOMAINS` in `core/tool_profiles.py` filters native domains; it is not authorization. Platform-specific imports and registration follow `core/platform` capability gates.
+
+The unreleased `coding_core` profile also supplies a fixed native allowlist. `ExtensionMCPServer.add_tool` preserves the public SDK registration signature and metadata while excluding other native names; startup requires the complete allowlist, and `call_tool` rejects hidden native names before dispatch. Other profiles retain `native_allowlist=None`. Keep registrations synchronous and inert, and use the existing external policy's explicit profile eligibility. This static capability filter is not a sandbox or a model-quality claim; the live-model UX pilot remains gated separately.
 
 ## Classification, lifecycle and recovery
 
@@ -34,6 +36,18 @@ The native wrapper's raised/returned-error terminal semantics do not establish w
 Validate at the public boundary and again where state can race. Reuse `resolve_path`, target locks, expected hashes, backups, staged validation, and atomic publication rather than duplicating them. Existing `write_file` checks `expected_sha256` inside `RESOURCE_LOCKS.sync`, calls the shared atomic writer, and invalidates the Python metadata cache only after a change. Document edits additionally preserve archive validation, locks, macro bytes, and durable file-hash postconditions.
 
 Keep network or process I/O outside database/file-lock transactions. Classify partial success and cancellation explicitly. Audit only allowlisted identity/outcome/size fields; `audit_action` does not automatically remove secrets from arbitrary details. Native `failure`/`ToolError` conversions are appropriate only for errors already safe to expose; do not feed untrusted provider exceptions into str-based native conversion.
+
+## Language requests and workspace edits
+
+The seven read tools (`symbol_definition`, `symbol_references`, `document_symbols`, `workspace_symbols`, `symbol_hover`, `call_hierarchy`, `language_diagnostics`) retain their names and `{ok, method, result}` response envelope. Supply exactly one of legacy `params` or the tool's typed `request`; supplying both or neither returns `lsp_request_shape`. Typed models reject extra fields and require non-negative integer positions in UTF-16 code units. Shared validation also applies to legacy input before process dispatch: local file URIs must resolve inside the selected workspace, positioned documents must be UTF-8 within 2 MiB, and parameter trees are bounded to 64 KiB. There is no public executable or arbitrary-method parameter, and partial/work tokens are unsupported.
+
+`language_id` accepts Python, TypeScript/TSX, JavaScript/JSX and PHP identifiers; document suffixes infer the language, and an explicit mismatch returns `lsp_language_mismatch`. Workspace-symbol requests default to Python. Default one-shot mode still uses the discovered `pyright-langserver --stdio`; accepting a language identifier does not establish real-provider support. `MCP_LSP_PERSISTENT_ENABLED` defaults off. Operator opt-in uses a server-owned manager and reviewed provider configuration (`MCP_LSP_PROVIDERS_CONFIG`); construction, listing and health never launch a provider. See [providers.py](../../tools/language/providers.py) for configuration validation and [sessions.py](../../tools/language/sessions.py) for bounded queues, document retention, deadlines and cleanup. Local fake-provider acceptance is separate from real Python/TypeScript/PHP provider validation.
+
+`rename_symbol` and `apply_code_action` require an expected SHA-256 for every touched file; their `dry_run` path validates and prepares without writes or backups. Code actions consume only `action.edit`; returned commands are ignored. Create/rename/delete resource operations are unsupported. Plans reject duplicate/overlapping edits, malformed or boolean positions, and more than 100 files, 1,000 edits or 2 MiB of replacement text. Versioned `documentChanges` require matching `document_versions`. Persistent rename also requires each target in both the server's document-version and source-hash snapshot maps, including unversioned `changes`. An unopened target absent from those snapshots is rejected with `lsp_result_stale`; cross-file rename support is limited to snapshotted targets. This fail-closed restriction is intentional for the current implementation.
+
+The direct [apply_workspace_edit](../../tools/language/edits.py) helper requires an enabled supervised recovery journal, otherwise `recovery_unavailable` occurs before backup/write. Native resource admission and locks precede the final hash recheck. Verified exclusive backups are pinned until bounded metadata is durably checkpointed as `prepared`, then `may_dispatch` precedes the first write. Rollback replaces only byte-identical postimages produced by this operation; conflicts or unknown outcomes preserve uncertainty and backups without automatic replay. Inspect the existing recovery operation before another mutation. Atomicity is per file, with recovery evidence for the batch. Drain and reconcile unresolved operations before downgrading code that reads the new checkpoint fields.
+
+Worker offload of an admitted mutation must explicitly bind recovery in the owning task with `core.recovery.bind_operation_recovery` before dispatch. Inherited child-task/thread context alone grants no reuse of the parent's operation. Keep the owning mutation open until non-abandoning worker completion, including cancellation. Successful workspace edits invalidate Python/context caches and retire the workspace's persistent session. Relevant errors include `hash_conflict`, `lsp_edit_precondition_required`, `lsp_document_version_conflict`, `lsp_edit_budget`, `lsp_position_invalid`, `workspace_edit_outcome_uncertain` and `workspace_edit_limit`; none authorizes retry after possible effects.
 
 ## Results, output and cleanup
 

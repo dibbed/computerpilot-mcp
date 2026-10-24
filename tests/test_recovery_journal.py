@@ -26,6 +26,281 @@ def _records(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _workspace_evidence(tmp_path: Path, count: int = 1) -> recovery.WorkspaceEditEvidence:
+    return recovery.WorkspaceEditEvidence(
+        files=tuple(
+            recovery.WorkspaceEditFile(
+                path=str((tmp_path / f"file-{index}.py").resolve()),
+                before_sha256="a" * 64,
+                after_sha256="b" * 64,
+                backup_path=str((tmp_path / "backups" / f"{index}.bak").resolve()),
+            )
+            for index in range(count)
+        )
+    )
+
+
+def test_workspace_edit_checkpoint_survives_restart_and_compaction(tmp_path: Path) -> None:
+    path = tmp_path / "workspace.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "before")
+    handle = journal.begin("workspace_edit", "2 files")
+    assert handle is not None
+    evidence = _workspace_evidence(tmp_path, 2)
+    journal.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+    journal.checkpoint_workspace_edit(handle, evidence, stage="may_dispatch")
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+    recovered.compact()
+
+    operation = recovered.inspect(handle.operation_id)
+    assert operation["state"] == "uncertain"
+    assert operation["workspace_edit"]["dispatch_stage"] == "may_dispatch"
+    assert operation["workspace_edit"]["files"] == [
+        {
+            "path": item.path,
+            "before_sha256": item.before_sha256,
+            "after_sha256": item.after_sha256,
+            "backup_path": item.backup_path,
+        }
+        for item in evidence.files
+    ]
+    assert recovered.protected_workspace_backups() == {
+        Path(item.backup_path) for item in evidence.files
+    }
+    serialized = json.dumps(operation)
+    assert "newText" not in serialized
+    assert "before content" not in serialized
+
+
+def test_workspace_edit_prepared_crash_recovers_failed_without_replay(tmp_path: Path) -> None:
+    path = tmp_path / "workspace.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "before")
+    handle = journal.begin("workspace_edit")
+    assert handle is not None
+    journal.checkpoint_workspace_edit(handle, _workspace_evidence(tmp_path), stage="prepared")
+    journal.finish(handle, known_result="raised")
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+    operation = recovered.inspect(handle.operation_id)
+    assert operation["state"] == "failed"
+    assert recovered.protected_workspace_backups() == set()
+
+
+def test_workspace_edit_checkpoint_rejects_invalid_or_unbounded_evidence(tmp_path: Path) -> None:
+    journal = OperationRecoveryJournal()
+    journal.configure(tmp_path / "workspace.jsonl", "runtime")
+    handle = journal.begin("workspace_edit")
+    assert handle is not None
+
+    with pytest.raises(ToolError) as stage:
+        journal.checkpoint_workspace_edit(handle, _workspace_evidence(tmp_path), stage="may_dispatch")
+    assert stage.value.code == "operation_checkpoint_conflict"
+
+    relative = recovery.WorkspaceEditEvidence(
+        files=(recovery.WorkspaceEditFile("relative.py", "a" * 64, "b" * 64, str(tmp_path / "x.bak")),)
+    )
+    with pytest.raises(ToolError) as bad_path:
+        journal.checkpoint_workspace_edit(handle, relative, stage="prepared")
+    assert bad_path.value.code == "invalid_workspace_edit_evidence"
+
+    oversized = recovery.WorkspaceEditEvidence(
+        files=tuple(
+            recovery.WorkspaceEditFile(
+                path=str(tmp_path / ("p" * 400)),
+                before_sha256="a" * 64,
+                after_sha256="b" * 64,
+                backup_path=str(tmp_path / f"{index}.bak"),
+            )
+            for index in range(100)
+        )
+    )
+    with pytest.raises(ToolError) as too_large:
+        journal.checkpoint_workspace_edit(handle, oversized, stage="prepared")
+    assert too_large.value.code == "lsp_edit_evidence_too_large"
+
+
+def test_protected_workspace_backups_fail_closed_over_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(recovery, "_MAX_WORKSPACE_PROTECTED_PATHS", 1)
+    journal = OperationRecoveryJournal()
+    journal.configure(tmp_path / "workspace.jsonl", "runtime")
+    handle = journal.begin("workspace_edit")
+    assert handle is not None
+    evidence = _workspace_evidence(tmp_path, 2)
+    journal.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+    journal.checkpoint_workspace_edit(handle, evidence, stage="may_dispatch")
+
+    with pytest.raises(ToolError) as raised:
+        journal.protected_workspace_backups()
+    assert raised.value.code == "workspace_backup_protection_limit"
+
+
+def test_workspace_edit_mutation_reuses_only_same_task_scope(tmp_path: Path) -> None:
+    path = tmp_path / "workspace.jsonl"
+    recovery.OPERATION_RECOVERY.configure(path, "scope-runtime")
+    try:
+        outer = recovery.OPERATION_RECOVERY.begin("outer_tool")
+        assert outer is not None
+
+        with recovery.operation_recovery_context(outer):
+            with recovery.workspace_edit_mutation((tmp_path / "first.txt",)) as reused:
+                assert reused.operation_id == outer.operation_id
+
+            async def child() -> str:
+                with recovery.workspace_edit_mutation((tmp_path / "second.txt",)) as owned:
+                    assert owned.operation_id != outer.operation_id
+                    return owned.operation_id
+
+            child_id = asyncio.run(child())
+        recovery.OPERATION_RECOVERY.finish(outer, known_result="ok")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+    records = _records(path)
+    begins = [record for record in records if record.get("type") == "begin"]
+    assert {record["operation_id"] for record in begins} == {outer.operation_id, child_id}
+    assert next(record for record in begins if record["operation_id"] == child_id)["operation_type"] == "workspace_edit"
+
+
+def test_workspace_edit_mutation_reuses_owning_task_in_worker_thread(tmp_path: Path) -> None:
+    path = tmp_path / "workspace.jsonl"
+    recovery.OPERATION_RECOVERY.configure(path, "worker-runtime")
+    try:
+        outer = recovery.OPERATION_RECOVERY.begin("rename_symbol")
+        assert outer is not None
+
+        def use_workspace_edit() -> str:
+            with recovery.workspace_edit_mutation((tmp_path / "worker.txt",)) as handle:
+                return handle.operation_id
+
+        async def scenario() -> str:
+            with recovery.operation_recovery_context(outer):
+                return await asyncio.to_thread(recovery.bind_operation_recovery(use_workspace_edit))
+
+        worker_id = asyncio.run(scenario())
+        recovery.OPERATION_RECOVERY.finish(outer, known_result="ok")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+    assert worker_id == outer.operation_id
+    begins = [record for record in _records(path) if record.get("type") == "begin"]
+    assert [record["operation_id"] for record in begins] == [outer.operation_id]
+
+
+@pytest.mark.parametrize("bind_in_child", [False, True])
+def test_child_task_offload_cannot_reuse_parent_recovery(
+    tmp_path: Path, bind_in_child: bool,
+) -> None:
+    path = tmp_path / "child-offload.jsonl"
+    recovery.OPERATION_RECOVERY.configure(path, "child-runtime")
+    try:
+        outer = recovery.OPERATION_RECOVERY.begin("rename_symbol")
+        assert outer is not None
+
+        def mutate() -> str:
+            with recovery.workspace_edit_mutation((tmp_path / "child.txt",)) as handle:
+                return handle.operation_id
+
+        async def child() -> str:
+            call = recovery.bind_operation_recovery(mutate) if bind_in_child else mutate
+            return await asyncio.to_thread(call)
+
+        async def scenario() -> str:
+            with recovery.operation_recovery_context(outer):
+                return await asyncio.create_task(child())
+
+        child_id = asyncio.run(scenario())
+        assert child_id != outer.operation_id
+        recovery.OPERATION_RECOVERY.finish(outer, known_result="ok")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+    begins = [record for record in _records(path) if record.get("type") == "begin"]
+    assert {record["operation_id"] for record in begins} == {outer.operation_id, child_id}
+
+
+def test_bound_recovery_worker_rejects_finished_scope(tmp_path: Path) -> None:
+    calls: list[bool] = []
+    with recovery.operation_recovery_context(None):
+        call = recovery.bind_operation_recovery(lambda: calls.append(True))
+    with pytest.raises(ToolError) as raised:
+        call()
+    assert raised.value.code == "invalid_operation_handle"
+    assert calls == []
+
+
+def test_workspace_edit_mutation_denies_when_unresolved_quota_is_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "workspace.jsonl"
+    recovery.OPERATION_RECOVERY.configure(path, "quota-runtime")
+    monkeypatch.setattr(recovery.OPERATION_RECOVERY, "_max_unresolved_workspace", 0)
+    try:
+        with pytest.raises(ToolError) as raised:
+            with recovery.workspace_edit_mutation((tmp_path / "denied.txt",)):
+                pytest.fail("workspace edit admission must be denied before any operation starts")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+    assert raised.value.code == "workspace_edit_limit"
+    assert not path.exists() or not any(record.get("type") == "begin" for record in _records(path))
+
+
+def test_workspace_edit_checkpoint_denies_second_unresolved_operation(tmp_path: Path) -> None:
+    journal = OperationRecoveryJournal(max_unresolved_workspace=1)
+    path = tmp_path / "workspace.jsonl"
+    journal.configure(path, "quota-runtime")
+    try:
+        first = journal.begin("workspace_edit")
+        assert first is not None
+        evidence = _workspace_evidence(tmp_path)
+        journal.checkpoint_workspace_edit(first, evidence, stage="prepared")
+        second = journal.begin("workspace_edit")
+        assert second is not None
+
+        with pytest.raises(ToolError) as raised:
+            journal.checkpoint_workspace_edit(second, evidence, stage="prepared")
+        assert raised.value.code == "workspace_edit_limit"
+        assert journal.workspace_edit_stage(second) is None
+    finally:
+        journal.configure(None, None)
+
+
+def test_old_journal_records_and_new_checkpoint_compact_without_loss(tmp_path: Path) -> None:
+    path = tmp_path / "workspace.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "before")
+    legacy = journal.begin("legacy_tool")
+    assert legacy is not None
+    journal.finish(legacy, known_result="ok")
+    handle = journal.begin("workspace_edit")
+    assert handle is not None
+    evidence = _workspace_evidence(tmp_path)
+    journal.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+    journal.checkpoint_workspace_edit(handle, evidence, stage="may_dispatch")
+
+    journal.compact()
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+    operation = recovered.inspect(handle.operation_id)
+    assert operation["state"] == "uncertain"
+    assert operation["workspace_edit"]["dispatch_stage"] == "may_dispatch"
+    assert recovered.protected_workspace_backups() == {Path(evidence.files[0].backup_path)}
+
+
+def test_workspace_edit_mutation_requires_enabled_recovery(tmp_path: Path) -> None:
+    recovery.OPERATION_RECOVERY.configure(None, None)
+    with pytest.raises(ToolError) as raised:
+        with recovery.workspace_edit_mutation((tmp_path / "target.txt",)):
+            pass
+    assert raised.value.code == "recovery_unavailable"
+
+
 def test_mutation_target_includes_workflow_and_operation_identity() -> None:
     def operation(workflow_id: str, operation_id: str) -> None:
         del workflow_id, operation_id

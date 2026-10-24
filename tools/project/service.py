@@ -90,9 +90,15 @@ def iter_files(root: Path, max_files: int) -> tuple[list[Path], bool]:
     if root.is_file():
         return [root], False
     files: list[Path] = []
-    for current, directories, names in os.walk(root):
-        directories[:] = [name for name in directories if name not in EXCLUDED_DIRS and not name.startswith(".pytest-tmp-")]
-        for name in names:
+    for current, directories, names in os.walk(root, followlinks=False):
+        directories[:] = sorted(
+            name
+            for name in directories
+            if name not in EXCLUDED_DIRS
+            and not name.startswith(".pytest-tmp-")
+            and not (Path(current) / name).is_symlink()
+        )
+        for name in sorted(names):
             files.append(Path(current) / name)
             if len(files) >= max_files:
                 return files, True

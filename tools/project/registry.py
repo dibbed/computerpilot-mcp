@@ -10,10 +10,10 @@ from pydantic import Field
 
 from core.config import resolve_path
 from core.response import page
-from core.tooling import READ_ONLY, PathArg, compact_errors
+from core.tooling import OPEN_WORLD_READ, READ_ONLY, PathArg, compact_errors
 from tools.project import service
-from tools.project.context import lookup_code_context
 from tools.project.index import ClassMetadata, FunctionMetadata
+from tools.project.intelligence_models import CodePosition
 
 
 def _matches(candidate: str, query: str, mode: Literal["exact", "contains"]) -> bool:
@@ -257,9 +257,9 @@ def register(mcp: MCPServer) -> None:
             **result,
         }
 
-    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @mcp.tool(annotations=OPEN_WORLD_READ, structured_output=True)
     @compact_errors("code_context")
-    def code_context(
+    async def code_context(
         path: PathArg,
         symbol: Annotated[str, Field(min_length=1, max_length=500)],
         match: Literal["exact", "contains"] = "exact",
@@ -270,28 +270,30 @@ def register(mcp: MCPServer) -> None:
         include_references: bool = True,
         include_imports: bool = True,
         include_tests: bool = True,
-        max_depth: Annotated[int, Field(ge=1, le=2)] = 1,
+        max_depth: Annotated[int, Field(strict=True, ge=0, le=2)] = 1,
         max_files: Annotated[int, Field(ge=1, le=50_000)] = 5_000,
         max_relationships: Annotated[int, Field(ge=1, le=1_000)] = 100,
         source_max_chars: Annotated[int, Field(ge=0, le=200_000)] = 20_000,
         offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0,
+        language_id: Literal["auto", "python", "typescript", "javascript", "php"] | None = None,
+        backend: Literal["auto", "ast", "semantic"] = "auto",
+        semantic_anchor: CodePosition | None = None,
     ) -> dict[str, Any]:
-        """Return a bounded definition, relationship, import, and test context for a Python symbol."""
+        """Return bounded Python AST or configured semantic context; omitted language retains Python behavior."""
 
-        return lookup_code_context(
-            resolve_path(path),
+        from tools.language.sessions import LspSessionManager
+        from tools.project.intelligence import lookup_project_context
+
+        manager = getattr(mcp, "lsp_manager", None)
+        return await lookup_project_context(
+            path,
             symbol,
-            match=match,
-            file_filter=file_filter,
-            include_source=include_source,
-            include_callers=include_callers,
-            include_callees=include_callees,
-            include_references=include_references,
-            include_imports=include_imports,
-            include_tests=include_tests,
-            max_depth=max_depth,
-            max_files=max_files,
-            max_relationships=max_relationships,
-            source_max_chars=source_max_chars,
-            offset=offset,
+            language_id=language_id, backend=backend, anchor=semantic_anchor,
+            manager=manager if isinstance(manager, LspSessionManager) else None,
+            options={
+                "match": match, "file_filter": file_filter, "include_source": include_source,
+                "include_callers": include_callers, "include_callees": include_callees, "include_references": include_references,
+                "include_imports": include_imports, "include_tests": include_tests, "max_depth": max_depth,
+                "max_files": max_files, "max_relationships": max_relationships, "source_max_chars": source_max_chars, "offset": offset,
+            },
         )

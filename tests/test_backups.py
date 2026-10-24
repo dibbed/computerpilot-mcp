@@ -15,6 +15,7 @@ import pytest
 
 import core.backups as backups
 from core.backups import BackupCleanupResult, BackupPolicy, BackupRetentionManager, cleanup_backups
+from core.errors import ToolError
 from tools.filesystem import service
 
 
@@ -445,6 +446,178 @@ def test_backup_file_is_atomically_published_and_leaves_no_temp(tmp_path: Path, 
     assert list(backup_dir.glob("*.tmp")) == []
 
 
+def test_pin_paths_blocks_retention_until_release(tmp_path: Path) -> None:
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    old = directory / "old.bak"
+    _backup(old, 10, 100)
+    newer = directory / "newer.bak"
+    _backup(newer, 10, 200)
+    manager = BackupRetentionManager(directory, _policy(max_count=1, recent_grace_sec=0))
+
+    with manager.pin_paths((old,)):
+        manager.schedule()
+        assert manager.flush(3)
+        assert old.is_file() and newer.is_file()
+
+    manager.schedule()
+    assert manager.flush(3)
+    assert not old.exists()
+    assert newer.is_file()
+
+
+def test_pin_paths_rejects_paths_outside_backup_directory(tmp_path: Path) -> None:
+    from core.errors import ToolError
+
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    manager = BackupRetentionManager(directory, _policy())
+    with pytest.raises(ToolError) as raised:
+        with manager.pin_paths((tmp_path / "outside.bak",)):
+            pass
+    assert raised.value.code == "backup_path_invalid"
+
+
+def test_pin_publication_cannot_race_an_already_started_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release_cleanup = threading.Event()
+    published = threading.Event()
+    release_pin = threading.Event()
+    failures: list[BaseException] = []
+    original = backups.cleanup_backups
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    reserved = directory / "reserved.bak"
+    newest = directory / "newest.bak"
+    manager = BackupRetentionManager(directory, _policy(max_count=1, recent_grace_sec=0))
+
+    def paused_cleanup(
+        directory: Path,
+        policy: BackupPolicy,
+        *,
+        now: float | None = None,
+        protected_paths: set[Path] | None = None,
+    ) -> BackupCleanupResult:
+        entered.set()
+        assert release_cleanup.wait(5)
+        return original(directory, policy, now=now, protected_paths=protected_paths)
+
+    def publish() -> None:
+        try:
+            with manager.pin_paths((reserved,)):
+                _backup(reserved, 10, 100)
+                _backup(newest, 10, 200)
+                published.set()
+                assert release_pin.wait(5)
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(backups, "cleanup_backups", paused_cleanup)
+    manager.schedule()
+    assert entered.wait(5)
+    publisher = threading.Thread(target=publish)
+    publisher.start()
+    try:
+        # A cleanup that already captured protection must finish before new publication.
+        published.wait(0.5)
+        release_cleanup.set()
+        assert manager.flush(5)
+        assert published.wait(5)
+        assert reserved.is_file()
+        assert newest.is_file()
+    finally:
+        release_cleanup.set()
+        release_pin.set()
+        publisher.join(5)
+    assert not publisher.is_alive()
+    assert not failures
+
+
+def test_retention_skips_cleanup_when_recovery_journal_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.errors import ToolError
+    from core.recovery import OPERATION_RECOVERY
+
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    old = directory / "old.bak"
+    _backup(old, 10, 100)
+    newest = directory / "newest.bak"
+    _backup(newest, 10, 200)
+    manager = BackupRetentionManager(directory, _policy(max_count=1, recent_grace_sec=0))
+
+    def unavailable() -> set[Path]:
+        raise ToolError("operation_journal_unavailable", "journal unavailable")
+
+    monkeypatch.setattr(OPERATION_RECOVERY, "protected_workspace_backups", unavailable)
+    manager.schedule()
+    assert manager.flush(3)
+    assert old.is_file() and newest.is_file()
+    assert str(manager.snapshot()["last_error"]).startswith("recovery_unavailable")
+
+
+def test_retention_protects_unresolved_workspace_edit_backups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core import recovery
+
+    journal_path = tmp_path / "runtime" / "operations.jsonl"
+    journal_path.parent.mkdir()
+    recovery.OPERATION_RECOVERY.configure(journal_path, "retention-test")
+    handle = recovery.OPERATION_RECOVERY.begin("workspace_edit")
+    assert handle is not None
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    protected = directory / "protected.bak"
+    newest = directory / "newest.bak"
+    _backup(protected, 10, 100)
+    _backup(newest, 10, 200)
+    evidence = recovery.WorkspaceEditEvidence(
+        files=(recovery.WorkspaceEditFile(
+            path=str((tmp_path / "target.py").resolve()),
+            before_sha256="a" * 64,
+            after_sha256="b" * 64,
+            backup_path=str(protected.resolve()),
+        ),)
+    )
+    try:
+        recovery.OPERATION_RECOVERY.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+        recovery.OPERATION_RECOVERY.checkpoint_workspace_edit(handle, evidence, stage="may_dispatch")
+        manager = BackupRetentionManager(directory, _policy(max_count=1, recent_grace_sec=0))
+        manager.schedule()
+        assert manager.flush(3)
+        assert protected.is_file()
+        recovery.OPERATION_RECOVERY.mark_uncertain(handle, "test_uncertain")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+
+def test_backup_file_publishes_to_exclusive_reserved_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("recoverable", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setattr(service, "SETTINGS", SimpleNamespace(backup_dir=backup_dir))
+    destination = backup_dir / "reserved.bak"
+
+    result = service._backup_file(source, "a" * 64, destination=destination)
+
+    assert result == str(destination)
+    assert destination.read_text(encoding="utf-8") == "recoverable"
+    with pytest.raises(ToolError) as conflict:
+        service._backup_file(source, "a" * 64, destination=destination)
+    assert conflict.value.code == "backup_conflict"
+    assert destination.read_text(encoding="utf-8") == "recoverable"
+    with pytest.raises(ToolError) as outside:
+        service._backup_file(source, "a" * 64, destination=tmp_path / "outside.bak")
+    assert outside.value.code == "backup_path_invalid"
+
+
 def test_retention_manager_coalesces_dirty_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     entered = threading.Event()
     release = threading.Event()
@@ -579,13 +752,18 @@ def test_manager_rate_limits_repeated_cleanup_scans(tmp_path: Path, monkeypatch:
         now: float | None = None,
         protected_paths: set[Path] | None = None,
     ) -> BackupCleanupResult:
-        calls.append(time.monotonic())
+        if directory == tmp_path:
+            calls.append(time.monotonic())
         return original(directory, policy, now=now, protected_paths=protected_paths)
 
     monkeypatch.setattr(backups, "cleanup_backups", tracked_cleanup)
     manager = BackupRetentionManager(tmp_path, _policy(interval=0.05))
     manager.schedule()
     assert manager.flush(2)
+    unrelated = BackupRetentionManager(tmp_path / "unrelated", _policy(interval=0.05))
+    unrelated.schedule()
+    assert unrelated.flush(2)
+    assert unrelated.snapshot()["last_result"] is not None
     manager.schedule()
     assert manager.flush(2)
     assert len(calls) == 2

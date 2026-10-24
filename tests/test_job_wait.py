@@ -229,7 +229,6 @@ def test_mcp_job_wait_returns_existing_output_immediately(
     job_id = _seed(store)
     (store.output_dir / job_id / "stdout.bin").write_bytes(b"collecting 42 items\n")
     monkeypatch.setattr(registry, "JobStore", lambda: store)
-    monkeypatch.setattr(registry, "ensure_job_scheduler", lambda _: None)
 
     async def scenario() -> None:
         server = MCPServer("jobs-progress")
@@ -271,7 +270,6 @@ def test_mcp_job_wait_returns_heartbeat_when_no_progress(
     store = JobStore(tmp_path / "jobs.sqlite3")
     job_id = _seed(store)
     monkeypatch.setattr(registry, "JobStore", lambda: store)
-    monkeypatch.setattr(registry, "ensure_job_scheduler", lambda _: None)
 
     async def scenario() -> None:
         server = MCPServer("jobs-heartbeat")
@@ -306,7 +304,6 @@ def test_mcp_job_wait_preserves_explicit_short_timeout(
     store = JobStore(tmp_path / "jobs.sqlite3")
     job_id = _seed(store)
     monkeypatch.setattr(registry, "JobStore", lambda: store)
-    monkeypatch.setattr(registry, "ensure_job_scheduler", lambda _: None)
 
     async def scenario() -> None:
         server = MCPServer("jobs-timeout")
@@ -336,7 +333,6 @@ def test_mcp_job_wait_does_not_block_state_update(tmp_path: Path, monkeypatch: p
     store = JobStore(tmp_path / "jobs.sqlite3")
     job_id = _seed(store)
     monkeypatch.setattr(registry, "JobStore", lambda: store)
-    monkeypatch.setattr(registry, "ensure_job_scheduler", lambda _: None)
 
     async def scenario() -> None:
         server = MCPServer("jobs-wait")

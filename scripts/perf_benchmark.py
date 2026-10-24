@@ -49,7 +49,9 @@ from tools.filesystem.search_snapshots import SearchSnapshotStore, search_finger
 from tools.filesystem.service import search_by_name, search_by_name_streaming
 from tools.git.service import run_git
 from tools.language.edits import prepare_workspace_edit
-from tools.language.lsp import _frame, _parse_frames
+from tools.language.lsp import LspClient, _frame, _parse_frames
+from tools.language.providers import LspProvider, command_for
+from tools.language.sessions import LspSessionManager
 from tools.project.context import lookup_code_context
 from tools.project.service import parse_python
 from tools.testing.diagnostics import merge_diagnostics
@@ -70,6 +72,8 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "artifact_files": [1_000],
         "job_history_rows": [500],
         "extension_counts": [1, 2],
+        "lsp_requests": [1, 10],
+        "lsp_workspaces": [1, 2],
     },
     "full": {
         "output_sizes": [1_024, MiB, 100 * MiB],
@@ -82,6 +86,8 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "artifact_files": [5_000],
         "job_history_rows": [2_000],
         "extension_counts": [1, 2, 4],
+        "lsp_requests": [1, 10, 100],
+        "lsp_workspaces": [1, 2],
     },
 }
 SUITES = (
@@ -98,6 +104,7 @@ SUITES = (
     "resilience",
     "workflow",
     "extensions",
+    "lsp",
 )
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
@@ -795,6 +802,303 @@ def _lsp_protocol_once() -> dict[str, Any]:
     if parsed != [payload]:
         raise RuntimeError("LSP framing correctness mismatch.")
     return {"bytes": len(framed), "messages": len(parsed)}
+
+
+@dataclass(slots=True)
+class _LspSample:
+    peak_rss_bytes: int
+    peak_handles: int
+    spawns: int
+    max_queue: int
+
+
+class _LspSampler:
+    """Sample only LSP fixture descendants, excluding the benchmark process itself."""
+
+    def __init__(
+        self,
+        entrypoint: Path,
+        *,
+        queue_depth: Callable[[], int] | None = None,
+        interval_sec: float = 0.01,
+    ) -> None:
+        self._entrypoint_real = os.path.realpath(entrypoint)
+        self._entrypoint_name = entrypoint.name
+        self._queue_depth = queue_depth
+        self._interval_sec = interval_sec
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._peak_rss = 0
+        self._peak_handles = 0
+        self._pids: set[int] = set()
+        self._max_queue = 0
+
+    def _matches_entrypoint(self, argument: str) -> bool:
+        """Match the fixture despite POSIX symlink rewrites such as /var -> /private/var."""
+
+        if not argument:
+            return False
+        try:
+            if os.path.realpath(argument) == self._entrypoint_real:
+                return True
+        except OSError:
+            pass
+        return os.path.basename(argument) == self._entrypoint_name
+
+    @staticmethod
+    def _descends_from(process: psutil.Process, parent_pid: int) -> bool:
+        seen: set[int] = set()
+        try:
+            current = process.ppid()
+            while current not in (0, parent_pid):
+                if current in seen:
+                    return False
+                seen.add(current)
+                current = psutil.Process(current).ppid()
+            return current == parent_pid
+        except psutil.Error:
+            return False
+
+    def _sample_once(self) -> None:
+        rss = 0
+        handles = 0
+        pids: list[int] = []
+        benchmark = psutil.Process()
+        benchmark_pid = benchmark.pid
+        try:
+            children = benchmark.children(recursive=True)
+        except psutil.Error:
+            try:
+                children = list(psutil.process_iter())
+            except psutil.Error:
+                children = []
+        for child in children:
+            try:
+                if not any(self._matches_entrypoint(argument) for argument in child.cmdline()):
+                    continue
+                if not self._descends_from(child, benchmark_pid):
+                    continue
+                if child.ppid() == benchmark_pid:
+                    pids.append(child.pid)
+                rss += child.memory_info().rss
+                num_handles = getattr(child, "num_handles", None)
+                handles += int(num_handles()) if num_handles is not None else int(child.num_fds())
+            except (psutil.Error, AttributeError, OSError):
+                continue
+        queue_depth = int(self._queue_depth()) if self._queue_depth is not None else 0
+        with self._lock:
+            self._peak_rss = max(self._peak_rss, rss)
+            self._peak_handles = max(self._peak_handles, handles)
+            self._pids.update(pids)
+            self._max_queue = max(self._max_queue, queue_depth)
+
+    def _sample(self) -> None:
+        while not self._stop.wait(self._interval_sec):
+            self._sample_once()
+
+    def start(self) -> None:
+        self._sample_once()
+        self._thread = threading.Thread(target=self._sample, name="lsp-fixture-sampler", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> _LspSample:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._sample_once()
+        with self._lock:
+            return _LspSample(self._peak_rss, self._peak_handles, len(self._pids), self._max_queue)
+
+
+def _lsp_percentile(samples: list[float], fraction: float) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    return round(ordered[max(int(len(ordered) * fraction) - 1, 0)], 3)
+
+
+def _lsp_case_details(
+    *,
+    started: float,
+    latencies_ms: list[float],
+    spawns: int,
+    restarts: int,
+    max_queue: int,
+    peak_rss: int,
+    open_handles: int,
+    errors: int,
+) -> dict[str, object]:
+    return {
+        "elapsed": round(time.perf_counter() - started, 3),
+        "p50": _lsp_percentile(latencies_ms, 0.50),
+        "p95": _lsp_percentile(latencies_ms, 0.95),
+        "p99": _lsp_percentile(latencies_ms, 0.99),
+        "spawns": spawns,
+        "restarts": restarts,
+        "max_queue": max_queue,
+        "peak_rss": round(peak_rss / MiB, 3),
+        "open_handles": open_handles,
+        "errors": errors,
+    }
+
+
+def _one_shot_request(
+    provider: LspProvider,
+    workspace: Path,
+    index: int,
+    sampler: _LspSampler,
+) -> tuple[bool, float]:
+    """Run one one-shot request while sampling its short-lived child from this thread."""
+    started = time.perf_counter()
+    outcome: list[bool] = []
+
+    def run() -> None:
+        try:
+            LspClient(list(command_for(provider)), workspace, timeout_sec=30).request(
+                "workspace/symbol", {"query": f"benchmark-{index}"},
+            )
+            outcome.append(True)
+        except Exception:
+            outcome.append(False)
+
+    worker = threading.Thread(target=run, name="lsp-one-shot-request", daemon=True)
+    worker.start()
+    while worker.is_alive():
+        sampler._sample_once()
+        worker.join(timeout=0.002)
+    worker.join()
+    return (outcome[0] if outcome else False), (time.perf_counter() - started) * 1_000
+
+
+def _lsp_session_case(requests: int, workspaces: int, persistent: bool) -> dict[str, object]:
+    """Measure the reviewed local fixture only; this is not real-provider coverage.
+
+    Persistent cases warm one session per workspace before timing; one-shot cases are
+    the cold baseline. Per-session requests stay serial, so latency excludes queueing.
+    """
+
+    if type(requests) is not int or not 1 <= requests <= 1_000:
+        raise ValueError("requests must be an integer between 1 and 1000")
+    if type(workspaces) is not int or not 1 <= workspaces <= 2:
+        raise ValueError("workspaces must be 1 or 2")
+    fixture = PROJECT_ROOT / "tests" / "fixtures" / "persistent_lsp_server.py"
+    if not fixture.is_file():
+        raise BenchmarkSkip("The persistent LSP fixture is unavailable.")
+    executable = Path(sys.executable).resolve()
+    started = time.perf_counter()
+    with _temporary_root("lsp-session") as temporary:
+        root = Path(temporary)
+        entrypoint = root / "lsp_benchmark_server.py"
+        shutil.copyfile(fixture, entrypoint)
+        provider = LspProvider(
+            provider_id="pyright",
+            languages=("python",),
+            executable=executable,
+            executable_sha256=_hash_file(executable),
+            entrypoint=entrypoint,
+            entrypoint_sha256=_hash_file(entrypoint),
+            declared_version="fixture",
+            trusted_roots=(root,),
+        )
+        workspace_roots = [root / f"workspace_{index}" for index in range(workspaces)]
+        for workspace in workspace_roots:
+            workspace.mkdir()
+        latencies_ms: list[float] = []
+        errors = 0
+        peak_rss = 0
+        open_handles = 0
+        max_queue = 0
+
+        if persistent:
+            manager = LspSessionManager((provider,), generation=f"benchmark-{uuid.uuid4().hex}")
+            sampler = _LspSampler(entrypoint, queue_depth=lambda: manager.snapshot()["queue_depth"])
+            sampler.start()
+
+            async def run_requests() -> None:
+                nonlocal errors
+                for workspace in workspace_roots:
+                    try:
+                        await manager.arequest(
+                            workspace, "python", "workspace/symbol",
+                            {"query": "warmup"}, timeout_sec=30,
+                        )
+                    except Exception:
+                        errors += 1
+
+                async def run_workspace(workspace: Path, indices: list[int]) -> None:
+                    nonlocal errors
+                    for index in indices:
+                        request_started = time.perf_counter()
+                        try:
+                            await manager.arequest(
+                                workspace, "python", "workspace/symbol",
+                                {"query": f"benchmark-{index}"}, timeout_sec=30,
+                            )
+                        except Exception:
+                            errors += 1
+                        latencies_ms.append((time.perf_counter() - request_started) * 1_000)
+
+                assignments = [
+                    [index for index in range(requests) if index % workspaces == workspace_index]
+                    for workspace_index in range(workspaces)
+                ]
+                await asyncio.gather(*(
+                    run_workspace(workspace, indices)
+                    for workspace, indices in zip(workspace_roots, assignments, strict=True)
+                ))
+
+            live_rss = 0
+            try:
+                try:
+                    asyncio.run(run_requests())
+                    live_rss = manager.snapshot()["rss_bytes"]
+                finally:
+                    manager.close_all(timeout_sec=5)
+            finally:
+                sample = sampler.stop()
+            snapshot = manager.snapshot()
+            if snapshot["active"] or snapshot["quarantined"]:
+                raise RuntimeError("Persistent LSP sessions were not fully cleaned up.")
+            spawns = snapshot["spawn_count"]
+            restarts = snapshot["restart_count"]
+            max_queue = sample.max_queue
+            peak_rss = max(sample.peak_rss_bytes, live_rss)
+            open_handles = sample.peak_handles
+        else:
+            spawns = 0
+            for index in range(requests):
+                workspace = workspace_roots[index % workspaces]
+                sampler = _LspSampler(entrypoint)
+                sampler.start()
+                try:
+                    succeeded, elapsed_ms = _one_shot_request(provider, workspace, index, sampler)
+                finally:
+                    sample = sampler.stop()
+                latencies_ms.append(elapsed_ms)
+                if not succeeded:
+                    errors += 1
+                peak_rss = max(peak_rss, sample.peak_rss_bytes)
+                open_handles = max(open_handles, sample.peak_handles)
+                if succeeded:
+                    # A completed one-shot request always launched the server; this
+                    # minimum covers a child that exited between sampler ticks.
+                    spawns += max(sample.spawns, 1)
+            restarts = 0
+
+        if errors:
+            raise RuntimeError(f"{errors} LSP request(s) failed; benchmark case must fail closed.")
+
+        return _lsp_case_details(
+            started=started,
+            latencies_ms=latencies_ms,
+            spawns=spawns,
+            restarts=restarts,
+            max_queue=max_queue,
+            peak_rss=peak_rss,
+            open_handles=open_handles,
+            errors=errors,
+        )
 
 
 def _workspace_edit_plan_once(root: Path) -> dict[str, Any]:
@@ -2139,6 +2443,24 @@ def run_benchmarks(
                 )
             results.append(measure("extensions_fault_isolation", partial(_extension_fault_isolation_once, root), runs))
             results.append(measure("extensions_bounded_resources", partial(_extension_bounded_resources_once, root), runs))
+
+    if "lsp" in suites:
+        for requests in limits["lsp_requests"]:
+            for workspaces in limits["lsp_workspaces"]:
+                results.append(
+                    measure(
+                        f"lsp_persistent_{requests}_requests_{workspaces}_workspaces",
+                        partial(_lsp_session_case, requests, workspaces, True),
+                        runs,
+                    )
+                )
+                results.append(
+                    measure(
+                        f"lsp_one_shot_{requests}_requests_{workspaces}_workspaces",
+                        partial(_lsp_session_case, requests, workspaces, False),
+                        runs,
+                    )
+                )
 
     process = psutil.Process()
     return {

@@ -8,6 +8,7 @@ Available profiles:
 
 - `minimal`
 - `coding`
+- `coding_core` (unreleased opt-in; model UX pilot pending)
 - `git`
 - `testing`
 - `documents`
@@ -23,6 +24,8 @@ MCP_TOOL_PROFILE=<profile>
 ```
 
 `discover_tool_domains` reports the requested/active domains and platform capabilities. `recommend_tools` searches only the tools actually registered in the active profile and attaches shared execution metadata when known.
+
+`coding_core` uses the coding domains with an exact 43-tool native catalog covering discovery, files, project/LSP context, verification, Git, recovery and job observation/cancellation. Set it before startup and restart; clients can cache the catalog for the whole session. Choose `coding` or `full` and restart when broader capabilities are needed. Hidden native tools are rejected before dispatch, and extensions need explicit `coding_core` profile eligibility. Profiles are capability filters, not security sandboxes; visible mutations keep their existing policy, lifecycle and recovery guards. Static SDK journeys pass, but the separately budgeted live-model UX comparison is unverified; this profile does not change the default.
 
 ## Adaptive execution routing
 
@@ -128,6 +131,24 @@ Testing tools integrate:
 - merged diagnostics;
 - change-aware verification;
 - durable validation watches.
+
+`affected_tests` keeps Python selection by default and accepts `test_backend="auto"` for read-only package runner plans.
+JavaScript, TypeScript, PHP and other executable or unclassified changes always report unknown coverage, including in the
+default Python mode. Auto mode uses bounded package/runner metadata and source fingerprints; it recommends package full
+suites and broadens across packages when dependency coverage is unavailable. It never starts an LSP provider or executes
+package scripts/configuration. `package_selections`, `missing_inputs`, `source_fingerprint`, Git/worktree identity and
+`total_exact` describe the evidence and its limits. Renames preserve destination-only `changed_paths` and expose both
+paths through `touched_paths`; deleted tests are not suggested as runnable files. The result cap applies across flat
+Python tests and package selections. A full-suite recommendation or `tests=[]` with incomplete evidence is not test success.
+Runner execution through verification is a separate integration step; existing verification entrypoints still use Python.
+
+Internal runner helpers bind the current workspace, installed entrypoint and host runtime to hashes, then revalidate
+them under managed package claims before each direct invocation. They use fixed argv for Jest 29, Vitest 3,
+PHPUnit 11 and Pest 3; unsupported versions remain unavailable. Python keeps its virtual-environment invocation path,
+and unittest requires an explicit selection. Package scripts, shell launchers and automatic installs are excluded.
+Reports use private temporary storage and bounded parsing; missing, invalid or zero-test results remain unknown.
+Timeouts use the existing owned process-tree cleanup and never retry a possibly completed run. These helpers do not
+establish sandbox isolation or prove that an installed foreign runner has passed its real integration gate.
 
 Recommended code-change loop:
 

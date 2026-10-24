@@ -5,12 +5,15 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
+import scripts.perf_benchmark as perf_benchmark
 from core.jobs import JobStore
 from core.registry import create_server
 from scripts.perf_benchmark import (
@@ -31,6 +34,8 @@ from scripts.perf_benchmark import (
     _job_wait_change_once,
     _job_wait_timeout_once,
     _launcher_validation_once,
+    _lsp_session_case,
+    _one_shot_request,
     _output_once,
     _prepare_python_fixture,
     _prepare_workflow_history_fixture,
@@ -47,6 +52,7 @@ from scripts.perf_benchmark import (
     _workflow_start_once,
     _workflow_status_once,
     _workflow_store_reopen_once,
+    build_parser,
     measure,
     run_benchmarks,
 )
@@ -71,8 +77,173 @@ def test_benchmark_profiles_cover_planned_scale_points() -> None:
     assert full["artifact_files"] == [5_000]
     assert full["job_history_rows"] == [2_000]
     assert full["extension_counts"] == [1, 2, 4]
+    assert full["lsp_requests"] == [1, 10, 100]
+    assert full["lsp_workspaces"] == [1, 2]
     quick = PROFILE_LIMITS["quick"]
     assert quick["extension_counts"] == [1, 2]
+    assert quick["lsp_requests"] == [1, 10]
+
+
+_LSP_DETAIL_KEYS = {
+    "elapsed",
+    "p50",
+    "p95",
+    "p99",
+    "spawns",
+    "restarts",
+    "max_queue",
+    "peak_rss",
+    "open_handles",
+    "errors",
+}
+
+
+def test_lsp_benchmark_reports_spawn_counts_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    persistent = _lsp_session_case(4, 2, True)
+    warmed = _lsp_session_case(1, 2, True)
+    cold = _lsp_session_case(1, 1, True)
+    one_shot = _lsp_session_case(2, 1, False)
+
+    assert persistent["spawns"] == 2
+    assert warmed["spawns"] == 2
+    assert cold["spawns"] == 1
+    assert one_shot["spawns"] == 2
+    for name, case in (
+        ("persistent", persistent),
+        ("warmed", warmed),
+        ("cold", cold),
+        ("one_shot", one_shot),
+    ):
+        assert set(case) == _LSP_DETAIL_KEYS, name
+        assert case["errors"] == 0, name
+        assert case["restarts"] == 0, name
+        assert cast(float, case["elapsed"]) > 0, name
+        assert 0 <= cast(float, case["p50"]) <= cast(float, case["p99"]), name
+        assert 0 <= cast(float, case["p95"]) <= cast(float, case["p99"]), name
+        assert cast(int, case["max_queue"]) >= 0, name
+        assert cast(float, case["peak_rss"]) > 0, name
+        assert cast(int, case["open_handles"]) > 0, name
+
+
+def test_one_shot_request_samples_while_request_is_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    release = threading.Event()
+
+    class FakeClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def request(self, *_args: object, **_kwargs: object) -> object:
+            assert release.wait(2)
+            return {}
+
+    def sample() -> None:
+        calls.append(1)
+        if len(calls) >= 2:
+            release.set()
+
+    monkeypatch.setattr(perf_benchmark, "LspClient", FakeClient)
+    monkeypatch.setattr(perf_benchmark, "command_for", lambda _provider: ["python"])
+    sampler: Any = SimpleNamespace(_sample_once=sample)
+    succeeded, elapsed_ms = _one_shot_request(cast(Any, object()), tmp_path, 0, sampler)
+
+    assert succeeded is True
+    assert elapsed_ms > 0
+    assert len(calls) >= 2
+
+
+def test_lsp_benchmark_fails_closed_on_request_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+
+    class FailingClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def request(self, *args: object, **kwargs: object) -> object:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(perf_benchmark, "LspClient", FailingClient)
+    result = measure("lsp_failure", lambda: _lsp_session_case(1, 1, False), 1)
+    assert result["status"] == "error"
+    assert result["error"] == "RuntimeError"
+    assert "LSP request" in result["message"]
+
+
+def test_lsp_persistent_benchmark_fails_closed_on_request_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+
+    async def failing_arequest(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(perf_benchmark.LspSessionManager, "arequest", failing_arequest)
+    result = measure("lsp_persistent_failure", lambda: _lsp_session_case(1, 1, True), 1)
+    assert result["status"] == "error"
+    assert result["error"] == "RuntimeError"
+    assert "LSP request" in result["message"]
+
+
+def test_lsp_persistent_benchmark_fails_closed_on_warmup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    calls = 0
+
+    async def warmup_failing_arequest(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("warmup boom")
+        return {"ok": True}
+
+    monkeypatch.setattr(perf_benchmark.LspSessionManager, "arequest", warmup_failing_arequest)
+    result = measure("lsp_warmup_failure", lambda: _lsp_session_case(1, 1, True), 1)
+    assert result["status"] == "error"
+    assert result["error"] == "RuntimeError"
+    assert "LSP request" in result["message"]
+    assert calls == 2
+
+
+def test_lsp_suite_runs_through_benchmark_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    parser = build_parser()
+    assert parser.parse_args(["--suite", "lsp"]).suites == ["lsp"]
+
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"lsp"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    cases = {item["name"]: item for item in report["results"]}
+    expected_spawns = {
+        f"lsp_persistent_{requests}_requests_{workspaces}_workspaces": workspaces
+        for requests in (1, 10)
+        for workspaces in (1, 2)
+    }
+    expected_spawns.update({
+        f"lsp_one_shot_{requests}_requests_{workspaces}_workspaces": requests
+        for requests in (1, 10)
+        for workspaces in (1, 2)
+    })
+    assert set(cases) == set(expected_spawns)
+    assert len(report["results"]) == len(expected_spawns)
+    assert all(item["status"] == "ok" for item in report["results"])
+    for name, expected in expected_spawns.items():
+        details = cases[name]["details"]
+        assert details["errors"] == 0, name
+        assert details["spawns"] == expected, name
 
 
 def test_browser_pool_details_report_instances_contexts_and_keys() -> None:

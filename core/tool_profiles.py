@@ -35,6 +35,19 @@ PROFILE_DOMAINS: dict[str, tuple[str, ...]] = {
     "operations": ("terminal", "process", "system", "windows", "jobs", "recovery", "workflows"),
     "full": ALL_DOMAINS,
 }
+PROFILE_DOMAINS["coding_core"] = PROFILE_DOMAINS["coding"]
+
+CODING_CORE_TOOLS = frozenset("""
+discover_tool_domains recommend_tools execution_candidates execution_recommend server_health
+read_file search_files list_directory get_file_info apply_patch replace_exact write_file create_file
+project_summary code_context
+symbol_definition symbol_references document_symbols workspace_symbols symbol_hover
+call_hierarchy language_diagnostics rename_symbol apply_code_action
+affected_tests verify_changes start_verification
+git_status git_diff git_diff_summary git_changed_files git_stage git_commit git_conflicts
+list_uncertain_operations inspect_uncertain_operation reconcile_operation acknowledge_uncertain_operation get_operation_history
+job_status job_wait job_output cancel_job
+""".split())
 
 PREFERRED_USE: dict[str, str] = {
     "apply_patch": "Use for transactional multi-file unified-diff edits.",
@@ -58,6 +71,7 @@ PREFERRED_USE: dict[str, str] = {
 class ToolProfile:
     name: str
     domains: tuple[str, ...]
+    native_allowlist: frozenset[str] | None = None
 
 
 def resolve_profile(name: str | None) -> ToolProfile:
@@ -69,5 +83,5 @@ def resolve_profile(name: str | None) -> ToolProfile:
             f"Unknown MCP tool profile {name!r}.",
             hint=f"Use one of: {', '.join(PROFILE_DOMAINS)}.",
         )
-    return ToolProfile(normalized, domains)
+    return ToolProfile(normalized, domains, CODING_CORE_TOOLS if normalized == "coding_core" else None)
 
