@@ -142,6 +142,14 @@ paths through `touched_paths`; deleted tests are not suggested as runnable files
 Python tests and package selections. A full-suite recommendation or `tests=[]` with incomplete evidence is not test success.
 Runner execution through verification is a separate integration step; existing verification entrypoints still use Python.
 
+Internal runner helpers bind the current workspace, installed entrypoint and host runtime to hashes, then revalidate
+them under managed package claims before each direct invocation. They use fixed argv for Jest 29, Vitest 3,
+PHPUnit 11 and Pest 3; unsupported versions remain unavailable. Python keeps its virtual-environment invocation path,
+and unittest requires an explicit selection. Package scripts, shell launchers and automatic installs are excluded.
+Reports use private temporary storage and bounded parsing; missing, invalid or zero-test results remain unknown.
+Timeouts use the existing owned process-tree cleanup and never retry a possibly completed run. These helpers do not
+establish sandbox isolation or prove that an installed foreign runner has passed its real integration gate.
+
 Recommended code-change loop:
 
 ```text

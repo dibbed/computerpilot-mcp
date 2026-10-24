@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import stat
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -19,7 +20,7 @@ except ImportError:  # Python 3.10 reports missing parser evidence instead of gu
 
 from core.config import resolve_path
 from core.errors import ToolError
-from tools.project.project_types import ManifestInfo, PackageInfo, ProjectInventory, _read_bytes
+from tools.project.project_types import ManifestInfo, PackageInfo, ProjectInventory, _read_bytes, detect_project_types
 
 RunnerKind = Literal["pytest", "unittest", "jest", "vitest", "phpunit", "pest", "unknown"]
 
@@ -54,6 +55,15 @@ _PHP_CONFIGS = ("phpunit.xml", "phpunit.xml.dist")
 
 
 @dataclass(frozen=True, slots=True)
+class RunnerRuntime:
+    """Identity selected by an authorized native invocation, never by project metadata."""
+
+    path: Path
+    sha256: str
+    binary_path: Path
+
+
+@dataclass(frozen=True, slots=True)
 class RunnerSpec:
     runner: RunnerKind
     package_root: Path
@@ -64,6 +74,10 @@ class RunnerSpec:
     discovery_evidence: tuple[str, ...]
     complete: bool
     missing_inputs: tuple[str, ...]
+    workspace_root: Path | None = None
+    workspace_id: str | None = None
+    runtime: RunnerRuntime | None = None
+    entrypoint_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -719,3 +733,159 @@ def discover_test_runners(root: Path, inventory: ProjectInventory) -> RunnerInve
         complete=inventory.complete and all(spec.complete for spec in specs),
         missing_inputs=tuple(sorted(dict.fromkeys(missing))),
     )
+
+
+def _execution_error(code: str = "stale_test_runner") -> ToolError:
+    return ToolError(code, "The test runner identity is unavailable, unsupported, or changed; rediscover before execution.")
+
+
+def _file_sha256(path: Path, maximum: int = 256 * 1024 * 1024) -> str:
+    """Hash bounded regular files without accepting a replaced file or final symlink."""
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode) or before.st_size > maximum
+            or int(getattr(before, "st_file_attributes", 0)) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ):
+            raise _execution_error()
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            digest = hashlib.sha256()
+            consumed = 0
+            while chunk := stream.read(min(65536, maximum + 1 - consumed)):
+                consumed += len(chunk)
+                if consumed > maximum:
+                    raise _execution_error()
+                digest.update(chunk)
+            finished = os.fstat(stream.fileno())
+        after = path.lstat()
+        identities = {(item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns) for item in (before, opened, finished, after)}
+        if len(identities) != 1 or consumed != before.st_size:
+            raise _execution_error()
+        return digest.hexdigest()
+    except (OSError, ValueError):
+        raise _execution_error() from None
+
+
+def _execution_runtime(spec: RunnerSpec, root: Path) -> Path:
+    if spec.runner in {"pytest", "unittest"}:
+        from tools.testing.runners import python_for
+
+        candidate = Path(python_for(spec.package_root))
+        if not candidate.is_absolute():
+            raise _execution_error("runtime_unavailable")
+        return candidate.parent.resolve(strict=True) / candidate.name
+    name = "node" if spec.runner in {"jest", "vitest"} else "php"
+    # Do not let Windows' implicit cwd search, PATHEXT scripts, or project PATH entries select a runtime.
+    for value in os.environ.get("PATH", "").split(os.pathsep):
+        directory = Path(value)
+        if not value or not directory.is_absolute():
+            continue
+        try:
+            directory = directory.resolve(strict=True)
+            if directory.is_relative_to(root):
+                continue
+            candidate = directory / (name + ".exe" if os.name == "nt" else name)
+            resolved = candidate.resolve(strict=True)
+            if resolved.is_relative_to(root) or not resolved.is_file() or not os.access(resolved, os.X_OK):
+                continue
+            if resolved.suffix.casefold() in {".cmd", ".bat", ".ps1"}:
+                continue
+            return resolved
+        except (OSError, RuntimeError):
+            continue
+    raise _execution_error("runtime_unavailable")
+
+
+def _discovery_spec(spec: RunnerSpec) -> RunnerSpec:
+    return replace(spec, workspace_root=None, workspace_id=None, runtime=None, entrypoint_sha256=None)
+
+
+def _current_runner(spec: RunnerSpec, root: Path) -> ProjectInventory:
+    inventory = detect_project_types(root)
+    fresh = discover_test_runners(root, inventory)
+    selected = _discovery_spec(spec)
+    candidates = list(fresh.runners)
+    if spec.runner == "unittest":
+        candidates.extend(
+            replace(item, runner="unittest", complete=True, missing_inputs=())
+            for item in fresh.runners
+            if item.runner == "unknown" and item.missing_inputs == ("runner_required",)
+            and any(value.startswith("tests_directory:") for value in item.discovery_evidence)
+            and any(manifest.kind == "python" for package in inventory.packages if package.root == item.package_root
+                    for manifest in package.manifests)
+        )
+    if not inventory.complete or selected not in candidates or not spec.complete:
+        raise _execution_error()
+    return inventory
+
+
+def _execution_workspace_id(root: Path, inventory: ProjectInventory) -> str:
+    info = root.stat()
+    return hashlib.sha256(f"{inventory.worktree_id}:{info.st_dev}:{info.st_ino}".encode()).hexdigest()
+
+
+def bind_runner_runtime(
+    spec: RunnerSpec, *, workspace_root: Path, runner: Literal["unittest"] | None = None,
+) -> RunnerSpec:
+    """Bind host runtime identity at the native authorization boundary; this grants no permission."""
+    if spec.runtime is not None:
+        validate_runner_execution(spec)
+        if workspace_root.resolve(strict=True) != spec.workspace_root or (runner is not None and runner != spec.runner):
+            raise _execution_error()
+        return spec
+    try:
+        if runner is not None:
+            if runner != "unittest" or spec.runner != "unknown" or spec.missing_inputs != ("runner_required",):
+                raise _execution_error()
+            spec = replace(spec, runner="unittest", complete=True, missing_inputs=())
+        root = workspace_root.resolve(strict=True)
+        if (
+            not workspace_root.is_absolute() or spec.package_root.resolve(strict=True) != spec.package_root
+            or not spec.package_root.is_relative_to(root)
+        ):
+            raise _execution_error()
+        inventory = _current_runner(spec, root)
+        runtime = _execution_runtime(spec, root)
+        binary = runtime.resolve(strict=True)
+        bound = replace(
+            spec, workspace_root=root, workspace_id=_execution_workspace_id(root, inventory),
+            runtime=RunnerRuntime(runtime, _file_sha256(binary), binary),
+            entrypoint_sha256=_file_sha256(spec.entrypoint, _MAX_AGGREGATE_BYTES) if spec.entrypoint else None,
+        )
+        validate_runner_execution(bound)
+        return bound
+    except (OSError, RuntimeError) as exc:
+        if isinstance(exc, ToolError):
+            raise
+        raise _execution_error() from None
+
+
+def validate_runner_execution(spec: RunnerSpec) -> None:
+    """Recheck current discovery and original pins immediately before every spawn."""
+    try:
+        root, runtime = spec.workspace_root, spec.runtime
+        if (
+            root is None or runtime is None or not root.is_absolute() or root.resolve(strict=True) != root
+            or not spec.package_root.is_relative_to(root) or spec.package_root.resolve(strict=True) != spec.package_root
+            or not runtime.path.is_absolute() or runtime.path.parent.resolve(strict=True) != runtime.path.parent
+            or runtime.path.resolve(strict=True) != runtime.binary_path
+            or (spec.runner not in {"pytest", "unittest"} and runtime.path != runtime.binary_path)
+            or runtime.path.suffix.casefold() in {".cmd", ".bat", ".ps1"}
+        ):
+            raise _execution_error()
+        inventory = _current_runner(spec, root)
+        if _execution_workspace_id(root, inventory) != spec.workspace_id or _execution_runtime(spec, root) != runtime.path:
+            raise _execution_error()
+        if _file_sha256(runtime.binary_path) != runtime.sha256:
+            raise _execution_error()
+        if spec.entrypoint is not None:
+            if _file_sha256(spec.entrypoint, _MAX_AGGREGATE_BYTES) != spec.entrypoint_sha256:
+                raise _execution_error()
+        elif spec.entrypoint_sha256 is not None:
+            raise _execution_error()
+    except (OSError, RuntimeError) as exc:
+        if isinstance(exc, ToolError):
+            raise
+        raise _execution_error() from None
