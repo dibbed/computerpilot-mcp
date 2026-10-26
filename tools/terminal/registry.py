@@ -108,7 +108,7 @@ def register(mcp: MCPServer) -> None:
         delivery: Literal["inline", "file", "auto"] = output_default,
     ) -> dict[str, Any]:
         """Run PowerShell non-interactively with optional output limits and a hard timeout.
-        Use for cmdlets/pipelines; prefer run_process for binaries and native tools for files/search/Git.
+        For cmdlets/pipelines; prefer run_process or native file/search/Git tools.
         """
 
         executable = shutil.which("pwsh") or shutil.which("powershell")
