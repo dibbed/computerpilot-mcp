@@ -16,14 +16,16 @@ from tools.language.edits import apply_workspace_edit, prepare_workspace_edit
 
 @pytest.fixture(autouse=True)
 def _workspace_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    from dataclasses import replace
     from types import SimpleNamespace
 
-    from core import recovery
+    from core import config, recovery
     from core.backups import BackupPolicy, BackupRetentionManager
     from tools.filesystem import service
 
     journal = tmp_path / "runtime" / "operation-recovery.jsonl"
     journal.parent.mkdir()
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=journal.parent))
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
     monkeypatch.setattr(edits, "SETTINGS", SimpleNamespace(backup_dir=backup_dir))
@@ -167,7 +169,7 @@ def test_success_invalidates_context_and_lsp(
                     },
                 )
             )
-            assert applied["ok"] is True
+            assert applied["ok"] is True, applied.get("error")
 
     asyncio.run(scenario())
     assert target.read_text(encoding="utf-8") == "new\n"

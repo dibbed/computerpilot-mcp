@@ -32,6 +32,8 @@ EXCLUDED_DIRS = {
     "vendor",
     "__pycache__",
     ".agent_state",
+    ".real_lsp_tools",
+    ".real_lsp_runs",
     ".playwright-cli",
     ".pytest_cache",
     ".pytest-tmp",

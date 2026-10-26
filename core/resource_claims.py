@@ -321,6 +321,11 @@ def managed_resource_claims(
             if result["admitted"] is True:
                 admitted = True
                 break
+            if result.get("reason") == "resource_quarantined":
+                raise ToolError(
+                    "resource_quarantined",
+                    "Conflicting resource ownership is quarantined. Reconcile it before retrying; this operation was not dispatched.",
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 claim_store.release_resource_request(request_id, owner_token=owner_token)

@@ -604,3 +604,38 @@ def test_installed_vendor_packages_are_not_workspace_projects(tmp_path: Path) ->
     assert before.source_fingerprint == after.source_fingerprint
     explicit, truncated = service.iter_files(tmp_path / "vendor", 100)
     assert target in explicit and not truncated
+
+
+@pytest.mark.parametrize("ignored", [".real_lsp_tools", ".real_lsp_runs"])
+def test_ignored_real_lsp_fixtures_do_not_pollute_project_or_test_selection(
+    tmp_path: Path, ignored: str,
+) -> None:
+    from tools.project import service
+    from tools.testing.impact import select_affected_tests
+
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("def calculate() -> int:\n    return 1\n", encoding="utf-8")
+    test_file = tmp_path / "tests" / ignored / "isolated" / "test_false_positive.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text("def test_canary() -> None:\n    assert False\n", encoding="utf-8")
+
+    files, truncated = service.iter_files(tmp_path, 50)
+    assert not truncated
+    assert source in files
+    assert test_file not in files
+    assert not any(ignored in str(file) for file in files)
+
+    inventory_before = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert inventory_before.complete
+    test_file.write_text("def test_canary() -> None:\n    assert True\n", encoding="utf-8")
+    inventory_after = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert inventory_after.source_fingerprint == inventory_before.source_fingerprint
+
+    selection = select_affected_tests(
+        tmp_path, changed_paths=["src/app.py"], max_files=50, max_depth=5,
+        fallback_policy="report",
+    )
+    assert selection["ok"] is True
+    assert selection["test_count"] == 0
+    assert not any(ignored in item["path"] for item in selection["tests"])

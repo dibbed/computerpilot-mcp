@@ -750,6 +750,25 @@ def test_inherited_cleanup_storage_failure_preserves_parent_fence(tmp_path: Path
     )["admitted"] is False
 
 
+def test_managed_claims_report_quarantine_without_waiting_or_releasing_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
+    claim = path_claim(tmp_path / "target", "write")
+    store.reserve_resource_claims(request_id="blocked", owner_token="owner", category="test", claims=(claim,))
+    store.quarantine_resource_request("blocked", owner_token="owner", reason="cleanup_unresolved")
+    monkeypatch.setattr(resource_claims.time, "sleep", lambda _: pytest.fail("waited on unresolved quarantine"))
+
+    with pytest.raises(ToolError) as raised:
+        with managed_resource_claims((claim,), category="test", store=store):
+            pytest.fail("dispatched through quarantine")
+
+    assert raised.value.code == "resource_quarantined"
+    assert store.resource_request("blocked")["state"] == "quarantined"
+    summary = store.health_summary()
+    assert summary["pending_resource_request_count"] == 0
+
+
 @pytest.mark.parametrize("writer", ["document", "workspace_edit"])
 def test_document_and_language_writers_enforce_inherited_scope(tmp_path: Path, writer: str) -> None:
     from tools.documents.common import publish_document
