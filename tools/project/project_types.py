@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import time
 from collections import deque
@@ -190,15 +191,19 @@ def _directory_identity(path: Path, root: Path, expected: tuple[int, int, int] |
     return identity
 
 
-def detect_project_types(root: Path, *, max_manifests: int = 256, fingerprint_sources: bool = False) -> ProjectInventory:
+def detect_project_types(
+    root: Path, *, max_manifests: int = 256, fingerprint_sources: bool = False, fingerprint_inputs: bool = False,
+) -> ProjectInventory:
     if type(max_manifests) is not int or not 1 <= max_manifests <= _MAX_MANIFESTS:
         raise ToolError("inventory_limit", "Manifest admission must be between 1 and 256.")
     if type(fingerprint_sources) is not bool:
         raise ToolError("inventory_limit", "Source fingerprint selection must be a boolean.")
+    if type(fingerprint_inputs) is not bool or (fingerprint_inputs and not fingerprint_sources):
+        raise ToolError("inventory_limit", "Complete input fingerprints require source fingerprints.")
     root = resolve_path(root)
     if not root.is_dir():
         raise ToolError("project_scope_escape", "The selected project root must be an existing directory.")
-    deadline = time.monotonic() + _INVENTORY_SECONDS
+    deadline = time.monotonic() + (min(_INVENTORY_SECONDS, 0.25) if fingerprint_inputs else _INVENTORY_SECONDS)
     try:
         root_identity = _directory_identity(root, root)
     except (OSError, RuntimeError):
@@ -270,7 +275,10 @@ def detect_project_types(root: Path, *, max_manifests: int = 256, fingerprint_so
             try:
                 info = path.lstat()
                 is_directory = path.is_dir()
-                if is_directory and (path.name in EXCLUDED_DIRS or path.name.startswith(".pytest-tmp-")):
+                excluded = path.name in EXCLUDED_DIRS and not (
+                    fingerprint_inputs and path.name in {"node_modules", "vendor", ".venv", "venv", "build", "dist"}
+                )
+                if is_directory and (excluded or path.name.startswith(".pytest-tmp-")):
                     continue
                 if not path.resolve(strict=True).is_relative_to(root):
                     incomplete("project_scope_escape", current)
@@ -290,6 +298,18 @@ def detect_project_types(root: Path, *, max_manifests: int = 256, fingerprint_so
                 language = language_for_path(path)
                 if language != "unsupported":
                     languages.add(language)
+                if fingerprint_inputs and fingerprint_available:
+                    try:
+                        if path.name == ".env" or path.name.startswith(".env.") or ".secrets" in path.parts:
+                            raise ValueError("Private input is not cache evidence")
+                        data = _read_bytes(path, root, min(_MAX_SOURCE_FILE_BYTES, _MAX_SOURCE_BYTES - source_bytes))
+                        if re.search(rb"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|file://|~[\\/]|\.\.[\\/])", data):
+                            raise ValueError("Foreign inputs are not covered by this workspace")
+                        source_bytes += len(data)
+                        fingerprint_entries.append(("source", path.relative_to(root).as_posix(), hashlib.sha256(data).hexdigest()))
+                    except (OSError, RuntimeError, ToolError, ValueError):
+                        fingerprint_available = False
+                elif language != "unsupported":
                     if fingerprint_available:
                         try:
                             data = _read_bytes(path, root, min(_MAX_SOURCE_FILE_BYTES, _MAX_SOURCE_BYTES - source_bytes))
@@ -302,7 +322,7 @@ def detect_project_types(root: Path, *, max_manifests: int = 256, fingerprint_so
                         except (OSError, RuntimeError, ToolError, UnicodeError):
                             # Optional cache evidence must not hide otherwise usable package metadata.
                             fingerprint_available = False
-                if path.name in _FINGERPRINT_FILES:
+                if path.name in _FINGERPRINT_FILES and not fingerprint_inputs:
                     if fingerprint_available:
                         try:
                             data = _read_bytes(path, root, _MAX_MANIFEST_BYTES)
@@ -325,7 +345,7 @@ def detect_project_types(root: Path, *, max_manifests: int = 256, fingerprint_so
                     break
                 manifest, reason = _manifest(path, root)
                 packages.setdefault(path.parent, []).append(manifest)
-                if fingerprint_available:
+                if fingerprint_available and not fingerprint_inputs:
                     fingerprint_entries.append(("manifest", path.relative_to(root).as_posix(), manifest.sha256))
                 if manifest.kind == "python":
                     languages.add("python")
@@ -387,6 +407,31 @@ def detect_project_types(root: Path, *, max_manifests: int = 256, fingerprint_so
         missing_inputs=tuple(missing),
         source_fingerprint=source_fingerprint,
     )
+
+
+def lsp_input_fingerprint(root: Path, language_id: str) -> str | None:
+    """Conservative bounded input evidence; complex or external analysis stays uncached."""
+    name = "pyrightconfig.json" if language_id == "python" else "composer.json" if language_id == "php" else "tsconfig.json"
+    config = root / name
+    try:
+        parsed = json.loads(_read_bytes(config, root).decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+        if not isinstance(parsed, dict):
+            return None
+        pending: list[object] = [parsed]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                if value.keys() & {
+                    "extends", "references", "pythonPath", "venvPath", "extraPaths", "typeRoots", "stubPath", "typeshedPath", "plugins",
+                }:
+                    return None
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+        inventory = detect_project_types(root, fingerprint_sources=True, fingerprint_inputs=True)
+        return inventory.source_fingerprint
+    except (OSError, RuntimeError, ToolError, UnicodeError, ValueError, RecursionError):
+        return None
 
 
 def resolve_package_for_file(inventory: ProjectInventory, path: Path) -> PackageInfo | None:

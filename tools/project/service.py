@@ -21,6 +21,7 @@ EXCLUDED_DIRS = {
     ".venv",
     "venv",
     "node_modules",
+    "vendor",
     "__pycache__",
     ".agent_state",
     ".playwright-cli",

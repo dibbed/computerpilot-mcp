@@ -583,3 +583,24 @@ def test_source_fingerprint_revalidates_earlier_content_after_later_source_read(
     assert changed and target.stat().st_mtime_ns == before.st_mtime_ns
     assert inventory.complete
     assert inventory.source_fingerprint is None
+
+
+
+def test_installed_vendor_packages_are_not_workspace_projects(tmp_path: Path) -> None:
+    from tools.project import service
+
+    for relative in ["composer.json", "apps/first-party/composer.json", "vendor/acme/library/composer.json"]:
+        manifest = tmp_path / relative
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text('{"name":"fixture/package"}', encoding="utf-8")
+    target = tmp_path / "vendor/acme/library/internal.py"
+    target.write_text("private_dependency = 1\n", encoding="utf-8")
+    before = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert {item.root.relative_to(tmp_path).as_posix() for item in before.packages} == {".", "apps/first-party"}
+    files, truncated = service.iter_files(tmp_path, 100)
+    assert not truncated and not any(path.is_relative_to(tmp_path / "vendor") for path in files)
+    target.write_text("private_dependency = 2\n", encoding="utf-8")
+    after = detect_project_types(tmp_path, fingerprint_sources=True)
+    assert before.source_fingerprint == after.source_fingerprint
+    explicit, truncated = service.iter_files(tmp_path / "vendor", 100)
+    assert target in explicit and not truncated

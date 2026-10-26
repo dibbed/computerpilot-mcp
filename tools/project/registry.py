@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server import MCPServer
 from pydantic import Field
 
 from core.config import resolve_path
 from core.response import page
+from core.response_models import validate_tool_output
 from core.tooling import OPEN_WORLD_READ, READ_ONLY, PathArg, compact_errors
 from tools.project import service
 from tools.project.index import ClassMetadata, FunctionMetadata
-from tools.project.intelligence_models import CodePosition
+from tools.project.intelligence_models import CodeContextResult, CodePosition
+from tools.project.models import ProjectSummaryResult
 
 
 def _matches(candidate: str, query: str, mode: Literal["exact", "contains"]) -> bool:
@@ -78,10 +80,11 @@ def register(mcp: MCPServer) -> None:
     def project_summary(
         path: PathArg,
         max_files: Annotated[int, Field(ge=100, le=100_000)] = 10_000,
-    ) -> dict[str, Any]:
+    ) -> ProjectSummaryResult:
         """Detect languages, frameworks, dependencies, entry points, databases, and tests."""
 
-        return service.project_summary(resolve_path(path), max_files)
+        result = service.project_summary(resolve_path(path), max_files)
+        return cast(ProjectSummaryResult, validate_tool_output(ProjectSummaryResult, result, operation="project_summary"))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("find_function")
@@ -278,14 +281,14 @@ def register(mcp: MCPServer) -> None:
         language_id: Literal["auto", "python", "typescript", "javascript", "php"] | None = None,
         backend: Literal["auto", "ast", "semantic"] = "auto",
         semantic_anchor: CodePosition | None = None,
-    ) -> dict[str, Any]:
+    ) -> CodeContextResult:
         """Return bounded Python AST or configured semantic context; omitted language retains Python behavior."""
 
         from tools.language.sessions import LspSessionManager
         from tools.project.intelligence import lookup_project_context
 
         manager = getattr(mcp, "lsp_manager", None)
-        return await lookup_project_context(
+        result = await lookup_project_context(
             path,
             symbol,
             language_id=language_id, backend=backend, anchor=semantic_anchor,
@@ -297,3 +300,4 @@ def register(mcp: MCPServer) -> None:
                 "max_files": max_files, "max_relationships": max_relationships, "source_max_chars": source_max_chars, "offset": offset,
             },
         )
+        return cast(CodeContextResult, validate_tool_output(CodeContextResult, result, operation="code_context"))
