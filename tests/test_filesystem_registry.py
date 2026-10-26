@@ -124,6 +124,39 @@ def test_fifty_concurrent_edits_keep_all_changes(tmp_path: Path, monkeypatch: py
     assert path.read_text() == "\n".join(f"new_{i}!" for i in range(50))
 
 
+def test_known_independent_edits_have_equal_sequential_refactor_and_patch_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import difflib
+    import hashlib
+
+    settings = replace(config.SETTINGS, state_dir=tmp_path / "state")
+    monkeypatch.setattr(config, "SETTINGS", settings)
+    monkeypatch.setattr(registry.service, "SETTINGS", settings)
+    monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+    server = ToolCapture()
+    registry.register(cast(Any, server))
+    before = "alpha\nbeta\ngamma\ndelta\n"
+    after = before.upper()
+    paths = {mode: tmp_path / f"{mode}.txt" for mode in ("sequential", "refactor", "patch")}
+    for target in paths.values():
+        target.write_bytes(before.encode())
+    for word in before.splitlines():
+        result = server.functions["replace_exact"](str(paths["sequential"]), word, word.upper(), backup=False)
+        assert result["ok"], result
+    edits = [registry.RefactorEdit(mode="exact", old=word, new=word.upper()) for word in before.splitlines()]
+    result = server.functions["safe_refactor"](str(paths["refactor"]), edits)
+    assert result["ok"], result
+    patch = "diff --git a/patch.txt b/patch.txt\n" + "".join(
+        difflib.unified_diff(before.splitlines(True), after.splitlines(True), "a/patch.txt", "b/patch.txt"),
+    )
+    result = server.functions["apply_patch"](
+        str(tmp_path), patch, expected_sha256={"patch.txt": hashlib.sha256(before.encode()).hexdigest()},
+    )
+    assert result["ok"], result
+    assert {target.read_bytes() for target in paths.values()} == {after.encode()}
+
+
 def test_opposite_moves_finish(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
     server = ToolCapture()

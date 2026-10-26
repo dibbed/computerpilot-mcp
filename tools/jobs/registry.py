@@ -43,7 +43,7 @@ def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = No
         encoding: Annotated[str, Field(min_length=1, max_length=40)] = "utf-8",
         queue_timeout_sec: Annotated[float | None, Field(gt=0, le=86400)] = None,
     ) -> dict[str, Any]:
-        """Submit a retry-safe durable command. Execution timeout starts after launch; optional queue timeout bounds pre-launch waiting."""
+        """Retry-safe durable jobs; timeout starts at launch; queue_timeout_sec bounds waiting. Use job_wait; short/stdin: run_process."""
         audit_action("submit_job", target=resolve_path(cwd), details={"executable": executable})
         result = get_store().submit(
             [executable, *(args or [])],
@@ -65,7 +65,7 @@ def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = No
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_status")
     def job_status(job_id: JobId) -> JobStatusResult:
-        """Read a durable job status by ID after reconnect or server restart."""
+        """Read a durable job status by ID after reconnect or server restart. Prefer job_wait to poll."""
         result = {"ok": True, **get_store().get(job_id)}
         if result.get("status") not in get_args(JobStatus):
             raise ToolError("output_version_unsupported", "The stored job status version is unsupported.")

@@ -73,7 +73,7 @@ def register(mcp: MCPServer) -> None:
         stdin_text: Annotated[str | None, Field(max_length=100_000)] = None,
         delivery: Literal["inline", "file", "auto"] = output_default,
     ) -> dict[str, Any]:
-        """Run an executable with a timeout and optional per-stream output limits."""
+        """Run an executable with a timeout and optional per-stream output limits. Prefer read_file/search_files/git_* for native work."""
 
         working = _cwd(cwd)
         process_args = args or []
@@ -107,7 +107,9 @@ def register(mcp: MCPServer) -> None:
         env: Annotated[dict[str, str] | None, Field(max_length=100)] = None,
         delivery: Literal["inline", "file", "auto"] = output_default,
     ) -> dict[str, Any]:
-        """Run PowerShell non-interactively with optional output limits and a hard timeout."""
+        """Run PowerShell non-interactively with optional output limits and a hard timeout.
+        Use for cmdlets/pipelines; prefer run_process for binaries and native tools for files/search/Git.
+        """
 
         executable = shutil.which("pwsh") or shutil.which("powershell")
         if executable is None:

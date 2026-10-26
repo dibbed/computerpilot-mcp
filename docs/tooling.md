@@ -36,7 +36,11 @@ Use the routing diagnostics when an agent or workflow needs to decide *how* an i
 
 Supported initial structured intents are:
 
-`filesystem.read`, `filesystem.write`, `code.rename`, `git.read`, `git.write`, `process.run`, `system.inspect`, `document.excel.read`, `document.excel.write`, `document.docx.read`, `document.docx.write`, `document.pdf.read`, `document.pdf.create`, `browser.interact`, `desktop.semantic.interact`, and `desktop.raw.interact`.
+`filesystem.read`, `filesystem.write`, `filesystem.edit_batch`, `filesystem.patch`, `code.rename`, `git.read`, `git.write`, `process.run`, `process.powershell`, `process.durable`, `system.inspect`, `document.excel.read`, `document.excel.write`, `document.docx.read`, `document.docx.write`, `document.pdf.read`, `document.pdf.create`, `browser.interact`, `desktop.semantic.interact`, and `desktop.raw.interact`.
+
+Use native file/search/Git tools for their structured operations, `process.run` for an executable, and `process.powershell` for cmdlets or pipelines. The PowerShell intent requires the PowerShell capability and has no executable fallback. Existing cost/latency tiers are ordinal planning estimates informed by the local execution-cost benchmark; they do not measure network or model latency. Recommendations never dispatch a tool or grant permission.
+
+For known independent edits, `filesystem.edit_batch` recommends `safe_refactor` within one file and `filesystem.patch` recommends the guarded multi-file `apply_patch`. Edits depending on earlier results need separate calls. These intents do not merge requests or change backup, hash, rollback or recovery rules. `process.durable` recommends `submit_job` for work that must survive a client disconnect; collect progress with `job_wait`. Keep short commands and bounded stdin on `process.run`, which does not provide an interactive terminal session.
 
 The planning client maps a request such as "write cells in Excel" to a canonical intent before calling `execution_recommend`:
 

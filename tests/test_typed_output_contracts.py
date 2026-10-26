@@ -973,7 +973,31 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
             # Windows. POSIX registrars expose different platform-specific
             # metadata, including in coding profiles, despite stable names.
             if os.name == "nt":
-                assert hashlib.sha256(encode(metadata)).hexdigest() == metadata_sha
+                # P14 guidance is the only intentional metadata delta; keep the P08 golden guard.
+                descriptions = {
+                    "run_process": "Run an executable with a timeout and optional per-stream output limits.",
+                    "run_powershell": "Run PowerShell non-interactively with optional output limits and a hard timeout.",
+                    "replace_exact": "Replace an exact small fragment only when its match count is known.",
+                    "submit_job": (
+                        "Submit a retry-safe durable command. Execution timeout starts after launch; "
+                        "optional queue timeout bounds pre-launch waiting."
+                    ),
+                    "job_status": "Read a durable job status by ID after reconnect or server restart.",
+                }
+                growth = 0
+                original_metadata = []
+                for item in metadata:
+                    if item["name"] in descriptions:
+                        original = descriptions[item["name"]]
+                        added = len(item["description"].encode()) - len(original.encode())
+                        assert added <= 120
+                        if item["name"] not in {"replace_exact", "submit_job"}:
+                            assert item["description"].startswith(original)
+                        growth += added
+                        item = {**item, "description": original}
+                    original_metadata.append(item)
+                assert growth < 1200
+                assert hashlib.sha256(encode(original_metadata)).hexdigest() == metadata_sha
             catalogue = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
             if os.name == "nt":
                 # The frozen baseline includes historical generic output schemas.

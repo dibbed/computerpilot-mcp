@@ -556,7 +556,7 @@ def register(mcp: MCPServer) -> None:
         backup: bool = True,
         validate_python: bool = True,
     ) -> dict[str, Any]:
-        """Replace an exact small fragment only when its match count is known."""
+        """Replace an exact fragment with a known match count. For independent edits: safe_refactor (one file), apply_patch (files)."""
         with managed_path_claims(path, category="native.filesystem"), RESOURCE_LOCKS.sync(path):
             target, before, used_encoding = service.load_text(path, encoding)
             after, count = service.exact_replace(before, old, new, expected_count)

@@ -7,6 +7,8 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-26: Recommend existing safe_refactor/apply_patch tools for known independent edits and submit_job/job_wait for durable commands, while retaining direct execution for short commands. Add advisory intents without merging requests or changing edit/recovery behavior.
+- 2026-10-26: Guide native file/search/Git operations and direct executable selection; add an advisory PowerShell intent for cmdlets/pipelines with capability denial and existing cost/latency tiers. Keep execution permissions and public schemas unchanged.
 - 2026-10-26: Correlate native audit/timing records, recovery-operation references and durable job workers with bounded private trace metadata. Preserve command idempotency and public tool payloads, propagate context through DAG workers, and retain the worker's single SQLite connection.
 - 2026-10-26: Fail fast on quarantined native resource conflicts, load local Windows runtime settings at startup, exclude isolated LSP fixtures from project/test discovery, and isolate semantic-edit test state from unrelated resource fences.
 - 2026-10-26: Add an opt-in `exec_cost` benchmark suite for equivalent native/process/PowerShell reads and searches, sequential/batched edits, and direct/durable commands. Use randomized paired samples, output hashes, isolated source/state and verified worker cleanup; retain failed fixtures and report unavailable worker timing explicitly.
