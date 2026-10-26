@@ -138,7 +138,7 @@ def source_fingerprint(repo: Path, *, changed_paths: list[str] | None = None) ->
         check_budget()
         dirs[:] = sorted(
             name for name in dirs
-            if name not in EXCLUDED_DIRS | {"vendor"} and not name.startswith((".pytest-tmp", ".codebase-memory"))
+            if name not in EXCLUDED_DIRS and not name.startswith((".pytest-tmp", ".codebase-memory"))
         )
         if any(_is_symlink_or_junction(Path(directory) / name) for name in dirs):
             raise ValueError("Verification inputs cannot contain directory symlinks")

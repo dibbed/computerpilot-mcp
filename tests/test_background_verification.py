@@ -290,7 +290,11 @@ def test_registered_verification_tools_forward_backend_and_budget(
 
     def verify(*args: Any, **kwargs: Any) -> dict[str, Any]:
         captured.update(kwargs)
-        return {"ok": True, "mode": "focused"}
+        return {
+            "ok": True, "mode": "focused", "stages": [], "duration_ms": 1,
+            "required_unknown": False, "changed_paths": [], "affected": {},
+            "execution_uncertain": False, "tests_executed": False, "claim_testing": False,
+        }
 
     def submit(store: Any, request: VerificationRequest, *args: Any) -> dict[str, Any]:
         captured.update(request.options())

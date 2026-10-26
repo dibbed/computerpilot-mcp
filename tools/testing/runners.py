@@ -453,10 +453,12 @@ def _xml_report_counts(data: bytes) -> tuple[dict[str, int], bool]:
     return counts, not counts["failed"] and not counts["errors"]
 
 
-def _test_environment() -> dict[str, str]:
+def _test_environment(home: Path) -> dict[str, str]:
     allowed = {"PATH", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"}
     # run_bounded merges env; explicitly empty inherited secrets and loader injection variables.
     result = {key: value if key.upper() in allowed else "" for key, value in os.environ.items()}
+    # Empty home variables break Node module resolution; never expose the operator's home.
+    result.update(HOME=str(home), USERPROFILE=str(home))
     result["PYTHONNOUSERSITE"] = "1"
     return result
 
@@ -509,7 +511,7 @@ def _run_project_tests(
                 try:
                     result = run_bounded(
                         command, cwd=spec.package_root, timeout_sec=min(600, remaining),
-                        stdout_limit=65536, stderr_limit=65536, output_mode="tail", encoding="utf-8", env=_test_environment(),
+                        stdout_limit=65536, stderr_limit=65536, output_mode="tail", encoding="utf-8", env=_test_environment(owned_root),
                     )
                 except Exception as exc:
                     if isinstance(exc, ToolError) and exc.code == "process_cleanup_incomplete":

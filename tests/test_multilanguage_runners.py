@@ -560,3 +560,30 @@ def test_inherited_capability_denies_before_spawn(tmp_path: Path, monkeypatch: p
             with pytest.raises(ToolError) as exc:
                 _run(spec)
             assert exc.value.code == "resource_capability_scope_violation"
+
+
+
+def test_runner_uses_private_home_without_inheriting_secrets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import config
+
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path / "state"))
+    spec = _node(tmp_path / "package", monkeypatch)
+    monkeypatch.setenv("USERPROFILE", "private-home-canary")
+    monkeypatch.setenv("HOME", "private-home-canary")
+    monkeypatch.setenv("NODE_OPTIONS", "private-loader-canary")
+    captured: list[Path] = []
+    original = runners.run_bounded
+
+    def inspect(command: list[str], **kwargs: Any) -> dict[str, Any]:
+        env = kwargs["env"]
+        home = Path(env["HOME"])
+        assert home.is_absolute() and home.is_dir()
+        assert env["USERPROFILE"] == str(home)
+        assert "private-home-canary" not in env.values() and env["NODE_OPTIONS"] == ""
+        captured.append(home)
+        return original(command, **kwargs)
+
+    monkeypatch.setattr(runners, "run_bounded", inspect)
+    result = _run(spec)
+    assert result["ok"] and len(captured) == 1
+    assert not captured[0].exists()
