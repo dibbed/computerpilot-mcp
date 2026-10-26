@@ -97,7 +97,9 @@ Language tools add LSP-based:
 - transactional rename;
 - code-action workspace edits.
 
-The language layer uses a trusted discovered `pyright-langserver --stdio` executable and bounds one-shot protocol requests.
+The default language layer uses a trusted discovered `pyright-langserver --stdio` executable and bounds one-shot protocol requests. Opt-in persistent sessions require reviewed local configuration through `MCP_LSP_PROVIDERS_CONFIG` and `MCP_LSP_PERSISTENT_ENABLED=true`. The configuration accepts at most four explicit provider identities: `pyright`, `typescript`, `phpactor`, and `intelephense`; executable and entrypoint SHA-256 pins and trusted workspace roots are checked before launch. Configuring two providers for the same language and root is ambiguous and fails before dispatch.
+
+For native Windows PHP, `intelephense` uses a pinned Node executable plus its pinned `lib/intelephense.js` entrypoint with `--stdio`; PHPActor remains available for supported operator-selected runtimes. [Intelephense](https://intelephense.net/docs) provides definition, references and push diagnostics without a premium licence. Sessions isolate its caches and licence lookup under their private runtime directory, and remove that directory after confirmed process cleanup. Premium operations, including rename and code actions, are outside this free-provider acceptance; no licence is loaded or activated. Provider configuration is never enabled automatically. See [real-provider acceptance](development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md) for tested versions, reproduction and limitations.
 
 ## Git
 
@@ -147,6 +149,7 @@ them under managed package claims before each direct invocation. They use fixed 
 PHPUnit 11 and Pest 3; unsupported versions remain unavailable. Python keeps its virtual-environment invocation path,
 and unittest requires an explicit selection. Package scripts, shell launchers and automatic installs are excluded.
 Reports use private temporary storage and bounded parsing; missing, invalid or zero-test results remain unknown.
+Package runners receive a private temporary home directory through `HOME` and `USERPROFILE`; credential and loader variables remain scrubbed. Project discovery excludes Composer `vendor` dependencies alongside `node_modules`; explicitly selected installed runner metadata is still validated.
 Timeouts use the existing owned process-tree cleanup and never retry a possibly completed run. These helpers do not
 establish sandbox isolation or prove that an installed foreign runner has passed its real integration gate.
 
@@ -350,6 +353,14 @@ Use it to inspect:
 Detailed panel endpoints are control-token guarded. The panel is intended for loopback use, not direct untrusted-network exposure.
 
 ## Health and discovery
+
+Ten native tools publish validated output schemas: `code_context`, `affected_tests`, `search_files`, `project_summary`, `job_status`, `workflow_status`, `server_health`, `verify_changes`, `language_diagnostics`, and `execution_recommend`. Their existing dictionaries remain the wire format; no extra SDK `result` wrapper is added. The other tools retain their current contracts.
+
+These generated native output schemas omit descriptive annotations and redundant string-literal types, and collapse simple nullable unions only when their constraints still apply correctly. Literal data, property names, local `$defs`/`$ref` identities, validation ranges and conditional non-null requirements are preserved. Compaction does not change native inputs, tool names, descriptions, annotations, other discovery metadata, runtime validation, payloads or absent-versus-null behavior. A shared tool advertises the same output schema in every profile; native counts remain `full=151`, `coding=96`, `coding_core=43` on Windows.
+
+The P08 catalog allowance is an increase of at most 32,284 UTF-8 JSON bytes per profile over the committed baseline (`full=161424`, `coding=100462`, `coding_core=47156` bytes), serialized with `ensure_ascii=False`, sorted keys and compact separators. This retains the full-profile 20% ceiling and applies its absolute allowance to smaller profiles because the shared output definitions have a fixed cost. External encoding checks similarly allow increases of at most 7,487 `cl100k_base` and 7,882 `o200k_base` tokens per profile against that baseline, using tiktoken 0.7.0 and hash-verified vocabularies. These are catalog encoding counts, not complete client prompts, billed usage or evidence of live-model quality or UX. The existing catalog benchmark separately reports `output_schema_json_bytes`, the sum of compact UTF-8 JSON sizes of present wire output schemas; it excludes catalog keys and other tool metadata and adds no tokenizer dependency.
+
+An unsuccessful verification is a valid report with stages and explicit unknown outcomes. A recommendation with no eligible route remains an advisory result and grants no permission. Workflow status retains its existing state/checkpoint shape, including uncertainty. Health supports full snapshots, bounded summaries, and the compact unavailable response. Language diagnostics retain full versus unchanged pull reports, UTF-16 ranges, and any explicit completeness flag; opaque diagnostic data is redacted before validation. Unsupported stored job/workflow states return `output_version_unsupported`; malformed output returns a fixed `output_contract_violation` without echoing its payload.
 
 `server_health` reports runtime/platform capability state plus resource/job/browser/workflow/recovery summaries and a bounded in-memory `execution_router` snapshot with policy, route distribution, fallback/no-route/rejection counts, native/semantic/raw usage, latency, and recent decisions.
 
