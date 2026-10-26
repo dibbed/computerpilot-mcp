@@ -7,6 +7,7 @@ import codecs
 import difflib
 import fnmatch
 import hashlib
+import io
 import locale
 import os
 import re
@@ -14,8 +15,10 @@ import shutil
 import stat
 import tempfile
 import textwrap
+import threading
 import time
 from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +29,7 @@ from core.config import SETTINGS, ensure_runtime_dirs, resolve_path
 from core.errors import ToolError
 from core.executor import run_bounded
 from core.response import page, sha256_bytes
+from core.state_paths import unlinked_directory_tree, unlinked_regular_file
 
 COMMON_EXCLUDES = {
     ".git",
@@ -65,6 +69,10 @@ def _replace_with_retry(source: Path, destination: Path) -> None:
 def detect_encoding(path: Path) -> str:
     with path.open("rb") as handle:
         sample = handle.read(65_536)
+    return _sample_encoding(sample, path)
+
+
+def _sample_encoding(sample: bytes, path: Path | None = None) -> str:
     if sample.startswith(codecs.BOM_UTF8):
         return "utf-8-sig"
     if sample.startswith(codecs.BOM_UTF32_LE) or sample.startswith(codecs.BOM_UTF32_BE):
@@ -72,7 +80,7 @@ def detect_encoding(path: Path) -> str:
     if sample.startswith(codecs.BOM_UTF16_LE) or sample.startswith(codecs.BOM_UTF16_BE):
         return "utf-16"
     if b"\x00" in sample:
-        raise ToolError("binary_file", f"File appears binary: {path}")
+        raise ToolError("binary_file", f"File appears binary: {path}" if path is not None else "File appears binary.")
     try:
         sample.decode("utf-8")
         return "utf-8"
@@ -87,6 +95,83 @@ def detect_encoding(path: Path) -> str:
     except ImportError:
         pass
     return locale.getpreferredencoding(False) or "cp1252"
+
+
+@dataclass(frozen=True)
+class ReadWindowLimits:
+    root: Path
+    root_identity: tuple[int, int]
+    source_bytes: int
+    deadline: float
+    cancelled: threading.Event
+
+    def check(self) -> None:
+        if self.cancelled.is_set():
+            raise ToolError("batch_cancelled", "The batch read was cancelled.")
+        if time.monotonic() >= self.deadline:
+            raise ToolError("batch_deadline", "The batch read deadline elapsed.")
+
+
+def local_read_path(path: Path) -> bool:
+    """Reject known remote mounts before reading; this is not an OS I/O timeout."""
+    if str(path).startswith(("\\\\", "//")):
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        return ctypes.windll.kernel32.GetDriveTypeW(str(path.absolute().anchor)) in {2, 3, 6}
+    import psutil
+
+    mounts = [p for p in psutil.disk_partitions(all=True) if path.absolute().is_relative_to(p.mountpoint)]
+    if not mounts:
+        return False
+    mount = max(mounts, key=lambda p: len(p.mountpoint))
+    return mount.fstype.casefold() not in {"nfs", "nfs4", "cifs", "smbfs", "smb3", "afpfs", "9p", "fuse.sshfs", "sshfs"}
+
+
+def _read_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    # Windows stat/fstat disagree on ctime; file identity and write time are comparable.
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, 0 if os.name == "nt" else info.st_ctime_ns
+
+
+@contextmanager
+def _bounded_window(path: Path, encoding: str, limits: ReadWindowLimits) -> Iterator[tuple[io.StringIO, str, str]]:
+    limits.check()
+    if not local_read_path(path) or not path.resolve(strict=True).is_relative_to(limits.root):
+        raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
+    root_info = limits.root.stat()
+    if (root_info.st_dev, root_info.st_ino) != limits.root_identity:
+        raise ToolError("batch_source_changed", "The batch source changed.")
+    if not unlinked_directory_tree(path.parent) or not unlinked_regular_file(path):
+        raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
+    before = _read_identity(path.stat())
+    if before[2] != limits.source_bytes or not 0 <= before[2] <= 2 * 1024 * 1024:
+        raise ToolError("batch_source_changed", "The batch source changed.")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as raw:
+        if not stat.S_ISREG(os.fstat(raw.fileno()).st_mode) or _read_identity(os.fstat(raw.fileno())) != before:
+            raise ToolError("batch_source_changed", "The batch source changed.")
+        pieces: list[bytes] = []
+        captured = 0
+        while True:
+            limits.check()
+            piece = raw.read(min(65_536, limits.source_bytes + 1 - captured))
+            if not piece:
+                break
+            pieces.append(piece)
+            captured += len(piece)
+            if captured > limits.source_bytes:
+                raise ToolError("batch_source_changed", "The batch source changed.")
+        if _read_identity(os.fstat(raw.fileno())) != before:
+            raise ToolError("batch_source_changed", "The batch source changed.")
+    data = b"".join(pieces)
+    used_encoding = _sample_encoding(data[:65_536]) if encoding == "auto" else chosen_encoding(path, encoding)
+    with io.StringIO(data.decode(used_encoding, errors="strict"), newline="") as text:
+        yield text, used_encoding, hashlib.sha256(data).hexdigest()
+    limits.check()
+    if _read_identity(path.stat()) != before or not unlinked_directory_tree(path.parent) or not unlinked_regular_file(path):
+        raise ToolError("batch_source_changed", "The batch source changed.")
 
 
 def chosen_encoding(path: Path, requested: str) -> str:
@@ -107,13 +192,31 @@ def read_window(
     offset: int,
     max_chars: int | None,
     encoding: str,
+    limits: ReadWindowLimits | None = None,
 ) -> dict[str, Any]:
     path = resolve_path(path_value)
     if not path.is_file():
         raise FileNotFoundError(f"File not found: {path}")
     if end_line is not None and end_line < start_line:
         raise ToolError("invalid_line_range", "end_line must be greater than or equal to start_line.")
-    used_encoding = chosen_encoding(path, encoding)
+    used_encoding = chosen_encoding(path, encoding) if limits is None else encoding
+    bounded = _bounded_window(path, encoding, limits) if limits is not None else nullcontext(None)
+    read_sha256: str | None = None
+    with bounded as snapshot:
+        context: AbstractContextManager[Any]
+        if snapshot is not None:
+            stream, used_encoding, read_sha256 = snapshot
+            context = nullcontext(stream)
+        else:
+            context = path.open("r", encoding=used_encoding, errors="strict", newline="")
+        with context as handle:
+            return _read_text_window(handle, path, used_encoding, start_line, end_line, offset, max_chars, limits, read_sha256)
+
+
+def _read_text_window(
+    handle: Any, path: Path, used_encoding: str, start_line: int, end_line: int | None, offset: int,
+    max_chars: int | None, limits: ReadWindowLimits | None, read_sha256: str | None,
+) -> dict[str, Any]:
     remaining_offset = offset
     pieces: list[str] = []
     captured = 0
@@ -122,43 +225,44 @@ def read_window(
     has_more = False
     chunk_size = 65_536
     pending = ""
-    with path.open("r", encoding=used_encoding, errors="strict", newline="") as handle:
-        while True:
-            if end_line is not None and current_line > end_line:
-                break
-            fragment = pending + handle.readline(chunk_size - len(pending))
-            pending = ""
-            if not fragment:
-                break
-            if fragment.endswith("\r"):
-                following = handle.read(1)
-                if following == "\n":
-                    fragment += following
+    while True:
+        if limits is not None:
+            limits.check()
+        if end_line is not None and current_line > end_line:
+            break
+        fragment = pending + handle.readline(chunk_size - len(pending))
+        pending = ""
+        if not fragment:
+            break
+        if fragment.endswith("\r"):
+            following = handle.read(1)
+            if following == "\n":
+                fragment += following
+            else:
+                pending = following
+        line_ended = fragment.endswith(("\n", "\r"))
+        if current_line >= start_line:
+            last_line = current_line
+            if remaining_offset:
+                skipped = min(len(fragment), remaining_offset)
+                fragment = fragment[skipped:]
+                remaining_offset -= skipped
+            if fragment:
+                if max_chars is None:
+                    pieces.append(fragment)
+                    captured += len(fragment)
                 else:
-                    pending = following
-            line_ended = fragment.endswith(("\n", "\r"))
-            if current_line >= start_line:
-                last_line = current_line
-                if remaining_offset:
-                    skipped = min(len(fragment), remaining_offset)
-                    fragment = fragment[skipped:]
-                    remaining_offset -= skipped
-                if fragment:
-                    if max_chars is None:
-                        pieces.append(fragment)
-                        captured += len(fragment)
-                    else:
-                        available = max_chars + 1 - captured
-                        if available <= 0:
-                            has_more = True
-                            break
-                        pieces.append(fragment[:available])
-                        captured += min(len(fragment), available)
-                        if len(fragment) > available or captured > max_chars:
-                            has_more = True
-                            break
-            if line_ended:
-                current_line += 1
+                    available = max_chars + 1 - captured
+                    if available <= 0:
+                        has_more = True
+                        break
+                    pieces.append(fragment[:available])
+                    captured += min(len(fragment), available)
+                    if len(fragment) > available or captured > max_chars:
+                        has_more = True
+                        break
+        if line_ended:
+            current_line += 1
     content = "".join(pieces)
     if max_chars is not None and len(content) > max_chars:
         content = content[:max_chars]
@@ -174,6 +278,7 @@ def read_window(
         "offset": offset,
         "truncated": has_more,
         "next_offset": offset + len(content) if has_more else None,
+        **({"read_sha256": read_sha256, "source_bytes": limits.source_bytes} if limits is not None else {}),
     }
 
 

@@ -99,7 +99,9 @@ def create_server() -> MCPServer:
     for domain in active_domains:
         registrar = REGISTRARS.get(domain)
         if registrar is not None:
-            if domain == "testing":
+            if domain == "filesystem" and profile.name == "read_batch":
+                register_filesystem(server, batch_enabled=True)
+            elif domain == "testing":
                 register_testing(server, background_enabled="jobs" in active_domains, store_getter=store_getter)
             elif domain == "jobs":
                 register_jobs(server, store_getter=store_getter)
@@ -307,6 +309,8 @@ def create_server() -> MCPServer:
                 recovery=OPERATION_RECOVERY,
                 workflow_store_factory=workflow_store,
             )
+        if profile.name == "read_batch":
+            result["native_read_batch"] = cast(Any, server).native_read_batch_state.snapshot()
         return cast(HealthResult, validate_tool_output(HealthResult, result, operation="server_health"))
 
     if profile.native_allowlist is not None and server.native_registered_names != profile.native_allowlist:

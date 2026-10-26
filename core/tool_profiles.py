@@ -36,6 +36,12 @@ PROFILE_DOMAINS: dict[str, tuple[str, ...]] = {
     "full": ALL_DOMAINS,
 }
 PROFILE_DOMAINS["coding_core"] = PROFILE_DOMAINS["coding"]
+PROFILE_DOMAINS["read_batch"] = ("filesystem",)
+
+READ_BATCH_TOOLS = frozenset({
+    "native_read_batch", "read_file", "server_health", "discover_tool_domains", "recommend_tools",
+    "execution_candidates", "execution_recommend",
+})
 
 CODING_CORE_TOOLS = frozenset("""
 discover_tool_domains recommend_tools execution_candidates execution_recommend server_health
@@ -83,5 +89,6 @@ def resolve_profile(name: str | None) -> ToolProfile:
             f"Unknown MCP tool profile {name!r}.",
             hint=f"Use one of: {', '.join(PROFILE_DOMAINS)}.",
         )
-    return ToolProfile(normalized, domains, CODING_CORE_TOOLS if normalized == "coding_core" else None)
+    allowlist = {"coding_core": CODING_CORE_TOOLS, "read_batch": READ_BATCH_TOOLS}.get(normalized)
+    return ToolProfile(normalized, domains, allowlist)
 

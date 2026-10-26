@@ -23,6 +23,7 @@ from core.response import ok, page
 from core.response_models import validate_tool_output
 from core.tooling import DESTRUCTIVE, MUTATING, READ_ONLY, PathArg, compact_errors
 from tools.filesystem import service
+from tools.filesystem.batch import BatchReader, BatchResult, ReadItem
 from tools.filesystem.models import SearchFilesResult
 from tools.filesystem.patches import PatchLimits, apply_patch_transaction
 from tools.filesystem.search_snapshots import SEARCH_SNAPSHOTS, search_fingerprint
@@ -99,7 +100,22 @@ def _model_image_result(target: Path) -> dict[str, Any]:
     return image_tool_result(metadata, target, delivery="auto")
 
 
-def register(mcp: MCPServer) -> None:
+def register(mcp: MCPServer, *, batch_enabled: bool = False) -> None:
+    if batch_enabled:
+        reader = BatchReader(mcp)
+        cast(Any, mcp).native_read_batch_state = reader
+
+        @mcp.tool(annotations=READ_ONLY, structured_output=True)
+        @compact_errors("native_read_batch")
+        async def native_read_batch(
+            root: PathArg,
+            items: Annotated[list[ReadItem], Field(min_length=1, max_length=16)],
+            max_parallel: Annotated[int, Field(strict=True, ge=1, le=4)] = 1,
+            timeout_sec: Annotated[float, Field(strict=True, gt=0, le=60, allow_inf_nan=False)] = 10,
+        ) -> BatchResult:
+            """Read independent local text windows in one bounded response; no shared snapshot or hard I/O timeout."""
+            return await reader.execute(root, items, max_parallel, timeout_sec)
+
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("view_image")
     def view_image(path: PathArg) -> dict[str, Any]:

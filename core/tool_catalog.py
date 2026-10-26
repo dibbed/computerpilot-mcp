@@ -74,6 +74,9 @@ def _meta(
 TOOL_EXECUTION_METADATA: dict[str, ToolExecutionMetadata] = {
     # Filesystem
     "read_file": _meta("read_file", "filesystem", RouteClass.NATIVE_FILESYSTEM, 5, RiskClass.LOW, RecoverabilityClass.STRONG),
+    "native_read_batch": _meta(
+        "native_read_batch", "filesystem", RouteClass.NATIVE_FILESYSTEM, 5, RiskClass.LOW, RecoverabilityClass.STRONG,
+    ),
     "write_file": _meta("write_file", "filesystem", RouteClass.NATIVE_FILESYSTEM, 5, RiskClass.MEDIUM, RecoverabilityClass.STRONG),
     "create_file": _meta("create_file", "filesystem", RouteClass.NATIVE_FILESYSTEM, 5, RiskClass.MEDIUM, RecoverabilityClass.STRONG),
     "delete_file": _meta("delete_file", "filesystem", RouteClass.NATIVE_FILESYSTEM, 5, RiskClass.HIGH, RecoverabilityClass.STRONG),
