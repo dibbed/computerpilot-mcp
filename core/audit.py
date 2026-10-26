@@ -17,6 +17,7 @@ from typing import Any
 
 from core.config import SETTINGS, Settings
 from core.file_lock import exclusive_file_lock
+from core.timings import current_trace_metadata
 
 _LOCK_WAIT_SEC = 5.0
 _SYNC_FALLBACK_WAIT_SEC = 0.05
@@ -402,6 +403,7 @@ def audit_action(
         record["target"] = str(target)
     if details:
         record["details"] = details
+    record.update(current_trace_metadata())
     payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     _get_writer().submit(payload, durable=durable)
 

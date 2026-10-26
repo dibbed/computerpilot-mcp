@@ -7,6 +7,7 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextvars import copy_context
 from functools import partial
 from typing import Any
 
@@ -627,7 +628,7 @@ class WorkflowExecutor:
                                 owner_token=resource_owner_token,
                                 attempt_token=str(reserved["attempt_token"]),
                             )
-                            future = pool.submit(bind_operation_recovery(partial(
+                            future = pool.submit(copy_context().run, bind_operation_recovery(partial(
                                 self._run_dag_attempt,
                                 workflow_id,
                                 str(operation["operation_id"]),

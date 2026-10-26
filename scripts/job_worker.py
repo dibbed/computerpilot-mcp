@@ -30,6 +30,7 @@ from core.resource_claims import (
     resource_requires_native_ownership,
     validate_resource_capability,
 )
+from core.timings import invocation_trace, timing_span
 
 
 def _poll_interval(elapsed: float) -> float:
@@ -95,7 +96,13 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
     process: OwnedProcess | None = None
     # The worker owns one SQLite connection for its lifetime. Short transactions
     # keep WAL readers/writers independent while avoiding a connection per poll.
-    with closing(store.connect()) as db:
+    with closing(store.connect()) as db, ExitStack() as tracing:
+        try:
+            metadata = json.loads(_row(db, job_id)["spec"]).get("_trace")
+        except Exception:
+            metadata = None
+        tracing.enter_context(invocation_trace(metadata, new=True))
+        tracing.enter_context(timing_span("job_worker", metadata={"job_id": job_id}))
         worker_created = psutil.Process().create_time()
         admission_attempt = 0
         while True:
@@ -152,16 +159,17 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 return
             with (directory / "stdout.bin").open("ab") as stdout, (directory / "stderr.bin").open("ab") as stderr:
                 try:
-                    process = spawn_owned_process(
-                        spec["command"],
-                        cwd=spec["cwd"],
-                        env=env,
-                        stdin=subprocess.DEVNULL,
-                        stdout=stdout,
-                        stderr=stderr,
-                        creationflags=_creation_flags(),
-                        require_native=resource_requires_native_ownership(capability, resource_authority),
-                    )
+                    with timing_span("process_spawn", metadata={"job_id": job_id}):
+                        process = spawn_owned_process(
+                            spec["command"],
+                            cwd=spec["cwd"],
+                            env=env,
+                            stdin=subprocess.DEVNULL,
+                            stdout=stdout,
+                            stderr=stderr,
+                            creationflags=_creation_flags(),
+                            require_native=resource_requires_native_ownership(capability, resource_authority),
+                        )
                 except FileNotFoundError:
                     # Popen rejected the executable before creating a child: no
                     # external effect is possible and the fresh job claim must not
@@ -183,30 +191,31 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 status = "succeeded"
                 capacity_identities = [(process.pid, created)] if created is not None else []
                 code: int | None = None
-                while code is None:
-                    now = time.monotonic()
-                    row = db.execute("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
-                    if row is None:
-                        raise RuntimeError("Durable job disappeared while its worker was running.")
-                    cancelled = bool(row[0])
-                    if cancelled or now >= deadline:
-                        status = "cancelled" if cancelled else "timed_out"
-                        audit_action(
-                            "job_terminate_process_tree",
-                            target=str(process.pid),
-                            details={"job_id": job_id, "reason": status},
-                        )
-                        capacity_identities = _capacity_process_identities(process.pid, created)
-                        cleanup = process.terminate_tree(force=True)
-                        if cleanup.get("alive_pids"):
-                            raise ToolError("process_cleanup_incomplete", "Process-tree cleanup did not stop every child.")
-                        code = process.wait(timeout=5)
-                        break
-                    wait_for = min(_poll_interval(now - started), max(deadline - now, 0.001))
-                    try:
-                        code = process.wait(timeout=wait_for)
-                    except subprocess.TimeoutExpired:
-                        code = None
+                with timing_span("process_execution", metadata={"job_id": job_id}):
+                    while code is None:
+                        now = time.monotonic()
+                        row = db.execute("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
+                        if row is None:
+                            raise RuntimeError("Durable job disappeared while its worker was running.")
+                        cancelled = bool(row[0])
+                        if cancelled or now >= deadline:
+                            status = "cancelled" if cancelled else "timed_out"
+                            audit_action(
+                                "job_terminate_process_tree",
+                                target=str(process.pid),
+                                details={"job_id": job_id, "reason": status},
+                            )
+                            capacity_identities = _capacity_process_identities(process.pid, created)
+                            cleanup = process.terminate_tree(force=True)
+                            if cleanup.get("alive_pids"):
+                                raise ToolError("process_cleanup_incomplete", "Process-tree cleanup did not stop every child.")
+                            code = process.wait(timeout=5)
+                            break
+                        wait_for = min(_poll_interval(now - started), max(deadline - now, 0.001))
+                        try:
+                            code = process.wait(timeout=wait_for)
+                        except subprocess.TimeoutExpired:
+                            code = None
                 if status == "succeeded" and code != 0:
                     status = "failed"
                 process.close_ownership()

@@ -21,6 +21,7 @@ from core.artifacts import Delivery, deliver_file
 from core.config import SETTINGS
 from core.errors import ToolError
 from core.resource_locks import RESOURCE_LOCKS
+from core.timings import current_trace_metadata, invocation_trace, validated_trace_metadata
 
 JOB_SCHEMA_VERSION = 4
 JOB_STATUS_COLUMNS = (
@@ -145,6 +146,7 @@ class JobStore:
         db.row_factory = sqlite3.Row
         return db
 
+    @invocation_trace()
     def submit(
         self,
         command: list[str],
@@ -181,6 +183,8 @@ class JobStore:
         fingerprint = hashlib.sha256(fingerprint_spec.encode()).hexdigest()
         if _resource_capability is not None:
             spec_data["_resource_capability"] = _resource_capability
+        if trace := current_trace_metadata():
+            spec_data["_trace"] = trace
         spec = json.dumps(spec_data, sort_keys=True)
         job_id = uuid.uuid4().hex
         now = time.time()
@@ -246,6 +250,13 @@ class JobStore:
         if row is None:
             raise ToolError("job_not_found", "Unknown job_id.")
         return dict(row)
+
+    def trace_metadata(self, job_id: str) -> dict[str, Any]:
+        try:
+            spec = json.loads(self.raw(job_id)["spec"])
+            return validated_trace_metadata(spec.get("_trace")) if isinstance(spec, dict) else {}
+        except Exception:
+            return {}
 
     def _status_raw(self, job_id: str) -> dict[str, Any]:
         with closing(self.connect()) as db:

@@ -17,7 +17,7 @@ from core.recovery import (
     uses_native_uia_dispatch_protocol,
 )
 from core.response import failure
-from core.timings import tool_timing
+from core.timings import tool_timing, trace_operation
 from core.tool_activity import TOOL_ACTIVITY
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
@@ -152,7 +152,10 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                                 )
                                 recovery_scope = None
                                 try:
-                                    with operation_recovery_context(handle) as recovery_scope:
+                                    with (
+                                        operation_recovery_context(handle) as recovery_scope,
+                                        trace_operation(handle.operation_id if handle is not None else None),
+                                    ):
                                         result = await fn(*args, **kwargs)
                                 except BaseException:
                                     try:
@@ -188,7 +191,10 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                             )
                             recovery_scope = None
                             try:
-                                with operation_recovery_context(handle) as recovery_scope:
+                                with (
+                                    operation_recovery_context(handle) as recovery_scope,
+                                    trace_operation(handle.operation_id if handle is not None else None),
+                                ):
                                     result = fn(*args, **kwargs)
                             except BaseException:
                                 try:

@@ -276,6 +276,7 @@ def managed_resource_claims(
 
     from core.config import SETTINGS
     from core.errors import ToolError
+    from core.timings import record_timing
     from core.workflow_store import WorkflowStore
 
     def quarantine(authority: WorkflowStore, request_id: str, owner_token: str) -> None:
@@ -310,6 +311,7 @@ def managed_resource_claims(
     deadline = time.monotonic() + max(0.001, timeout_sec)
     admitted = False
     release_on_exit = True
+    admission_started = time.perf_counter()
     try:
         while True:
             result = claim_store.reserve_resource_claims(
@@ -334,9 +336,12 @@ def managed_resource_claims(
                     "Managed resource admission did not become available before the timeout.",
                 )
             time.sleep(min(0.05, remaining))
+        record_timing("claim_wait", (time.perf_counter() - admission_started) * 1_000)
         with resource_capability(capability):
             yield capability
     except BaseException as exc:
+        if not admitted:
+            record_timing("claim_wait", (time.perf_counter() - admission_started) * 1_000, ok=False)
         if admitted and not isinstance(exc, NativeOwnershipRequiredError) and (
             quarantine_on_error or (isinstance(exc, ToolError) and exc.code == "process_cleanup_incomplete")
         ):

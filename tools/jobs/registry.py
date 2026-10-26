@@ -22,6 +22,7 @@ from core.jobs import (
     lazy_job_store,
 )
 from core.response_models import JobStatus, JobStatusResult, validate_tool_output
+from core.timings import record_timing, timings_enabled
 from core.tooling import DESTRUCTIVE, OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 
 JobId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
@@ -44,7 +45,7 @@ def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = No
     ) -> dict[str, Any]:
         """Submit a retry-safe durable command. Execution timeout starts after launch; optional queue timeout bounds pre-launch waiting."""
         audit_action("submit_job", target=resolve_path(cwd), details={"executable": executable})
-        return get_store().submit(
+        result = get_store().submit(
             [executable, *(args or [])],
             resolve_path(cwd),
             timeout_sec,
@@ -52,6 +53,14 @@ def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = No
             encoding,
             queue_timeout_sec=queue_timeout_sec,
         )
+        try:
+            audit_action(
+                "submit_job", outcome="completed",
+                details={"job_id": result["job_id"], "deduplicated": result["deduplicated"]},
+            )
+        except Exception:
+            pass
+        return result
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_status")
@@ -105,6 +114,11 @@ def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = No
 
         if state["timed_out"] and (heartbeat or progressed):
             state = {**state, "timed_out": False}
+        if timings_enabled():
+            record_timing(
+                "job_wait", (time.monotonic() - started) * 1_000,
+                metadata={"job_id": job_id, "job_correlation_id": store.trace_metadata(job_id).get("correlation_id")},
+            )
         return {
             **state,
             "heartbeat": heartbeat,

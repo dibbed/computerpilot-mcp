@@ -7,12 +7,13 @@ import functools
 import json
 import os
 import queue
+import secrets
 import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -27,6 +28,18 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 TIMING_MAX_FILE_BYTES = 8 * 1_024 * 1_024
 TIMING_KEEP_FILES = 3
 _CURRENT_TOOL: ContextVar[str | None] = ContextVar("mcp_current_tool", default=None)
+_TRACE_KEYS = frozenset({"trace_schema_version", "correlation_id", "parent_operation_id"})
+
+
+def _new_trace_id() -> str | None:
+    try:
+        return secrets.token_hex(16)
+    except Exception:
+        return None
+
+
+def _valid_trace_id(value: object) -> bool:
+    return type(value) is str and len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 
 
 @dataclass(slots=True)
@@ -34,6 +47,8 @@ class _RequestTimingState:
     request_started: float
     tool: str | None = None
     validation_finished: float | None = None
+    correlation_id: str | None = field(default_factory=_new_trace_id)
+    parent_operation_id: str | None = None
 
 
 _REQUEST_STATE: ContextVar[_RequestTimingState | None] = ContextVar("mcp_request_timing_state", default=None)
@@ -42,6 +57,58 @@ _WRITER_START_LOCK = threading.Lock()
 _WRITER_THREAD: threading.Thread | None = None
 _SDK_HOOK_LOCK = threading.Lock()
 _SDK_HOOKS_INSTALLED = False
+
+
+def validated_trace_metadata(value: object) -> dict[str, Any]:
+    if type(value) is not dict or not value.keys() <= _TRACE_KEYS:
+        return {}
+    if type(value.get("trace_schema_version")) is not int or value.get("trace_schema_version") != 1:
+        return {}
+    if not _valid_trace_id(value.get("correlation_id")):
+        return {}
+    if "parent_operation_id" in value and not _valid_trace_id(value["parent_operation_id"]):
+        return {}
+    return dict(value)
+
+
+def current_trace_metadata() -> dict[str, Any]:
+    state = _REQUEST_STATE.get()
+    if state is None or not _valid_trace_id(state.correlation_id):
+        return {}
+    metadata: dict[str, Any] = {"trace_schema_version": 1, "correlation_id": state.correlation_id}
+    if _valid_trace_id(state.parent_operation_id):
+        metadata["parent_operation_id"] = state.parent_operation_id
+    return metadata
+
+
+@contextmanager
+def invocation_trace(metadata: object = None, *, new: bool = False) -> Iterator[None]:
+    if metadata is None and not new and _REQUEST_STATE.get() is not None:
+        yield
+        return
+    restored = validated_trace_metadata(metadata)
+    state = _RequestTimingState(request_started=time.perf_counter())
+    if restored:
+        state.correlation_id = restored["correlation_id"]
+        state.parent_operation_id = restored.get("parent_operation_id")
+    token = _REQUEST_STATE.set(state)
+    try:
+        yield
+    finally:
+        _REQUEST_STATE.reset(token)
+
+
+@contextmanager
+def trace_operation(operation_id: str | None) -> Iterator[None]:
+    state = _REQUEST_STATE.get()
+    if state is None or not _valid_trace_id(operation_id):
+        yield
+        return
+    token = _REQUEST_STATE.set(replace(state, parent_operation_id=operation_id))
+    try:
+        yield
+    finally:
+        _REQUEST_STATE.reset(token)
 
 
 def timings_enabled() -> bool:
@@ -64,6 +131,8 @@ def _safe_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
         return {}
     safe: dict[str, Any] = {}
     for key, value in metadata.items():
+        if key in _TRACE_KEYS:
+            continue
         if value is None or isinstance(value, (bool, int, float)):
             safe[str(key)] = value
         elif isinstance(value, str):
@@ -235,9 +304,10 @@ def record_timing(
     if method:
         record["method"] = method
     record.update(_safe_metadata(metadata))
+    record.update(current_trace_metadata())
     try:
         _enqueue_record(timing_file(), record)
-    except OSError:
+    except Exception:
         return
 
 
@@ -262,22 +332,23 @@ def timing_span(phase: str, *, metadata: Mapping[str, Any] | None = None) -> Ite
 def tool_timing(operation: str) -> Iterator[None]:
     """Attach a tool name to nested spans and measure dispatch wait plus tool body."""
 
-    state = _REQUEST_STATE.get()
-    started = time.perf_counter()
-    if state is not None:
-        state.tool = operation
-        if state.validation_finished is not None:
-            record_timing(
-                "queue_wait",
-                (started - state.validation_finished) * 1_000,
-                tool=operation,
-            )
-    token = _CURRENT_TOOL.set(operation)
-    try:
-        with timing_span("tool_body"):
-            yield
-    finally:
-        _CURRENT_TOOL.reset(token)
+    with invocation_trace():
+        state = _REQUEST_STATE.get()
+        started = time.perf_counter()
+        if state is not None:
+            state.tool = operation
+            if state.validation_finished is not None:
+                record_timing(
+                    "queue_wait",
+                    (started - state.validation_finished) * 1_000,
+                    tool=operation,
+                )
+        token = _CURRENT_TOOL.set(operation)
+        try:
+            with timing_span("tool_body"):
+                yield
+        finally:
+            _CURRENT_TOOL.reset(token)
 
 
 def install_sdk_timing_hooks() -> None:
@@ -370,7 +441,7 @@ class ToolRequestTimingMiddleware:
     """Measure the MCP tools/call pipeline before wire serialization."""
 
     async def __call__(self, ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
-        if ctx.method != "tools/call" or not timings_enabled():
+        if ctx.method != "tools/call":
             return await call_next(ctx)
         tool_name: str | None = None
         if isinstance(ctx.params, Mapping):
@@ -381,6 +452,8 @@ class ToolRequestTimingMiddleware:
         state = _RequestTimingState(request_started=started, tool=tool_name)
         token = _REQUEST_STATE.set(state)
         try:
+            if not timings_enabled():
+                return await call_next(ctx)
             try:
                 result = await call_next(ctx)
             except BaseException:
