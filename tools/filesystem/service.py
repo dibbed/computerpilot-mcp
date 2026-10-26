@@ -22,7 +22,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from core.backups import BACKUP_RETENTION
 from core.config import SETTINGS, ensure_runtime_dirs, resolve_path
@@ -119,7 +119,7 @@ def local_read_path(path: Path) -> bool:
     if os.name == "nt":
         import ctypes
 
-        return ctypes.windll.kernel32.GetDriveTypeW(str(path.absolute().anchor)) in {2, 3, 6}
+        return cast(Any, ctypes).windll.kernel32.GetDriveTypeW(str(path.absolute().anchor)) in {2, 3, 6}
     import psutil
 
     mounts = [p for p in psutil.disk_partitions(all=True) if path.absolute().is_relative_to(p.mountpoint)]
