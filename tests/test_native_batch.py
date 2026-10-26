@@ -267,8 +267,10 @@ def test_global_capacity_and_repeated_cancel_hold_slots_until_reads_finish(tmp_p
         reader = server.native_read_batch_state
         # Exercise concurrency without conflating it with cold SQLite migration.
         await asyncio.to_thread(reader._store)
-        items = [{"id": str(i), "path": "file.txt"} for i in range(4)]
-        tasks = [asyncio.create_task(reader.execute(str(tmp_path), items, max_parallel=4, timeout_sec=30)) for _ in range(4)]
+        # Each admitted batch must own a real blocked read before cancellation;
+        # otherwise a scheduler may give all four slots to another batch.
+        items = [{"id": "only", "path": "file.txt"}]
+        tasks = [asyncio.create_task(reader.execute(str(tmp_path), items, max_parallel=1, timeout_sec=30)) for _ in range(4)]
         try:
             assert await asyncio.to_thread(entered.wait, 12), {
                 "calls": len(calls), "snapshot": reader.snapshot(), "done": [task.done() for task in tasks],
