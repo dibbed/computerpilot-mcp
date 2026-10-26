@@ -139,6 +139,77 @@ def test_native_standalone_pyright_command_has_no_entrypoint(tmp_path: Path, spa
     assert spawn_spy == []
 
 
+def test_intelephense_is_pinned_explicit_and_php_only(tmp_path: Path, spawn_spy: list[object]) -> None:
+    trusted = tmp_path / "workspace"
+    trusted.mkdir()
+    node = tmp_path / "node.exe"
+    script = tmp_path / "intelephense.js"
+    entry = _entry(
+        "intelephense", executable=node, entrypoint=script,
+        trusted_roots=[trusted], languages=["php"],
+    )
+    config = _write_config(tmp_path / "providers.json", [entry])
+    providers = load_lsp_providers(config)
+    assert validate_provider(trusted, "php", providers=providers).provider_id == "intelephense"
+    assert command_for(providers[0]) == (str(node), str(script), "--stdio")
+    with pytest.raises(ToolError, match="No LSP provider") as unavailable:
+        validate_provider(trusted, "python", providers=providers)
+    assert unavailable.value.code == "lsp_provider_unavailable"
+    entry["languages"] = ["python"]
+    with pytest.raises(ToolError) as wrong_language:
+        load_lsp_providers(_write_config(config, [entry]))
+    assert wrong_language.value.code == "config_invalid"
+    entry["languages"] = ["php"]
+    script.write_text("modified", encoding="utf-8")
+    with pytest.raises(ToolError) as changed:
+        validate_provider(trusted, "php", providers=providers)
+    assert changed.value.code == "lsp_provider_changed"
+    entry["entrypoint"] = None
+    entry["entrypoint_sha256"] = None
+    with pytest.raises(ToolError) as missing_entrypoint:
+        load_lsp_providers(_write_config(config, [entry]))
+    assert missing_entrypoint.value.code == "config_invalid"
+    assert spawn_spy == []
+
+
+def test_four_known_provider_configs_stay_bounded(tmp_path: Path, spawn_spy: list[object]) -> None:
+    entries = [
+        _entry(
+            provider_id, executable=tmp_path / f"{provider_id}.exe", entrypoint=tmp_path / f"{provider_id}.js",
+            trusted_roots=[tmp_path], languages=[language],
+        )
+        for provider_id, language in (
+            ("pyright", "python"), ("typescript", "typescript"), ("phpactor", "php"), ("intelephense", "php"),
+        )
+    ]
+    config = tmp_path / "providers.json"
+    assert len(load_lsp_providers(_write_config(config, entries))) == 4
+    with pytest.raises(ToolError) as oversize:
+        load_lsp_providers(_write_config(config, [*entries, entries[0]]))
+    assert oversize.value.code == "config_invalid"
+    assert spawn_spy == []
+
+
+def test_php_provider_overlap_stays_ambiguous(tmp_path: Path, spawn_spy: list[object]) -> None:
+    trusted = tmp_path / "workspace"
+    trusted.mkdir()
+    entries = [
+        _entry(
+            provider_id, executable=tmp_path / executable, entrypoint=tmp_path / script,
+            trusted_roots=[trusted], languages=["php"],
+        )
+        for provider_id, executable, script in (
+            ("phpactor", "php.exe", "phpactor.php"),
+            ("intelephense", "node.exe", "intelephense.js"),
+        )
+    ]
+    providers = load_lsp_providers(_write_config(tmp_path / "providers.json", entries))
+    with pytest.raises(ToolError) as ambiguous:
+        validate_provider(trusted, "php", providers=providers)
+    assert ambiguous.value.code == "lsp_provider_ambiguous"
+    assert spawn_spy == []
+
+
 def test_duplicate_unknown_or_oversize_config_rejected(tmp_path: Path, spawn_spy: list[object]) -> None:
     config = tmp_path / "providers.json"
     config.write_text('{"schema_version":1,"schema_version":1,"providers":[]}', encoding="utf-8")

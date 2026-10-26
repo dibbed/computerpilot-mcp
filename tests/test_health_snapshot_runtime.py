@@ -3,9 +3,21 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
-from core.health_snapshot import collect_server_health
+from core.health_snapshot import _lsp_snapshot, collect_server_health
+
+
+def test_lsp_reuse_health_publishes_only_bounded_numeric_counters() -> None:
+    class Manager:
+        def snapshot(self) -> dict[str, Any]:
+            return {"context_cache_hits": 7, "context_shared_waiters": 2**80, "private_payload": "private-canary"}
+
+    result = _lsp_snapshot(SimpleNamespace(lsp_manager=Manager()))
+    assert result["context_cache_hits"] == 7
+    assert result["context_shared_waiters"] == 2**63 - 1
+    assert "private_payload" not in result
 
 
 def test_health_metrics_collection_does_not_block_event_loop() -> None:

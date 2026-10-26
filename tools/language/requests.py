@@ -7,12 +7,14 @@ import math
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import unquote_to_bytes, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError, model_validator
 
 from core.errors import ToolError
+from core.response_models import NativeFailure, WireRootModel
+from core.workflow_store import redact_inputs
 from tools.language.lsp import position_to_offset, uri_to_path
 
 _MAX_PARAMS_BYTES = 64 * 1024
@@ -49,6 +51,84 @@ class Range(_Request):
         if (self.start.line, self.start.character) > (self.end.line, self.end.character):
             raise ValueError("Range endpoints must be ordered")
         return self
+
+
+class DiagnosticLocation(_Request):
+    uri: Annotated[str, Field(min_length=1, max_length=32_767)]
+    range: Range
+
+
+class DiagnosticRelatedInformation(_Request):
+    location: DiagnosticLocation
+    message: Annotated[str, Field(max_length=32_767)]
+
+
+class LanguageDiagnostic(_Request):
+    range: Range
+    message: Annotated[str, Field(max_length=32_767)]
+    severity: Annotated[StrictInt, Field(ge=1, le=4)] | None = None
+    source: Annotated[str, Field(max_length=500)] | None = None
+    code: StrictInt | str | None = None
+    codeDescription: dict[str, Annotated[str, Field(max_length=32_767)]] | None = None
+    tags: Annotated[list[Annotated[StrictInt, Field(ge=1, le=2)]], Field(max_length=2)] | None = None
+    relatedInformation: Annotated[list[DiagnosticRelatedInformation], Field(max_length=1_000)] | None = None
+    data: Any = None
+
+
+class DiagnosticReport(_Request):
+    model_config = ConfigDict(json_schema_extra={"allOf": [
+        {
+            "if": {"properties": {"kind": {"const": "full"}}},
+            "then": {"required": ["items"], "properties": {"items": {"type": "array"}}},
+        },
+        {
+            "if": {"properties": {"kind": {"const": "unchanged"}}},
+            "then": {
+                "required": ["resultId"],
+                "properties": {"resultId": {"type": "string"}},
+                "not": {"required": ["items"]},
+            },
+        },
+    ]})
+
+    kind: Literal["full", "unchanged"]
+    items: Annotated[list[LanguageDiagnostic], Field(max_length=10_000)] | None = None
+    resultId: Annotated[str, Field(min_length=1, max_length=32_767)] | None = None
+    relatedDocuments: dict[str, DiagnosticReport] | None = None
+    complete: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def _validate_report_kind(self) -> DiagnosticReport:
+        if self.kind == "full" and self.items is None:
+            raise ValueError("Full diagnostic reports require their item list.")
+        if self.kind == "unchanged" and (self.resultId is None or "items" in self.model_fields_set):
+            raise ValueError("Unchanged diagnostics require a result identity and no replacement items.")
+        return self
+
+
+class DiagnosticSuccess(_Request):
+    ok: Literal[True]
+    method: Literal["textDocument/diagnostic"]
+    result: DiagnosticReport
+
+
+class DiagnosticsResult(WireRootModel[DiagnosticSuccess | NativeFailure]):
+    pass
+
+
+def sanitize_diagnostic_report(value: Any) -> Any:
+    """Redact opaque provider data before validating or publishing diagnostics."""
+    if not isinstance(value, dict):
+        return value
+    result = dict(value)
+    if isinstance(result.get("items"), list):
+        result["items"] = [
+            {**item, "data": redact_inputs(item["data"])} if isinstance(item, dict) and "data" in item else item
+            for item in result["items"]
+        ]
+    if isinstance(result.get("relatedDocuments"), dict):
+        result["relatedDocuments"] = {uri: sanitize_diagnostic_report(report) for uri, report in result["relatedDocuments"].items()}
+    return result
 
 
 class HierarchyItem(_Request):

@@ -992,11 +992,18 @@ def test_manager_close_all_stops_admission_and_drains_workspaces(tmp_path: Path)
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("sync_kind", [0, 1, 2])
-def test_manager_document_sync_versions_and_utf16_range(tmp_path: Path, sync_kind: int) -> None:
+@pytest.mark.parametrize("sync_kind, numeric", [(0, False), (1, False), (2, False), (1, True), (2, True)])
+def test_manager_document_sync_versions_and_utf16_range(tmp_path: Path, sync_kind: int, numeric: bool) -> None:
     from tools.language.sessions import LspSessionManager
 
     provider, log = manager_provider(tmp_path, sync_kind=sync_kind)
+    if numeric:
+        assert provider.entrypoint is not None
+        source = provider.entrypoint.read_text(encoding="utf-8")
+        options = repr({"openClose": True, "change": sync_kind, "save": {"includeText": True}})
+        assert source.count(options) == 1
+        provider.entrypoint.write_text(source.replace(options, str(sync_kind)), encoding="utf-8")
+        provider = replace(provider, entrypoint_sha256=hashlib.sha256(provider.entrypoint.read_bytes()).hexdigest())
     path = tmp_path / "source.py"
     path.write_bytes("😀\r\nold😀".encode())
     manager = LspSessionManager((provider,), generation="test")
@@ -1026,8 +1033,9 @@ def test_manager_document_sync_versions_and_utf16_range(tmp_path: Path, sync_kin
             "start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 5},
         }
     saves = [item for item in notifications if item["method"] == "textDocument/didSave"]
-    assert len(saves) == 1
-    assert saves[0]["params"]["text"] == "new😀\r\n"
+    assert len(saves) == (0 if numeric else 1)
+    if not numeric:
+        assert saves[0]["params"]["text"] == "new😀\r\n"
 
 
 def test_manager_disk_change_during_hover_is_stale(tmp_path: Path) -> None:
@@ -1164,10 +1172,18 @@ def test_manager_document_language_and_unicode_identity(tmp_path: Path, suffix: 
     assert opens[0]["params"]["textDocument"]["languageId"] == language
 
 
-def test_manager_missing_sync_capability_denies_before_document_send(tmp_path: Path) -> None:
+@pytest.mark.parametrize("numeric", [None, False, True, 0, 3])
+def test_manager_missing_sync_capability_denies_before_document_send(tmp_path: Path, numeric: object) -> None:
     from tools.language.sessions import LspSessionManager
 
     provider, log = manager_provider(tmp_path, open_close=False)
+    if numeric is not None:
+        assert provider.entrypoint is not None
+        source = provider.entrypoint.read_text(encoding="utf-8")
+        options = repr({"openClose": False, "change": 1, "save": {"includeText": True}})
+        assert source.count(options) == 1
+        provider.entrypoint.write_text(source.replace(options, repr(numeric)), encoding="utf-8")
+        provider = replace(provider, entrypoint_sha256=hashlib.sha256(provider.entrypoint.read_bytes()).hexdigest())
     path = tmp_path / "source.py"
     path.write_text("x", encoding="utf-8")
     manager = LspSessionManager((provider,), generation="test")

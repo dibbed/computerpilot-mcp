@@ -7,7 +7,7 @@ import shutil
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 import anyio
 from mcp.server import MCPServer
@@ -17,16 +17,19 @@ from core.audit import audit_action
 from core.config import SETTINGS, resolve_path
 from core.errors import ToolError
 from core.recovery import bind_operation_recovery
+from core.response_models import validate_tool_output
 from core.tooling import MUTATING, OPEN_WORLD_READ, compact_errors
 from tools.language.edits import apply_workspace_edit, prepare_workspace_edit
 from tools.language.lsp import LspClient, uri_to_path
 from tools.language.requests import (
     DiagnosticRequest,
+    DiagnosticsResult,
     DocumentRequest,
     PositionRequest,
     ReferencesRequest,
     WorkspaceSymbolRequest,
     language_for_uri,
+    sanitize_diagnostic_report,
     select_request,
     validate_request,
 )
@@ -213,12 +216,14 @@ def register(mcp: MCPServer, *, manager: LspSessionManager | None = None) -> Non
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
         request: DiagnosticRequest | None = None,
         language_id: LanguageId | None = None,
-    ) -> dict[str, Any]:
+    ) -> DiagnosticsResult:
         """Return language diagnostics for one document."""
-        return await _dispatch_read(
+        result = await _dispatch_read(
             root, params, request, timeout_sec, "textDocument/diagnostic",
             manager=manager, language_id=language_id,
         )
+        result["result"] = sanitize_diagnostic_report(result["result"])
+        return cast(DiagnosticsResult, validate_tool_output(DiagnosticsResult, result, operation="language_diagnostics"))
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("rename_symbol")

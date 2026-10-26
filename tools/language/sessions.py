@@ -8,6 +8,8 @@ import json
 import math
 import os
 import queue
+import shutil
+import stat
 import threading
 import time
 import uuid
@@ -21,8 +23,9 @@ from typing import Literal
 
 import psutil
 
-from core.config import resolve_path
+from core.config import SETTINGS, resolve_path
 from core.errors import ToolError
+from core.file_lock import exclusive_file_lock
 from core.process_ownership import OwnedProcess
 from core.resource_locks import canonical_path
 from tools.language.lsp import _language_id, position_to_offset, uri_to_path
@@ -35,11 +38,21 @@ _SAMPLE_SEC = 0.5
 _MAX_WIRE_BYTES = 64 * 1024 * 1024
 _MAX_RSS_BYTES = 512 * 1024 * 1024
 _MAX_TOTAL_RSS_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_HANDLES_PER_SESSION = 512
+# A real TypeScript server can start a four-process tree with ~600 Windows handles.
+_MAX_TYPESCRIPT_HANDLES_PER_SESSION = 1024
 _MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 _MAX_DOCUMENT_TOTAL_BYTES = 16 * 1024 * 1024
 _CONTEXT_MAX_RESULTS = 32
 _CONTEXT_MAX_BYTES = 16 * 1024 * 1024
 _CONTEXT_TTL_SEC = 30.0
+_CACHED_READ_METHODS = frozenset({
+    "textDocument/definition", "textDocument/references", "textDocument/hover",
+    "textDocument/documentSymbol", "workspace/symbol",
+})
+_MAX_CACHE_BYTES = 128 * 1024 * 1024
+_MAX_CACHE_ENTRIES = 4096
+_MAX_CACHE_DIRECTORIES = 16
 _EVIDENCE_CAPABILITIES = (
     "workspaceSymbolProvider", "documentSymbolProvider", "definitionProvider",
     "referencesProvider", "callHierarchyProvider", "typeHierarchyProvider",
@@ -51,6 +64,64 @@ _DOCUMENT_ERRORS = frozenset({
     "lsp_document_unavailable", "lsp_document_changed", "lsp_document_encoding", "lsp_document_too_large",
     "lsp_document_capacity", "lsp_position_invalid", "lsp_sync_unsupported", "lsp_path_outside_workspace", "lsp_uri_unsupported",
 })
+
+
+def _trusted_typescript_tsserver(provider: LspProvider) -> Path | None:
+    """Resolve tsserver next to the pinned provider, never in untrusted workspace source."""
+    if provider.provider_id != "typescript" or provider.entrypoint is None:
+        return None
+    try:
+        entrypoint = provider.entrypoint.resolve(strict=True)
+        if entrypoint.name != "cli.mjs" or entrypoint.parent.parent.name != "typescript-language-server":
+            return None
+        node_modules = entrypoint.parent.parent.parent.resolve(strict=True)
+        tsserver = (node_modules / "typescript" / "lib" / "tsserver.js").resolve(strict=True)
+        return tsserver if tsserver.is_file() and tsserver.is_relative_to(node_modules) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _check_cache(directory: Path, deadline: float) -> None:
+    pending = [directory]
+    count = size = 0
+    while pending:
+        if time.monotonic() >= deadline:
+            raise _error("lsp_resource_exceeded")
+        current = pending.pop()
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise _error("lsp_resource_exceeded")
+        with os.scandir(current) as entries:
+            for entry in entries:
+                count += 1
+                info = entry.stat(follow_symlinks=False)
+                size += info.st_size
+                if (count > _MAX_CACHE_ENTRIES or size > _MAX_CACHE_BYTES or time.monotonic() >= deadline
+                        or stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400):
+                    raise _error("lsp_resource_exceeded")
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(Path(entry.path))
+
+
+def _create_cache(session: _Session) -> None:
+    state = SETTINGS.state_dir.resolve()
+    storage = state / "lsp"
+    storage.mkdir(parents=True, exist_ok=True)
+    if storage.resolve() != storage:
+        raise _error("lsp_resource_exceeded")
+    with exclusive_file_lock(storage / ".admission.lock", timeout_sec=0.5):
+        count = 0
+        with os.scandir(storage) as existing:
+            for entry in existing:
+                if entry.name == ".admission.lock":
+                    continue
+                count += 1
+                if count >= _MAX_CACHE_DIRECTORIES:
+                    raise _error("lsp_resource_exceeded")
+                _check_cache(Path(entry.path), time.monotonic() + 0.25)
+        cache = storage / session.incarnation
+        cache.mkdir(exist_ok=False)
+        session.cache_directory = cache
 
 
 @dataclass
@@ -163,6 +234,8 @@ class _Session:
     document_bytes: int = 0
     pending_document_closes: set[str] = field(default_factory=set)
     capabilities: dict[str, object] = field(default_factory=dict)
+    cache_directory: Path | None = None
+    read_cache_retry_after: float = 0.0
     last_activity: float = field(default_factory=time.monotonic)
     rss_bytes: int = 0
     cpu_seconds: float = 0.0
@@ -207,6 +280,8 @@ class LspSessionManager:
         self._context_epoch = 0
         self._context_preparing = 0
         self._context_flights: dict[_ContextKey, _ContextFlight] = {}
+        self._context_cache_hits = 0
+        self._context_shared_waiters = 0
 
     def _invalidate_context_locked(self) -> None:
         self._context_epoch += 1
@@ -311,6 +386,7 @@ class LspSessionManager:
                 self._context_bytes -= len(self._context_results.pop(cache_key).payload)
                 entry = None
             if entry is not None:
+                self._context_cache_hits += 1
                 self._context_results.move_to_end(cache_key)
                 result = (entry.payload, entry.generation)
                 flight = None
@@ -326,6 +402,11 @@ class LspSessionManager:
                     owner_snapshot if before is not None else cache_key[6],
                 )
                 flight = self._context_flights.get(flight_key)
+                if flight is None and owner_snapshot and before is not None:
+                    # A cold producer can create its owner while an equal caller fingerprints.
+                    flight = self._context_flights.get((*flight_key[:6], ""))
+                if flight is not None:
+                    self._context_shared_waiters += 1
                 owns = flight is None
                 if flight is None:
                     if len(self._context_flights) >= _CONTEXT_MAX_RESULTS:
@@ -426,7 +507,97 @@ class LspSessionManager:
     async def arequest(
         self, root: Path, language_id: str, method: str, params: dict[str, object], *, timeout_sec: float,
     ) -> object:
-        return (await self.arequest_with_evidence(root, language_id, method, params, timeout_sec=timeout_sec)).value
+        # Preserve the original request/cancellation path when a complete input
+        # inventory cannot even be attempted. Real-workspace cache admission
+        # requires an explicit, self-contained language configuration.
+        config_name = (
+            "pyrightconfig.json" if language_id == "python"
+            else "composer.json" if language_id == "php" else "tsconfig.json"
+        )
+        if method not in _CACHED_READ_METHODS or not (root / config_name).is_file():
+            return (await self.arequest_with_evidence(root, language_id, method, params, timeout_sec=timeout_sec)).value
+        if isinstance(timeout_sec, bool) or not math.isfinite(timeout_sec) or not 0 < timeout_sec <= 300:
+            raise _error("lsp_timeout_invalid")
+        deadline = time.monotonic() + timeout_sec
+        with self._lock:
+            if self._closed:
+                raise _error()
+            if self._preparing_count + sum(item.queue.qsize() for item in self._sessions.values()) >= 32:
+                raise _error("lsp_capacity_exceeded")
+            self._preparing_count += 1
+
+        async def prepare() -> tuple[Path, dict[str, object]]:
+            try:
+                resolved = await asyncio.to_thread(resolve_path, root)
+                validated = await asyncio.to_thread(validate_request, resolved, method, params)
+                return resolved, validated
+            finally:
+                with self._lock:
+                    self._preparing_count -= 1
+
+        preparation = asyncio.create_task(prepare())
+        preparation.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        try:
+            root, validated = await asyncio.wait_for(asyncio.shield(preparation), timeout=max(0, deadline - time.monotonic()))
+        except asyncio.TimeoutError:
+            raise _error("lsp_timeout") from None
+        request_key = hashlib.sha256(json.dumps(
+            {"raw_lsp_read": method, "params": validated}, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        canonical = canonical_path(root)
+        fingerprint_unavailable = False
+
+        async def fingerprint() -> str | None:
+            nonlocal fingerprint_unavailable
+            if fingerprint_unavailable:
+                return None
+            with self._lock:
+                if any(
+                    session.key.workspace_root == canonical and session.key.language_id == language_id
+                    and session.read_cache_retry_after > time.monotonic() for session in self._sessions.values()
+                ):
+                    fingerprint_unavailable = True
+                    return None
+
+            def scan() -> str | None:
+                # Runtime imports keep project inventory independent of session construction.
+                from tools.project.index import PYTHON_METADATA_CACHE
+                from tools.project.project_types import lsp_input_fingerprint
+
+                before = PYTHON_METADATA_CACHE.invalidation_epoch
+                digest = lsp_input_fingerprint(root, language_id)
+                after = PYTHON_METADATA_CACHE.invalidation_epoch
+                return hashlib.sha256(f"{before}:{digest}".encode()).hexdigest() if digest is not None and before == after else None
+            digest = await asyncio.to_thread(scan)
+            if digest is None:
+                fingerprint_unavailable = True
+                with self._lock:
+                    for session in self._sessions.values():
+                        if session.key.workspace_root == canonical and session.key.language_id == language_id:
+                            # A denial hint only suppresses optimization; it never authorizes stale reuse.
+                            session.read_cache_retry_after = time.monotonic() + 5
+            return digest
+
+        async def build() -> tuple[bytes, str | None]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _error("lsp_timeout")
+            reply = await self.arequest_with_evidence(root, language_id, method, validated, timeout_sec=remaining)
+            payload = json.dumps(reply.value, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            generation = session_generation(reply.key, reply.incarnation, reply.documents) if reply.value else None
+            return payload, generation
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _error("lsp_timeout")
+        # A changed or incomplete fingerprint must fail closed. Re-dispatching
+        # here would silently replay a request whose first attempt may have run.
+        payload = await self.acontext_result(
+            root, language_id, request_key, fingerprint=fingerprint, build=build, timeout_sec=remaining,
+        )
+        if time.monotonic() >= deadline:
+            raise _error("lsp_timeout")
+        return json.loads(payload)
 
     async def arequest_with_evidence(
         self, root: Path, language_id: str, method: str, params: dict[str, object], *, timeout_sec: float,
@@ -591,6 +762,7 @@ class LspSessionManager:
             return
         assert session.transport is not None
         session.transport.send({"jsonrpc": "2.0", "method": "textDocument/didClose", "params": {"textDocument": {"uri": uri}}})
+        session.transport.track_document(uri, None)
         size = len(document.text.encode("utf-8"))
         with self._lock:
             del session.documents[uri]
@@ -603,6 +775,8 @@ class LspSessionManager:
         self, session: _Session, uri: str, deadline: float, *, protected: frozenset[str] = frozenset(),
     ) -> DocumentState:
         sync = session.capabilities.get("textDocumentSync")
+        if type(sync) is int and sync in {1, 2}:
+            sync = {"openClose": True, "change": sync}
         if not isinstance(sync, dict) or sync.get("openClose") is not True or type(sync.get("change")) is not int:
             raise _error("lsp_sync_unsupported")
         kind = sync["change"]
@@ -635,6 +809,7 @@ class LspSessionManager:
             if old is not None:
                 self._remove_document(session, canonical_uri)
                 old_size = 0
+            channel.track_document(canonical_uri, version)
             language = _language_id(path)
             if language == "plaintext":
                 language = session.key.language_id
@@ -643,6 +818,7 @@ class LspSessionManager:
                 "params": {"textDocument": {"uri": canonical_uri, "languageId": language, "version": version, "text": text}},
             })
         else:
+            channel.track_document(canonical_uri, version)
             change: dict[str, object] = {"text": text}
             if kind == 2:
                 lines = old.text.split("\n")
@@ -710,6 +886,8 @@ class LspSessionManager:
 
     def _sample(self, session: _Session, *, cpu_baseline: float | None = None) -> None:
         assert session.process is not None
+        if session.cache_directory is not None:
+            _check_cache(session.cache_directory, time.monotonic() + 0.25)
         if session.process.poll() is not None:
             raise _error()
         try:
@@ -736,19 +914,28 @@ class LspSessionManager:
             session.cpu_seconds += consumed
             session.cpu_samples = samples
             total = sum(item.rss_bytes for item in self._sessions.values() if item.state != "CLOSED")
-        if rss > _MAX_RSS_BYTES or total > _MAX_TOTAL_RSS_BYTES or handles > 512:
+        handle_limit = (
+            _MAX_TYPESCRIPT_HANDLES_PER_SESSION
+            if session.provider.provider_id == "typescript" else _MAX_HANDLES_PER_SESSION
+        )
+        if rss > _MAX_RSS_BYTES or total > _MAX_TOTAL_RSS_BYTES or handles > handle_limit:
             raise _error("lsp_resource_exceeded")
         if cpu_baseline is not None and session.cpu_seconds - cpu_baseline > 30:
             raise _error("lsp_resource_exceeded")
 
     def _receive(
         self, session: _Session, deadline: float, cancel: threading.Event, *, cpu_baseline: float,
+        diagnostic_uri: str | None = None,
     ) -> dict[str, object]:
         assert session.transport is not None
         self._sample(session, cpu_baseline=cpu_baseline)
         while True:
             try:
-                response = session.transport.receive(deadline=min(deadline, time.monotonic() + _SAMPLE_SEC), cancel=cancel)
+                receive_deadline = min(deadline, time.monotonic() + _SAMPLE_SEC)
+                response: dict[str, object] = (
+                    {"result": session.transport.receive_diagnostics(diagnostic_uri, deadline=receive_deadline, cancel=cancel)}
+                    if diagnostic_uri is not None else session.transport.receive(deadline=receive_deadline, cancel=cancel)
+                )
                 self._sample(session, cpu_baseline=cpu_baseline)
                 return response
             except ToolError as error:
@@ -761,6 +948,8 @@ class LspSessionManager:
         try:
             if session.stop.is_set() or time.monotonic() >= startup_deadline:
                 return
+            if session.provider.provider_id == "intelephense":
+                _create_cache(session)
             session.process = open_transport(session.provider, Path(session.key.workspace_root))
             with self._lock:
                 self._spawn_count += 1
@@ -772,10 +961,30 @@ class LspSessionManager:
             cpu_baseline = session.cpu_seconds
             if session.stop.is_set() or time.monotonic() >= startup_deadline:
                 return
+            workspace_root = Path(session.key.workspace_root)
+            initialize_params: dict[str, object] = {
+                "processId": None, "rootUri": workspace_root.as_uri(),
+                "capabilities": {
+                    "workspace": {"configuration": True, "applyEdit": False},
+                    "textDocument": {"publishDiagnostics": {"versionSupport": True}, "definition": {"linkSupport": True}},
+                },
+            }
+            tsserver = _trusted_typescript_tsserver(session.provider)
+            if tsserver is not None:
+                initialize_params["initializationOptions"] = {
+                    "tsserver": {"path": str(tsserver), "useSyntaxServer": "never"},
+                    "disableAutomaticTypingAcquisition": True,
+                }
+            if session.provider.provider_id == "intelephense":
+                cache = session.cache_directory
+                assert cache is not None
+                initialize_params["initializationOptions"] = {
+                    "storagePath": str(cache), "globalStoragePath": str(cache),
+                    "licenceKey": str(cache / "licence-disabled.txt"),
+                }
             channel.send({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {"processId": None, "rootUri": Path(session.key.workspace_root).as_uri(),
-                           "capabilities": {"workspace": {"configuration": True, "applyEdit": False}}},
+                "params": initialize_params,
             })
             initialized = self._receive(
                 session, min(startup_deadline, time.monotonic() + 30), session.stop, cpu_baseline=cpu_baseline,
@@ -826,11 +1035,23 @@ class LspSessionManager:
                     session.current = None
                     continue
                 ticket.phase = "may_dispatch"
-                channel.send({"jsonrpc": "2.0", "id": ticket.request_id, **message})
+                params = message.get("params")
+                raw_document = params.get("textDocument") if isinstance(params, dict) else None
+                diagnostic_uri = (
+                    raw_document.get("uri") if isinstance(raw_document, dict)
+                    and message.get("method") == "textDocument/diagnostic"
+                    and session.provider.provider_id in {"typescript", "intelephense"}
+                    and not session.capabilities.get("diagnosticProvider") else None
+                )
+                if diagnostic_uri is None:
+                    channel.send({"jsonrpc": "2.0", "id": ticket.request_id, **message})
                 try:
-                    response = self._receive(session, ticket.deadline, ticket.cancelled, cpu_baseline=cpu_baseline)
+                    response = self._receive(
+                        session, ticket.deadline, ticket.cancelled, cpu_baseline=cpu_baseline,
+                        diagnostic_uri=diagnostic_uri if isinstance(diagnostic_uri, str) else None,
+                    )
                 except ToolError as error:
-                    if error.code in {"lsp_cancelled", "lsp_timeout"}:
+                    if diagnostic_uri is None and error.code in {"lsp_cancelled", "lsp_timeout"}:
                         channel.send({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": ticket.request_id}})
                         try:
                             channel.receive(deadline=time.monotonic() + 0.25, cancel=threading.Event())
@@ -896,6 +1117,14 @@ class LspSessionManager:
                     closed = close_transport(session.process, timeout_sec=0.5)
             except Exception:
                 closed = False
+            if closed and session.cache_directory is not None:
+                try:
+                    if (session.cache_directory.name != session.incarnation
+                            or session.cache_directory.resolve() != session.cache_directory):
+                        raise OSError("Language server cache ownership changed.")
+                    shutil.rmtree(session.cache_directory)
+                except OSError:
+                    closed = False
             with self._lock:
                 session.current = None
                 session.state = "CLOSED" if closed else "QUARANTINED"
@@ -985,4 +1214,6 @@ class LspSessionManager:
                 "rss_bytes": sum(item.rss_bytes for item in sessions),
                 "documents": sum(len(item.documents) for item in sessions),
                 "document_bytes": sum(item.document_bytes for item in sessions),
+                "context_cache_hits": self._context_cache_hits,
+                "context_shared_waiters": self._context_shared_waiters,
             }

@@ -21,12 +21,13 @@ from core.config import SETTINGS, Settings
 from core.errors import ToolError
 from core.resource_locks import canonical_path
 
-ProviderId = Literal["pyright", "typescript", "phpactor"]
+ProviderId = Literal["pyright", "typescript", "phpactor", "intelephense"]
 
 PROVIDER_LANGUAGES: dict[str, tuple[str, ...]] = {
     "pyright": ("python",),
     "typescript": ("javascript", "javascriptreact", "typescript", "typescriptreact"),
     "phpactor": ("php",),
+    "intelephense": ("php",),
 }
 _PROVIDER_FIELDS = frozenset(
     {
@@ -42,7 +43,7 @@ _PROVIDER_FIELDS = frozenset(
 )
 MAX_CONFIG_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 8
-MAX_PROVIDERS = 3
+MAX_PROVIDERS = 4
 MAX_TRUSTED_ROOTS = 32
 MAX_WORKTREE_MARKER_BYTES = 4_096
 MAX_DECLARED_VERSION_CHARS = 64
@@ -165,7 +166,7 @@ def _load_provider(entry: object) -> LspProvider:
         if not isinstance(entrypoint_sha256, str) or _DIGEST_RE.fullmatch(entrypoint_sha256) is None:
             raise _invalid()
         entrypoint_path = Path(entrypoint)
-    if provider_id in {"typescript", "phpactor"} and entrypoint_path is None:
+    if provider_id in {"typescript", "phpactor", "intelephense"} and entrypoint_path is None:
         raise _invalid()
     declared_version = entry["declared_version"]
     if (

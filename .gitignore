@@ -16,6 +16,9 @@ ENV/
 !.env.example
 
 # Runtime caches and test artifacts
+# Explicit opt-in real LSP acceptance installs and disposable workspaces
+tests/.real_lsp_tools/
+tests/.real_lsp_runs/
 .pytest_cache/
 .pytest-tmp/
 .pytest-tmp*/

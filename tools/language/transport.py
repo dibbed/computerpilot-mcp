@@ -22,12 +22,14 @@ from collections import deque
 from collections.abc import Sequence
 from pathlib import Path
 from typing import IO, Any
+from urllib.parse import unquote_to_bytes
 
 from core.errors import ToolError
 from core.executor import _creation_flags
 from core.extensions.transport import FrameDepthExceededError, scan_json_depth
 from core.process_ownership import OwnedProcess, spawn_owned_process
 from core.windows_job import NativeOwnershipRequiredError
+from core.workflow_store import redact_inputs
 from tools.language.providers import LspProvider, command_for, validate_provider
 
 _OS_ENV_VARS = ("SystemRoot", "WINDIR", "TEMP", "TMP") if os.name == "nt" else ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
@@ -36,6 +38,15 @@ _MAX_HEADER_BYTES = 64 * 1024
 
 def _protocol_error() -> ToolError:
     return ToolError("lsp_protocol_error", "Language server returned a malformed protocol message.")
+
+
+def _document_key(uri: str) -> str:
+    # Servers may percent-encode the drive colon and lowercase Windows drive names.
+    try:
+        key = unquote_to_bytes(uri).decode("utf-8", errors="strict")
+    except UnicodeError:
+        raise _protocol_error() from None
+    return os.path.normcase(key) if os.name == "nt" else key
 
 
 def _reject_constant(value: str) -> None:
@@ -146,6 +157,8 @@ class LspTransport:
         self._stale = 0
         self._partial_token: object = None
         self._partial_results: list[object] = []
+        self._diagnostic_versions: dict[str, int] = {}
+        self._diagnostics: dict[str, tuple[dict[str, object], int]] = {}
         self.notification_counts = {"textDocument/publishDiagnostics": 0, "$/progress": 0}
         self.wire_bytes = 0
         self._reader = threading.Thread(target=self._read, name="lsp-stdout-reader", daemon=True)
@@ -204,6 +217,32 @@ class LspTransport:
             raise _protocol_error()
         self._request_bytes = 0
         self._preparing_request = True
+        self._notifications = 0
+        self._stale = 0
+        self._partial_token = None
+        self._partial_results = []
+
+    def track_document(self, uri: str, version: int | None) -> None:
+        """Retain publications only for synchronized documents, invalidating old versions."""
+        self._check_owner()
+        uri = _document_key(uri)
+        self._diagnostics.pop(uri, None)
+        with self._condition:
+            retained = deque(
+                (item, size) for item, size in self._messages
+                if not (item.get("method") == "textDocument/publishDiagnostics"
+                        and isinstance(item.get("params"), dict)
+                        and isinstance(item["params"].get("uri"), str)
+                        and _document_key(item["params"]["uri"]) == uri)
+            )
+            self._messages = retained
+            self._queued_bytes = sum(size for _item, size in retained)
+        if version is None:
+            self._diagnostic_versions.pop(uri, None)
+        else:
+            if uri not in self._diagnostic_versions and len(self._diagnostic_versions) >= 16:
+                raise _protocol_error()
+            self._diagnostic_versions[uri] = version
 
     def send(self, payload: dict[str, object]) -> None:
         self._check_owner()
@@ -239,10 +278,8 @@ class LspTransport:
             self._fail(_protocol_error())
             raise _protocol_error() from None
 
-    def receive(self, *, deadline: float, cancel: threading.Event) -> dict[str, object]:
+    def _next_message(self, *, deadline: float, cancel: threading.Event) -> tuple[dict[str, Any], int]:
         self._check_owner()
-        if self._pending is None:
-            raise _protocol_error()
         while True:
             if cancel.is_set():
                 raise ToolError("lsp_cancelled", "Language server request was cancelled.")
@@ -263,30 +300,78 @@ class LspTransport:
             if self._request_bytes > self.max_request_bytes:
                 self._fail(ToolError("lsp_message_too_large", "Language server response exceeded the configured total limit."))
                 raise self._failure or _protocol_error()
-            if "method" in item:
-                self._notifications += 1
-                if self._notifications > 256:
+            return item, size
+
+    def _notification(self, item: dict[str, Any], size: int) -> None:
+        self._notifications += 1
+        if self._notifications > 256:
+            self._fail(_protocol_error())
+            raise _protocol_error()
+        if "id" in item:
+            reply: dict[str, object] = {"jsonrpc": "2.0", "id": item["id"]}
+            params = item.get("params")
+            items = params.get("items") if isinstance(params, dict) else None
+            if item["method"] == "workspace/configuration" and isinstance(items, list) and len(items) <= 100:
+                reply["result"] = [None] * len(items)
+            else:
+                reply["error"] = {"code": -32601, "message": "Client method not supported"}
+            self.send(reply)
+        elif item["method"] in self.notification_counts:
+            name = item["method"]
+            self.notification_counts[name] = min(self.notification_counts[name] + 1, 256)
+            params = item.get("params")
+            if name == "textDocument/publishDiagnostics" and isinstance(params, dict):
+                uri, version, diagnostics = params.get("uri"), params.get("version"), params.get("diagnostics")
+                if not isinstance(uri, str) or not isinstance(diagnostics, list) or (
+                    version is not None and type(version) is not int
+                ):
+                    raise _protocol_error()
+                uri = _document_key(uri)
+                if uri in self._diagnostic_versions and (version is None or version == self._diagnostic_versions[uri]):
+                    # Unversioned publications follow LSP's implicit latest-report semantics.
+                    diagnostics = [
+                        {**entry, "data": redact_inputs(entry["data"])}
+                        if isinstance(entry, dict) and "data" in entry else entry for entry in diagnostics
+                    ]
+                    self._diagnostics[uri] = ({"kind": "full", "items": diagnostics}, size)
+                    while sum(entry[1] for entry in self._diagnostics.values()) > self.max_message_bytes:
+                        del self._diagnostics[next(iter(self._diagnostics))]
+            if name == "$/progress" and isinstance(params, dict) and "value" in params:
+                if self._partial_token is not None and params.get("token") == self._partial_token:
+                    self._partial_results.append(params["value"])
+                elif not isinstance(params["value"], dict) or params["value"].get("kind") not in {"begin", "report", "end"}:
                     self._fail(_protocol_error())
                     raise _protocol_error()
-                if "id" in item:
-                    reply: dict[str, object] = {"jsonrpc": "2.0", "id": item["id"]}
-                    params = item.get("params")
-                    items = params.get("items") if isinstance(params, dict) else None
-                    if item["method"] == "workspace/configuration" and isinstance(items, list) and len(items) <= 100:
-                        reply["result"] = [None] * len(items)
-                    else:
-                        reply["error"] = {"code": -32601, "message": "Client method not supported"}
-                    self.send(reply)
-                elif item["method"] in self.notification_counts:
-                    name = item["method"]
-                    self.notification_counts[name] = min(self.notification_counts[name] + 1, 256)
-                    params = item.get("params")
-                    if name == "$/progress" and isinstance(params, dict) and "value" in params:
-                        if self._partial_token is not None and params.get("token") == self._partial_token:
-                            self._partial_results.append(params["value"])
-                        elif not isinstance(params["value"], dict) or params["value"].get("kind") not in {"begin", "report", "end"}:
-                            self._fail(_protocol_error())
-                            raise _protocol_error()
+
+    def receive_diagnostics(self, uri: str, *, deadline: float, cancel: threading.Event) -> dict[str, object]:
+        """Return an actual bounded publication; absence is a timeout, never an empty success."""
+        self._check_owner()
+        uri = _document_key(uri)
+        if self._pending is not None or uri not in self._diagnostic_versions:
+            raise _protocol_error()
+        while True:
+            self._check_owner()
+            if cancel.is_set():
+                raise ToolError("lsp_cancelled", "Language server request was cancelled.")
+            if time.monotonic() >= deadline:
+                raise ToolError("lsp_timeout", "Language server did not respond before the timeout.")
+            with self._condition:
+                queued = bool(self._messages)
+            if not queued and uri in self._diagnostics:
+                return self._diagnostics[uri][0]
+            item, size = self._next_message(deadline=deadline, cancel=cancel)
+            if "method" not in item:
+                raise _protocol_error()
+            self._notification(item, size)
+
+    def receive(self, *, deadline: float, cancel: threading.Event) -> dict[str, object]:
+        self._check_owner()
+        if self._pending is None:
+            raise _protocol_error()
+        while True:
+            item, size = self._next_message(deadline=deadline, cancel=cancel)
+            if "method" in item:
+                self._notification(item, size)
                 continue
             response_id = item.get("id")
             if type(response_id) is not int or response_id > self._pending or len({"result", "error"} & item.keys()) != 1:

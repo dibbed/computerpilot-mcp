@@ -30,7 +30,7 @@ MAX_RUNTIME_HEALTH_BYTES = 512 * 1024
 RUNTIME_HEALTH_MAX_AGE_SEC = 30.0
 _LSP_COUNTERS = (
     "spawn_count", "reuse_count", "failed", "restart_count", "active", "ready", "quarantined", "queue_depth",
-    "in_flight", "rss_bytes", "documents", "document_bytes", "preparing",
+    "in_flight", "rss_bytes", "documents", "document_bytes", "preparing", "context_cache_hits", "context_shared_waiters",
 )
 
 
