@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import sqlite3
@@ -41,6 +42,7 @@ from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
 from core.recovery import OperationRecoveryJournal
 from core.registry import create_server
+from core.resource_claims import RESOURCE_CAPABILITY_ENV
 from core.state_paths import unlinked_directory_tree, unlinked_regular_file
 from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 from tools.desktop.uia import ElementLocator, UIAutomationService, WindowLocator
@@ -53,7 +55,7 @@ from tools.language.lsp import LspClient, _frame, _parse_frames
 from tools.language.providers import LspProvider, command_for
 from tools.language.sessions import LspSessionManager
 from tools.project.context import lookup_code_context
-from tools.project.service import parse_python
+from tools.project.service import iter_files, parse_python
 from tools.testing.diagnostics import merge_diagnostics
 from tools.testing.impact import select_affected_tests
 from tools.testing.verification import build_verification_plan
@@ -91,6 +93,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
     },
 }
 SUITES = (
+    "exec_cost",
     "catalog",
     "startup",
     "output",
@@ -2203,6 +2206,352 @@ def _temporary_root(name: str) -> Iterator[str]:
             yield directory
 
 
+def _exec_cost_summary(samples: list[dict[str, Any]], expected: str) -> dict[str, Any]:
+    errors = sum("error" in sample or sample.get("sha256") != expected for sample in samples)
+    if errors or not samples:
+        return {"status": "error", "comparable": False, "errors": max(errors, 1)}
+    elapsed = sorted(float(sample["elapsed_ms"]) for sample in samples)
+
+    def percentile(fraction: float) -> float:
+        position = (len(elapsed) - 1) * fraction
+        low = int(position)
+        return round(elapsed[low] + (elapsed[min(low + 1, len(elapsed) - 1)] - elapsed[low]) * (position - low), 3)
+
+    return {
+        "status": "ok",
+        "comparable": True,
+        "errors": 0,
+        "count": len(samples),
+        "p50_ms": percentile(0.5),
+        "p95_ms": percentile(0.95),
+        "p99_ms": percentile(0.99),
+        "p99_exploratory": True,
+        "output_sha256": expected,
+        "samples": samples,
+    }
+
+
+def _exec_cost_worker(repeats: int, include_jobs: bool) -> dict[str, Any]:
+    """Run only in the owned source copy: all default state paths then stay isolated."""
+    import difflib
+
+    from mcp import Client
+
+    from core import resource_claims
+    from tools.terminal import registry as terminal_registry
+
+    root = PROJECT_ROOT / "fixture"
+    root.mkdir()
+    text = "alpha\nbeta\ngamma\ndelta\n"
+    (root / "sample.txt").write_text(text, encoding="utf-8", newline="\n")
+    for index in range(32):
+        (root / f"item-{index:02}.txt").write_text(str(index), encoding="utf-8")
+    after = text.upper()
+    search = "\n".join(f"item-{index:02}.txt" for index in range(32))
+    workloads = {
+        "read": ["native", "python", "powershell"],
+        "search": ["native", "python", "powershell"],
+        "edit": ["sequential", "patch"],
+    }
+    if include_jobs:
+        workloads.update({"short": ["direct", "job"], "medium": ["direct", "job"]})
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if not powershell:
+        for workload in ("read", "search"):
+            workloads[workload].remove("powershell")
+    expected = {
+        name: hashlib.sha256(value.encode()).hexdigest()
+        for name, value in (
+            ("read", text),
+            ("search", search),
+            ("edit", after),
+            ("short", "completed"),
+            ("medium", "completed"),
+        )
+    }
+    samples: dict[str, list[dict[str, Any]]] = {f"{w}/{v}": [] for w, variants in workloads.items() for v in variants}
+    waits: list[float] = []
+    managed = resource_claims.managed_resource_claims
+
+    @contextmanager
+    def observed_claims(*args: Any, **kwargs: Any) -> Iterator[str]:
+        started = time.perf_counter()
+        with managed(*args, **kwargs) as capability:
+            waits.append((time.perf_counter() - started) * 1_000)
+            yield capability
+
+    resource_claims.managed_resource_claims = observed_claims
+    terminal_registry.managed_resource_claims = observed_claims
+    job_ids: list[str] = []
+    store: JobStore | None = None
+    host_load = {"cpu_percent": psutil.cpu_percent(interval=0.1), "memory_percent": psutil.virtual_memory().percent}
+
+    async def run() -> None:
+        nonlocal store
+        server = create_server()
+        async with Client(server) as client:
+
+            async def call(name: str, **arguments: Any) -> dict[str, Any]:
+                result = await client.call_tool(name, arguments)
+                payload = result.structured_content
+                if not isinstance(payload, dict) or payload.get("ok") is False or result.is_error:
+                    if isinstance(payload, dict):
+                        raise RuntimeError(f"Benchmark tool failed: {name} {payload.get('error')}")
+                    raise RuntimeError("Benchmark tool did not return a successful structured result.")
+                return payload
+
+            if include_jobs:
+                store = server.job_store_getter()  # type: ignore[attr-defined]
+            rng = random.Random(1401)
+            for round_index in range(5 + repeats):
+                for workload, variants in workloads.items():
+                    order = list(variants)
+                    rng.shuffle(order)
+                    for variant in order:
+                        target = root / "edit.txt"
+                        if workload == "edit":
+                            target.write_text(text, encoding="utf-8", newline="\n")
+                        waits.clear()
+                        started = time.perf_counter()
+                        launches = 0
+                        output = ""
+                        try:
+                            if workload in {"read", "search"}:
+                                if variant == "native":
+                                    if workload == "read":
+                                        output = str((await call("read_file", path=str(root / "sample.txt"), encoding="utf-8"))["content"])
+                                    else:
+                                        found = await call(
+                                            "search_files", path=str(root), query="item-", search_type="name", max_results=50
+                                        )
+                                        output = "\n".join(sorted(Path(item["path"]).name for item in found["items"]))
+                                else:
+                                    if variant == "python":
+                                        script = (
+                                            "from pathlib import Path; import sys; sys.stdout.write("
+                                            + (
+                                                "Path('sample.txt').read_text(encoding='utf-8')"
+                                                if workload == "read"
+                                                else "'\\n'.join(sorted(p.name for p in Path('.').glob('item-*')))"
+                                            )
+                                            + ")"
+                                        )
+                                        result = await call(
+                                            "run_process",
+                                            executable=sys.executable,
+                                            args=["-c", script],
+                                            cwd=str(root),
+                                            timeout_sec=15,
+                                            delivery="inline",
+                                        )
+                                    else:
+                                        script = (
+                                            "[Console]::Out.Write("
+                                            + (
+                                                "[IO.File]::ReadAllText((Join-Path (Get-Location) 'sample.txt'))"
+                                                if workload == "read"
+                                        else "((Get-ChildItem -File -Filter 'item-*' | Sort-Object Name | "
+                                        "ForEach-Object {$_.Name}) -join [char]10)"
+                                            )
+                                            + ")"
+                                        )
+                                        result = await call(
+                                            "run_powershell", script=script, cwd=str(root), timeout_sec=15, delivery="inline"
+                                        )
+                                    if result["exit_code"] != 0 or result["stdout"].get("truncated"):
+                                        raise RuntimeError("Benchmark process failed or truncated its output.")
+                                    launches = int(isinstance(result.get("pid"), int))
+                                    output = str(result["stdout"]["text"]).replace("\r\n", "\n")
+                            elif workload == "edit":
+                                if variant == "sequential":
+                                    for old in text.splitlines():
+                                        await call(
+                                            "replace_exact", path=str(target), old=old, new=old.upper(), expected_count=1, encoding="utf-8"
+                                        )
+                                else:
+                                    # Both variants validate the same exact preimage in this uncontended fixture.
+                                    patch = "diff --git a/edit.txt b/edit.txt\n" + "".join(
+                                        difflib.unified_diff(
+                                            text.splitlines(True),
+                                            after.splitlines(True),
+                                            fromfile="a/edit.txt",
+                                            tofile="b/edit.txt",
+                                        )
+                                    )
+                                    await call(
+                                        "apply_patch",
+                                        root=str(root),
+                                        patch=patch,
+                                        expected_sha256={"edit.txt": _hash_file(target)},
+                                        encoding="utf-8",
+                                    )
+                                output = target.read_text(encoding="utf-8")
+                            else:
+                                delay = 0.01 if workload == "short" else 0.2
+                                args = ["-c", f"import time; time.sleep({delay}); print('completed', end='')"]
+                                if variant == "direct":
+                                    result = await call(
+                                        "run_process",
+                                        executable=sys.executable,
+                                        args=args,
+                                        cwd=str(root),
+                                        timeout_sec=15,
+                                        delivery="inline",
+                                    )
+                                    if result["exit_code"] != 0:
+                                        raise RuntimeError("Direct benchmark failed.")
+                                    output = str(result["stdout"]["text"])
+                                    launches = int(isinstance(result.get("pid"), int))
+                                else:
+                                    submitted = await call(
+                                        "submit_job",
+                                        executable=sys.executable,
+                                        args=args,
+                                        cwd=str(root),
+                                        timeout_sec=15,
+                                        idempotency_key=uuid.uuid4().hex,
+                                    )
+                                    job_id = str(submitted["job_id"])
+                                    job_ids.append(job_id)
+                                    version = 0
+                                    deadline = time.monotonic() + 30
+                                    while time.monotonic() < deadline:
+                                        result = await call("job_wait", job_id=job_id, after_version=version, timeout=1)
+                                        version = int(result["version"])
+                                        if result["status"] in FINAL_JOB_STATES:
+                                            break
+                                    else:
+                                        raise RuntimeError("Benchmark job did not complete within its deadline.")
+                                    if result["status"] != "succeeded":
+                                        raise RuntimeError("Benchmark job failed.")
+                                    output = str((await call("job_output", job_id=job_id, delivery="inline"))["stdout"]["text"])
+                                    assert store is not None
+                                    row = store.raw(job_id)
+                                    launches = len({int(row["worker_pid"]), int(row["pid"])})
+                            sample = {
+                                "elapsed_ms": round((time.perf_counter() - started) * 1_000, 3),
+                                "sha256": hashlib.sha256(output.encode()).hexdigest(),
+                                "process_launches": launches,
+                                "claim_wait_ms": round(sum(waits), 3) if waits else None,
+                            }
+                        except Exception as exc:
+                            sample = {"error": type(exc).__name__}
+                        if sample.get("sha256") != expected[workload]:
+                            samples[f"{workload}/{variant}"].append(sample)
+                            raise RuntimeError(f"Non-equivalent benchmark sample: {workload}/{variant} {sample.get('error', 'checksum')}")
+                        if round_index >= 5:
+                            samples[f"{workload}/{variant}"].append(sample)
+
+    try:
+        asyncio.run(run())
+    finally:
+        resource_claims.managed_resource_claims = managed
+        terminal_registry.managed_resource_claims = managed
+        if store is not None:
+            for job_id in job_ids:
+                row = store.raw(job_id)
+                if row["status"] not in FINAL_JOB_STATES:
+                    store.cancel(job_id)
+            deadline = time.monotonic() + 20
+            while any(
+                same_process(store.raw(j)[pid], store.raw(j)[created])
+                for j in job_ids for pid, created in (("worker_pid", "worker_created"), ("pid", "pid_created"))
+            ):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Benchmark worker cleanup could not be verified.")
+                time.sleep(0.02)
+    return {
+        "warmups": 5,
+        "repeats": repeats,
+        "seed": 1401,
+        "order": "paired_randomized",
+        "host_load_at_start": host_load,
+        "host_load_at_end": {"cpu_percent": psutil.cpu_percent(), "memory_percent": psutil.virtual_memory().percent},
+        "runtime": {"python": platform.python_version(), "powershell_binary_sha256": _hash_file(Path(powershell)) if powershell else None},
+        "host_control": "shared host; exploratory timings, not a production SLA",
+        "scope": "in-process SDK calls; no client/model/network latency; short=10ms, medium=200ms",
+        "process_launch_scope": "controlled command roots plus durable workers; not OS helper processes",
+        "claim_wait_scope": "parent-process admission only; worker claim/SQLite/serialization NOT_MEASURED until P14-02",
+        "powershell_available": bool(powershell),
+        "job_cases_enabled": include_jobs,
+        "workers_cleaned": True,
+        "cases": {key: _exec_cost_summary(value, expected[key.split("/")[0]]) for key, value in samples.items()},
+    }
+
+
+def _exec_cost_once(repeats: int, include_jobs: bool) -> dict[str, Any]:
+    if not 1 <= repeats <= 100:
+        raise ValueError("exec_cost requires 1..100 paired repeats.")
+    # A source copy isolates hardcoded PROJECT_ROOT state, including detached job workers.
+    temporary = Path(tempfile.mkdtemp(prefix="computerpilot-exec-cost-"))
+    cleanup_verified = False
+    try:
+        source = temporary / "source"
+        source.mkdir()
+        paths: list[Path] = []
+        for directory in ("core", "tools", "scripts"):
+            files, truncated = iter_files(PROJECT_ROOT / directory, 1_000)
+            if truncated:
+                raise RuntimeError("Benchmark source snapshot exceeded its file limit.")
+            paths.extend(path for path in files if path.suffix == ".py")
+        manifest: dict[str, str] = {}
+        remaining_bytes = 32 * MiB
+        for path in paths:
+            if not path.resolve().is_relative_to(PROJECT_ROOT.resolve()) or not unlinked_regular_file(path):
+                raise RuntimeError("Benchmark source is not a contained regular file.")
+            with path.open("rb") as stream:
+                content = stream.read(remaining_bytes + 1)
+            if len(content) > remaining_bytes:
+                raise RuntimeError("Benchmark source snapshot exceeded its byte limit.")
+            remaining_bytes -= len(content)
+            relative = path.relative_to(PROJECT_ROOT).as_posix()
+            manifest[relative] = hashlib.sha256(content).hexdigest()
+            destination = source / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+        fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        command = [
+            sys.executable,
+            "-c",
+            # Keep the parent's claim around this child, but never reuse its database inside the owned fixture.
+            f"import os,json; os.environ.pop({RESOURCE_CAPABILITY_ENV!r},None); "
+            "from scripts.perf_benchmark import _exec_cost_worker; print(json.dumps(_exec_cost_worker("
+            + str(repeats)
+            + ", "
+            + str(include_jobs)
+            + ")))",
+        ]
+        env = {key: "" for key in os.environ if key.upper().startswith(("MCP_", "PYTHON"))}
+        env.update({"MCP_TOOL_PROFILE": "full", "MCP_LSP_PERSISTENT_ENABLED": "0", "MCP_WORKFLOW_DAG_ENABLED": "0"})
+        result = run_bounded(
+            command,
+            cwd=source,
+            timeout_sec=min(3_600, 120 + repeats * 30),
+            stdout_limit=2_000_000,
+            stderr_limit=2_000,
+            env=env,
+            delivery="inline",
+        )
+        if result["exit_code"] != 0:
+            return {
+                "name": "exec_cost", "status": "error", "comparable": False,
+                "error": "isolated_benchmark_failed", "retained_fixture": str(temporary),
+            }
+        details = json.loads(result["stdout"]["text"])
+        cleanup_verified = details.get("workers_cleaned") is True and all(
+            case.get("status") == "ok" for case in details["cases"].values()
+        )
+        if not cleanup_verified:
+            raise RuntimeError("Isolated benchmark cleanup or correctness is unverified; fixture retained.")
+        return {"name": "exec_cost", "status": "ok", "source_manifest_sha256": fingerprint, "source_files": len(manifest), **details}
+
+    finally:
+        if cleanup_verified:
+            if temporary.parent.resolve() != Path(tempfile.gettempdir()).resolve():
+                raise RuntimeError("Benchmark cleanup target escaped temporary storage.")
+            shutil.rmtree(temporary)
+
+
 def run_benchmarks(
     *,
     profile: str,
@@ -2219,8 +2568,11 @@ def run_benchmarks(
     if unknown:
         raise ValueError(f"Unknown suites: {sorted(unknown)}")
     limits = PROFILE_LIMITS[profile]
-    stale_temp_dirs_removed = _cleanup_stale_temp_roots()
+    stale_temp_dirs_removed = 0 if suites == {"exec_cost"} else _cleanup_stale_temp_roots()
     results: list[dict[str, Any]] = []
+
+    if "exec_cost" in suites:
+        results.append(_exec_cost_once(runs, include_jobs))
 
     if "catalog" in suites:
         results.append(measure("tool_catalog", _catalog_once, runs))

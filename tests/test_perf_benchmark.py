@@ -84,6 +84,91 @@ def test_benchmark_profiles_cover_planned_scale_points() -> None:
     assert quick["lsp_requests"] == [1, 10]
 
 
+def test_exec_cost_suite_rejects_unequal_or_failed_samples() -> None:
+    summarize = perf_benchmark._exec_cost_summary
+    good = {"elapsed_ms": 2.0, "sha256": "a" * 64, "process_launches": 0, "claim_wait_ms": 0.0}
+    result = summarize([good, {**good, "elapsed_ms": 4.0}], "a" * 64)
+    assert result["status"] == "ok"
+    assert result["p50_ms"] == 3.0
+    assert result["p95_ms"] >= result["p50_ms"]
+    assert result["p99_exploratory"] is True
+    for samples in ([{**good, "sha256": "b" * 64}], [{"error": "canary-private-payload"}], []):
+        failed = summarize(samples, "a" * 64)
+        assert failed["status"] == "error"
+        assert failed["comparable"] is False
+        assert "p50_ms" not in failed
+        assert "canary-private-payload" not in json.dumps(failed)
+
+
+def test_exec_cost_registered_suite_uses_requested_repeats(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, bool]] = []
+
+    def fake(repeats: int, include_jobs: bool) -> dict[str, Any]:
+        calls.append((repeats, include_jobs))
+        return {"name": "exec_cost", "status": "ok"}
+
+    monkeypatch.setattr(perf_benchmark, "_exec_cost_once", fake)
+    monkeypatch.setattr(perf_benchmark, "_cleanup_stale_temp_roots", lambda: 0)
+    assert build_parser().parse_args(["--suite", "exec_cost"]).suites == ["exec_cost"]
+    report = run_benchmarks(profile="quick", runs=30, suites={"exec_cost"}, include_jobs=True, include_browser=False)
+    assert calls == [(30, True)]
+    assert report["results"] == [{"name": "exec_cost", "status": "ok"}]
+
+
+def test_exec_cost_real_sdk_paths_are_equivalent_and_isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(perf_benchmark.subprocess, "check_output", lambda *a, **k: pytest.fail("benchmark requires Git metadata"))
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path / "must-not-create"))
+    monkeypatch.setenv("MCP_WORKFLOW_DAG_ENABLED", "1")
+    monkeypatch.setenv("MCP_TOOL_PROFILE", "coding_core")
+    from core.resource_claims import coordination_claim, managed_resource_claims, path_claim
+    from core.workflow_store import WorkflowStore
+
+    parent = WorkflowStore(tmp_path / "parent" / "workflows.sqlite3", recover=False)
+    with managed_resource_claims(
+        (coordination_claim(exclusive=True), path_claim(tmp_path, "write", scope="subtree")),
+        category="test", store=parent,
+    ):
+        report = perf_benchmark._exec_cost_once(1, True)
+        assert parent.health_summary()["active_resource_request_count"] == 1
+    assert parent.health_summary()["active_resource_request_count"] == 0
+    assert report["status"] == "ok"
+    assert report["workers_cleaned"] is True
+    assert not (tmp_path / "must-not-create").exists()
+    assert len(report["cases"]) == (12 if report["powershell_available"] else 10)
+    for case in report["cases"].values():
+        assert case["status"] == "ok"
+        assert case["count"] == 1
+        assert case["errors"] == 0
+    assert report["cases"]["short/job"]["output_sha256"] == report["cases"]["short/direct"]["output_sha256"]
+
+
+@pytest.mark.parametrize("repeats", [0, 101])
+def test_exec_cost_bounds_work_before_launch(repeats: int) -> None:
+    with pytest.raises(ValueError, match="paired repeats"):
+        perf_benchmark._exec_cost_once(repeats, False)
+
+
+def test_exec_cost_retains_failed_fixture_without_raw_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs["env"]["MCP_WORKFLOW_DAG_ENABLED"] == "0"
+        return {"exit_code": 1, "stderr": {"text": "secret-canary"}}
+
+    monkeypatch.setattr(perf_benchmark, "run_bounded", fail)
+    report = perf_benchmark._exec_cost_once(1, False)
+    retained = Path(report["retained_fixture"])
+    try:
+        assert report["status"] == "error"
+        assert report["comparable"] is False
+        assert retained.is_dir()
+        assert "secret-canary" not in json.dumps(report)
+    finally:
+        # This fake never spawned a worker; its disposable fixture can be removed.
+        import shutil
+
+        assert retained.parent.resolve() == Path(perf_benchmark.tempfile.gettempdir()).resolve()
+        shutil.rmtree(retained)
+
+
 _LSP_DETAIL_KEYS = {
     "elapsed",
     "p50",
