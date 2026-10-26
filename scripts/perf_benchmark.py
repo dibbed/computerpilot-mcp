@@ -292,6 +292,10 @@ def _catalog_once() -> dict[str, Any]:
     return {
         "tool_count": len(tools),
         "catalog_json_bytes": len(payload),
+        "output_schema_json_bytes": sum(
+            len(json.dumps(tool["outputSchema"], ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            for tool in catalog if "outputSchema" in tool
+        ),
         "serialization_ms": round(serialization_ms, 3),
     }
 
@@ -783,9 +787,16 @@ def _prepare_impact_fixture(root: Path, count: int) -> None:
 
 def _impact_once(root: Path, count: int) -> dict[str, Any]:
     result = select_affected_tests(root, changed_paths=["app/module_0000.py"], max_files=count + count // 5 + 10, max_depth=20)
-    if result["decision"] not in {"focused", "focused_plus_full_recommended"}:
-        raise RuntimeError(f"affected_tests correctness mismatch: {result['decision']!r}")
-    return {"files": count, "tests": result["test_count"], "modules_traversed": result["modules_traversed"]}
+    decision = result["decision"]
+    if decision not in {"focused", "focused_plus_full_recommended", "full_suite"}:
+        raise RuntimeError(f"affected_tests correctness mismatch: {decision!r}")
+    if decision == "full_suite" and not result.get("full_suite_reasons"):
+        raise RuntimeError("Full-suite fallback lacks explicit coverage evidence.")
+    return {
+        "files": count, "tests": result["test_count"], "modules_traversed": result["modules_traversed"],
+        "decision": decision, "unknown_coverage": result.get("unknown_coverage", False),
+        "full_suite_reasons": result.get("full_suite_reasons", []),
+    }
 
 
 def _verification_plan_once(root: Path) -> dict[str, Any]:

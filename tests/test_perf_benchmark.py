@@ -367,6 +367,12 @@ def test_catalog_benchmark_uses_complete_wire_tool_models() -> None:
     wire_catalog = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
     expected = len(json.dumps(wire_catalog, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     assert result["details"]["catalog_json_bytes"] == expected
+    expected_output_bytes = sum(
+        len(json.dumps(tool["outputSchema"], ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        for tool in wire_catalog if "outputSchema" in tool
+    )
+    assert 0 < expected_output_bytes < expected
+    assert result["details"]["output_schema_json_bytes"] == expected_output_bytes
 
 
 def test_resilience_benchmarks_cover_recovery_uia_and_workflow(tmp_path: Path) -> None:
