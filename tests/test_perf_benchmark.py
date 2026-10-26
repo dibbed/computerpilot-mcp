@@ -84,6 +84,44 @@ def test_benchmark_profiles_cover_planned_scale_points() -> None:
     assert quick["lsp_requests"] == [1, 10]
 
 
+def test_native_batch_benchmark_counts_requests_and_checks_equal_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_benchmark, "PROJECT_ROOT", tmp_path)
+    report = perf_benchmark._native_batch_worker(1, include_powershell=False)
+    assert report["workers_cleaned"] is True
+    assert report["warmups"] == 5
+    assert report["wire_scope"] == "NDJSON roundtrip of actual SDK messages; in-memory transport, no tunnel"
+    assert report["denied_dispatches"] == 0
+    assert report["tokenizer"] == "NOT_MEASURED"
+    for count in (1, 4, 8, 16):
+        direct = report["cases"][f"{count}/direct"]
+        for parallel in (1, 2, 4):
+            batch = report["cases"][f"{count}/batch{parallel}"]
+            assert batch["errors"] == 0 and batch["output_sha256"] == direct["output_sha256"]
+            assert batch["samples"][0]["requests"] == batch["samples"][0]["responses"] == 1
+            assert direct["samples"][0]["requests"] == count
+            assert batch["samples"][0]["request_frame_bytes"] > 0
+            assert batch["samples"][0]["response_frame_bytes"] > 0
+            assert 0 < batch["peak_workers"] <= parallel
+            if count >= 4:
+                assert batch["synthetic_wait_saving_percent"]["100"] >= 50
+
+
+def test_benchmark_unreadable_launcher_does_not_weaken_strict_hashing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    launcher = tmp_path / "pwsh.EXE"
+    launcher.write_bytes(b"executable")
+    digest, status = perf_benchmark._benchmark_launcher_fingerprint(str(launcher))
+    assert status == "verified" and len(digest or "") == 64
+
+    def fail_to_open(_: Path) -> str:
+        raise OSError(22, "unreadable Windows Store launcher")
+
+    monkeypatch.setattr(perf_benchmark, "_hash_file", fail_to_open)
+    assert perf_benchmark._benchmark_launcher_fingerprint(str(launcher)) == (None, "unreadable_launcher")
+    assert perf_benchmark._benchmark_launcher_fingerprint(None) == (None, "unavailable")
+    with pytest.raises(OSError):
+        perf_benchmark._hash_file(launcher)
+
+
 def test_exec_cost_suite_rejects_unequal_or_failed_samples() -> None:
     summarize = perf_benchmark._exec_cost_summary
     good = {"elapsed_ms": 2.0, "sha256": "a" * 64, "process_launches": 0, "claim_wait_ms": 0.0}

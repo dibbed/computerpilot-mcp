@@ -22,14 +22,15 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 import psutil
+from pydantic import Field
 
 from core.artifact_retention import ArtifactPolicy, cleanup_artifacts
 from core.audit import AuditPolicy, AuditWriter
@@ -94,6 +95,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
 }
 SUITES = (
     "exec_cost",
+    "native_batch",
     "catalog",
     "startup",
     "output",
@@ -1744,6 +1746,18 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _benchmark_launcher_fingerprint(executable: str | None) -> tuple[str | None, str]:
+    """Only benchmark metadata may tolerate an unreadable OS command shim."""
+    if executable is None:
+        return None, "unavailable"
+    try:
+        return _hash_file(Path(executable)), "verified"
+    except OSError:
+        # Windows Store App Execution Aliases can launch but cannot be opened.
+        # Do not weaken _hash_file for security-sensitive callers.
+        return None, "unreadable_launcher"
+
+
 def _backup_inventory_once(directory: Path) -> dict[str, Any]:
     counts: dict[str, int] = {}
     sizes: dict[str, int] = {}
@@ -2460,6 +2474,7 @@ def _exec_cost_worker(repeats: int, include_jobs: bool) -> dict[str, Any]:
                 if time.monotonic() >= deadline:
                     raise RuntimeError("Benchmark worker cleanup could not be verified.")
                 time.sleep(0.02)
+    powershell_hash, powershell_fingerprint_status = _benchmark_launcher_fingerprint(powershell)
     return {
         "warmups": 5,
         "repeats": repeats,
@@ -2467,7 +2482,8 @@ def _exec_cost_worker(repeats: int, include_jobs: bool) -> dict[str, Any]:
         "order": "paired_randomized",
         "host_load_at_start": host_load,
         "host_load_at_end": {"cpu_percent": psutil.cpu_percent(), "memory_percent": psutil.virtual_memory().percent},
-        "runtime": {"python": platform.python_version(), "powershell_binary_sha256": _hash_file(Path(powershell)) if powershell else None},
+        "runtime": {"python": platform.python_version(), "powershell_binary_sha256": powershell_hash,
+                    "powershell_binary_fingerprint_status": powershell_fingerprint_status},
         "host_control": "shared host; exploratory timings, not a production SLA",
         "scope": "in-process SDK calls; no client/model/network latency; short=10ms, medium=200ms",
         "process_launch_scope": "controlled command roots plus durable workers; not OS helper processes",
@@ -2479,7 +2495,203 @@ def _exec_cost_worker(repeats: int, include_jobs: bool) -> dict[str, Any]:
     }
 
 
-def _exec_cost_once(repeats: int, include_jobs: bool) -> dict[str, Any]:
+def _native_batch_worker(repeats: int, include_powershell: bool = True) -> dict[str, Any]:
+    """Measure a private file-only prototype; it is not a production dispatcher."""
+    import base64
+
+    from mcp import Client
+    from mcp.client._memory import InMemoryTransport
+    from mcp.server import MCPServer
+    from mcp.shared.message import SessionMessage
+    from mcp.types import JSONRPCMessage
+    from pydantic import TypeAdapter
+
+    from core.extensions.bridge import ExtensionMCPServer
+    from tools.filesystem import registry as filesystem_registry
+    from tools.filesystem.service import read_window
+    from tools.terminal import registry as terminal_registry
+
+    root = PROJECT_ROOT / "native-batch-fixture"
+    root.mkdir()
+    contents = [f"fixture-{index}: alpha beta\n" * 16 for index in range(16)]
+    paths = [root / f"item-{index}.txt" for index in range(16)]
+    for path, content in zip(paths, contents, strict=True):
+        path.write_bytes(content.encode())
+    counters = {"requests": 0, "responses": 0, "request_frame_bytes": 0, "response_frame_bytes": 0}
+    workers = {"active": 0, "peak": 0}
+    lock = threading.Lock()
+    request_ids: set[Any] = set()
+    message_adapter: TypeAdapter[Any] = TypeAdapter(cast(Any, JSONRPCMessage))
+
+    def frame(message: Any) -> Any:
+        if not isinstance(message, SessionMessage):
+            return message
+        encoded = message.message.model_dump_json(by_alias=True, exclude_none=True) + "\n"
+        value = json.loads(encoded)
+        if value.get("method") == "tools/call":
+            request_ids.add(value["id"])
+            counters["requests"] += 1
+            counters["request_frame_bytes"] += len(encoded.encode())
+        elif value.get("id") in request_ids and ("result" in value or "error" in value):
+            request_ids.remove(value["id"])
+            counters["responses"] += 1
+            counters["response_frame_bytes"] += len(encoded.encode())
+        return SessionMessage(message_adapter.validate_json(encoded), message.metadata)
+
+    class FramedStream:
+        def __init__(self, stream: Any) -> None:
+            self.stream = stream
+
+        async def send(self, message: Any) -> None:
+            await self.stream.send(frame(message))
+
+        async def receive(self) -> Any:
+            return frame(await self.stream.receive())
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> Any:
+            import anyio
+
+            try:
+                return await self.receive()
+            except anyio.EndOfStream:
+                raise StopAsyncIteration from None
+
+        async def aclose(self) -> None:
+            await self.stream.aclose()
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            await self.aclose()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.stream, name)
+
+    powershell = include_powershell and bool(shutil.which("pwsh") or shutil.which("powershell"))
+    allowed = frozenset({"read_file", "fixture_read_batch", *({"run_powershell"} if powershell else set())})
+    server = ExtensionMCPServer("native-batch-benchmark", native_allowlist=allowed)
+    filesystem_registry.register(server)
+    if powershell:
+        terminal_registry.register(server)
+
+    def read(path: str) -> str:
+        with lock:
+            workers["active"] += 1
+            workers["peak"] = max(workers["peak"], workers["active"])
+        try:
+            return str(read_window(path, start_line=1, end_line=None, offset=0, max_chars=4096, encoding="utf-8")["content"])
+        finally:
+            with lock:
+                workers["active"] -= 1
+
+    @server.tool()
+    async def fixture_read_batch(
+        paths: Annotated[list[str], Field(min_length=1, max_length=16)],
+        parallel: Annotated[int, Field(ge=1, le=4)],
+    ) -> dict[str, Any]:
+        # Only owned benchmark files enter this private, unexported prototype.
+        assert all(Path(path).parent == root for path in paths)
+        semaphore = asyncio.Semaphore(parallel)
+
+        async def one(path: str) -> str:
+            async with semaphore:
+                return await asyncio.to_thread(read, path)
+
+        return {"ok": True, "contents": await asyncio.gather(*(one(path) for path in paths))}
+
+    samples: dict[str, list[dict[str, Any]]] = {}
+    peaks: dict[str, int] = {}
+    expected: dict[int, str] = {}
+    denied_dispatches = 0
+
+    def hidden_probe() -> dict[str, bool]:
+        nonlocal denied_dispatches
+        denied_dispatches += 1
+        return {"ok": True}
+
+    MCPServer.add_tool(server, hidden_probe)
+
+    @asynccontextmanager
+    async def transport() -> Any:
+        async with InMemoryTransport(server) as (reader, writer):
+            yield FramedStream(reader), FramedStream(writer)
+
+    async def run() -> None:
+        rng = random.Random(1501)
+        async with Client(transport()) as client:
+            for name, arguments in (("hidden_probe", {}), ("fixture_read_batch", {"paths": [], "parallel": 5})):
+                denied = await client.call_tool(name, arguments)
+                assert denied.is_error
+            assert denied_dispatches == 0 and workers["active"] == 0
+            async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                result = await client.call_tool(name, arguments)
+                value = result.structured_content
+                if not isinstance(value, dict) or value.get("ok") is False or result.is_error:
+                    raise RuntimeError("Native batch benchmark call failed.")
+                return value
+
+            for count in (1, 4, 8, 16):
+                expected[count] = hashlib.sha256(json.dumps(contents[:count], ensure_ascii=False).encode()).hexdigest()
+                variants = ["direct", "batch1", "batch2", "batch4", *(["powershell"] if powershell else [])]
+                for round_index in range(5 + repeats):
+                    rng.shuffle(variants)
+                    for variant in variants:
+                        for key in counters:
+                            counters[key] = 0
+                        workers["peak"] = 0
+                        started = time.perf_counter()
+                        if variant == "direct":
+                            values = [(await call("read_file", {"path": str(path), "max_chars": 4096}))["content"]
+                                      for path in paths[:count]]
+                        elif variant == "powershell":
+                            encoded = base64.b64encode(json.dumps([str(p) for p in paths[:count]]).encode()).decode()
+                            script = (
+                                "$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + encoded + "'))|ConvertFrom-Json;"
+                                "ConvertTo-Json -Compress -InputObject @($p|ForEach-Object{[IO.File]::ReadAllText($_)})"
+                            )
+                            value = await call("run_powershell", {"script": script, "cwd": str(root), "timeout_sec": 15})
+                            assert value["exit_code"] == 0 and not value["stdout"]["truncated"]
+                            values = json.loads(value["stdout"]["text"])
+                        else:
+                            values = (await call("fixture_read_batch", {
+                                "paths": [str(path) for path in paths[:count]], "parallel": int(variant[-1]),
+                            }))["contents"]
+                        sample = {"elapsed_ms": (time.perf_counter() - started) * 1000, **counters,
+                                  "sha256": hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).hexdigest()}
+                        assert sample["sha256"] == expected[count] and workers["active"] == 0
+                        if round_index >= 5:
+                            key = f"{count}/{variant}"
+                            samples.setdefault(key, []).append(sample)
+                            peaks[key] = max(peaks.get(key, 0), workers["peak"])
+
+    process = psutil.Process()
+    cpu_before = sum(process.cpu_times()[:2])
+    rss_before = process.memory_info().rss
+    asyncio.run(run())
+    cases = {}
+    for key, values in samples.items():
+        count = int(key.split("/")[0])
+        summary = _exec_cost_summary(values, expected[count])
+        summary["peak_workers"] = peaks[key]
+        summary["synthetic_wait_saving_percent"] = {
+            str(latency): (0 if latency == 0 else 100 * (count - values[0]["requests"]) / count)
+            for latency in (0, 20, 100, 250)
+        }
+        cases[key] = summary
+    return {"warmups": 5, "repeats": repeats, "seed": 1501, "order": "paired_randomized",
+            "prototype_only": True, "scope": "actual in-process MCP calls; synthetic RTT is arithmetic, not tunnel latency",
+            "wire_scope": "NDJSON roundtrip of actual SDK messages; in-memory transport, no tunnel",
+            "denied_dispatches": denied_dispatches, "tokenizer": "NOT_MEASURED",
+            "cpu_sec": sum(process.cpu_times()[:2]) - cpu_before,
+            "rss_before_after_max_bytes": max(rss_before, process.memory_info().rss),
+            "workers_cleaned": workers["active"] == 0, "cases": cases}
+
+
+def _exec_cost_once(repeats: int, include_jobs: bool, *, suite: Literal["exec_cost", "native_batch"] = "exec_cost") -> dict[str, Any]:
     if not 1 <= repeats <= 100:
         raise ValueError("exec_cost requires 1..100 paired repeats.")
     # A source copy isolates hardcoded PROJECT_ROOT state, including detached job workers.
@@ -2515,10 +2727,13 @@ def _exec_cost_once(repeats: int, include_jobs: bool) -> dict[str, Any]:
             "-c",
             # Keep the parent's claim around this child, but never reuse its database inside the owned fixture.
             f"import os,json; os.environ.pop({RESOURCE_CAPABILITY_ENV!r},None); "
-            "from scripts.perf_benchmark import _exec_cost_worker; print(json.dumps(_exec_cost_worker("
+            "[os.environ.pop(k,None) for k in list(os.environ) if k.upper().startswith(('MCP_','PYTHON'))]; "
+            "from scripts.perf_benchmark import "
+            + ("_exec_cost_worker; print(json.dumps(_exec_cost_worker(" if suite == "exec_cost"
+               else "_native_batch_worker; print(json.dumps(_native_batch_worker(")
             + str(repeats)
             + ", "
-            + str(include_jobs)
+            + str(include_jobs if suite == "exec_cost" else True)
             + ")))",
         ]
         env = {key: "" for key in os.environ if key.upper().startswith(("MCP_", "PYTHON"))}
@@ -2534,7 +2749,7 @@ def _exec_cost_once(repeats: int, include_jobs: bool) -> dict[str, Any]:
         )
         if result["exit_code"] != 0:
             return {
-                "name": "exec_cost", "status": "error", "comparable": False,
+                "name": suite, "status": "error", "comparable": False,
                 "error": "isolated_benchmark_failed", "retained_fixture": str(temporary),
             }
         details = json.loads(result["stdout"]["text"])
@@ -2543,7 +2758,7 @@ def _exec_cost_once(repeats: int, include_jobs: bool) -> dict[str, Any]:
         )
         if not cleanup_verified:
             raise RuntimeError("Isolated benchmark cleanup or correctness is unverified; fixture retained.")
-        return {"name": "exec_cost", "status": "ok", "source_manifest_sha256": fingerprint, "source_files": len(manifest), **details}
+        return {"name": suite, "status": "ok", "source_manifest_sha256": fingerprint, "source_files": len(manifest), **details}
 
     finally:
         if cleanup_verified:
@@ -2568,11 +2783,13 @@ def run_benchmarks(
     if unknown:
         raise ValueError(f"Unknown suites: {sorted(unknown)}")
     limits = PROFILE_LIMITS[profile]
-    stale_temp_dirs_removed = 0 if suites == {"exec_cost"} else _cleanup_stale_temp_roots()
+    stale_temp_dirs_removed = 0 if suites <= {"exec_cost", "native_batch"} else _cleanup_stale_temp_roots()
     results: list[dict[str, Any]] = []
 
     if "exec_cost" in suites:
         results.append(_exec_cost_once(runs, include_jobs))
+    if "native_batch" in suites:
+        results.append(_exec_cost_once(runs, False, suite="native_batch"))
 
     if "catalog" in suites:
         results.append(measure("tool_catalog", _catalog_once, runs))
