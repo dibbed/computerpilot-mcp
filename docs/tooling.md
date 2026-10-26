@@ -9,6 +9,7 @@ Available profiles:
 - `minimal`
 - `coding`
 - `coding_core` (unreleased opt-in; model UX pilot pending)
+- `read_batch` (unreleased, explicit opt-in; seven fixed read/discovery tools)
 - `git`
 - `testing`
 - `documents`
@@ -26,6 +27,14 @@ MCP_TOOL_PROFILE=<profile>
 `discover_tool_domains` reports the requested/active domains and platform capabilities. `recommend_tools` searches only the tools actually registered in the active profile and attaches shared execution metadata when known.
 
 `coding_core` uses the coding domains with an exact 43-tool native catalog covering discovery, files, project/LSP context, verification, Git, recovery and job observation/cancellation. Set it before startup and restart; clients can cache the catalog for the whole session. Choose `coding` or `full` and restart when broader capabilities are needed. Hidden native tools are rejected before dispatch, and extensions need explicit `coding_core` profile eligibility. Profiles are capability filters, not security sandboxes; visible mutations keep their existing policy, lifecycle and recovery guards. Static SDK journeys pass, but the separately budgeted live-model UX comparison is unverified; this profile does not change the default.
+
+### Opt-in native read batching
+
+The unreleased `read_batch` profile contains only `read_file`, `native_read_batch` and five existing discovery, health and advisory route tools. Select `MCP_TOOL_PROFILE=read_batch` **before starting the server** and reconnect/restart clients that cache `tools/list`. The default `full`, `coding`, `coding_core` and `minimal` catalogs are unchanged; the feature is not available from those profiles. This profile is a tool filter, not an OS security sandbox.
+
+`native_read_batch` accepts an explicit local `root` and 1–16 ordered, uniquely identified `read_file` windows. Each item has `path`, optional line window, offset, encoding and `max_chars` (default 4096, maximum 16384). `max_parallel` is 1–4 (default 1); cooperative `timeout_sec` is at most 60 seconds (default 10). The server accepts at most four simultaneous batches and four in-flight reads across them. Each regular file is limited to 2 MiB; aggregate source data to 8 MiB, requested result text to 64 KiB, and the encoded response to 192 KiB. Invalid request shapes are rejected before dispatch, while valid independent items can return separate errors.
+
+Results preserve input order and report bounded per-item status, completeness, truncation, read hash and source size. **There is no atomic snapshot across files**. Source changes, symlink or network paths, unavailable/hidden tools and resource exhaustion fail closed. Cancellation/deadline stops admission of new work and suppresses late success, but cannot forcibly interrupt a blocking OS file read; resource slots remain occupied until actual completion. This tool does not execute commands, write files, accept arbitrary tool names or wrap Git/search. An SDK client may issue one `native_read_batch` call instead of multiple `read_file` calls for independent local windows; a fixed-profile client without catalog refresh must reconnect after profile changes. **Do not assume a local speedup:** in the controlled Windows in-process SDK run (30 measured pairs, 5 warmups), four direct reads had p50 3.138 ms versus batch p50 48.153 ms, and 16 direct reads p50 11.455 ms versus batch p50 206.649 ms. Batch reduces the number of requests from N to 1, so it can save time across sufficiently high-latency transport hops, but live Tunnel and model end-to-end latency have not been measured.
 
 ## Adaptive execution routing
 

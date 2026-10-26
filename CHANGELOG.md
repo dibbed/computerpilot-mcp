@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-26: Implement an unreleased, explicitly selected seven-tool `read_batch` profile and typed, bounded `native_read_batch` for independent local text windows. Reuse the native reader and durable resource claims; cap local paths, source/response bytes, concurrent reads and cancellation without changing legacy catalogs or activating the current operator server. Include actual MCP request-count and cancellation tests.
 - 2026-10-26: Recommend existing safe_refactor/apply_patch tools for known independent edits and submit_job/job_wait for durable commands, while retaining direct execution for short commands. Add advisory intents without merging requests or changing edit/recovery behavior.
 - 2026-10-26: Guide native file/search/Git operations and direct executable selection; add an advisory PowerShell intent for cmdlets/pipelines with capability denial and existing cost/latency tiers. Keep execution permissions and public schemas unchanged.
 - 2026-10-26: Correlate native audit/timing records, recovery-operation references and durable job workers with bounded private trace metadata. Preserve command idempotency and public tool payloads, propagate context through DAG workers, and retain the worker's single SQLite connection.
