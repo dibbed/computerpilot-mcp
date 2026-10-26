@@ -14,6 +14,7 @@ from tools.language import sessions
 from tools.language.providers import LspProvider, SessionKey
 
 
+@pytest.mark.parametrize("sample_platform", ["nt", "posix"])
 @pytest.mark.parametrize(
     ("provider_id", "handles", "accepted"),
     [
@@ -27,7 +28,7 @@ from tools.language.providers import LspProvider, SessionKey
 )
 def test_real_provider_handle_budget_is_strictly_scoped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider_id: str,
-    handles: int, accepted: bool,
+    handles: int, accepted: bool, sample_platform: str,
 ) -> None:
     class ProcessProbe:
         def __init__(self, pid: int) -> None:
@@ -49,10 +50,15 @@ def test_real_provider_handle_budget_is_strictly_scoped(
         def num_handles(self) -> int:
             return handles
 
+        def num_fds(self) -> int:
+            # POSIX psutil exposes file descriptors rather than Windows handles.
+            return handles
+
     monkeypatch.setattr(
         sessions, "psutil",
         SimpleNamespace(Process=ProcessProbe, Error=sessions.psutil.Error),
     )
+    monkeypatch.setattr(sessions, "os", SimpleNamespace(name=sample_platform))
     language = {"pyright": "python", "typescript": "typescript", "phpactor": "php"}[provider_id]
     provider = LspProvider(
         provider_id=cast(Any, provider_id),

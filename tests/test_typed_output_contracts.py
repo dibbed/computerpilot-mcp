@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -642,7 +643,8 @@ def test_ten_tool_output_schemas_preserve_catalog_identity(monkeypatch: pytest.M
             tools = {tool.name: tool for tool in await server.list_tools()}
             assert names <= tools.keys()
             if profile == "full":
-                assert len(tools) == 151
+                # Windows-only tool domains are excluded by capability negotiation on POSIX.
+                assert len(tools) == (151 if os.name == "nt" else 137)
             for name in names:
                 schema = tools[name].output_schema
                 assert schema is not None
@@ -900,6 +902,46 @@ def test_compact_success_conditions_preserve_explicit_nullable_fields() -> None:
                 Contract.model_validate(payload)
 
 
+def test_portable_catalogue_excludes_only_platform_gated_domains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from dataclasses import replace
+
+    from core import registry
+    from core.platform import detect_capabilities
+
+    fake_posix = replace(
+        detect_capabilities(),
+        system="linux", desktop_input=False, desktop_screenshot=False, semantic_ui=False,
+    )
+    monkeypatch.setattr(registry, "detect_capabilities", lambda: fake_posix)
+
+    async def scenario() -> None:
+        for profile, count in (("full", 137), ("coding", 96), ("coding_core", 43)):
+            monkeypatch.setattr(registry, "SETTINGS", replace(registry.SETTINGS, tool_profile=profile))
+            tools = await registry.create_server().list_tools()
+            assert len(tools) == count
+            assert len({tool.name for tool in tools}) == count
+            assert {"symbol_definition", "project_summary", "language_diagnostics"} <= {tool.name for tool in tools}
+
+    asyncio.run(scenario())
+
+
+def test_project_summary_without_toml_parser_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.project import service
+
+    monkeypatch.setattr(service, "_toml", None)
+    (tmp_path / "pyproject.toml").write_text("[project]\ndependencies=['safe']\n", encoding="utf-8")
+    (tmp_path / "main.py").write_text("pass\n", encoding="utf-8")
+    result = service.project_summary(tmp_path, 100)
+    assert result["ok"] is True
+    assert "Python" in {name["name"] for name in result["languages"]}
+    assert "safe" not in result["dependencies"]
+
+
 def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
     import asyncio
     import hashlib
@@ -908,7 +950,7 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
     from core import registry
 
     baseline = {
-        "full": (151, 161424, "dd943f86782309bdadfce181d99ff868ae7a1a496a2aeaadcb177ad3e47257e6"),
+        "full": (151 if os.name == "nt" else 137, 161424, "dd943f86782309bdadfce181d99ff868ae7a1a496a2aeaadcb177ad3e47257e6"),
         "coding": (96, 100462, "63d7cefc60e4f461de32b37fa45d3aeca267ada484e074114f9824d0d570e593"),
         "coding_core": (43, 47156, "6bac11be7330500d44e2439fe434e216faf46e0ccd025b8c2cb7c7614b88275f"),
     }
@@ -927,8 +969,13 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                 tools = await registry.create_server().list_tools()
             assert len(tools) == count
             metadata = [tool.model_dump(mode="json", by_alias=True, exclude_none=True, exclude={"output_schema"}) for tool in tools]
-            assert hashlib.sha256(encode(metadata)).hexdigest() == metadata_sha
+            # Full Windows metadata has a pinned baseline hash; POSIX correctly
+            # excludes 14 Windows/desktop tools. Coding profiles are portable.
+            if profile != "full" or os.name == "nt":
+                assert hashlib.sha256(encode(metadata)).hexdigest() == metadata_sha
             catalogue = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
+            # Preserve the frozen historical byte budget, not "without output
+            # schemas": existing generic schemas were already in that baseline.
             added_bytes = len(encode(catalogue)) - before_bytes
             assert 0 < added_bytes <= 32284, (profile, added_bytes)
             expected = names - ({"workflow_status"} if profile == "coding_core" else set())

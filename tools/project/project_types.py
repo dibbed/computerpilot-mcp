@@ -217,7 +217,7 @@ def detect_project_types(
     fingerprint_available = fingerprint_sources
     source_bytes = 0
     fingerprint_entries: list[tuple[str, str, str]] = []
-    scanned_directories: list[tuple[Path, tuple[int, int, int], int, int]] = []
+    scanned_directories: list[tuple[Path, tuple[int, int, int], int, int, frozenset[str]]] = []
 
     def incomplete(code: str, path: Path) -> None:
         if len(missing) < 1_000:
@@ -243,7 +243,6 @@ def detect_project_types(
                 _directory_identity(current, root, identity)
                 if fingerprint_available:
                     scanned = current.stat()
-                    scanned_directories.append((current, identity, scanned.st_mtime_ns, scanned.st_ctime_ns))
                 for entry in scanner:
                     _directory_identity(current, root, identity)
                     visited += 1
@@ -253,6 +252,11 @@ def detect_project_types(
                         break
                     entries.append(Path(entry.path))
                 _directory_identity(current, root, identity)
+            if fingerprint_available:
+                scanned_directories.append((
+                    current, identity, scanned.st_mtime_ns, scanned.st_ctime_ns,
+                    frozenset(item.name for item in entries),
+                ))
         except ToolError as error:
             incomplete(error.code, current)
             continue
@@ -363,7 +367,8 @@ def detect_project_types(
         try:
             _directory_identity(root, root, root_identity)
             verified_source_bytes = 0
-            # Re-read known inputs, never re-enumerate; each of two source passes has a 16 MiB budget.
+            # Re-read known inputs; a final bounded name-only rescan detects newly
+            # added sources even if filesystem directory timestamps lack precision.
             for kind, relative, expected_digest in fingerprint_entries:
                 if time.monotonic() >= deadline:
                     fingerprint_available = False
@@ -378,12 +383,26 @@ def detect_project_types(
                 if hashlib.sha256(data).hexdigest() != expected_digest or time.monotonic() >= deadline:
                     fingerprint_available = False
                     break
-            for directory, identity, modified, changed in scanned_directories:
+            for directory, identity, modified, changed, expected_names in scanned_directories:
                 if not fingerprint_available:
                     break
                 _directory_identity(directory, root, identity)
                 current_info = directory.stat()
                 if (current_info.st_mtime_ns, current_info.st_ctime_ns) != (modified, changed) or time.monotonic() >= deadline:
+                    fingerprint_available = False
+                    break
+                # On Windows, timestamp granularity can hide a file created during
+                # the scan. Compare actual directory entries rather than trusting
+                # metadata-only change detection for cache admission.
+                with os.scandir(directory) as scanner:
+                    seen: set[str] = set()
+                    for entry in scanner:
+                        seen.add(entry.name)
+                        if len(seen) > _MAX_ENTRIES or time.monotonic() >= deadline:
+                            fingerprint_available = False
+                            break
+                _directory_identity(directory, root, identity)
+                if seen != expected_names:
                     fingerprint_available = False
                     break
             if fingerprint_available and _worktree_identity(root) == worktree_id and time.monotonic() < deadline:

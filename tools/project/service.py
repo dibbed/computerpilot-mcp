@@ -12,6 +12,14 @@ from itertools import islice
 from pathlib import Path
 from typing import Any
 
+try:
+    import tomllib as _toml
+except ImportError:  # Python 3.10 may have the compatible optional tomli package.
+    try:
+        import tomli as _toml
+    except ImportError:
+        _toml = None
+
 from core.errors import ToolError
 from tools.project.index import PYTHON_METADATA_CACHE, PythonFileMetadata
 
@@ -152,9 +160,9 @@ def _read_dependencies(root: Path) -> tuple[set[str], list[str]]:
     pyproject = root / "pyproject.toml"
     if pyproject.is_file():
         try:
-            import tomllib
-
-            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            if _toml is None:
+                raise ValueError("TOML parser unavailable")
+            data = _toml.loads(pyproject.read_text(encoding="utf-8"))
             project = data.get("project", {})
             for value in project.get("dependencies", []):
                 name = _dependency_name(str(value))
@@ -188,9 +196,9 @@ def _read_dependencies(root: Path) -> tuple[set[str], list[str]]:
     cargo = root / "Cargo.toml"
     if cargo.is_file():
         try:
-            import tomllib
-
-            data = tomllib.loads(cargo.read_text(encoding="utf-8"))
+            if _toml is None:
+                raise ValueError("TOML parser unavailable")
+            data = _toml.loads(cargo.read_text(encoding="utf-8"))
             dependencies.update(data.get("dependencies", {}).keys())
         except (OSError, ValueError):
             pass
