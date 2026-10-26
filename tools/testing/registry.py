@@ -10,7 +10,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server import MCPServer
 from pydantic import Field
@@ -21,6 +21,7 @@ from core.config import PROJECT_ROOT, SETTINGS, resolve_path
 from core.errors import ToolError
 from core.jobs import JobStore, lazy_job_store
 from core.resource_claims import coordination_claim, managed_resource_claims, path_claim
+from core.response_models import validate_tool_output
 from core.runtime_capacity import acquire_runtime_capacity
 from core.tooling import OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 from core.workflow_store import WorkflowStore
@@ -28,6 +29,7 @@ from tools.testing import runners as _runners
 from tools.testing.background import VerificationRequest, submit_verification
 from tools.testing.diagnostics import merge_diagnostics
 from tools.testing.impact import select_affected_tests
+from tools.testing.models import AffectedTestsResult, VerificationResult
 from tools.testing.runners import run_mypy_summary, run_pytest_summary, run_ruff_summary
 from tools.testing.verification import _CHECKS, Check, verify_changed_repository
 
@@ -317,9 +319,9 @@ def register(
         include_changed_tests: bool = True,
         fallback_policy: Literal["report", "select_full_suite"] = "report",
         test_backend: Literal["python", "auto"] = "python",
-    ) -> dict[str, Any]:
+    ) -> AffectedTestsResult:
         """Select Python tests; opt into package runner plans with explicit multilingual coverage gaps."""
-        return select_affected_tests(
+        result = select_affected_tests(
             _cwd(repo),
             changed_paths=changed_paths,
             base=base,
@@ -330,6 +332,7 @@ def register(
             fallback_policy=fallback_policy,
             test_backend=test_backend,
         )
+        return cast(AffectedTestsResult, validate_tool_output(AffectedTestsResult, result, operation="affected_tests"))
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("verify_changes")
@@ -349,7 +352,7 @@ def register(
         diagnostic_cap: Annotated[int, Field(ge=1, le=200)] = 30,
         max_parallel_checks: Annotated[int, Field(ge=1, le=3)] = 1,
         delivery: Literal["inline", "file", "auto"] = "inline",
-    ) -> dict[str, Any]:
+    ) -> VerificationResult:
         """Verify changed Python code with syntax, Ruff, mypy, and the narrowest sound pytest scope."""
         if any(not math.isfinite(value) or value <= 0 for value in (stage_timeout_sec, total_timeout_sec)):
             raise ValueError("Verification deadlines must be positive finite values")
@@ -405,4 +408,4 @@ def register(
             if delivered["delivery"] == "file":
                 response["artifact"] = delivered
         audit_action("verify_changes", target=working, outcome="completed", details={"ok": response["ok"], "mode": response["mode"]})
-        return response
+        return cast(VerificationResult, validate_tool_output(VerificationResult, response, operation="verify_changes"))

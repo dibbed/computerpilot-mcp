@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast, get_args
 
 from mcp.server import MCPServer
 from pydantic import Field
@@ -12,6 +12,7 @@ from pydantic import Field
 from core.artifacts import default_delivery
 from core.audit import audit_action
 from core.config import resolve_path
+from core.errors import ToolError
 from core.jobs import (
     JOB_PROGRESS_CHUNK_BYTES,
     JOB_WAIT_HEARTBEAT_SEC,
@@ -20,6 +21,7 @@ from core.jobs import (
     JobStore,
     lazy_job_store,
 )
+from core.response_models import JobStatus, JobStatusResult, validate_tool_output
 from core.tooling import DESTRUCTIVE, OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 
 JobId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
@@ -53,9 +55,12 @@ def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = No
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_status")
-    def job_status(job_id: JobId) -> dict[str, Any]:
+    def job_status(job_id: JobId) -> JobStatusResult:
         """Read a durable job status by ID after reconnect or server restart."""
-        return {"ok": True, **get_store().get(job_id)}
+        result = {"ok": True, **get_store().get(job_id)}
+        if result.get("status") not in get_args(JobStatus):
+            raise ToolError("output_version_unsupported", "The stored job status version is unsupported.")
+        return cast(JobStatusResult, validate_tool_output(JobStatusResult, result, operation="job_status"))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_wait")

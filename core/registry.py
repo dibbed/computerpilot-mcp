@@ -21,6 +21,7 @@ from core.jobs import JobStore, lazy_job_store
 from core.platform import available_domains, detect_capabilities
 from core.recovery import OPERATION_RECOVERY
 from core.resource_health import collect_resource_metrics
+from core.response_models import HealthResult, RouteRecommendation, validate_tool_output
 from core.timings import ToolRequestTimingMiddleware, install_sdk_timing_hooks
 from core.tool_catalog import ToolExecutionMetadata, external_tool_execution_metadata, tool_execution_metadata
 from core.tool_profiles import ALL_DOMAINS, PREFERRED_USE, PROFILE_DOMAINS, resolve_profile
@@ -267,7 +268,7 @@ def create_server() -> MCPServer:
         requires_macro_preservation: bool = False,
         allow_raw_desktop: bool = False,
         preferred_tool: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> RouteRecommendation:
         """Recommend one explainable execution route without executing it."""
 
         router = await _execution_router()
@@ -280,30 +281,33 @@ def create_server() -> MCPServer:
             allow_raw_desktop=allow_raw_desktop,
             preferred_tool=preferred_tool,
         )
-        return router.recommend(
+        result = router.recommend(
             request,
             explain=SETTINGS.execution_router_explain if explain is None else explain,
             max_candidates=max_candidates,
         )
+        return cast(RouteRecommendation, validate_tool_output(RouteRecommendation, result, operation="execution_recommend"))
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("server_health")
-    async def server_health() -> dict[str, Any]:
+    async def server_health() -> HealthResult:
         if not getattr(server, "runtime_started", False):
             native = await MCPServer.list_tools(server)
-            return {
+            result = {
                 "ok": True, "health_status": "unavailable", "snapshot_reason": "runtime_not_started",
                 "server": SETTINGS.server_name, "version": SETTINGS.version, "tool_profile": profile.name,
                 "tool_count": len(native), "unique_tool_names": len({tool.name for tool in native}) == len(native),
             }
-        return await collect_server_health(
-            server,
-            settings=SETTINGS,
-            browser_manager=BROWSER_MANAGER,
-            resource_collector=collect_resource_metrics,
-            recovery=OPERATION_RECOVERY,
-            workflow_store_factory=workflow_store,
-        )
+        else:
+            result = await collect_server_health(
+                server,
+                settings=SETTINGS,
+                browser_manager=BROWSER_MANAGER,
+                resource_collector=collect_resource_metrics,
+                recovery=OPERATION_RECOVERY,
+                workflow_store_factory=workflow_store,
+            )
+        return cast(HealthResult, validate_tool_output(HealthResult, result, operation="server_health"))
 
     if profile.native_allowlist is not None and server.native_registered_names != profile.native_allowlist:
         raise ToolError("profile_invalid", "The static profile's native tool registrations are incomplete.")
