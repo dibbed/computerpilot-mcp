@@ -2699,7 +2699,12 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
     process = psutil.Process()
     cpu_before = sum(process.cpu_times()[:2])
     rss_before = process.memory_info().rss
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+        claim_health = reader._store().health_summary() if production else None
+    finally:
+        if production:
+            reader.close()
     cases = {}
     for key, values in samples.items():
         count = int(key.split("/")[0])
@@ -2712,7 +2717,6 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
         cases[key] = summary
     batch_counters = reader.snapshot() if production else None
     claim_keys = ("active_resource_request_count", "pending_resource_request_count", "quarantined_resource_request_count")
-    claim_health = reader._store().health_summary() if production else None
     claims = {key: claim_health[key] for key in claim_keys} if claim_health is not None else None
     return {"warmups": 5, "repeats": repeats, "seed": 1501, "order": "paired_randomized",
             "prototype_only": not production,
@@ -2723,7 +2727,8 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
             "rss_before_after_max_bytes": max(rss_before, process.memory_info().rss),
             "workers_cleaned": workers["active"] == 0 and (
                 batch_counters is None or not any(batch_counters.values())
-            ) and (claims is None or not any(claims.values())),
+            ) and (claims is None or not any(claims.values())) and (not production or reader._claim_store is None),
+            "production_connection_closed": reader._claim_store is None if production else None,
             "production_batch_counters_final": batch_counters, "production_claims_final": claims, "cases": cases}
 
 

@@ -125,6 +125,7 @@ def test_production_batch_benchmark_dispatches_real_batch(tmp_path: Path, monkey
     monkeypatch.setattr(BatchReader, "execute", observed)
     report = perf_benchmark._native_batch_worker(1, include_powershell=False, production=True)
     assert report["prototype_only"] is False
+    assert report["production_connection_closed"] is True
     assert set(calls) == {1, 4, 8, 16} and len(calls) == 4 * 3 * 6
     for count in (1, 4, 8, 16):
         direct = report["cases"][f"{count}/direct"]
