@@ -7,12 +7,30 @@ import os
 import sys
 import threading
 import traceback
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 from mcp import Client
+
+
+@pytest.fixture(autouse=True)
+def close_batch_readers(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    from tools.filesystem.batch import BatchReader
+
+    readers: list[BatchReader] = []
+    original = BatchReader.__init__
+
+    def initialize(reader: BatchReader, server: Any) -> None:
+        original(reader, server)
+        readers.append(reader)
+
+    monkeypatch.setattr(BatchReader, "__init__", initialize)
+    yield
+    for reader in readers:
+        reader.close()
 
 
 def _server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str = "read_batch") -> Any:
@@ -27,6 +45,350 @@ def _server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str = "rea
         monkeypatch.setattr(module, "SETTINGS", settings)
     monkeypatch.setattr(batch, "RUNTIME_LIFECYCLE", RuntimeLifecycle())
     return registry.create_server()
+
+
+def test_batch_connection_is_closed_with_lifespan_and_server_can_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _server(tmp_path, monkeypatch)
+    (tmp_path / "file.txt").write_text("sample", encoding="utf-8")
+    stores: list[Any] = []
+
+    async def scenario() -> None:
+        for _ in range(2):
+            async with Client(server) as client:
+                result = await client.call_tool("native_read_batch", {
+                    "root": str(tmp_path), "items": [{"id": "file", "path": "file.txt"}],
+                })
+                assert result.structured_content and result.structured_content["ok"]
+                stores.append(server.native_read_batch_state._claim_store)
+            assert stores[-1]._closed and stores[-1]._shared_connection is None
+            assert server.native_read_batch_state._claim_store is None
+        assert stores[0] is not stores[1]
+
+    asyncio.run(scenario())
+
+
+def test_batch_shutdown_keeps_connection_until_cancelled_read_finishes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.errors import ToolError
+    from core.workflow_store import WorkflowStore
+    from tools.filesystem import service
+
+    server = _server(tmp_path, monkeypatch)
+    reader = server.native_read_batch_state
+    (tmp_path / "file.txt").write_text("sample", encoding="utf-8")
+    entered, release = threading.Event(), threading.Event()
+    original = service.read_window
+
+    def blocked(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "read_window", blocked)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(reader.execute(str(tmp_path), [{"id": "file", "path": "file.txt"}]))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            store = reader._claim_store
+            reader.close()
+            assert not store._closed
+            with pytest.raises(ToolError) as denied:
+                await reader.execute(str(tmp_path), [{"id": "next", "path": "file.txt"}])
+            assert denied.value.code == "batch_draining"
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done() and reader.snapshot()["active_reads"] == 1
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert store._closed and reader._claim_store is None
+        health = WorkflowStore(tmp_path / "state" / "workflows.sqlite3", recover=False).health_summary()
+        assert health["active_resource_request_count"] == health["quarantined_resource_request_count"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_reused_batch_store_observes_external_quarantine_before_reading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.resource_claims import path_claim
+    from core.workflow_store import WorkflowStore
+    from tools.filesystem import service
+
+    server = _server(tmp_path, monkeypatch)
+    reader = server.native_read_batch_state
+    path = tmp_path / "file.txt"
+    path.write_text("sample", encoding="utf-8")
+    arguments = [{"id": "file", "path": "file.txt"}]
+    assert asyncio.run(reader.execute(str(tmp_path), arguments))["ok"]
+    other = WorkflowStore(tmp_path / "state" / "workflows.sqlite3", recover=False)
+    assert other.reserve_resource_claims(
+        request_id="blocker", owner_token="external-owner", category="test", claims=(path_claim(path, "write"),),
+    )["admitted"]
+    other.quarantine_resource_request("blocker", owner_token="external-owner", reason="fixture")
+    original = service.read_window
+    dispatched: list[bool] = []
+
+    def observed(*args: Any, **kwargs: Any) -> Any:
+        dispatched.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "read_window", observed)
+    denied = asyncio.run(reader.execute(str(tmp_path), arguments))
+    assert not denied["ok"] and denied["items"][0]["error"] == "batch_scope_denied"
+    assert dispatched == []
+    assert other.resource_request("blocker")["state"] == "quarantined"
+    other.resolve_quarantined_resource_request(
+        "blocker", owner_token="external-owner", resolution="released", evidence="fixture has no effects",
+    )
+    assert asyncio.run(reader.execute(str(tmp_path), arguments))["ok"]
+    assert dispatched == [True]
+
+
+def test_deferred_store_cleanup_cannot_close_restarted_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.filesystem import service
+
+    reader = _server(tmp_path, monkeypatch).native_read_batch_state
+    (tmp_path / "file.txt").write_text("sample", encoding="utf-8")
+    entered, release_read = threading.Event(), threading.Event()
+    original_read, original_thread = service.read_window, reader._thread
+
+    def blocked(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release_read.wait(5)
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(service, "read_window", blocked)
+
+    async def scenario() -> None:
+        queued, release_close = asyncio.Event(), asyncio.Event()
+
+        async def pause_close(call: Any, cancelled: threading.Event) -> Any:
+            if reader._closed and reader.snapshot()["active_batches"] == 0:
+                queued.set()
+                await release_close.wait()
+            return await original_thread(call, cancelled)
+
+        monkeypatch.setattr(reader, "_thread", pause_close)
+        arguments = [{"id": "file", "path": "file.txt"}]
+        task = asyncio.create_task(reader.execute(str(tmp_path), arguments))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            reader.close()
+            release_read.set()
+            await asyncio.wait_for(queued.wait(), timeout=5)
+            reader.start()
+            assert (await reader.execute(str(tmp_path), arguments))["ok"]
+            new_store = reader._claim_store
+        finally:
+            release_read.set()
+            release_close.set()
+        await task
+        assert not reader._closed and reader._claim_store is new_store and not new_store._closed
+        assert (await reader.execute(str(tmp_path), arguments))["ok"]
+
+    asyncio.run(scenario())
+
+
+def test_request_waiting_for_eligibility_cannot_cross_reader_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.errors import ToolError
+
+    reader = _server(tmp_path, monkeypatch).native_read_batch_state
+    (tmp_path / "file.txt").write_text("sample", encoding="utf-8")
+    original = reader._eligible
+
+    async def scenario() -> None:
+        entered, resume = asyncio.Event(), asyncio.Event()
+
+        async def paused() -> None:
+            entered.set()
+            await resume.wait()
+            await original()
+
+        monkeypatch.setattr(reader, "_eligible", paused)
+        task = asyncio.create_task(reader.execute(str(tmp_path), [{"id": "file", "path": "file.txt"}]))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            reader.close()
+            reader.start()
+        finally:
+            resume.set()
+        with pytest.raises(ToolError) as denied:
+            await task
+        assert denied.value.code == "batch_draining"
+        assert reader._claim_store is None
+        assert reader.snapshot()["active_batches"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_read_waiting_for_capacity_rechecks_profile_before_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.filesystem import service
+
+    server = _server(tmp_path, monkeypatch)
+    reader = server.native_read_batch_state
+    (tmp_path / "file.txt").write_text("sample", encoding="utf-8")
+    original_read = service.read_window
+    dispatched: list[bool] = []
+
+    def observed(*args: Any, **kwargs: Any) -> Any:
+        dispatched.append(True)
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(service, "read_window", observed)
+
+    async def scenario() -> None:
+        checked = asyncio.Event()
+        slots = reader._read_slots
+
+        class ObservedSlots:
+            def acquire(self, *args: Any, **kwargs: Any) -> bool:
+                acquired = bool(slots.acquire(*args, **kwargs))
+                if not acquired:
+                    checked.set()
+                return acquired
+
+            def release(self) -> None:
+                slots.release()
+
+        monkeypatch.setattr(reader, "_read_slots", ObservedSlots())
+        held = 0
+        for _ in range(4):
+            assert reader._read_slots.acquire(blocking=False)
+            held += 1
+        task = asyncio.create_task(reader.execute(str(tmp_path), [{"id": "file", "path": "file.txt"}]))
+        try:
+            await asyncio.wait_for(checked.wait(), timeout=5)
+            server.native_allowlist = frozenset(server.native_allowlist - {"read_file"})
+            reader._read_slots.release()
+            held -= 1
+            result = await task
+        finally:
+            for _ in range(held):
+                reader._read_slots.release()
+        assert result["items"][0]["error"] == "batch_hidden_tool"
+        assert dispatched == []
+
+    asyncio.run(scenario())
+
+
+def test_read_waiting_for_claim_rechecks_profile_before_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.resource_claims import path_claim
+    from core.workflow_store import WorkflowStore
+    from tools.filesystem import service
+
+    server = _server(tmp_path, monkeypatch)
+    reader = server.native_read_batch_state
+    path = tmp_path / "file.txt"
+    path.write_text("sample", encoding="utf-8")
+    other = WorkflowStore(tmp_path / "state" / "workflows.sqlite3", recover=False)
+    assert other.reserve_resource_claims(
+        request_id="blocker", owner_token="external-owner", category="test", claims=(path_claim(path, "write"),),
+    )["admitted"]
+    store = reader._store()
+    original_reserve, original_read = store.reserve_resource_claims, service.read_window
+    waiting = threading.Event()
+    dispatched: list[bool] = []
+
+    def reserve(*args: Any, **kwargs: Any) -> Any:
+        result = original_reserve(*args, **kwargs)
+        if not result["admitted"]:
+            waiting.set()
+        return result
+
+    def observed(*args: Any, **kwargs: Any) -> Any:
+        dispatched.append(True)
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(store, "reserve_resource_claims", reserve)
+    monkeypatch.setattr(service, "read_window", observed)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(reader.execute(str(tmp_path), [{"id": "file", "path": "file.txt"}]))
+        try:
+            assert await asyncio.to_thread(waiting.wait, 5)
+            server.native_allowlist = frozenset(server.native_allowlist - {"read_file"})
+        finally:
+            other.release_resource_request("blocker", owner_token="external-owner")
+        result = await task
+        assert result["items"][0]["error"] == "batch_hidden_tool"
+        assert dispatched == []
+        assert other.health_summary()["active_resource_request_count"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_final_eligibility_timeout_cancels_check_and_releases_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.filesystem import service
+
+    reader = _server(tmp_path, monkeypatch).native_read_batch_state
+    (tmp_path / "file.txt").write_text("sample", encoding="utf-8")
+    store = reader._store()
+    store.health_summary()
+    original = reader._eligible
+    dispatched: list[bool] = []
+    monkeypatch.setattr(service, "read_window", lambda *args, **kwargs: dispatched.append(True))
+
+    async def scenario() -> None:
+        finished = asyncio.Event()
+        checks = 0
+
+        async def eligible() -> None:
+            nonlocal checks
+            await original()
+            checks += 1
+            if checks == 2:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    finished.set()
+
+        monkeypatch.setattr(reader, "_eligible", eligible)
+        result = await reader.execute(str(tmp_path), [{"id": "file", "path": "file.txt"}], timeout_sec=1.0)
+        await asyncio.wait_for(finished.wait(), timeout=5)
+        assert result["items"][0]["status"] == "deadline"
+        assert dispatched == []
+        assert reader.snapshot()["active_reads"] == 0
+        assert store.health_summary()["active_resource_request_count"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_stop_during_final_eligibility_prevents_file_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.filesystem import service
+
+    reader = _server(tmp_path, monkeypatch).native_read_batch_state
+    (tmp_path / "file.txt").write_text("sample", encoding="utf-8")
+    store = reader._store()
+    original = reader._eligible
+    dispatched: list[bool] = []
+    monkeypatch.setattr(service, "read_window", lambda *args, **kwargs: dispatched.append(True))
+
+    async def scenario() -> None:
+        validated, release = asyncio.Event(), asyncio.Event()
+        checks = 0
+
+        async def eligible() -> None:
+            nonlocal checks
+            await original()
+            checks += 1
+            if checks == 2:
+                validated.set()
+                await release.wait()
+
+        monkeypatch.setattr(reader, "_eligible", eligible)
+        task = asyncio.create_task(reader.execute(str(tmp_path), [{"id": "file", "path": "file.txt"}]))
+        try:
+            await asyncio.wait_for(validated.wait(), timeout=5)
+            reader.stop()
+        finally:
+            release.set()
+        result = await task
+        assert result["items"][0]["error"] == "batch_draining"
+        assert dispatched == []
+        assert reader.snapshot()["active_reads"] == 0
+        assert store._closed
+
+    asyncio.run(scenario())
 
 
 def test_batch_profile_and_public_mcp_preserve_order_with_independent_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
