@@ -28,6 +28,7 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 TIMING_MAX_FILE_BYTES = 8 * 1_024 * 1_024
 TIMING_KEEP_FILES = 3
 _CURRENT_TOOL: ContextVar[str | None] = ContextVar("mcp_current_tool", default=None)
+_TIMINGS_SUPPRESSED: ContextVar[bool] = ContextVar("mcp_timings_suppressed", default=False)
 _TRACE_KEYS = frozenset({"trace_schema_version", "correlation_id", "parent_operation_id"})
 
 
@@ -112,7 +113,16 @@ def trace_operation(operation_id: str | None) -> Iterator[None]:
 
 
 def timings_enabled() -> bool:
-    return os.getenv("MCP_TIMINGS", "").strip().casefold() in _TRUE_VALUES
+    return not _TIMINGS_SUPPRESSED.get() and os.getenv("MCP_TIMINGS", "").strip().casefold() in _TRUE_VALUES
+
+
+@contextmanager
+def suppress_timings() -> Iterator[None]:
+    token = _TIMINGS_SUPPRESSED.set(True)
+    try:
+        yield
+    finally:
+        _TIMINGS_SUPPRESSED.reset(token)
 
 
 def timing_file() -> Path:

@@ -94,6 +94,7 @@ def test_native_batch_benchmark_counts_requests_and_checks_equal_outputs(tmp_pat
     assert report["tokenizer"] == "NOT_MEASURED"
     for count in (1, 4, 8, 16):
         direct = report["cases"][f"{count}/direct"]
+        assert direct["peak_workers"] is None
         for parallel in (1, 2, 4):
             batch = report["cases"][f"{count}/batch{parallel}"]
             assert batch["errors"] == 0 and batch["output_sha256"] == direct["output_sha256"]
@@ -104,6 +105,76 @@ def test_native_batch_benchmark_counts_requests_and_checks_equal_outputs(tmp_pat
             assert 0 < batch["peak_workers"] <= parallel
             if count >= 4:
                 assert batch["synthetic_wait_saving_percent"]["100"] >= 50
+
+
+def test_production_batch_benchmark_dispatches_real_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    from core import config
+    from tools.filesystem.batch import BatchReader
+
+    monkeypatch.setattr(perf_benchmark, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path / "state", memory_dir=tmp_path / "memory"))
+    calls: list[int] = []
+    original = BatchReader.execute
+
+    async def observed(self: Any, root: str, items: Any, max_parallel: int = 1, timeout_sec: float = 10) -> Any:
+        calls.append(len(items))
+        return await original(self, root, items, max_parallel, timeout_sec)
+
+    monkeypatch.setattr(BatchReader, "execute", observed)
+    report = perf_benchmark._native_batch_worker(1, include_powershell=False, production=True)
+    assert report["prototype_only"] is False
+    assert set(calls) == {1, 4, 8, 16} and len(calls) == 4 * 3 * 6
+    for count in (1, 4, 8, 16):
+        direct = report["cases"][f"{count}/direct"]
+        assert direct["peak_workers"] is None
+        for parallel in (1, 2, 4):
+            batch = report["cases"][f"{count}/batch{parallel}"]
+            assert batch["errors"] == 0 and batch["output_sha256"] == direct["output_sha256"]
+            assert batch["samples"][0]["requests"] == batch["samples"][0]["responses"] == 1
+    assert report["workers_cleaned"] is True
+    assert report["production_batch_counters_final"] == {
+        "active_batches": 0, "active_reads": 0, "reserved_response_bytes": 0,
+    }
+    assert report["production_claims_final"] == {
+        "active_resource_request_count": 0, "pending_resource_request_count": 0, "quarantined_resource_request_count": 0,
+    }
+
+
+def test_production_benchmark_requires_explicit_report_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_benchmark, "_cleanup_managed_reports", lambda: pytest.fail("Touched managed report state"))
+    with pytest.raises(SystemExit):
+        perf_benchmark.main(["--suite", "native_batch_production", "--runs", "1"])
+
+
+def test_production_benchmark_rejects_mixed_suites_before_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_benchmark, "_cleanup_stale_temp_roots", lambda: pytest.fail("Touched managed benchmark state"))
+    with pytest.raises(ValueError, match="production"):
+        perf_benchmark.run_benchmarks(
+            profile="quick", runs=1, suites={"native_batch_production", "catalog"}, include_jobs=False, include_browser=False,
+        )
+
+
+def test_production_benchmark_does_not_write_parent_timing_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import timings
+
+    for directory in ("core", "tools", "scripts"):
+        (tmp_path / directory).mkdir()
+    monkeypatch.setattr(perf_benchmark, "PROJECT_ROOT", tmp_path)
+    timing_log = tmp_path / "operator-timings.jsonl"
+    monkeypatch.setenv("MCP_TIMINGS", "1")
+    monkeypatch.setenv("MCP_TIMINGS_FILE", str(timing_log))
+    enqueued: list[Any] = []
+    monkeypatch.setattr(timings, "_enqueue_record", lambda *args: enqueued.append(args))
+
+    def simulated_run(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        timings.record_timing("benchmark-test", 1)
+        return {"exit_code": 0, "stdout": {"text": json.dumps({"workers_cleaned": True, "cases": {}})}}
+
+    monkeypatch.setattr(perf_benchmark, "run_bounded", simulated_run)
+    result = perf_benchmark._exec_cost_once(1, False, suite="native_batch_production")
+    assert result["status"] == "ok" and not enqueued and not timing_log.exists()
 
 
 def test_benchmark_unreadable_launcher_does_not_weaken_strict_hashing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

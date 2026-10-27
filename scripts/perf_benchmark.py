@@ -45,6 +45,7 @@ from core.recovery import OperationRecoveryJournal
 from core.registry import create_server
 from core.resource_claims import RESOURCE_CAPABILITY_ENV
 from core.state_paths import unlinked_directory_tree, unlinked_regular_file
+from core.timings import suppress_timings
 from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 from tools.desktop.uia import ElementLocator, UIAutomationService, WindowLocator
 from tools.filesystem.patches import PatchLimits, apply_patch_transaction
@@ -96,6 +97,7 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
 SUITES = (
     "exec_cost",
     "native_batch",
+    "native_batch_production",
     "catalog",
     "startup",
     "output",
@@ -2495,8 +2497,8 @@ def _exec_cost_worker(repeats: int, include_jobs: bool) -> dict[str, Any]:
     }
 
 
-def _native_batch_worker(repeats: int, include_powershell: bool = True) -> dict[str, Any]:
-    """Measure a private file-only prototype; it is not a production dispatcher."""
+def _native_batch_worker(repeats: int, include_powershell: bool = True, *, production: bool = False) -> dict[str, Any]:
+    """Measure either the private prototype or the actual file-only batch tool."""
     import base64
 
     from mcp import Client
@@ -2572,9 +2574,10 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True) -> dict[
             return getattr(self.stream, name)
 
     powershell = include_powershell and bool(shutil.which("pwsh") or shutil.which("powershell"))
-    allowed = frozenset({"read_file", "fixture_read_batch", *({"run_powershell"} if powershell else set())})
+    batch_name = "native_read_batch" if production else "fixture_read_batch"
+    allowed = frozenset({"read_file", batch_name, *({"run_powershell"} if powershell else set())})
     server = ExtensionMCPServer("native-batch-benchmark", native_allowlist=allowed)
-    filesystem_registry.register(server)
+    filesystem_registry.register(server, batch_enabled=production)
     if powershell:
         terminal_registry.register(server)
 
@@ -2588,20 +2591,36 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True) -> dict[
             with lock:
                 workers["active"] -= 1
 
-    @server.tool()
-    async def fixture_read_batch(
-        paths: Annotated[list[str], Field(min_length=1, max_length=16)],
-        parallel: Annotated[int, Field(ge=1, le=4)],
-    ) -> dict[str, Any]:
-        # Only owned benchmark files enter this private, unexported prototype.
-        assert all(Path(path).parent == root for path in paths)
-        semaphore = asyncio.Semaphore(parallel)
+    if production:
+        reader = cast(Any, server).native_read_batch_state
+        original_read = reader._read
 
-        async def one(path: str) -> str:
-            async with semaphore:
-                return await asyncio.to_thread(read, path)
+        def observed_read(*args: Any, **kwargs: Any) -> Any:
+            with lock:
+                workers["active"] += 1
+                workers["peak"] = max(workers["peak"], workers["active"])
+            try:
+                return original_read(*args, **kwargs)
+            finally:
+                with lock:
+                    workers["active"] -= 1
 
-        return {"ok": True, "contents": await asyncio.gather(*(one(path) for path in paths))}
+        reader._read = observed_read
+    else:
+        @server.tool()
+        async def fixture_read_batch(
+            paths: Annotated[list[str], Field(min_length=1, max_length=16)],
+            parallel: Annotated[int, Field(ge=1, le=4)],
+        ) -> dict[str, Any]:
+            # Only owned benchmark files enter this private, unexported prototype.
+            assert all(Path(path).parent == root for path in paths)
+            semaphore = asyncio.Semaphore(parallel)
+
+            async def one(path: str) -> str:
+                async with semaphore:
+                    return await asyncio.to_thread(read, path)
+
+            return {"ok": True, "contents": await asyncio.gather(*(one(path) for path in paths))}
 
     samples: dict[str, list[dict[str, Any]]] = {}
     peaks: dict[str, int] = {}
@@ -2623,7 +2642,8 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True) -> dict[
     async def run() -> None:
         rng = random.Random(1501)
         async with Client(transport()) as client:
-            for name, arguments in (("hidden_probe", {}), ("fixture_read_batch", {"paths": [], "parallel": 5})):
+            invalid = {"root": str(root), "items": [], "max_parallel": 5} if production else {"paths": [], "parallel": 5}
+            for name, arguments in (("hidden_probe", {}), (batch_name, invalid)):
                 denied = await client.call_tool(name, arguments)
                 assert denied.is_error
             assert denied_dispatches == 0 and workers["active"] == 0
@@ -2657,9 +2677,17 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True) -> dict[
                             assert value["exit_code"] == 0 and not value["stdout"]["truncated"]
                             values = json.loads(value["stdout"]["text"])
                         else:
-                            values = (await call("fixture_read_batch", {
-                                "paths": [str(path) for path in paths[:count]], "parallel": int(variant[-1]),
-                            }))["contents"]
+                            if production:
+                                result = await call(batch_name, {
+                                    "root": str(root), "items": [{"id": str(i), "path": path.name}
+                                                                  for i, path in enumerate(paths[:count])],
+                                    "max_parallel": int(variant[-1]),
+                                })
+                                values = [item["content"] for item in result["items"]]
+                            else:
+                                values = (await call(batch_name, {
+                                    "paths": [str(path) for path in paths[:count]], "parallel": int(variant[-1]),
+                                }))["contents"]
                         sample = {"elapsed_ms": (time.perf_counter() - started) * 1000, **counters,
                                   "sha256": hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).hexdigest()}
                         assert sample["sha256"] == expected[count] and workers["active"] == 0
@@ -2676,22 +2704,32 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True) -> dict[
     for key, values in samples.items():
         count = int(key.split("/")[0])
         summary = _exec_cost_summary(values, expected[count])
-        summary["peak_workers"] = peaks[key]
+        summary["peak_workers"] = peaks[key] if "/batch" in key else None
         summary["synthetic_wait_saving_percent"] = {
             str(latency): (0 if latency == 0 else 100 * (count - values[0]["requests"]) / count)
             for latency in (0, 20, 100, 250)
         }
         cases[key] = summary
+    batch_counters = reader.snapshot() if production else None
+    claim_keys = ("active_resource_request_count", "pending_resource_request_count", "quarantined_resource_request_count")
+    claim_health = reader._store().health_summary() if production else None
+    claims = {key: claim_health[key] for key in claim_keys} if claim_health is not None else None
     return {"warmups": 5, "repeats": repeats, "seed": 1501, "order": "paired_randomized",
-            "prototype_only": True, "scope": "actual in-process MCP calls; synthetic RTT is arithmetic, not tunnel latency",
+            "prototype_only": not production,
+            "scope": "actual in-process MCP calls; synthetic RTT is arithmetic, not tunnel latency",
             "wire_scope": "NDJSON roundtrip of actual SDK messages; in-memory transport, no tunnel",
             "denied_dispatches": denied_dispatches, "tokenizer": "NOT_MEASURED",
             "cpu_sec": sum(process.cpu_times()[:2]) - cpu_before,
             "rss_before_after_max_bytes": max(rss_before, process.memory_info().rss),
-            "workers_cleaned": workers["active"] == 0, "cases": cases}
+            "workers_cleaned": workers["active"] == 0 and (
+                batch_counters is None or not any(batch_counters.values())
+            ) and (claims is None or not any(claims.values())),
+            "production_batch_counters_final": batch_counters, "production_claims_final": claims, "cases": cases}
 
 
-def _exec_cost_once(repeats: int, include_jobs: bool, *, suite: Literal["exec_cost", "native_batch"] = "exec_cost") -> dict[str, Any]:
+def _exec_cost_once(
+    repeats: int, include_jobs: bool, *, suite: Literal["exec_cost", "native_batch", "native_batch_production"] = "exec_cost",
+) -> dict[str, Any]:
     if not 1 <= repeats <= 100:
         raise ValueError("exec_cost requires 1..100 paired repeats.")
     # A source copy isolates hardcoded PROJECT_ROOT state, including detached job workers.
@@ -2734,19 +2772,20 @@ def _exec_cost_once(repeats: int, include_jobs: bool, *, suite: Literal["exec_co
             + str(repeats)
             + ", "
             + str(include_jobs if suite == "exec_cost" else True)
-            + ")))",
+            + (", production=True)))" if suite == "native_batch_production" else ")))"),
         ]
         env = {key: "" for key in os.environ if key.upper().startswith(("MCP_", "PYTHON"))}
         env.update({"MCP_TOOL_PROFILE": "full", "MCP_LSP_PERSISTENT_ENABLED": "0", "MCP_WORKFLOW_DAG_ENABLED": "0"})
-        result = run_bounded(
-            command,
-            cwd=source,
-            timeout_sec=min(3_600, 120 + repeats * 30),
-            stdout_limit=2_000_000,
-            stderr_limit=2_000,
-            env=env,
-            delivery="inline",
-        )
+        with suppress_timings() if suite == "native_batch_production" else nullcontext():
+            result = run_bounded(
+                command,
+                cwd=source,
+                timeout_sec=min(3_600, 120 + repeats * 30),
+                stdout_limit=2_000_000,
+                stderr_limit=2_000,
+                env=env,
+                delivery="inline",
+            )
         if result["exit_code"] != 0:
             return {
                 "name": suite, "status": "error", "comparable": False,
@@ -2782,14 +2821,18 @@ def run_benchmarks(
     unknown = suites - set(SUITES)
     if unknown:
         raise ValueError(f"Unknown suites: {sorted(unknown)}")
+    if "native_batch_production" in suites and suites != {"native_batch_production"}:
+        raise ValueError("The production batch benchmark must run without other suites.")
     limits = PROFILE_LIMITS[profile]
-    stale_temp_dirs_removed = 0 if suites <= {"exec_cost", "native_batch"} else _cleanup_stale_temp_roots()
+    stale_temp_dirs_removed = 0 if suites <= {"exec_cost", "native_batch", "native_batch_production"} else _cleanup_stale_temp_roots()
     results: list[dict[str, Any]] = []
 
     if "exec_cost" in suites:
         results.append(_exec_cost_once(runs, include_jobs))
     if "native_batch" in suites:
         results.append(_exec_cost_once(runs, False, suite="native_batch"))
+    if "native_batch_production" in suites:
+        results.append(_exec_cost_once(runs, False, suite="native_batch_production"))
 
     if "catalog" in suites:
         results.append(measure("tool_catalog", _catalog_once, runs))
@@ -3148,7 +3191,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.output is None and "native_batch_production" in (args.suites or ()):
+        parser.error("the native_batch_production suite requires an explicit --output path")
     if args.output is None:
         _cleanup_managed_reports()  # Also recover reports left by an earlier process.
     suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "resilience", "workflow"))
