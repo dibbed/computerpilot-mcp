@@ -105,6 +105,8 @@ Key runtime invariants:
 
 A deeper component map is in [Architecture](docs/architecture.md).
 
+The unreleased, opt-in `read_batch` profile reduces independent file-window requests to one call. Its durable claims and shutdown guards are tested, but the final single-file performance gate remains open; use `read_file` for one file. See [batch limits and measured results](docs/tooling.md#opt-in-native-read-batching).
+
 ## Platform Support
 
 | Platform | Release status | Native CI | Native desktop / UIA | Notes |

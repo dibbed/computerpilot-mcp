@@ -11,14 +11,14 @@
 - آغاز بررسی: 2026-10-18؛ ادامه و تکمیل: 2026-10-19، Asia/Tehran؛ نسخه طرح: 1؛ نویسنده هم‌زمان: فقط همین نشست.
 - مسیر canonical: LOCAL_PATH_REDACTED
 - ریشه سورس: LOCAL_PATH_REDACTED
-- SOURCE_BASE (historical): e66c8c9c74ec73efca2eb1f7f23bd5bc2e6ee1b4؛ accepted runtime source / LOCAL_MAIN / ORIGIN_MAIN / LIVE_GITHUB_MAIN: 965a5cb641af40f1768f6fe3512d8332662ab28c.
-- Branch: fix/coding-evolution-acceptance in the original checkout; follow-up changes are tests/documentation only. PR #82 is MERGED; subsequent publication is recorded in the Ledger.
+- SOURCE_BASE (historical): e66c8c9c74ec73efca2eb1f7f23bd5bc2e6ee1b4؛ accepted runtime source: 965a5cb641af40f1768f6fe3512d8332662ab28c؛ current LOCAL_MAIN / ORIGIN_MAIN / LIVE_GITHUB_MAIN: 7ef385b67cbb416a66cee159ee0136a3591ef46f.
+- Branch: perf/batch-claim-connection-lifetime in the original checkout, based on main 7ef385b. Runtime changes committed through ae895d4 and locally verified; documentation publication and hosted gates follow. uv.lock remains unrelated/untracked.
 - PR #81 merged into the historical source base; PR #82 merged as 965a5cb. No release or tag is part of this continuation.
 - release پایدار v0.8.0 روی e4930a77c60b844a7845a82997e178c16694562e است. main جدیدتر از release است.
-- hosted main: all ten applicable checks succeeded on 965a5cb; Publish Release detected a non-release subject and skipped publication. Later follow-up gates are separate.
+- hosted main: all ten applicable checks succeeded on 7ef385b; the additional publication workflow detected a non-release commit and skipped release publication. No new tag or release.
 - تغییرات از قبل موجود: panel HTML and the two reviewed LSP reports were preserved and committed in PR #82; uv.lock remains untracked and is not used by requirements-based installation.
-- CURRENT_PHASE: backup recovery, context admission and Batch containment corrections accepted on the validated runtime source. P15-04 is BLOCKED by the measured single-file production overhead; P05-02/03 and P14-06 remain BLOCKED.
-- NEXT_TASK_ID: no ungated feature activation. P15-04 needs a safety-preserving performance solution meeting the unchanged 5ms target; P05-02 needs a separately budgeted, independently graded model run.
+- CURRENT_PHASE: owned-connection and post-wait eligibility corrections passed local full safety validation; hosted acceptance is pending. P15-04 remains BLOCKED because final production p95 overhead exceeds the unchanged 5 ms gate.
+- NEXT_TASK_ID: publish the locally verified batch improvements and collect ten current-head hosted gates before conditional merge. Preserve P15-04 BLOCKED and the separate P05 budget/grading gate.
 - P14 mandatory scope remains VERIFIED; P14-05 is DEFERRED and P14-06 BLOCKED. P15-02 safety is VERIFIED; P15-04 final performance acceptance is BLOCKED and P15-03 DEFERRED.
 - Historical P08 evidence: P08 local closure2298passed28skipped1known unrelated test-isolation warning540.96s; full Ruff/mypy293/compileall/startup151/health5 PASS. Full catalogue209326->191656bytes; ten schemas48706->31036bytes; normalized fixed byte/token allowances PASS in all profiles. Small-profile actual growthcoding30.09percent/core58.19percent disclosed. No Git publication or live activation.
 - Real LSP follow-up evidence (2026-10-26): Python/Pyright1.1.403, TLS5.3.0+TS5.9.3 and PHP/Intelephense1.18.5 all exit0. Exact cross-file definition; declaration/call references3/3/2; real clean0→type-error1→repair0 diagnostics; version/hash/edit; complete cycle after fresh restart; owned process/fixture cleanup PASS. Full pytest2338PASS28SKIP518.06s, independent243PASS1SKIP, full Ruff/mypy297/compileall/startup151/health5 PASS. [Acceptance appendix](#real-lsp-provider-acceptance-20261026) and repo docs/development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md. Hosted/other-platform/production activation NOT RUN.
@@ -4263,3 +4263,51 @@ FINAL-AUDIT-PASS — 2026-10-19: strict UTF-8؛43 جفت task marker یکتا و
 - P05 offline snapshots and balanced 180-invocation schedule were rebuilt for 965a5cb beneath the main checkout's ignored test fixtures; no live model was called. Separately approved budget, fixed client/model selection and independent correctness grading remain missing. Static SDK refresh is not evidence of the real host client's dynamic catalog support.
 - Index: 43 VERIFIED, 6 BLOCKED, 5 DEFERRED out of 54. No default profile, optional preflight, mixed batch, Job isolation, grounding, controller or delegation capability was activated.
 - EXACT_NEXT_ACTION: publish the reviewed acceptance records and collect hosted checks for the follow-up test-only changes; preserve the remaining gates rather than inventing missing approvals or acceptance evidence.
+
+### EVIDENCE-20 — P15 connection lifetime investigation IN_PROGRESS (2026-10-27)
+
+- User requested continuation from the current checkpoint. In the original workspace, branch perf/batch-claim-connection-lifetime starts at validated main 7ef385b.
+- Holding a separate connection after reading an actual table did not improve read p50 (14.229 ms baseline, 14.340 ms attached connection, 12.289 ms later baseline).
+- A different isolated diagnostic reused the very connection used by the existing claim methods: 30-read p50 changed from 12.989 ms to 2.896 ms while synchronous=FULL, existing claim transactions and settled transaction state were preserved. This is a promising hypothesis, not acceptance.
+- EXACT_NEXT_ACTION: implement opt-in, serialized connection ownership at the existing WorkflowStore boundary, prove rollback, cross-thread admission and bounded shutdown, then rerun actual production benchmark. Preserve normal store behavior and all resource/durability guards.
+
+
+### EVIDENCE-21 — Owned connection implementation IMPLEMENTED_UNVERIFIED (2026-10-27)
+
+- Added opt-in one-connection ownership to WorkflowStore, serialized by its existing RLock. Normal stores retain per-call connections. SQL leases preserve FULL synchronous commits, roll back abandoned transactions and discard failed rollback handles; no schema change or durability reduction. Only BatchReader enables the option.
+- Batch shutdown seals admission and retains the connection until actual reads/batches drain. Lifespan closes it off-thread; restart creates a fresh lifetime. Standalone benchmark explicitly closes its reader and checks the connection was retired.
+- Focused store/Batch/production benchmark tests: 34 passed; full mypy and targeted Ruff passed. Independent static review found a deferred-cleanup/restart race; deterministic test failed with the restarted reader sealed, and generation-scoped retirement plus admission generation checks fixed it. Re-review found no remaining concrete blocker; this is not yet full runtime acceptance.
+- One-sample production smoke: direct single-file p50 1.213 ms vs batch 5.648 ms (difference 4.435 ms), zero errors, all claims/counters drained and connection closed. A 30-run production benchmark is now running; do not substitute this smoke for the unchanged final numeric target.
+- EXACT_NEXT_ACTION: inspect the production 30-run report, then run exact-source full pytest, lifecycle/persistence checks, startup/health and Doctor before publication.
+
+### EVIDENCE-22 — Post-wait eligibility and shutdown regression verification (2026-10-27)
+
+- Production 30-run pre-final-check measurement improved N1 p50 overhead to 4.037 ms, but paired p95 remained 5.322 ms and max 6.052 ms. The unchanged 5 ms gate is NOT accepted from a passing median alone; this report also predates the final eligibility correction.
+- Reproduced a pre-existing profile-revocation gap after waiting for read capacity/resource claims. The final catalog eligibility check now runs on the owning event loop after both waits, within the read deadline and without holding a SQL lease. Timeout cancels that check and releases claims. Independent review found a further stop-during-handoff gap; a deterministic failing regression was added, then a post-handoff runtime/closed guard fixed it.
+- Current focused WorkflowStore/Batch/performance tests: 86 passed, 6 platform skips, 1 unrelated smoke deselected in 66.06 s. Full mypy: 306 files passed; targeted Ruff and diff checks passed. Final scoped independent static review PASS, with runtime/performance left to executed gates.
+- The earlier full-suite run was intentionally interrupted at 37 percent to incorporate the demonstrated denial fix. It is NOT a passing full-suite result. Final production 30-run benchmark is in progress; a fresh matching-source full suite follows it.
+- Source edits remain in the original directory on perf/batch-claim-connection-lifetime. Original operator state, tunnel, uv.lock and earlier archives remain preserved.
+- EXACT_NEXT_ACTION: inspect the final production benchmark including tails, then run matching-source full pytest, full static checks, compileall, startup/catalog, health and Full Doctor. Publish safe improvements only after matching hosted gates; preserve BLOCKED numeric acceptance if the unchanged limit is missed.
+
+### EVIDENCE-23 — Final production benchmark; numeric gate remains BLOCKED (2026-10-27)
+
+- Final production manifest 418fe7aad95e9088e0e83b0a31b95481132bdba9ca57166978b3bbc1f162753f; 145 source files. Report SHA256 55bf7bbf57f852ccda793f4ee69ac77b6bac3ad86a2567bba69abb1fc22cfdc3. All20 cases x30 measurements plus5 warmups; errors0, equivalent hashes, no denied dispatch, workers/claims/batch counters drained and connection closed. In-process SDK only; no live Tunnel/model latency claim.
+- N1 direct/batch1 p50 1.337/5.632 ms (difference4.295), p95 1.631/8.123 ms (difference6.492). Paired overhead median4.300, nearest-rank p95 6.984, max7.024 ms. P15-04 returns to BLOCKED; no acceptance from the passing median.
+- N4 direct/batch4 p50 4.415/12.949 ms; N16 16.610/46.961 ms. Reduced request count is established, a local speedup is not. FULL commits, ownership, path/profile/cancellation guards remain mandatory.
+- Matching-source isolated full Ruff, compileall, startup151, health5 and Full Doctor including real headless browser launch all PASS. Full pytest is running; no full-suite completion claimed yet. Existing live full-profile server is healthy151 and supervisor mcp/tunnel healthy with active_mutations0; neither live process nor Tunnel was restarted.
+- Index:43 VERIFIED,6 BLOCKED,5 DEFERRED. EXACT_NEXT_ACTION: finish full pytest, record the tested source, commit reviewed changes selectively, then collect ten same-head hosted gates before conditional merge.
+
+### EVIDENCE-24 — Clean-state full validation and focused commits (2026-10-27)
+
+- Committed reviewed, focused-test-passing changes: 77a275b5878019f1f548a953c0caa04884e18fac (owned SQL connection), 99edec12d782e479d74ec7d1ecc20013d462ac06 (batch admission/lifetime), ae895d40f3e02d893d42049885518f93f08d06d1 (benchmark connection cleanup). No push yet; no unrelated staging.
+- Reused full-suite fixture state contained an active native.command request created at 10:48:56 UTC by the earlier interrupted run, causing subsequent patch tests to wait60s each. The contaminated run was stopped and is not a pass. Its database remains preserved; no operational state was touched.
+- Direct cloning of the original checkout hit Git dubious-ownership validation of its .git path. No permissions or global trust settings were changed. A previously owned validation clone supplied Git metadata; all309 current source/test files were copied from the original workspace and hash matched. The new target had no .agent_state before running.
+- New exact-source full pytest is running with a clean MCP/Python environment and unbuffered progress. Source/test manifest SHA256 ecfdf8ba5747b87d6de18cd098208dae098988a39d6d3a99c46749cde1d56ae2. Static, startup, health and Doctor results remain valid; no production source changed after those checks.
+- EXACT_NEXT_ACTION: inspect the clean full-suite result, finalize the reviewed path-redacted documentation, push the branch and collect ten current-head checks before conditional merge. P15-04 numeric acceptance remains BLOCKED.
+
+### EVIDENCE-25 — Full local safety validation PASS; hosted publication next (2026-10-27)
+
+- Clean exact-source full pytest PASS:2444 passed,28 skipped,549.46s,exit0. Matching source/test manifest ecfdf8ba5747b87d6de18cd098208dae098988a39d6d3a99c46749cde1d56ae2 corresponds to runtime/test commits through ae895d4. Interrupted/contaminated earlier runs remain excluded and preserved as evidence.
+- Focused suite86pass6platformskip1unrelatedsmokedeselected; full Ruff, mypy306, compileall, startup151, health5 and Full Doctor including browser PASS. Independent static review PASS after deterministic eligibility/shutdown regressions. No runtime/test source changed after these checks.
+- README, CHANGELOG, tooling docs and the authorized path-redacted Coding Agent plan snapshot record the actual improved measurements and the still-failed tail-latency acceptance. No default profile, durability setting, operator state or Tunnel change. uv.lock is untracked and excluded.
+- Index remains43 VERIFIED,6 BLOCKED,5 DEFERRED. EXACT_NEXT_ACTION: push reviewed focused commits, create Draft PR, verify all ten checks at its final head, then conditionally merge and verify new main workflows. No tag/release.

@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import shutil
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import closing
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -11,6 +17,106 @@ from core.workflows import StepDefinition, WorkflowDefinition, WorkflowState, Wo
 
 def _definition() -> WorkflowDefinition:
     return WorkflowDefinition("verify", (StepDefinition("test", "verify_changes", {"cwd": "C:/repo"}),))
+
+
+def test_reused_connection_serializes_sql_without_serializing_claimed_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.resource_claims import managed_resource_claims, path_claim
+
+    store = WorkflowStore(tmp_path / "workflows.db", recover=False, reuse_connection=True)
+    original_connect = sqlite3.connect
+    connections: list[sqlite3.Connection] = []
+
+    def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    barrier = threading.Barrier(4)
+
+    def work() -> None:
+        with managed_resource_claims((path_claim(tmp_path / "target", "read"),), category="test", store=store):
+            barrier.wait(timeout=5)
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _: work(), range(4)))
+        assert len(connections) == 1
+        with closing(store._connect()) as connection:
+            assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+        assert store.health_summary()["active_resource_request_count"] == 0
+    finally:
+        store.close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute("SELECT 1")
+    with pytest.raises(ToolError) as error:
+        store.health_summary()
+    assert error.value.code == "workflow_store_closed"
+
+
+def test_reused_connection_rolls_back_abandoned_transaction_before_reuse(tmp_path: Path) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db", recover=False, reuse_connection=True)
+    try:
+        with pytest.raises(RuntimeError, match="interrupted"), closing(store._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("INSERT INTO workflow_maintenance(key) VALUES ('uncommitted')")
+            raise RuntimeError("interrupted")
+        with closing(store._connect()) as connection:
+            assert not connection.in_transaction
+            assert connection.execute("SELECT COUNT(*) FROM workflow_maintenance WHERE key='uncommitted'").fetchone()[0] == 0
+        store.create(_definition())
+    finally:
+        store.close()
+
+
+def test_reused_connection_close_waits_for_lease_and_rejects_wrong_thread(tmp_path: Path) -> None:
+    store = WorkflowStore(tmp_path / "workflows.db", recover=False, reuse_connection=True)
+    connection = store._connect()
+    started = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with pytest.raises(ToolError) as mismatch:
+                pool.submit(connection.close).result(timeout=5)
+            assert mismatch.value.code == "workflow_connection_owner_mismatch"
+
+            def close() -> None:
+                started.set()
+                store.close()
+
+            pending = pool.submit(close)
+            assert started.wait(5)
+            with pytest.raises(FutureTimeoutError):
+                pending.result(timeout=0.05)
+            connection.close()
+            pending.result(timeout=5)
+        with pytest.raises(ToolError) as closed:
+            connection.execute("SELECT 1")
+        assert closed.value.code == "workflow_connection_closed"
+    finally:
+        connection.close()
+        store.close()
+
+
+def test_reused_connection_discards_handle_when_rollback_fails(tmp_path: Path) -> None:
+    class BrokenRollback(sqlite3.Connection):
+        def rollback(self) -> None:
+            raise sqlite3.OperationalError("injected rollback failure")
+
+    store = WorkflowStore(tmp_path / "workflows.db", recover=False, reuse_connection=True)
+    broken = sqlite3.connect(store.path, isolation_level=None, check_same_thread=False, factory=BrokenRollback)
+    store._shared_connection = broken
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="injected"), closing(store._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("INSERT INTO workflow_maintenance(key) VALUES ('uncommitted')")
+        assert store._shared_connection is None
+        with closing(store._connect()) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM workflow_maintenance WHERE key='uncommitted'").fetchone()[0] == 0
+        assert store.health_summary()["active_resource_request_count"] == 0
+    finally:
+        store.close()
 
 
 def test_create_is_idempotent_for_exact_inputs_and_redacts_public_projection(tmp_path: Path) -> None:

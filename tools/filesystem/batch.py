@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
@@ -118,15 +119,53 @@ class BatchReader:
         self._read_slots = threading.BoundedSemaphore(4)
         self._claim_store_lock = threading.Lock()
         self._claim_store: WorkflowStore | None = None
+        self._closed = False
+        self._generation = 0
+
+    def start(self) -> None:
+        with self._claim_store_lock:
+            with self._lock:
+                if self._batches:
+                    raise ToolError("batch_busy", "The previous batch lifetime is still draining.")
+                self._closed = True
+            if self._claim_store is not None:
+                self._claim_store.close()
+                self._claim_store = None
+            with self._lock:
+                self._generation += 1
+                self._closed = False
+
+    def stop(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def close(self) -> None:
+        self.stop()
+        with self._lock:
+            if self._batches:
+                return
+            generation = self._generation
+        self._close_store(generation)
+
+    def _close_store(self, generation: int) -> None:
+        with self._claim_store_lock:
+            with self._lock:
+                if generation != self._generation or not self._closed or self._batches:
+                    return
+            if self._claim_store is not None:
+                self._claim_store.close()
+                self._claim_store = None
 
     def _store(self) -> WorkflowStore:
         # Reuse the existing durable claim authority; initializing it for each
         # parallel read would serialize schema checks behind a migration lock.
         with self._claim_store_lock:
+            if self._closed:
+                raise ToolError("batch_draining", "The batch reader is closed.")
             if self._claim_store is None:
                 from core.config import SETTINGS
 
-                self._claim_store = WorkflowStore(SETTINGS.workflow_db, recover=False)
+                self._claim_store = WorkflowStore(SETTINGS.workflow_db, recover=False, reuse_connection=True)
             return self._claim_store
 
     def snapshot(self) -> dict[str, int]:
@@ -135,6 +174,8 @@ class BatchReader:
                     "reserved_response_bytes": self._batches * MAX_RESPONSE_BYTES}
 
     async def _eligible(self) -> None:
+        if self._closed:
+            raise ToolError("batch_draining", "The batch reader is closed.")
         allowed = getattr(self.server, "native_allowlist", None)
         names = {"read_file", "native_read_batch"}
         if allowed is not None and not names <= allowed:
@@ -204,18 +245,37 @@ class BatchReader:
             raise ToolError("batch_source_budget", "The batch source byte budget is exceeded.")
         return root, (info.st_dev, info.st_ino), plan
 
-    def _read(self, path: Path, item: ReadItem, limits: service.ReadWindowLimits) -> dict[str, Any]:
+    def _read(
+        self, path: Path, item: ReadItem, limits: service.ReadWindowLimits, loop: asyncio.AbstractEventLoop,
+    ) -> dict[str, Any]:
         limits.check()
         with managed_resource_claims(
             (coordination_claim(), path_claim(path, "read")), category="native.read_batch",
             timeout_sec=max(0.001, limits.deadline - time.monotonic()), store=self._store(),
         ):
             limits.check()
+            if self._closed or RUNTIME_LIFECYCLE.snapshot()["state"] != "RUNNING":
+                raise ToolError("batch_draining", "The runtime is draining.")
+            eligibility = self._eligible()
+            try:
+                checked = asyncio.run_coroutine_threadsafe(eligibility, loop)
+            except RuntimeError:
+                eligibility.close()
+                raise ToolError("batch_draining", "The runtime event loop is unavailable.") from None
+            try:
+                checked.result(timeout=max(0.0, limits.deadline - time.monotonic()))
+            except FutureTimeoutError:
+                checked.cancel()
+                raise ToolError("batch_deadline", "The batch read deadline elapsed.") from None
+            limits.check()
+            if self._closed or RUNTIME_LIFECYCLE.snapshot()["state"] != "RUNNING":
+                raise ToolError("batch_draining", "The runtime is draining.")
             return service.read_window(str(path), start_line=item.start_line, end_line=item.end_line,
                                        offset=item.offset, max_chars=item.max_chars, encoding=item.encoding, limits=limits)
 
     async def execute(self, root: str, items: Any, max_parallel: int = 1, timeout_sec: float = 10) -> BatchResult:
         entered = time.monotonic()
+        generation = self._generation
         try:
             request = BatchRequest.model_validate({"root": root, "items": items, "max_parallel": max_parallel, "timeout_sec": timeout_sec})
         except ValidationError:
@@ -224,6 +284,8 @@ class BatchReader:
         if RUNTIME_LIFECYCLE.snapshot()["state"] != "RUNNING":
             raise ToolError("batch_draining", "The runtime is draining.")
         with self._lock:
+            if self._closed or generation != self._generation:
+                raise ToolError("batch_draining", "The batch reader lifetime changed.")
             if self._batches >= 4:
                 raise ToolError("batch_busy", "The bounded batch capacity is occupied.")
             self._batches += 1
@@ -234,6 +296,7 @@ class BatchReader:
             outcomes = [_error(item, entry if isinstance(entry, str) else "batch_not_started")
                         for item, entry in zip(request.items, plan, strict=True)]
             indices = iter(range(len(plan)))
+            loop = asyncio.get_running_loop()
 
             async def consume() -> None:
                 for index in indices:
@@ -246,7 +309,6 @@ class BatchReader:
                     acquired = False
                     try:
                         limits.check()
-                        await self._eligible()
                         if RUNTIME_LIFECYCLE.snapshot()["state"] != "RUNNING":
                             outcomes[index] = _error(item, "batch_draining")
                             continue
@@ -257,7 +319,7 @@ class BatchReader:
                         with self._lock:
                             self._reads += 1
                         with timing_span("batch_read", metadata={"item_index": index}):
-                            value = await self._thread(partial(self._read, path, item, limits), cancelled)
+                            value = await self._thread(partial(self._read, path, item, limits, loop), cancelled)
                         limits.check()
                         text = _bounded_content(value["content"], item.max_chars)
                         truncated = bool(value["truncated"] or text != value["content"])
@@ -271,6 +333,7 @@ class BatchReader:
                         code = exc.code if isinstance(exc, ToolError) else "batch_read_failed"
                         if code not in {
                             "batch_deadline", "batch_cancelled", "batch_source_changed", "batch_path_denied", "batch_hidden_tool",
+                            "batch_draining",
                         }:
                             code = "batch_scope_denied" if code.startswith("resource_") else "batch_read_failed"
                         outcomes[index] = _error(item, code, (time.monotonic() - started) * 1000)
@@ -307,3 +370,6 @@ class BatchReader:
             cancelled.set()
             with self._lock:
                 self._batches -= 1
+                close_store = self._closed and self._batches == 0
+            if close_store:
+                await self._thread(partial(self._close_store, generation), cancelled)

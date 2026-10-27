@@ -31,6 +31,9 @@ RUNTIME_HEALTH_PUBLISH_INTERVAL_SEC = 10.0
 @asynccontextmanager
 async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     ensure_runtime_dirs()
+    batch_reader = getattr(server, "native_read_batch_state", None)
+    if batch_reader is not None:
+        batch_reader.start()
     store_getter = getattr(server, "job_store_getter", None)
     if store_getter is not None:
         store = await asyncio.to_thread(store_getter)
@@ -120,6 +123,8 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
         if hasattr(server, "__dict__"):
             server.runtime_started = False
         RUNTIME_LIFECYCLE.mark_stopping()
+        if batch_reader is not None:
+            batch_reader.stop()
         lsp_manager = getattr(server, "lsp_manager", None)
         if lsp_manager is not None:
             # Seal admission before a busy worker pool can delay bounded draining.
@@ -127,6 +132,9 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
                 lsp_manager.close_all(timeout_sec=0)
 
         async def finish_lifespan() -> None:
+            if batch_reader is not None:
+                with suppress(Exception):
+                    await asyncio.wait_for(asyncio.to_thread(batch_reader.close), timeout=5.25)
             if lsp_manager is not None:
                 with suppress(Exception):
                     await asyncio.wait_for(asyncio.to_thread(lsp_manager.close_all, timeout_sec=5.0), timeout=5.25)

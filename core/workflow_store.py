@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from collections.abc import Sequence
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -159,17 +159,80 @@ def _lease_from_row(row: sqlite3.Row) -> WorkflowLease:
     )
 
 
+class _ConnectionLease:
+    """Return a lock-scoped borrow without closing the store's owned connection."""
+
+    def __init__(self, store: WorkflowStore, connection: sqlite3.Connection) -> None:
+        self._store = store
+        self._connection = connection
+        self._closed = False
+        self._owner_thread = threading.get_ident()
+
+    def __getattr__(self, name: str) -> Any:
+        if self._closed:
+            raise ToolError("workflow_connection_closed", "The workflow connection lease is closed.")
+        if threading.get_ident() != self._owner_thread:
+            raise ToolError("workflow_connection_owner_mismatch", "The workflow connection lease belongs to another thread.")
+        return getattr(self._connection, name)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if threading.get_ident() != self._owner_thread:
+            raise ToolError("workflow_connection_owner_mismatch", "The workflow connection lease belongs to another thread.")
+        self._closed = True
+        try:
+            try:
+                if self._connection.in_transaction:
+                    self._connection.rollback()
+            except BaseException:
+                self._store._shared_connection = None
+                with suppress(Exception):
+                    self._connection.close()
+                raise
+        finally:
+            self._store._lock.release()
+
+
 class WorkflowStore:
-    def __init__(self, path: Path, *, recover: bool = True) -> None:
+    def __init__(self, path: Path, *, recover: bool = True, reuse_connection: bool = False) -> None:
         self.path = path
         self._lock = threading.RLock()
+        self._reuse_connection = False
+        self._shared_connection: sqlite3.Connection | None = None
+        self._closed = False
         path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        self._reuse_connection = reuse_connection
         if recover:
             self.recover_interrupted()
 
     def _connect(self, *, setup_wal: bool = False) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        if not self._reuse_connection:
+            if self._closed:
+                raise ToolError("workflow_store_closed", "The workflow store is closed.")
+            return self._new_connection(setup_wal=setup_wal)
+        self._lock.acquire()
+        try:
+            if self._closed:
+                raise ToolError("workflow_store_closed", "The workflow store is closed.")
+            if self._shared_connection is None:
+                self._shared_connection = self._new_connection(setup_wal=setup_wal, shared=True)
+            return cast(sqlite3.Connection, _ConnectionLease(self, self._shared_connection))
+        except BaseException:
+            self._lock.release()
+            raise
+
+    def close(self) -> None:
+        """Seal an owned store and close its opt-in shared connection after SQL leases finish."""
+        with self._lock:
+            self._closed = True
+            if self._shared_connection is not None:
+                self._shared_connection.close()
+                self._shared_connection = None
+
+    def _new_connection(self, *, setup_wal: bool = False, shared: bool = False) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=10, isolation_level=None, check_same_thread=not shared)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout=10000")

@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-27: Reuse one serialized SQLite connection for native read-batch resource claims, retaining FULL durability and rollback isolation. Retire the connection after actual batch draining, fence restarted reader generations, and check standalone benchmark connection cleanup. Normal WorkflowStore callers keep per-operation connections.
 - 2026-10-26: Add an isolated production native-read-batch benchmark alongside the existing prototype, measuring real MCP calls, response equivalence and drained batch counters.
 - 2026-10-26: Implement an unreleased, explicitly selected seven-tool `read_batch` profile and typed, bounded `native_read_batch` for independent local text windows. Reuse the native reader and durable resource claims; cap local paths, source/response bytes, concurrent reads and cancellation without changing legacy catalogs or activating the current operator server. Include actual MCP request-count and cancellation tests.
 - 2026-10-26: Recommend existing safe_refactor/apply_patch tools for known independent edits and submit_job/job_wait for durable commands, while retaining direct execution for short commands. Add advisory intents without merging requests or changing edit/recovery behavior.
@@ -50,6 +51,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-15: Add `start_verification` in profiles containing testing and jobs. Native verification reuses durable job admission, cancellation and output, reports bounded stage events and stale inputs, and supports opt-in parallel read-only checks without changing foreground defaults.
 
 ### Fixed
+- 2026-10-27: Recheck native read-batch profile eligibility after read-slot and resource-claim waits, cancel timed-out checks, and reject dispatch when shutdown completes during the final eligibility handoff.
 - 2026-10-26: Serialize workspace-edit backup publication and retention across cooperating processes; skip cleanup when the canonical recovery journal is unconfigured or malformed.
 - 2026-10-26: Keep semantic context preparation capacity reserved after caller timeout or cancellation until the in-flight preparation completes.
 - 2026-10-26: Keep native read-batch file opens anchored to the admitted root while directory links or junctions change; reject unsafe opens and retain existing read, cancellation and resource limits.
