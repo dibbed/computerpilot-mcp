@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-26: Add an isolated production native-read-batch benchmark alongside the existing prototype, measuring real MCP calls, response equivalence and drained batch counters.
 - 2026-10-26: Implement an unreleased, explicitly selected seven-tool `read_batch` profile and typed, bounded `native_read_batch` for independent local text windows. Reuse the native reader and durable resource claims; cap local paths, source/response bytes, concurrent reads and cancellation without changing legacy catalogs or activating the current operator server. Include actual MCP request-count and cancellation tests.
 - 2026-10-26: Recommend existing safe_refactor/apply_patch tools for known independent edits and submit_job/job_wait for durable commands, while retaining direct execution for short commands. Add advisory intents without merging requests or changing edit/recovery behavior.
 - 2026-10-26: Guide native file/search/Git operations and direct executable selection; add an advisory PowerShell intent for cmdlets/pipelines with capability denial and existing cost/latency tiers. Keep execution permissions and public schemas unchanged.
@@ -49,6 +50,9 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 - 2026-10-15: Add `start_verification` in profiles containing testing and jobs. Native verification reuses durable job admission, cancellation and output, reports bounded stage events and stale inputs, and supports opt-in parallel read-only checks without changing foreground defaults.
 
 ### Fixed
+- 2026-10-26: Serialize workspace-edit backup publication and retention across cooperating processes; skip cleanup when the canonical recovery journal is unconfigured or malformed.
+- 2026-10-26: Keep semantic context preparation capacity reserved after caller timeout or cancellation until the in-flight preparation completes.
+- 2026-10-26: Keep native read-batch file opens anchored to the admitted root while directory links or junctions change; reject unsafe opens and retain existing read, cancellation and resource limits.
 - 2026-10-25: Accept numeric full/incremental LSP synchronization capabilities used by Pyright while preserving denial for disabled or malformed synchronization. Allow the Windows launcher to load optional local runtime settings from ignored state storage.
 - 2026-10-25: Bound terminal resource admission by the caller's timeout and deduct admission wait from process execution. Report quarantined ownership immediately without releasing its safety fence or leaving a pending command behind.
 - 2026-10-25: Give package test runners a private temporary home so Node resolution works without inheriting operator home settings. Exclude Composer vendor packages from workspace discovery while retaining explicit installed-runner validation and background fingerprint guards.

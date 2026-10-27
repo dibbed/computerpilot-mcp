@@ -179,6 +179,8 @@ The default `full` profile preserves the complete catalog. Smaller profiles redu
 
 Unreleased opt-in `coding_core` keeps an exact 43-tool native coding catalog for a client that lists tools once. It includes guarded file/LSP edits, verification, Git, recovery and job observation; extensions need explicit profile eligibility. Its static SDK journey is tested, while the separately budgeted live-model UX pilot remains unverified. It does not change the default. See the [profile contract](docs/tooling.md#profiles).
 
+The separate opt-in `read_batch` profile exposes bounded reads for independent local files in one MCP call. It does not provide an atomic multi-file snapshot or guarantee a local speedup; see [native read batching](docs/tooling.md#opt-in-native-read-batching).
+
 `discover_tool_domains` reports the current profile and platform capabilities. `recommend_tools` ranks tools that are actually registered in the active profile and enriches recognized tools with shared execution-route metadata. The read-only `execution_candidates` and `execution_recommend` diagnostics use that same registered catalog; metadata alone cannot make an unavailable tool routable.
 
 Set a profile with:
