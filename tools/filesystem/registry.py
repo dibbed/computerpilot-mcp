@@ -113,7 +113,7 @@ def register(mcp: MCPServer, *, batch_enabled: bool = False) -> None:
             max_parallel: Annotated[int, Field(strict=True, ge=1, le=4)] = 1,
             timeout_sec: Annotated[float, Field(strict=True, gt=0, le=60, allow_inf_nan=False)] = 10,
         ) -> BatchResult:
-            """Read independent local text windows in one bounded response; no shared snapshot or hard I/O timeout."""
+            """Read independent local text windows in one response; use read_file for one file. No shared snapshot or hard I/O timeout."""
             return await reader.execute(root, items, max_parallel, timeout_sec)
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)

@@ -125,11 +125,21 @@ def test_production_batch_benchmark_dispatches_real_batch(tmp_path: Path, monkey
     monkeypatch.setattr(BatchReader, "execute", observed)
     report = perf_benchmark._native_batch_worker(1, include_powershell=False, production=True)
     assert report["prototype_only"] is False
+    assert report["transport"] == "memory" and report["measurement_kind"] == "LOCAL"
+    assert report["paired_single_file_overhead"]["count"] == 1
     assert report["production_connection_closed"] is True
     assert set(calls) == {1, 4, 8, 16} and len(calls) == 4 * 3 * 6
     for count in (1, 4, 8, 16):
         direct = report["cases"][f"{count}/direct"]
         assert direct["peak_workers"] is None
+        for parallel in (2, 4):
+            concurrent = report["cases"][f"{count}/direct_parallel{parallel}"]
+            assert concurrent["errors"] == 0 and concurrent["output_sha256"] == direct["output_sha256"]
+            assert concurrent["samples"][0]["requests"] == concurrent["samples"][0]["responses"] == count
+            assert 0 < concurrent["peak_client_calls"] <= parallel
+            assert concurrent["synthetic_wait_saving_percent"]["100"] == (0 if count == 1 else {2: 50, 4: 75}[parallel])
+            if count >= 4:
+                assert concurrent["peak_client_calls"] > 1
         for parallel in (1, 2, 4):
             batch = report["cases"][f"{count}/batch{parallel}"]
             assert batch["errors"] == 0 and batch["output_sha256"] == direct["output_sha256"]
@@ -141,6 +151,75 @@ def test_production_batch_benchmark_dispatches_real_batch(tmp_path: Path, monkey
     assert report["production_claims_final"] == {
         "active_resource_request_count": 0, "pending_resource_request_count": 0, "quarantined_resource_request_count": 0,
     }
+
+
+def test_paired_batch_overhead_uses_matching_rounds_and_nearest_rank() -> None:
+    direct = [{"round": i, "elapsed_ms": 10} for i in range(4)]
+    batch = [{"round": i, "elapsed_ms": 10 + value} for i, value in enumerate((-1, 1, 3, 9))]
+    result = perf_benchmark._paired_batch_overhead(direct, batch)
+    assert result["p50_ms"] == 2 and result["p95_ms"] == 9
+    assert result["passed"] is False and result["limit_ms"] == 5
+    with pytest.raises(ValueError, match="round"):
+        perf_benchmark._paired_batch_overhead(direct, list(reversed(batch)))
+
+
+def test_thirty_round_prototype_is_not_production_acceptance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_benchmark, "PROJECT_ROOT", tmp_path)
+    report = perf_benchmark._native_batch_worker(30, include_powershell=False)
+    assert report["prototype_only"] is True and report["acceptance_eligible"] is False
+
+
+def test_owned_batch_transport_refuses_the_operator_checkout_before_activation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_benchmark, "create_server", lambda: pytest.fail("Activated the operator server"))
+    with pytest.raises(ValueError, match="isolated"):
+        perf_benchmark._native_batch_server("unused", "http")
+
+
+@pytest.mark.parametrize("transport", ["stdio", "http"])
+def test_production_batch_owned_transports_drain_and_reap(
+    transport: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tempfile
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    report = perf_benchmark._exec_cost_once(1, False, suite="native_batch_production", native_batch_transport=transport)
+    assert report["status"] == "ok" and report["transport"] == transport
+    assert report["server_process_exited"] and report["production_connection_closed"] and report["workers_cleaned"]
+    assert report["catalog"]["scope"] == "full_opt_in" and report["catalog"]["tool_count"] > 100
+    if transport == "http":
+        assert report["http_unauthenticated_denied"] is True
+    assert 1 <= report["server_peak_reads"] <= 4
+    assert report["cases"]["4/direct"]["samples"][0]["requests"] == 4
+    assert report["cases"]["4/batch4"]["samples"][0]["requests"] == 1
+
+
+def test_native_direct_parallel_reads_overlap_on_the_actual_sdk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp import Client
+    from mcp.server import MCPServer
+
+    from tools.filesystem import registry as filesystem_registry
+    from tools.filesystem import service
+
+    barrier = threading.Barrier(2)
+    original = service.read_window
+
+    def read(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        barrier.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "read_window", read)
+    server = MCPServer("parallel-read-proof")
+    filesystem_registry.register(server)
+    path = tmp_path / "read.txt"
+    path.write_text("parallel fixture", encoding="utf-8")
+
+    async def scenario() -> None:
+        async with Client(server) as client:
+            results = await asyncio.gather(*(client.call_tool("read_file", {"path": str(path)}) for _ in range(2)))
+            assert all(result.structured_content["content"] == "parallel fixture" for result in results)
+
+    asyncio.run(scenario())
 
 
 def test_production_benchmark_requires_explicit_report_path(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -4335,3 +4335,13 @@ FINAL-AUDIT-PASS — 2026-10-19: strict UTF-8؛43 جفت task marker یکتا و
 - The original four Downloads evidence roots, five access-denied p1501 roots,57 nonempty main pytest roots, original state/databases/plans/personal data and unrelated uv.lock remain preserved. Earlier97-file evidence archive and six-file/two-root diagnostic cleanup remain recorded separately.
 - Runtime continuation is complete with43 VERIFIED,6 BLOCKED,5 DEFERRED; no passing median substituted for P15 tail acceptance and no missing model/provider/isolation gates invented. This snapshot records the verified runtime subject; final documentation-only publication can advance Git HEAD separately.
 - EXACT_NEXT_ACTION: publish this reviewed final runtime checkpoint, then retain the11 explicit conditional gates for the next development decision. No additional runtime implementation is required for this delivery.
+
+
+### BATCH-PLUGIN — Opt-in integration and benchmark continuation IN_PROGRESS (2026-10-27)
+
+- Separately approved file-only continuation from main d78f8ac on perf/native-read-batch-plugin. Add default-off MCP_NATIVE_READ_BATCH_ENABLED for full; preserve old native descriptors, read_batch7 and the original safety limits. Unsupported profiles fail before capability discovery.
+- Live descriptor lookup retains post-slot/post-claim eligibility checks. Pre-runtime health stays within its existing typed envelope. Added no-dispatch revocation/removal/annotation regressions and <=4KiB opt-in catalog-growth coverage.
+- Production benchmark adds client-parallel2/4, matching-round nearest-rank overhead, explicit CPU/RSS scope, owned stdio and authenticated loopback HTTP fixtures. Subprocess catalogs contain152 Windows tools while fixture dispatch is restricted to the two file readers and health. SIMULATED delay is separate from actual transport evidence.
+- Matching runtime-source manifest c2e298d98a05ffd8e130970c083335601d8662ba7144112cd2fa52162f63e48a:30 measured rounds plus5 warmups; memory28cases paired p95 5.8403ms, stdio24cases6.7883ms and HTTP24cases5.7658ms. All exceed the unchanged5ms allowance. P15-04 remains BLOCKED; no activation or real GPT/Tunnel speedup claim. Simulated run and final full/hosted checks are pending.
+- Targeted runtime/transport/report checks passed; one older report-string compatibility failure was corrected and its regression passed. Publication is a tested draft checkpoint, not final acceptance. No live restart, Tunnel/configuration change, tag or release.
+- EXACT_NEXT_ACTION: finish simulated evidence and fresh exact-source full/static/startup/health/Doctor checks, collect ten PR-head gates, and retain the performance/activation blocker without weakening claims or durability.

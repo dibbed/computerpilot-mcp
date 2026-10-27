@@ -72,6 +72,9 @@ def create_server() -> MCPServer:
     ArgModelBase.model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
     ArgModelBase.model_rebuild(force=True)
     profile = resolve_profile(SETTINGS.tool_profile)
+    if SETTINGS.native_read_batch_enabled and profile.name not in {"full", "read_batch"}:
+        raise ToolError("batch_profile_unsupported", "Native read batching requires the full or read_batch profile.")
+    batch_enabled = profile.name == "read_batch" or SETTINGS.native_read_batch_enabled
     capabilities = detect_capabilities()
     active_domains = available_domains(profile.domains, capabilities)
     store_getter = lazy_job_store(lambda: JobStore()) if {"jobs", "testing"}.intersection(active_domains) else None
@@ -99,7 +102,7 @@ def create_server() -> MCPServer:
     for domain in active_domains:
         registrar = REGISTRARS.get(domain)
         if registrar is not None:
-            if domain == "filesystem" and profile.name == "read_batch":
+            if domain == "filesystem" and batch_enabled:
                 register_filesystem(server, batch_enabled=True)
             elif domain == "testing":
                 register_testing(server, background_enabled="jobs" in active_domains, store_getter=store_getter)
@@ -309,7 +312,7 @@ def create_server() -> MCPServer:
                 recovery=OPERATION_RECOVERY,
                 workflow_store_factory=workflow_store,
             )
-        if profile.name == "read_batch":
+        if batch_enabled and "runtime_generation" in result:
             result["native_read_batch"] = cast(Any, server).native_read_batch_state.snapshot()
         return cast(HealthResult, validate_tool_output(HealthResult, result, operation="server_health"))
 

@@ -33,18 +33,94 @@ def close_batch_readers(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         reader.close()
 
 
-def _server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str = "read_batch") -> Any:
+def _server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str = "read_batch", *, enabled: bool = False) -> Any:
     from core import audit, config, heartbeat, registry
     from core.lifecycle import RuntimeLifecycle
     from tools.filesystem import batch, service
     from tools.language import registry as language_registry
 
     settings = replace(config.SETTINGS, state_dir=tmp_path / "state", memory_dir=tmp_path / "memory",
-                       tool_profile=profile, persistent_enabled=False, extensions_enabled=False)
+                       tool_profile=profile, native_read_batch_enabled=enabled, persistent_enabled=False, extensions_enabled=False)
     for module in (audit, config, heartbeat, registry, service, language_registry):
         monkeypatch.setattr(module, "SETTINGS", settings)
     monkeypatch.setattr(batch, "RUNTIME_LIFECYCLE", RuntimeLifecycle())
     return registry.create_server()
+
+
+def test_full_batch_opt_in_preserves_existing_descriptors_and_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    baseline = _server(tmp_path, monkeypatch, "full")
+    before = {tool.name: tool.model_dump(mode="json", by_alias=True, exclude_none=True)
+              for tool in asyncio.run(baseline.list_tools())}
+    assert "native_read_batch" not in before
+    server = _server(tmp_path, monkeypatch, "full", enabled=True)
+    after = {tool.name: tool.model_dump(mode="json", by_alias=True, exclude_none=True)
+             for tool in asyncio.run(server.list_tools())}
+    assert after.keys() - before.keys() == {"native_read_batch"}
+    assert {name: after[name] for name in before} == before
+    def encode(value: Any) -> bytes:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+    assert len(encode(list(after.values()))) - len(encode(list(before.values()))) <= 4096
+    health = asyncio.run(server.call_tool("server_health", {}))
+    assert health.structured_content["snapshot_reason"] == "runtime_not_started"
+    from core import registry
+
+    async def collected(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"ok": True, "health_status": "healthy", "snapshot_schema_version": 1,
+                "runtime_generation": "fixture", "collected_at": "2026-10-27T00:00:00+00:00", "collected_monotonic": 1,
+                "server": "fixture", "version": "0.8.0", "tool_profile": "full", "tool_count": len(after),
+                "unique_tool_names": True}
+
+    monkeypatch.setattr(registry, "collect_server_health", collected)
+    server.runtime_started = True
+    health = asyncio.run(server.call_tool("server_health", {}))
+    assert health.structured_content["native_read_batch"] == {
+        "active_batches": 0, "active_reads": 0, "reserved_response_bytes": 0,
+    }
+
+
+@pytest.mark.parametrize("profile", ["coding", "coding_core", "minimal", "browser"])
+def test_batch_opt_in_rejects_unsupported_profiles_before_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str,
+) -> None:
+    from core import registry
+    from core.errors import ToolError
+
+    monkeypatch.setattr(registry, "detect_capabilities", lambda: pytest.fail("Discovered capabilities before configuration denial"))
+    with pytest.raises(ToolError) as raised:
+        _server(tmp_path, monkeypatch, profile, enabled=True)
+    assert raised.value.code == "batch_profile_unsupported"
+
+
+def test_eligibility_uses_live_native_descriptors_without_building_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp.server import MCPServer
+
+    from core.errors import ToolError
+
+    server = _server(tmp_path, monkeypatch)
+    reader = server.native_read_batch_state
+    monkeypatch.setattr(MCPServer, "list_tools", lambda *_: pytest.fail("Rebuilt the complete catalog"))
+    asyncio.run(reader._eligible())
+    tool = server._tool_manager.get_tool("read_file")
+    monkeypatch.setattr(tool, "annotations", tool.annotations.model_copy(update={"read_only_hint": False}))
+    with pytest.raises(ToolError) as raised:
+        asyncio.run(reader._eligible())
+    assert raised.value.code == "batch_hidden_tool"
+    server._tool_manager.remove_tool("read_file")
+    with pytest.raises(ToolError) as raised:
+        asyncio.run(reader._eligible())
+    assert raised.value.code == "batch_hidden_tool"
+
+
+@pytest.mark.parametrize(("value", "expected"), [("1", "1"), ("TRUE", "1"), ("0", "0"), ("false", "0"), ("invalid", "0")])
+def test_batch_operator_flag_accepts_only_explicit_true_values(value: str, expected: str) -> None:
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, "-c", "from core.config import SETTINGS; print(int(SETTINGS.native_read_batch_enabled))"],
+        cwd=Path(__file__).resolve().parents[1], env={**os.environ, "MCP_NATIVE_READ_BATCH_ENABLED": value},
+        capture_output=True, text=True, timeout=10, check=True,
+    )
+    assert result.stdout.strip() == expected
 
 
 def test_batch_connection_is_closed_with_lifespan_and_server_can_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,7 +297,10 @@ def test_request_waiting_for_eligibility_cannot_cross_reader_restart(tmp_path: P
     asyncio.run(scenario())
 
 
-def test_read_waiting_for_capacity_rechecks_profile_before_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("change", ["allowlist", "remove", "annotations"])
+def test_read_waiting_for_capacity_rechecks_profile_before_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
     from tools.filesystem import service
 
     server = _server(tmp_path, monkeypatch)
@@ -258,7 +337,13 @@ def test_read_waiting_for_capacity_rechecks_profile_before_dispatch(tmp_path: Pa
         task = asyncio.create_task(reader.execute(str(tmp_path), [{"id": "file", "path": "file.txt"}]))
         try:
             await asyncio.wait_for(checked.wait(), timeout=5)
-            server.native_allowlist = frozenset(server.native_allowlist - {"read_file"})
+            if change == "allowlist":
+                server.native_allowlist = frozenset(server.native_allowlist - {"read_file"})
+            elif change == "remove":
+                server._tool_manager.remove_tool("read_file")
+            else:
+                tool = server._tool_manager.get_tool("read_file")
+                monkeypatch.setattr(tool, "annotations", tool.annotations.model_copy(update={"read_only_hint": False}))
             reader._read_slots.release()
             held -= 1
             result = await task
