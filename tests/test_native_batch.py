@@ -316,3 +316,66 @@ def test_profile_eligibility_is_rechecked_between_items(tmp_path: Path, monkeypa
     assert calls == [True]
     assert [row["status"] for row in result["items"]] == ["success", "error"]
     assert result["items"][1]["error"] == "batch_hidden_tool"
+
+
+def test_racing_directory_link_cannot_escape_batch_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    from tools.filesystem import service
+
+    root = tmp_path / "root"
+    child = root / "child"
+    outside = tmp_path / "outside"
+    child.mkdir(parents=True)
+    outside.mkdir()
+    (child / "data.txt").write_text("inside", encoding="utf-8")
+    (outside / "data.txt").write_text("SECRET", encoding="utf-8")
+    held = root / "held"
+    server = _server(tmp_path, monkeypatch)
+    original_file = service.unlinked_regular_file
+    original_tree = service.unlinked_directory_tree
+    swapped = False
+    attempted = False
+
+    def swap_after_check(path: Path) -> bool:
+        nonlocal attempted, swapped
+        valid = original_file(path)
+        if valid and path == child / "data.txt" and not swapped:
+            attempted = True
+            child.rename(held)
+            if os.name == "nt":
+                subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(child), str(outside)],
+                               check=True, capture_output=True)
+            else:
+                child.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return valid
+
+    def restore_before_final_check(path: Path) -> bool:
+        nonlocal swapped
+        if swapped and path == child:
+            if os.name == "nt":
+                os.rmdir(child)
+            else:
+                child.unlink()
+            held.rename(child)
+            swapped = False
+        return original_tree(path)
+
+    monkeypatch.setattr(service, "unlinked_regular_file", swap_after_check)
+    monkeypatch.setattr(service, "unlinked_directory_tree", restore_before_final_check)
+    try:
+        result = asyncio.run(server.native_read_batch_state.execute(
+            str(root), [{"id": "a", "path": "child/data.txt"}]))
+    finally:
+        if swapped:
+            if os.name == "nt":
+                os.rmdir(child)
+            else:
+                child.unlink()
+            held.rename(child)
+    assert attempted
+    assert "SECRET" not in json.dumps(result)
+    assert result["ok"] is False
+    child.rename(held)
+    held.rename(child)

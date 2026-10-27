@@ -135,21 +135,122 @@ def _read_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
 
 
 @contextmanager
+def _open_contained(path: Path, limits: ReadWindowLimits) -> Iterator[Any]:
+    """Keep the open file rooted at the admitted directory through link races."""
+    relative = path.relative_to(limits.root)
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class FileInformation(ctypes.Structure):
+            _fields_ = [
+                ("attributes", wintypes.DWORD), ("created", wintypes.FILETIME),
+                ("accessed", wintypes.FILETIME), ("written", wintypes.FILETIME),
+                ("volume", wintypes.DWORD), ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD), ("links", wintypes.DWORD),
+                ("index_high", wintypes.DWORD), ("index_low", wintypes.DWORD),
+            ]
+
+        windows_ctypes = cast(Any, ctypes)
+        kernel = windows_ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                      wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.POINTER(FileInformation)]
+        kernel.GetFileInformationByHandle.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        read_attributes = 0x80
+        share_read_write = 3
+        open_existing = 3
+        open_reparse_point = 0x00200000
+        backup_semantics = 0x02000000
+        generic_read = 0x80000000
+        handles: list[int] = []
+        try:
+            # Denying delete sharing pins each parent while the next component opens.
+            for parent in reversed(path.parents):
+                limits.check()
+                handle = kernel.CreateFileW(
+                    str(parent), read_attributes, share_read_write, None, open_existing, backup_semantics | open_reparse_point, None,
+                )
+                if handle == ctypes.c_void_p(-1).value:
+                    raise windows_ctypes.WinError(windows_ctypes.get_last_error())
+                handles.append(handle)
+                info = FileInformation()
+                if not kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
+                    raise windows_ctypes.WinError(windows_ctypes.get_last_error())
+                if info.attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT or not info.attributes & stat.FILE_ATTRIBUTE_DIRECTORY:
+                    raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
+            root_info = limits.root.stat()
+            if (root_info.st_dev, root_info.st_ino) != limits.root_identity:
+                raise ToolError("batch_source_changed", "The batch source changed.")
+            handle = kernel.CreateFileW(str(path), generic_read, share_read_write, None, open_existing, open_reparse_point, None)
+            if handle == ctypes.c_void_p(-1).value:
+                raise windows_ctypes.WinError(windows_ctypes.get_last_error())
+            try:
+                info = FileInformation()
+                if not kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
+                    raise windows_ctypes.WinError(windows_ctypes.get_last_error())
+                if info.attributes & (stat.FILE_ATTRIBUTE_REPARSE_POINT | stat.FILE_ATTRIBUTE_DIRECTORY):
+                    raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
+                descriptor = cast(Any, msvcrt).open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            except BaseException:
+                kernel.CloseHandle(handle)
+                raise
+            try:
+                raw = os.fdopen(descriptor, "rb")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with raw:
+                yield raw
+        finally:
+            for handle in reversed(handles):
+                kernel.CloseHandle(handle)
+    else:
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY") or os.open not in os.supports_dir_fd:
+            raise ToolError("batch_path_denied", "Safe contained reads are unavailable.")
+        handles = []
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            root_fd = os.open(limits.root, flags)
+            handles.append(root_fd)
+            root_info = os.fstat(root_fd)
+            if (root_info.st_dev, root_info.st_ino) != limits.root_identity:
+                raise ToolError("batch_source_changed", "The batch source changed.")
+            current = root_fd
+            for part in relative.parts[:-1]:
+                limits.check()
+                current = os.open(part, flags, dir_fd=current)
+                handles.append(current)
+            descriptor = os.open(
+                relative.parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), dir_fd=current,
+            )
+            try:
+                raw = os.fdopen(descriptor, "rb")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with raw:
+                yield raw
+        finally:
+            for descriptor in reversed(handles):
+                os.close(descriptor)
+
+
+@contextmanager
 def _bounded_window(path: Path, encoding: str, limits: ReadWindowLimits) -> Iterator[tuple[io.StringIO, str, str]]:
     limits.check()
     if not local_read_path(path) or not path.resolve(strict=True).is_relative_to(limits.root):
         raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
-    root_info = limits.root.stat()
-    if (root_info.st_dev, root_info.st_ino) != limits.root_identity:
-        raise ToolError("batch_source_changed", "The batch source changed.")
-    if not unlinked_directory_tree(path.parent) or not unlinked_regular_file(path):
-        raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
-    before = _read_identity(path.stat())
-    if before[2] != limits.source_bytes or not 0 <= before[2] <= 2 * 1024 * 1024:
-        raise ToolError("batch_source_changed", "The batch source changed.")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    descriptor = os.open(path, flags)
-    with os.fdopen(descriptor, "rb") as raw:
+    with _open_contained(path, limits) as raw:
+        if not unlinked_directory_tree(path.parent) or not unlinked_regular_file(path):
+            raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
+        before = _read_identity(path.stat())
+        if before[2] != limits.source_bytes or not 0 <= before[2] <= 2 * 1024 * 1024:
+            raise ToolError("batch_source_changed", "The batch source changed.")
         if not stat.S_ISREG(os.fstat(raw.fileno()).st_mode) or _read_identity(os.fstat(raw.fileno())) != before:
             raise ToolError("batch_source_changed", "The batch source changed.")
         pieces: list[bytes] = []
@@ -165,13 +266,13 @@ def _bounded_window(path: Path, encoding: str, limits: ReadWindowLimits) -> Iter
                 raise ToolError("batch_source_changed", "The batch source changed.")
         if _read_identity(os.fstat(raw.fileno())) != before:
             raise ToolError("batch_source_changed", "The batch source changed.")
-    data = b"".join(pieces)
-    used_encoding = _sample_encoding(data[:65_536]) if encoding == "auto" else chosen_encoding(path, encoding)
-    with io.StringIO(data.decode(used_encoding, errors="strict"), newline="") as text:
-        yield text, used_encoding, hashlib.sha256(data).hexdigest()
-    limits.check()
-    if _read_identity(path.stat()) != before or not unlinked_directory_tree(path.parent) or not unlinked_regular_file(path):
-        raise ToolError("batch_source_changed", "The batch source changed.")
+        data = b"".join(pieces)
+        used_encoding = _sample_encoding(data[:65_536]) if encoding == "auto" else chosen_encoding(path, encoding)
+        with io.StringIO(data.decode(used_encoding, errors="strict"), newline="") as text:
+            yield text, used_encoding, hashlib.sha256(data).hexdigest()
+        limits.check()
+        if _read_identity(path.stat()) != before or not unlinked_directory_tree(path.parent) or not unlinked_regular_file(path):
+            raise ToolError("batch_source_changed", "The batch source changed.")
 
 
 def chosen_encoding(path: Path, requested: str) -> str:
