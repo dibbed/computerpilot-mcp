@@ -499,6 +499,43 @@ def test_context_cache_close_fences_in_progress_preparation(tmp_path: Path) -> N
     asyncio.run(scenario())
 
 
+def test_context_preparation_timeout_retains_capacity_until_thread_finishes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import sessions
+
+    manager = sessions.LspSessionManager((), generation="context-cache")
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_resolve(root: Path) -> Path:
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("test thread did not drain")
+        return root
+
+    monkeypatch.setattr(sessions, "resolve_path", blocked_resolve)
+
+    async def fingerprint() -> None:
+        return None
+
+    async def build() -> tuple[bytes, None]:
+        pytest.fail("timed out preparation must not dispatch")
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(ToolError) as failure:
+                await manager.acontext_result(tmp_path, "python", "a" * 64, fingerprint=fingerprint, build=build, timeout_sec=0.05)
+            assert failure.value.code == "lsp_timeout" and entered.is_set()
+            await asyncio.sleep(0.05)
+            assert manager._context_preparing == 1
+        finally:
+            release.set()
+        async def wait_for_drain() -> None:
+            while manager._context_preparing:
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(wait_for_drain(), 2)
+
+    asyncio.run(scenario())
+
+
 def test_context_cache_different_live_owner_snapshots_do_not_share_flight(tmp_path: Path) -> None:
     from tools.language import sessions
 

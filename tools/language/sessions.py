@@ -365,7 +365,7 @@ class LspSessionManager:
                 with self._lock:
                     self._context_preparing -= 1
 
-        preparation = asyncio.create_task(asyncio.wait_for(prepare(), timeout_sec))
+        preparation = asyncio.create_task(prepare())
         preparation.add_done_callback(lambda done: None if done.cancelled() else done.exception())
         root, provider_key, before = await asyncio.shield(preparation)
         canonical = canonical_path(root)
