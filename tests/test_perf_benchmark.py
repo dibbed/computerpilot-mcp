@@ -137,6 +137,7 @@ def test_production_batch_benchmark_dispatches_real_batch(tmp_path: Path, monkey
             assert concurrent["errors"] == 0 and concurrent["output_sha256"] == direct["output_sha256"]
             assert concurrent["samples"][0]["requests"] == concurrent["samples"][0]["responses"] == count
             assert 0 < concurrent["peak_client_calls"] <= parallel
+            assert concurrent["synthetic_wait_saving_percent"]["100"] == (0 if count == 1 else {2: 50, 4: 75}[parallel])
             if count >= 4:
                 assert concurrent["peak_client_calls"] > 1
         for parallel in (1, 2, 4):
@@ -162,6 +163,12 @@ def test_paired_batch_overhead_uses_matching_rounds_and_nearest_rank() -> None:
         perf_benchmark._paired_batch_overhead(direct, list(reversed(batch)))
 
 
+def test_thirty_round_prototype_is_not_production_acceptance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_benchmark, "PROJECT_ROOT", tmp_path)
+    report = perf_benchmark._native_batch_worker(30, include_powershell=False)
+    assert report["prototype_only"] is True and report["acceptance_eligible"] is False
+
+
 def test_owned_batch_transport_refuses_the_operator_checkout_before_activation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(perf_benchmark, "create_server", lambda: pytest.fail("Activated the operator server"))
     with pytest.raises(ValueError, match="isolated"):
@@ -169,7 +176,13 @@ def test_owned_batch_transport_refuses_the_operator_checkout_before_activation(m
 
 
 @pytest.mark.parametrize("transport", ["stdio", "http"])
-def test_production_batch_owned_transports_drain_and_reap(transport: Any) -> None:
+def test_production_batch_owned_transports_drain_and_reap(
+    transport: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tempfile
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", None)
     report = perf_benchmark._exec_cost_once(1, False, suite="native_batch_production", native_batch_transport=transport)
     assert report["status"] == "ok" and report["transport"] == transport
     assert report["server_process_exited"] and report["production_connection_closed"] and report["workers_cleaned"]

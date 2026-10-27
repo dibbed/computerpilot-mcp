@@ -2747,7 +2747,7 @@ def _native_batch_worker(
         command = [sys.executable, "-c", "from scripts.perf_benchmark import _native_batch_server; "
                    f"_native_batch_server({str(root)!r}, {transport_kind!r})"]
         environment = {key: value for key, value in os.environ.items()
-                       if key.upper() in {"SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP", "HOME", "USERPROFILE", "COMSPEC"}}
+                       if key.upper() in {"SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "COMSPEC"}}
         environment.update({"PYTHONUTF8": "1", "MCP_TOOL_PROFILE": "full", "MCP_NATIVE_READ_BATCH_ENABLED": "1"})
         if transport_kind == "stdio":
             async with bounded_stdio_transport(command, cwd=PROJECT_ROOT, env=environment,
@@ -2912,8 +2912,9 @@ def _native_batch_worker(
         summary["cpu_scope"] = "client_and_server" if transport_kind == "memory" else "client_only"
         summary["cpu_sec"] = sum(sample["cpu_sec"] for sample in values)
         summary["rss_before_after_max_bytes"] = max(sample["rss_before_after_max_bytes"] for sample in values)
+        call_waves = math.ceil(count / int(key[-1])) if "/direct_parallel" in key else values[0]["requests"]
         summary["synthetic_wait_saving_percent"] = {
-            str(latency): (0 if latency == 0 else 100 * (count - values[0]["requests"]) / count)
+            str(latency): (0 if latency == 0 else 100 * (count - call_waves) / count)
             for latency in (0, 20, 100, 250)
         }
         cases[key] = summary
@@ -2922,7 +2923,8 @@ def _native_batch_worker(
     claims = {key: claim_health[key] for key in claim_keys} if claim_health is not None else None
     overhead = _paired_batch_overhead(samples["1/direct"], samples["1/batch1"])
     return {"warmups": 5, "repeats": repeats, "seed": 1501, "order": "paired_randomized",
-            "acceptance_eligible": repeats >= 30 and not simulated_rtt_ms,
+            "acceptance_eligible": production and repeats >= 30 and not simulated_rtt_ms,
+            "synthetic_wait_model": "independent call waves; arithmetic only, excludes execution cost",
             "catalog": {**catalog_evidence, "scope": "full_opt_in" if transport_kind != "memory" else "bounded_native_fixture"},
             "subprocess_call_allowlist": ["read_file", "native_read_batch", "server_health"] if transport_kind != "memory" else None,
             "http_unauthenticated_denied": remote_identity.get("http_unauthenticated_denied"),
