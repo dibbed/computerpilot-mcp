@@ -40,6 +40,8 @@ Each read opens files relative to the admitted directory on POSIX. On Windows, p
 
 For an isolated comparison of the actual batch tool with direct MCP reads and PowerShell, run `python -m scripts.perf_benchmark --suite native_batch_production --runs 30 --output native-batch-production.json`. The older `native_batch` suite measures a private prototype, not the production dispatcher. Both use in-memory transport; synthetic round-trip savings are estimates, not Tunnel measurements.
 
+Final plan acceptance remains blocked on the single-file overhead target: the production run measured p50 1.451 ms for one direct read and 17.558 ms for batch parallelism 1, a 16.107 ms difference against the unchanged 5 ms allowance. A local profile attributed most read time to durable resource-claim transactions. Their ownership and durability checks remain required; the passing synthetic hop-savings comparison does not waive this gate. Prefer `read_file` for a single file.
+
 ## Adaptive execution routing
 
 Use the routing diagnostics when an agent or workflow needs to decide *how* an intent should be executed without executing it yet:

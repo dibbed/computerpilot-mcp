@@ -181,6 +181,8 @@ Unreleased opt-in `coding_core` keeps an exact 43-tool native coding catalog for
 
 The separate opt-in `read_batch` profile exposes bounded reads for independent local files in one MCP call. It does not provide an atomic multi-file snapshot or guarantee a local speedup; see [native read batching](docs/tooling.md#opt-in-native-read-batching).
 
+The coding evolution plan still has open acceptance gates: the controlled live-model comparison and the production batch single-file overhead target. Optional grounding, delegation and related extensions retain their separate design gates; the [reviewed plan snapshot](docs/development/CODING-AGENT-EVOLUTION-MASTER-PLAN-SNAPSHOT.fa.md) records the remaining decisions.
+
 `discover_tool_domains` reports the current profile and platform capabilities. `recommend_tools` ranks tools that are actually registered in the active profile and enriches recognized tools with shared execution-route metadata. The read-only `execution_candidates` and `execution_recommend` diagnostics use that same registered catalog; metadata alone cannot make an unavailable tool routable.
 
 Set a profile with:
