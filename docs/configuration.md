@@ -10,6 +10,7 @@ This page highlights the settings most users are likely to change.
 | --- | --- | --- |
 | `MCP_START_MODE` | `tunnel` or `local-http` | `tunnel` |
 | `MCP_TOOL_PROFILE` | active catalog profile | `full` |
+| `MCP_NATIVE_READ_BATCH_ENABLED` | add bounded file-only Batch to `full`; restart and client catalog refresh required | `0` |
 | `MCP_EXECUTION_ROUTER_ENABLED` | enable read-only adaptive route diagnostics and routed workflow planning | enabled |
 | `MCP_EXECUTION_ROUTER_POLICY` | versioned deterministic routing policy | `deterministic-v1` |
 | `MCP_EXECUTION_ROUTER_EXPLAIN` | include bounded candidate explanations in recommendations | enabled |
@@ -20,7 +21,7 @@ Named tool profiles are `minimal`, `coding`, `coding_core`, `read_batch`, `git`,
 
 Unreleased opt-in `coding_core` keeps a fixed 43-tool subset of the coding catalog. Set `MCP_TOOL_PROFILE=coding_core` before startup and restart to select it; switch back to `coding`/`full` with another restart. Extensions require explicit eligibility for the new profile. Its live-model UX pilot is pending separate budget/authorization; `full` remains the default. See [profiles](tooling.md#profiles).
 
-The unreleased opt-in `read_batch` profile adds one bounded read-only `native_read_batch` tool alongside `read_file` and five existing discovery/health/routing tools (seven total). It must be selected explicitly before server startup, followed by a client reconnect to refresh a cached catalog. The existing `full` default and its tool count do not change. See [native read batching](tooling.md#opt-in-native-read-batching) for file, response, concurrency, timeout and cancellation limits.
+The unreleased opt-in `read_batch` profile contains `native_read_batch`, `read_file` and five discovery/health/routing tools (seven total). Alternatively, set `MCP_NATIVE_READ_BATCH_ENABLED=1` with `MCP_TOOL_PROFILE=full` to retain every existing tool and add only `native_read_batch`. Only `1`, `true`, `yes` and `on` enable the flag; other values leave it disabled. Enabling the flag with any profile except `full` or `read_batch` rejects startup before capability discovery. The flag is unnecessary for the existing `read_batch` profile. The default full catalog stays unchanged; opt-in adds one tool and at most 4 KiB of catalog data. Restart MCP and reconnect/refresh clients that cache the catalog. Activation remains subject to the documented performance acceptance. See [native read batching](tooling.md#opt-in-native-read-batching).
 
 ## Managed tunnel runtime
 

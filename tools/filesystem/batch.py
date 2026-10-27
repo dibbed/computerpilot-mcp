@@ -180,10 +180,9 @@ class BatchReader:
         names = {"read_file", "native_read_batch"}
         if allowed is not None and not names <= allowed:
             raise ToolError("batch_hidden_tool", "The required native tools are unavailable.")
-        tools = {tool.name: tool for tool in await MCPServer.list_tools(self.server)}
         for name in names:
-            tool = tools.get(name)
-            annotations = tool.annotations if tool is not None else None
+            tool = self.server._tool_manager.get_tool(name)
+            annotations = tool.annotations if tool is not None and tool.name == name else None
             if annotations is None or annotations.read_only_hint is not True or annotations.open_world_hint is not False:
                 raise ToolError("batch_hidden_tool", "The required native tools are unavailable.")
 
@@ -263,15 +262,17 @@ class BatchReader:
                 eligibility.close()
                 raise ToolError("batch_draining", "The runtime event loop is unavailable.") from None
             try:
-                checked.result(timeout=max(0.0, limits.deadline - time.monotonic()))
+                with timing_span("batch_eligibility"):
+                    checked.result(timeout=max(0.0, limits.deadline - time.monotonic()))
             except FutureTimeoutError:
                 checked.cancel()
                 raise ToolError("batch_deadline", "The batch read deadline elapsed.") from None
             limits.check()
             if self._closed or RUNTIME_LIFECYCLE.snapshot()["state"] != "RUNNING":
                 raise ToolError("batch_draining", "The runtime is draining.")
-            return service.read_window(str(path), start_line=item.start_line, end_line=item.end_line,
-                                       offset=item.offset, max_chars=item.max_chars, encoding=item.encoding, limits=limits)
+            with timing_span("batch_file_read"):
+                return service.read_window(str(path), start_line=item.start_line, end_line=item.end_line,
+                                           offset=item.offset, max_chars=item.max_chars, encoding=item.encoding, limits=limits)
 
     async def execute(self, root: str, items: Any, max_parallel: int = 1, timeout_sec: float = 10) -> BatchResult:
         entered = time.monotonic()
@@ -280,7 +281,8 @@ class BatchReader:
             request = BatchRequest.model_validate({"root": root, "items": items, "max_parallel": max_parallel, "timeout_sec": timeout_sec})
         except ValidationError:
             raise ToolError("batch_invalid", "The batch input is invalid or exceeds its budget.") from None
-        await self._eligible()
+        with timing_span("batch_eligibility"):
+            await self._eligible()
         if RUNTIME_LIFECYCLE.snapshot()["state"] != "RUNNING":
             raise ToolError("batch_draining", "The runtime is draining.")
         with self._lock:
@@ -292,7 +294,8 @@ class BatchReader:
         cancelled = threading.Event()
         deadline = entered + request.timeout_sec
         try:
-            root_path, identity, plan = await self._thread(lambda: self._preflight(request, deadline, cancelled), cancelled)
+            with timing_span("batch_preflight"):
+                root_path, identity, plan = await self._thread(lambda: self._preflight(request, deadline, cancelled), cancelled)
             outcomes = [_error(item, entry if isinstance(entry, str) else "batch_not_started")
                         for item, entry in zip(request.items, plan, strict=True)]
             indices = iter(range(len(plan)))
@@ -312,9 +315,10 @@ class BatchReader:
                         if RUNTIME_LIFECYCLE.snapshot()["state"] != "RUNNING":
                             outcomes[index] = _error(item, "batch_draining")
                             continue
-                        while not self._read_slots.acquire(blocking=False):
-                            limits.check()
-                            await asyncio.sleep(0.005)
+                        with timing_span("batch_slot_wait"):
+                            while not self._read_slots.acquire(blocking=False):
+                                limits.check()
+                                await asyncio.sleep(0.005)
                         acquired = True
                         with self._lock:
                             self._reads += 1
