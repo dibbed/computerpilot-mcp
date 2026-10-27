@@ -2,7 +2,7 @@
 
 Date: 2026-10-26. Branch: feature/coding-agent-evolution.
 The initial evaluation source subject was ce311e2e7b9fe5bbdd039d3bb9f511ebc70524a4.
-PR #82 is still Draft. This is **not** a claim that P05-02 is VERIFIED.
+PR #82 was merged as `965a5cb641af40f1768f6fe3512d8332662ab28c` on 2026-10-27. The observations below retain their original evaluation subjects. P05-02 remains BLOCKED.
 
 ## Scope built and checked
 
@@ -91,5 +91,13 @@ directory every time. The results and snapshots are not committed.
 
 **Disposition**: new reproducible offline and opt-in live evaluation tooling
 is locally verified. P05-02 is STILL BLOCKED on a controlled, independently
-graded real-model comparison. No main merge, tag, release, current runtime
-restart or tool-profile activation occurred.
+graded real-model comparison. The original probes did not activate a profile or
+publish a release; the later foundation merge does not waive model acceptance.
+
+## Follow-up on 2026-10-27
+
+The preparer and offline planner produced fresh snapshots from `965a5cb` and a
+balanced 180-invocation schedule under an ignored fixture directory inside the
+main checkout. No model was called. The complete controlled comparison still
+requires its separately approved quota, fixed client/model configuration and
+independent response grading. The source default remains `full`.

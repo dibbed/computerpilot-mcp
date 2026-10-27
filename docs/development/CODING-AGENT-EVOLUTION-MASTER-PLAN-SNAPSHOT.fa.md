@@ -1,5 +1,5 @@
-<!-- Repository snapshot: sanitized for publication on 2026-10-26. -->
-> This is a reviewed, path-redacted snapshot of the externally maintained canonical plan. It records historical evidence and instructions, including superseded restrictions and older SHA-specific statuses; use current source, GitHub checks and the external ledger for current state. The user explicitly authorized this sanitized repository copy while retaining the external original.
+<!-- Repository snapshot: sanitized for publication on 2026-10-27. -->
+> This is a reviewed, path-redacted snapshot of the externally maintained canonical Coding Agent Evolution plan. Historical entries retain their original subjects; the current task index and later ledger entries record superseding decisions. The user authorized this repository copy while preserving the external original. This is distinct from the restricted v0.8 master plan.
 
 # طرح جامع تکامل قابلیت‌های کدنویسی ComputerPilot MCP
 
@@ -11,23 +11,23 @@
 - آغاز بررسی: 2026-10-18؛ ادامه و تکمیل: 2026-10-19، Asia/Tehran؛ نسخه طرح: 1؛ نویسنده هم‌زمان: فقط همین نشست.
 - مسیر canonical: LOCAL_PATH_REDACTED
 - ریشه سورس: LOCAL_PATH_REDACTED
-- SOURCE_BASE / LOCAL_ORIGIN_MAIN / LIVE_GITHUB_MAIN: e66c8c9c74ec73efca2eb1f7f23bd5bc2e6ee1b4؛ LOCAL_HEAD در سطر Branch و Ledger.
-- Branch: feature/coding-agent-evolution; current published HEAD 555a166c6173ca0cf841d4bb55a74430d6ee674e; PR #82 OPEN/Draft. Finalization and isolated remediation in progress; the final hosted subject is not yet known.
-- PR #81: MERGED به SOURCE_BASE؛ PR فعال همین مأموریت: Draft #82، feature/coding-agent-evolution، بدون merge/release.
+- SOURCE_BASE (historical): e66c8c9c74ec73efca2eb1f7f23bd5bc2e6ee1b4؛ accepted runtime source / LOCAL_MAIN / ORIGIN_MAIN / LIVE_GITHUB_MAIN: 965a5cb641af40f1768f6fe3512d8332662ab28c.
+- Branch: fix/coding-evolution-acceptance in the original checkout; follow-up changes are tests/documentation only. PR #82 is MERGED; subsequent publication is recorded in the Ledger.
+- PR #81 merged into the historical source base; PR #82 merged as 965a5cb. No release or tag is part of this continuation.
 - release پایدار v0.8.0 روی e4930a77c60b844a7845a82997e178c16694562e است. main جدیدتر از release است.
-- hosted main: شش CI، سه Platform و یک Packaging همگی success روی SOURCE_BASE؛ این گیت‌ها اثبات آزمون زنده LSP چندزبانه یا فعال‌سازی DAG نیستند.
-- تغییرات از قبل موجود: panel HTML, uv.lock and two LSP reports remain preserved and under review; generated uv.lock is not used by the current requirements-based installation.
-- CURRENT_PHASE: confirmed Batch path race, LSP preparation admission race and cross-process workspace-edit backup retention race. Affected tasks NEEDS_REVALIDATION until fixes and exact-head gates pass; P05-02 and P14-06 remain BLOCKED, P15-03 DEFERRED.
-- NEXT_TASK_ID: P15-02/P15-04 remediation and acceptance, live-resource recovery evidence, then GitHub disposition. Preserve the live tunnel and state.
-- P14 mandatory scope was VERIFIED at its recorded historical subject; P14-05 remains DEFERRED and P14-06 BLOCKED. Previous P15 acceptance is superseded by the confirmed Batch race and must be revalidated.
-- Active note: P08 local closure2298passed28skipped1known unrelated test-isolation warning540.96s; full Ruff/mypy293/compileall/startup151/health5 PASS. Full catalogue209326->191656bytes; ten schemas48706->31036bytes; normalized fixed byte/token allowances PASS in all profiles. Small-profile actual growthcoding30.09percent/core58.19percent disclosed. No Git publication or live activation.
+- hosted main: all ten applicable checks succeeded on 965a5cb; Publish Release detected a non-release subject and skipped publication. Later follow-up gates are separate.
+- تغییرات از قبل موجود: panel HTML and the two reviewed LSP reports were preserved and committed in PR #82; uv.lock remains untracked and is not used by requirements-based installation.
+- CURRENT_PHASE: backup recovery, context admission and Batch containment corrections accepted on the validated runtime source. P15-04 is BLOCKED by the measured single-file production overhead; P05-02/03 and P14-06 remain BLOCKED.
+- NEXT_TASK_ID: no ungated feature activation. P15-04 needs a safety-preserving performance solution meeting the unchanged 5ms target; P05-02 needs a separately budgeted, independently graded model run.
+- P14 mandatory scope remains VERIFIED; P14-05 is DEFERRED and P14-06 BLOCKED. P15-02 safety is VERIFIED; P15-04 final performance acceptance is BLOCKED and P15-03 DEFERRED.
+- Historical P08 evidence: P08 local closure2298passed28skipped1known unrelated test-isolation warning540.96s; full Ruff/mypy293/compileall/startup151/health5 PASS. Full catalogue209326->191656bytes; ten schemas48706->31036bytes; normalized fixed byte/token allowances PASS in all profiles. Small-profile actual growthcoding30.09percent/core58.19percent disclosed. No Git publication or live activation.
 - Real LSP follow-up evidence (2026-10-26): Python/Pyright1.1.403, TLS5.3.0+TS5.9.3 and PHP/Intelephense1.18.5 all exit0. Exact cross-file definition; declaration/call references3/3/2; real clean0→type-error1→repair0 diagnostics; version/hash/edit; complete cycle after fresh restart; owned process/fixture cleanup PASS. Full pytest2338PASS28SKIP518.06s, independent243PASS1SKIP, full Ruff/mypy297/compileall/startup151/health5 PASS. [Acceptance appendix](#real-lsp-provider-acceptance-20261026) and repo docs/development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md. Hosted/other-platform/production activation NOT RUN.
 - اجرای مجاز فعلی: user authorized reviewed commits, push and conditional PR merge after safety and same-head gates; no tag or release. Live operational state and tunnel remain protected.
-- 16 فاز (P00..P15)، 25 milestone و 54 task؛ P15 remediation is in progress; conditional BLOCKED/DEFERRED tasks remain unchanged.
-- Task state: VERIFIED=40, IN_PROGRESS=0, IMPLEMENTED_UNVERIFIED=0, NOT_STARTED=0, BLOCKED=5, DEFERRED=5, FAILED=0, NEEDS_REVALIDATION=4. The Index is authoritative.
+- 16 فاز (P00..P15)، 25 milestone و 54 task؛ current executable safety revalidation is complete; conditional gates remain explicit.
+- Task state: VERIFIED=43, IN_PROGRESS=0, IMPLEMENTED_UNVERIFIED=0, NOT_STARTED=0, BLOCKED=6, DEFERRED=5, FAILED=0, NEEDS_REVALIDATION=0. The Index is authoritative.
 - VERIFIED در سه task خواندنی فقط صحت خروجی طراحی/بازرسی را نشان می‌دهد؛ پیشرفت پیاده‌سازی قابلیت‌های پیشنهادی نیست.
-- Implementation Progress: 32/33=97.0% implemented; Verified Completion=29/33=87.9% while P03-05, P04-03 and P15-02 await revalidation. P05-02 remains BLOCKED.
-- NEEDS_REVALIDATION_TASK_IDS: TASK-P03-05, TASK-P04-03, TASK-P15-02, TASK-P15-04; TASK-P05-02 remains BLOCKED.
+- Implementation Progress: 32/33=97.0% implemented; Verified Completion=32/33=97.0% weighted. These weighted figures exclude weight-zero conditional tasks and are not 100% plan acceptance; 11 task records remain BLOCKED/DEFERRED.
+- NEEDS_REVALIDATION_TASK_IDS: none. P03-05/P04-03/P15-02 have accepted corrective evidence; P15-04 is explicitly BLOCKED on numeric performance, not silently waived.
 - فرمول: Σ(weight × implemented)/Σ(weight) و Σ(weight × accepted)/Σ(weight). برای taskهای جدید implemented=0 و accepted=0 است؛ taskهای تصمیم/پذیرش/اختیاری وزن0 دارند. مقدار ناشناخته NOT_MEASURED است و هرگز صفر فرض نمی‌شود.
 - READY_TO_EXECUTE: فقط با dependencyهای VERIFIED، Hash Guard صحیح و نبود blocker؛ مجوز جدید CI گیت‌های مستقل امنیت/deployment را حذف نمی‌کند.
 - طراحی P0 عمدتاً خرد و review-gated است؛ اطمینان از اجرای مدل ضعیف فقط با dry-run خواندنی سنجیده می‌شود.
@@ -58,11 +58,11 @@ STATE_RECORD_ID همان Task ID در ستون نخست است؛ این جدول
 | <a id="state-TASK-P03-01"></a>TASK-P03-01 | مدل و اعتبارسنجی methodهای LSP | VERIFIED | WEAK_WITH_REVIEW | 1 | TASK-P02-02 | [بلوک](#task-p03-01) |
 | <a id="state-TASK-P03-02"></a>TASK-P03-02 | ورودی typed سازگار با params قدیمی | VERIFIED | WEAK_WITH_REVIEW | 1 | TASK-P03-01, TASK-P02-07 | [بلوک](#task-p03-02) |
 | <a id="state-TASK-P03-03"></a>TASK-P03-03 | نسخه سند و guard ویرایش معنایی | VERIFIED | WEAK_WITH_REVIEW | 1 | TASK-P03-02 | [بلوک](#task-p03-03) |
-| <a id="state-TASK-P03-05"></a>TASK-P03-05 | بازیابی durable ویرایش چندفایلی و حفظ backup | NEEDS_REVALIDATION | STRONG_ONLY | 1 | TASK-P03-03 | [بلوک](#task-p03-05) |
+| <a id="state-TASK-P03-05"></a>TASK-P03-05 | بازیابی durable ویرایش چندفایلی و حفظ backup | VERIFIED | STRONG_ONLY | 1 | TASK-P03-03 | [بلوک](#task-p03-05) |
 | <a id="state-TASK-P03-04"></a>TASK-P03-04 | پذیرش schema و denial و recovery | VERIFIED | STRONG_ONLY | 0 | TASK-P03-03, TASK-P02-08, TASK-P03-05 | [بلوک](#task-p03-04) |
 | <a id="state-TASK-P04-01"></a>TASK-P04-01 | قرارداد شواهد و هویت نماد چندزبانه | VERIFIED | WEAK_READY | 1 | TASK-P01-04, TASK-P03-04 | [بلوک](#task-p04-01) |
 | <a id="state-TASK-P04-02"></a>TASK-P04-02 | adapter معنایی محدود روی نشست موجود | VERIFIED | WEAK_WITH_REVIEW | 1 | TASK-P04-01 | [بلوک](#task-p04-02) |
-| <a id="state-TASK-P04-03"></a>TASK-P04-03 | اتصال context چندزبانه و cache مشترک | NEEDS_REVALIDATION | WEAK_WITH_REVIEW | 1 | TASK-P04-02 | [بلوک](#task-p04-03) |
+| <a id="state-TASK-P04-03"></a>TASK-P04-03 | اتصال context چندزبانه و cache مشترک | VERIFIED | WEAK_WITH_REVIEW | 1 | TASK-P04-02 | [بلوک](#task-p04-03) |
 | <a id="state-TASK-P04-04"></a>TASK-P04-04 | fixtureهای Python و TS و PHP و worktree | VERIFIED | WEAK_WITH_REVIEW | 1 | TASK-P04-03 | [بلوک](#task-p04-04) |
 | <a id="state-TASK-P05-01"></a>TASK-P05-01 | ساخت server بدون side effect زمان ثبت | VERIFIED | WEAK_WITH_REVIEW | 1 | TASK-P00-02 | [بلوک](#task-p05-01) |
 | <a id="state-TASK-P05-02"></a>TASK-P05-02 | آزمایش profile coding_core ثابت | BLOCKED | WEAK_WITH_REVIEW | 1 | TASK-P05-01, TASK-P03-04 | [بلوک](#task-p05-02) |
@@ -92,9 +92,9 @@ STATE_RECORD_ID همان Task ID در ستون نخست است؛ این جدول
 | <a id="state-TASK-P14-06"></a>TASK-P14-06 | طراحیِ مشروط قفل دولایه‌ای Job، بدون تغییر کد تا رفع گیت ایمنی | BLOCKED | DESIGN_BLOCKED | 0 | TASK-P14-01, TASK-P14-02, TASK-P07-01 | [بلوک](#task-p14-06) |
 | <a id="state-TASK-P14-07"></a>TASK-P14-07 | پذیرش کمی P14 و عدم پسرفت؛ تسک‌های مشروط مانع پذیرش بخش قطعی نیستند | VERIFIED | STRONG_ONLY | 0 | TASK-P14-02, TASK-P14-03, TASK-P14-04 | [بلوک](#task-p14-07) |
 | <a id="state-TASK-P15-01"></a>TASK-P15-01 | قرارداد و بنچمارک Native Read Batch و تصمیم بودجهٔ کاتالوگ | VERIFIED | STRONG_ONLY | 0 | TASK-P14-01 | [بلوک](#task-p15-01) |
-| <a id="state-TASK-P15-02"></a>TASK-P15-02 | Batch خواندن فایل با ورودی typed و خروجی و منابع محدود | NEEDS_REVALIDATION | WEAK_WITH_REVIEW | 1 | TASK-P15-01, TASK-P14-02 | [بلوک](#task-p15-02) |
+| <a id="state-TASK-P15-02"></a>TASK-P15-02 | Batch خواندن فایل با ورودی typed و خروجی و منابع محدود | VERIFIED | WEAK_WITH_REVIEW | 1 | TASK-P15-01, TASK-P14-02 | [بلوک](#task-p15-02) |
 | <a id="state-TASK-P15-03"></a>TASK-P15-03 | گسترش مشروط به metadata/search/Git فقط پس از اثبات safety و سود | DEFERRED | STRONG_ONLY | 0 | TASK-P15-02, TASK-P14-03 | [بلوک](#task-p15-03) |
-| <a id="state-TASK-P15-04"></a>TASK-P15-04 | پذیرش یک درخواست/پاسخ، cancellation، پروفایل و عدم پسرفت Batch | NEEDS_REVALIDATION | STRONG_ONLY | 0 | TASK-P15-02, TASK-P14-04 | [بلوک](#task-p15-04) |
+| <a id="state-TASK-P15-04"></a>TASK-P15-04 | پذیرش یک درخواست/پاسخ، cancellation، پروفایل و عدم پسرفت Batch | BLOCKED | STRONG_ONLY | 0 | TASK-P15-02, TASK-P14-04 | [بلوک](#task-p15-04) |
 <!-- TASK-INDEX-END -->
 
 ## PHASE DASHBOARD
@@ -104,19 +104,19 @@ STATE_RECORD_ID همان Task ID در ستون نخست است؛ این جدول
 | P00 | Gate | VERIFIED | N/A / N/A؛ دو audit task | M00 | baseline فقط تا تغییر SHA معتبر است |
 | P01 | P0 | VERIFIED | 4/4 / 4/4 | M01a pagination+truth، M01b depth+cache | P02-01 |
 | P02 | P0 | COMPLETE (original tasks plus Windows LIVE LSP) | 7/7 / 7/7 (original scope) | M02a provider+transport، M02b lifecycle، M02c acceptance | Original8tasks accepted; real connected MCP on Windows with Pyright/TypeScript LS/Intelephense definition/references/diagnostics edit/repair VERIFIED_LIVE (2026-10-26); cross-OS and release validation remain separate |
-| P03 | P0 | NEEDS_REVALIDATION | 4/4 implemented / 3/4 verified | M03 pending backup recovery acceptance | Cross-process backup protection race reproduced; isolated fix under review |
-| P04 | P0 | NEEDS_REVALIDATION | 4/4 implemented / 3/4 verified | M04 pending context admission acceptance | LSP context preparation timeout race reproduced; isolated fix under review |
+| P03 | P0 | VERIFIED | 4/4 implemented / 4/4 verified | M03 accepted | Corrective source, recovery regression suite and same-source hosted validation accepted; see EVIDENCE-16 |
+| P04 | P0 | VERIFIED | 4/4 implemented / 4/4 verified | M04 accepted | Context capacity/freshness correction accepted; see EVIDENCE-16 |
 | P05 | P1 | BLOCKED | 2/2 / 1/2 | M05 | Static coding_core and three-profile AGY micro-pilot exist; controlled20x3x3 model evaluation remains unaccepted. P05-03 actual-client refresh transcript absent |
 | P06 | P1 | COMPLETE | 4/4 / 4/4 | M06 | All5tasks accepted; weighted4/4; local351pass3skip and four actual runner versions/16cases retained; no runtime activation |
 | P07 | P1 | VERIFIED; authorized local GO | N/A / N/A | M07 | All10hosted31c11ab PASS; live cap16 with17/17completed; compatible schema11 backup/restore; no unresolved effects; source default remains operator gated |
-| P08 | P2 | COMPLETE | 4/4 / 4/4 | M08a/M08b | Local2298pass28skip1known outside-scope warning; full18.73percent, normalized byte/token gates PASS; independent final review PASS; current diff hosted UNVERIFIED |
+| P08 | P2 | COMPLETE | 4/4 / 4/4 | M08a/M08b | Local2298pass28skip1known outside-scope warning; full18.73percent, normalized byte/token gates PASS; independent final review PASS; subsequent runtime source 965a5cb passed all hosted gates |
 | P09 | P2 | VERIFIED | N/A / N/A؛ runbook | M09 | امروز mutation انتشار ندارد |
 | P10 | P2 | BLOCKED | NOT_MEASURED / NOT_MEASURED | M10 | DESIGN-BLOCKER-02؛ سخت‌افزار/grounder |
 | P11 | اختیاری | DEFERRED | N/A / N/A | M11 | نیاز اضافه بر host اثبات نشده |
 | P12 | P2/P3 | DEFERRED | N/A / N/A | M12 | runtime به controller مستقل تبدیل نمی‌شود |
 | P13 | P3 | BLOCKED | NOT_MEASURED / NOT_MEASURED | M13 | DESIGN-BLOCKER-03؛ isolation و authorization |
 | P14 | P1/P2 | VERIFIED (mandatory scope) | 3/3 / 3/3؛ optional decisions independent | M14a/M14b VERIFIED; M14c conditional | P14-05 DEFERRED / P14-06 BLOCKED, no automatic activation |
-| P15 | P1/P2 | NEEDS_REVALIDATION | 1/1 implemented / 0/1 verified | M15a/M15b pending regression acceptance | Confirmed junction race; isolated fix under review; P15-03 remains DEFERRED |
+| P15 | P1/P2 | BLOCKED (final performance acceptance) | 1/1 implemented / 1/1 safety verified | M15b numeric gate BLOCKED | P15-02 safety accepted; production single-file overhead exceeds 5ms; P15-03 DEFERRED |
 
 Milestone یک checkpoint مرورپذیر است؛ هر task یک نوبت محلی یا یک gate مشخص. P00/P04/P05/P07/P09/P10/P11/P12/P13 هرکدام یک milestone؛ P01/P03/P06/P08 هرکدام دو؛ P02 سه؛ و P14 سه milestone جدید M14a/M14b/M14c: P15 دو milestone M15a/M15b اضافه می‌کند: جمع25. M14c شامل تصمیم‌های مشروط است و BLOCKED/DEFERRED آن، پذیرش M14a/M14b را بی‌دلیل مسدود نمی‌کند.
 <!-- MASTER-QUICK-START-END -->
@@ -307,7 +307,7 @@ LSP استاندارد «گراف کامل importهای همه زبان‌ها»
 ### source preflight قابل کپی
 
 ~~~powershell
-Set-Location -LiteralPath 'LOCAL_PATH_REDACTED
+Set-Location -LiteralPath 'LOCAL_PATH_REDACTED'
 $RepoName = 'dibbed/computerpilot-mcp'
 $PythonExe = Join-Path (Get-Location).Path '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $PythonExe)) { throw 'Missing reviewed Python environment' }
@@ -1550,7 +1550,7 @@ M14a=TASK-P14-01/02؛ M14b=TASK-P14-03/04/07؛ M14c=TASK-P14-05/06 (اختیار
 این بخش دستور اجرای آینده است. مأموریت فعلی همچنان PLAN_ONLY است. اول Quick Start تا MASTER-QUICK-START-END؛ سپس فقط قرارداد مشترک، phase مربوط و task فعال. فایل کامل را در هر turn دوباره نخوان. دستورات زیر فقط استخراج و نمایش می‌دهند:
 
 ~~~powershell
-$PlanPath = 'LOCAL_PATH_REDACTED
+$PlanPath = 'LOCAL_PATH_REDACTED'
 $TaskId = 'TASK-P01-01'
 $Utf8Strict = [System.Text.UTF8Encoding]::new($false, $true)
 $PlanText = [System.IO.File]::ReadAllText($PlanPath, $Utf8Strict)
@@ -2106,7 +2106,7 @@ FINAL-AUDIT-PASS — 2026-10-19: strict UTF-8؛43 جفت task marker یکتا و
 | task / state | TASK-P01-04 / IN_PROGRESS; prior accepted snapshot preserved as historical, only discovered cache lifecycle defects reopened |
 | cause | Current source review found invalidate(file) no longer invalidates containing root, and _generations retains inactive keys after LRU eviction despite bounded entries. Source unchanged at detection; authorization covers root-cause auto-recovery |
 | pending | Add regression for file-scoped invalidation during build and generation metadata under repeated LRU eviction; fail first, patch shared cache boundary, focused pytest/Ruff/full mypy, then advance digest |
-| validation_workspace | LOCAL_PATH_REDACTED baseline full suite running there on copied 26-file manifest; source remains authoritative in Downloads checkout |
+| validation_workspace | LOCAL_PATH_REDACTED; baseline full suite running there on copied 26-file manifest; source remains authoritative in Downloads checkout |
 | exact_next_action | Complete narrow P01-04 remediation before committing checkpoint and opening Draft PR; P02-03 POSIX acceptance remains IN_PROGRESS |
 
 ### EVIDENCE-1 — TASK-P01-04 cache lifecycle remediation accepted (2026-10-19)
@@ -2798,9 +2798,9 @@ FINAL-AUDIT-PASS — 2026-10-19: strict UTF-8؛43 جفت task marker یکتا و
 ### EVIDENCE-1 — 2026-10-21 P03-04 benchmark resumable checkpoint
 | field | evidence |
 |---|---|
-| benchmark_command | & .\.venv\Scripts\python.exe LOCAL_PATH_REDACTED helperSHA256 80540152a963ea3809cbf5cb122ad09d21e3a6a1c2c0c98dacc74e5ea1e14050 |
+| benchmark_command | & .\.venv\Scripts\python.exe LOCAL_PATH_REDACTED; helperSHA256 80540152a963ea3809cbf5cb122ad09d21e3a6a1c2c0c98dacc74e5ea1e14050 |
 | process_identity | [{"pid": 1352, "create_time": 1792605495.3823545}, {"pid": 13164, "create_time": 1792605495.3756807}]; verify exact command and creation time before treating PID as same process; process handles are not authorization to kill |
-| partial_report | LOCAL_PATH_REDACTED 9/12completed cases; no final PASS yet; current N100 one-shot1workspace has completed5/35runs including discarded5warmups |
+| partial_report | LOCAL_PATH_REDACTED; 9/12completed cases; no final PASS yet; current N100 one-shot1workspace has completed5/35runs including discarded5warmups |
 | verified_gates | Exact25ecb60 all10hostedSUCCESS; isolatedfull1809passed25skip; Ruff/mypy277/compileall/startup/health+independentreviewPASS |
 | exact_next_action | If matching benchmark process still live, wait without launching duplicate benchmark. If ended, read final output/partial JSON and require12cases+statusPASS+pairedp95 before acceptance; final durable report is written under Downloads/ComputerPilot-Coding-Evidence. On failure diagnose first, retain partial evidence; do not relabel missing samples as pass |
 
@@ -2825,7 +2825,7 @@ FINAL-AUDIT-PASS — 2026-10-19: strict UTF-8؛43 جفت task marker یکتا و
 | hosted | CI39647562487 6SUCCESS; Platform39647562489 3SUCCESS; Packaging39647562538SUCCESS; exact25ecb60 no missing/failed/skipped/pending required gates |
 | benchmark | PASS12casesx35invocations,5warmups discarded/30measured each;13320measuredrequests; elapsed1587.188s; paired requestp95 warm/cold: 1req/1ws 40.195/158.725ms; 1req/2ws 48.344/164.905ms; 10req/1ws 38.693/183.352ms; 10req/2ws 77.89/174.388ms; 100req/1ws 38.607/168.145ms; 100req/2ws 71.98/180.294ms |
 | resources | Errors/restarts0; expectedspawns every invocation; no orphan/cleanup uncertainty; peakchildRSS56.793MiB; handles306; queue2 |
-| report | LOCAL_PATH_REDACTED SHA2560041c129dddb84c5532f53be7804802f3051b893d0148aa1a0dae3d011889a24; head/fixture/benchmarkdigests rechecked after run |
+| report | LOCAL_PATH_REDACTED; SHA2560041c129dddb84c5532f53be7804802f3051b893d0148aa1a0dae3d011889a24; head/fixture/benchmarkdigests rechecked after run |
 | limits | RealprovidersUNVERIFIED; unopened rename targets intentionally failclosed until snapshotted; native/DAG defaults remainfalse; no mainpush/merge/release/tag; live state not cleaned/reset; earlier stopped health attempt state impactUNVERIFIED documented above |
 | exact_next_action | TASK-P04-01: frozen evidence/symbol contracts plus bounded project manifest inventory and root containment; RED->GREEN focusedtests/Ruff/mypy/review; P05-02 independentlyeligible with live-modelbudget gate retained |
 
@@ -3941,7 +3941,7 @@ FINAL-AUDIT-PASS — 2026-10-19: strict UTF-8؛43 جفت task marker یکتا و
 - RED:2newtests failed on absent helper/suite. GREEN final focused: python -m pytest -o addopts= -q tests/test_perf_benchmark.py -k exec_cost --basetemp=.pytest-tmp-plan-p1401-final =>6passed,44deselected,exit0,26.60sec. Surrounding module =>44passed,6skipped,exit0,60.48sec; skipped optional/platform tests are not exec_cost acceptance. Earlier -p no:cacheprovider run produced only known unknown-cache_dir config warning; final tests use normal configured cache.
 - Full Ruff PASS; full mypy core tools scripts tests PASS298files; compileall core/tools/scripts/tests PASS; git diff --check PASS. Full repository pytest/startup/Doctor/new hosted checks NOT RUN for this benchmark-only patch; hosted10green applies only committed e19daa7. No external reviewer claim; source/diff and failure-path review performed in this session.
 - Final command: .venv/Scripts/python.exe -m scripts.perf_benchmark --suite exec_cost --runs 30 --include-jobs --output <TEMP>/computerpilot-p1401-exec-cost-final-20261026.json,exit0. Owned copy142trackedPythonfiles; manifestSHA256 80607420e3fc1e395d0872c511c114596322d556f2570bc26911717c0d0b08cf. All360measuredsamples plus60warmups passed output/effect hashes. Fixed seed1401 randomized paired order. Isolated defaults and explicit DAG/LSP-off/full-profile override; no live state DB access. All worker/payload PID+creation-time identities dead before cleanup. Failed fixtures are retained with safe fixed error, no raw stderr.
-- Durable report: LOCAL_PATH_REDACTED SHA256 e0eecb69816c8622eeae0677a02edeb2498d607fb368ad01d1caab7ef33fcdb4. Runtime/load/binary hash and per-sample durations/admission wait/process roots are recorded. Start hostCPU4.2percent/memory64.8percent; shared host is not a controlled production SLA. p99 with30samples is exploratory. Timings cover in-process SDK/server paths, not network/tunnel/model selection.
+- Durable report: LOCAL_PATH_REDACTED; SHA256 e0eecb69816c8622eeae0677a02edeb2498d607fb368ad01d1caab7ef33fcdb4. Runtime/load/binary hash and per-sample durations/admission wait/process roots are recorded. Start hostCPU4.2percent/memory64.8percent; shared host is not a controlled production SLA. p99 with30samples is exploratory. Timings cover in-process SDK/server paths, not network/tunnel/model selection.
 - Measured launch roots: native/edit0, directPython/PowerShell1, durable worker+payload2 from returned/persisted PIDs; OS helper processes are excluded. Parent claim wait is observed; worker claim, exact SQLite and serialization phase decomposition remain NOT_MEASURED for P14-02. The patch variant uses a whole-file hash guard in addition to exact hunk validation; sequential replacements use exact-count guards. Both run on isolated uncontended equal preimages; no claim that their concurrency/rollback guarantees are identical.
 
 | Equivalent fixture | p50 ms | p95 ms | p99 ms (exploratory) |
@@ -4194,3 +4194,72 @@ FINAL-AUDIT-PASS — 2026-10-19: strict UTF-8؛43 جفت task marker یکتا و
 - Production in-memory MCP benchmark: 30 measured runs and 5 warmups, 20 cases, zero errors, workers and resource claims drained. Four-file p50 direct 5.229 ms and batch parallel4 58.593 ms; sixteen-file p50 direct 18.573 ms and batch 226.985 ms. Source manifest 718a3a695ae615a93f9dc7763aa7f808713dd5c357b92e86524526897c49326c, report SHA-256 4202353bbbc23a1dc3c42f977505da0ec7e4b696a5ce43eb79cddf6ed50e6b83. These are not Tunnel measurements.
 - Live health remains degraded with a quarantined native.command resource. Existing evidence does not prove the old process tree is gone; do not clear the fence. P05 live-model acceptance remains blocked.
 - EXACT_NEXT_ACTION: finish exec-cost benchmark, finalize sanitized snapshot, review and selectively commit changes, push PR branch, verify all hosted checks on the new head, and decide PR disposition before evidence archival and cleanup.
+
+
+### EVIDENCE-9 — PR head published; hosted validation IN_PROGRESS (2026-10-27)
+
+- Pushed feature/coding-agent-evolution through bfde66935e775d9f0fddc0e87aaba1c4b12d189e to PR #82 without rewriting history. Seven focused commits cover backup/recovery, LSP, native read safety, benchmarks, panel and documentation. The pre-existing uv.lock remains untracked and unstaged.
+- Final exec-cost benchmark: 30 runs, 12 cases, zero errors, workers cleaned, source manifest 718a3a695ae615a93f9dc7763aa7f808713dd5c357b92e86524526897c49326c; report SHA-256 9e21a9070c5bd34f902bee29cd85bad2c9bb3f6415619cbed8e47e7843c03530.
+- The exact source files used for the 2430-passed full run were compared byte-for-byte with the committed checkout. The current local runtime journal passed the new strict read-only validation over 1927 records. No quarantine was released.
+- PR remains draft while hosted checks on bfde669 are pending. EXACT_NEXT_ACTION: assess all ten hosted results for that SHA, review blockers, then determine PR disposition; archive evidence and inspect safe cleanup only after GitHub disposition.
+
+
+### EVIDENCE-10 — Hosted transport failure and fixture hardening IN_PROGRESS (2026-10-27)
+
+- Hosted Linux/Python 3.12 on bfde669 failed test_actual_http_entrypoint_exposes_modern_external_tools after waiting for a restored catalog notification; 2436 passed and 21 skipped. The CI server log was unavailable, so the precise hosted cause remains unconfirmed.
+- A deliberate pause during an in-place epoch write reproduced the same timeout locally. Publishing complete epoch files by same-directory replacement passed that forced reproduction. The extension fixture/refresh/transport suite passed 40 tests; scoped Ruff and mypy passed.
+- Pushed test-only commit 3f7c88c8781f5b09b4a0d80d4a3ad88c703ea660. The 2430-passed full Windows run preceded this test-only commit; its changed suite passed afterward. Hosted checks for the new SHA are pending; no merge or cleanup yet.
+- EXACT_NEXT_ACTION: inspect all hosted results on 3f7c88c, diagnose any failure, retain the live quarantine, decide PR status, and only then archive evidence and perform safe cleanup.
+
+
+### EVIDENCE-11 — PR merged; main validation IN_PROGRESS (2026-10-27)
+
+- All ten hosted checks succeeded on PR head 3f7c88c8781f5b09b4a0d80d4a3ad88c703ea660. Scoped independent review found no new concrete blocker. PR #82 was marked ready and merged with a non-squash merge commit 965a5cb641af40f1768f6fe3512d8332662ab28c.
+- Local main and origin/main were fast-forwarded to 965a5cb641af40f1768f6fe3512d8332662ab28c; the working checkout remains on feature/coding-agent-evolution and untracked uv.lock remains preserved. No tag or release was created.
+- Live health is still degraded because one native.command resource remains quarantined; no conclusive ownership evidence was found and the fence remains. Tunnel process is running with the previously observed executable hash; end-to-end connectivity is unverified.
+- EXACT_NEXT_ACTION: verify all hosted workflows on the merge SHA, then archive important evidence and inspect only demonstrably safe, inactive duplicates for Recycle Bin transfer.
+
+
+### EVIDENCE-12 — Hosted main gates and evidence preservation (2026-10-27)
+
+- All ten applicable hosted gates succeeded on merge commit 965a5cb641af40f1768f6fe3512d8332662ab28c. The automatic Publish Release workflow detected a non-release commit and skipped artifact build and publication; no new tag or release was created. Local main and origin/main match the merge SHA.
+- Archived 97 root-level evidence, benchmark, patch, log and database-backup files with source-before/source-after and destination SHA-256 checks to a dedicated local Downloads archive; a second manifest verification found zero mismatches. The four original evidence directories remain because the plan references them and nested evidence is not fully duplicated.
+- The five p1501 directories return UnauthorizedAccessException and remain untouched. Deep scan of the evolution session found 10 access errors; P14 contains numerous nested test Git repositories and database files. Fifty-seven nonempty project pytest temporary directories remain because their evidence, dependencies or active use cannot all be disproved. No item was moved to Recycle Bin in this cleanup stage.
+- Live health still reports resource_ownership_unresolved; leave quarantine fenced. Static LSP/P05 evidence does not substitute for the blocked live-model pilot, and Tunnel end-to-end connectivity remains unverified.
+- EXACT_NEXT_ACTION: investigate and reconcile the live ownership fence through supported recovery only if conclusive evidence becomes available; retain the blocked P05 pilot status until its acceptance criteria can be executed safely.
+
+
+### EVIDENCE-13 — Preboot ownership reconciliation VERIFIED (2026-10-27)
+
+- User explicitly requested remediation with full access. New current evidence establishes an OS reboot at 2026-10-26T19:14:12Z after the native.command quarantine at 18:53:33Z. CIM and psutil agree; the recorded native owner identity is no longer alive and all linked child capacities are released. This proves preboot process ownership ended; it does not prove command success.
+- A consistent SQLite backup passed integrity_check and schema 11 validation. Recovery was rehearsed on a separate copy with the existing WorkflowStore.resolve_quarantined_resource_request API, yielding zero quarantined requests without changing operation history.
+- EXACT_NEXT_ACTION: independently review this evidence, recheck the record and OS boot, use the official store resolution with bounded evidence, then verify public health and a harmless command without changing Tunnel settings.
+
+
+### EVIDENCE-14 — Live ownership reconciliation VERIFIED (2026-10-27)
+
+- Rechecked exact live store, sole quarantined native.command request, preboot timestamps, dead owner identity, and zero unsettled child capacities immediately before resolution. Independent source/evidence review found no concrete blocker to this bounded release. Used the existing WorkflowStore.resolve_quarantined_resource_request method with bounded evidence; no direct SQL UPDATE/DELETE, replay or success reclassification. The constructor still performs normal store initialization; no migration was needed (schema 11).
+- Pre-change SQLite backup is consistent, passes integrity_check and retains its recorded SHA-256; rehearsal succeeded on a separate copy. Live integrity_check passed after resolution. Original run_process journal history still contains exactly its begin and raised result records.
+- Public plugin health after resolution and again after the public command smoke: healthy, 151 unique tools, zero quarantine/active/pending resource requests, zero pending/uncertain recovery operations. The harmless command printed COMPUTERPILOT_RECOVERY_SMOKE_OK, exited 0, was not timed out and used windows_job ownership.
+- Tunnel process PID and executable hash remained unchanged across this recovery; no restart or code changes. Existing untracked uv.lock remains untouched. Evidence and backup are in the local Ownership Recovery folder.
+- EXACT_NEXT_ACTION: continue independently blocked P05 live-model acceptance only when its separate requirements can be fulfilled. Ownership cleanup is now verified; end-to-end network latency and broader product acceptance are not implied.
+
+
+### EVIDENCE-15 — Remaining acceptance continuation IN_PROGRESS (2026-10-27)
+
+- Work continues in the original checkout on fix/coding-evolution-acceptance from origin/main 965a5cb. Existing untracked uv.lock and operational state remain protected.
+- P03-05/P04-03/P15-02 safety fixes have merged same-subject hosted evidence but the index still needs an evidence-based reconciliation.
+- P15-04 reopened for a concrete numeric gap: the production benchmark single-file p50 overhead is 17.558 - 1.451 = 16.107 ms versus the plan's 5 ms target. Safety checks must not be weakened to meet the target. Diagnose before deciding acceptance.
+- P05 live-model evaluation still requires explicit budget and independently graded evidence; no paid/model calls have been dispatched in this continuation.
+- EXACT_NEXT_ACTION: profile production read overhead using disposable data, verify focused acceptance and Full Doctor safely, then reconcile only substantiated task statuses and report every remaining conditional gate.
+
+
+### EVIDENCE-16 — Remaining-task acceptance and explicit performance gate (2026-10-27)
+
+- Original workspace remains the edit location; all production source is unchanged from validated merge 965a5cb. Focused acceptance over recovery/backups/semantic edits/resources/context/LSP/Batch/profiles/output: 553 passed, 2 Windows directory-link skips, 1 cacheprovider configuration warning. Two link tests now re-raise on POSIX so hosted validation cannot silently skip these required guards. Updated backup suite: 49 passed, 2 Windows skips. Final follow-up hosted checks must confirm the test-only tightening.
+- Full Doctor in local-http mode with browser launch passed dependency imports, pip check, isolated MCP/filesystem/terminal health, browser import and actual headless launch. The Doctor source matched the main checkout and used disposable state; Tunnel-mode or end-to-end network readiness was not claimed.
+- P03-05, P04-03 and P15-02 reconcile to VERIFIED using their executed focused checks, previous complete runtime-source hosted gates and independent corrective review. No unchecked production change is introduced here.
+- P15-04 remains BLOCKED: the 30-run production report measured 1-file p50 direct 1.451 ms versus Batch1 17.558 ms, overhead 16.107 ms against the unchanged 5ms target. Synthetic 100ms hop savings for N>=4 pass but cannot waive the local gate. A 30-read cProfile diagnostic attributed 0.367 of 0.427 seconds to durable managed claims; transaction commits accounted for 0.175 seconds. This is diagnostic evidence, not a hard universal lower bound. Do not remove durable claims or change SQLite durability to manufacture a pass.
+- P05 offline snapshots and balanced 180-invocation schedule were rebuilt for 965a5cb beneath the main checkout's ignored test fixtures; no live model was called. Separately approved budget, fixed client/model selection and independent correctness grading remain missing. Static SDK refresh is not evidence of the real host client's dynamic catalog support.
+- Index: 43 VERIFIED, 6 BLOCKED, 5 DEFERRED out of 54. No default profile, optional preflight, mixed batch, Job isolation, grounding, controller or delegation capability was activated.
+- EXACT_NEXT_ACTION: publish the reviewed acceptance records and collect hosted checks for the follow-up test-only changes; preserve the remaining gates rather than inventing missing approvals or acceptance evidence.

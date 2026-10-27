@@ -386,6 +386,8 @@ def test_backup_cleanup_never_enters_linked_state_or_linked_backup(tmp_path: Pat
     try:
         link.symlink_to(outside, target_is_directory=True)
     except (NotImplementedError, OSError):
+        if os.name != "nt":
+            raise
         pytest.skip("Directory links are unavailable")
     assert cleanup_backups(link, _policy(max_age_sec=10), now=1_000).removed_files == 0
     assert old.exists()
@@ -408,6 +410,8 @@ def test_backup_cleanup_skips_linked_state_parent(tmp_path: Path) -> None:
     try:
         (tmp_path / ".agent_state").symlink_to(outside, target_is_directory=True)
     except (NotImplementedError, OSError):
+        if os.name != "nt":
+            raise
         pytest.skip("Directory links are unavailable")
     result = cleanup_backups(tmp_path / ".agent_state" / "backups", _policy(max_age_sec=10), now=1_000)
     assert result.removed_files == 0
