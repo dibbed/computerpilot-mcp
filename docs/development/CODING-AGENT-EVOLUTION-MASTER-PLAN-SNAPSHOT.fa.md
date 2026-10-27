@@ -7,18 +7,18 @@
 <a id="quick-start"></a>
 ## QUICK START / CURRENT STATE
 
-- PLAN_STATUS: DESIGN_COMPLETE؛ EXECUTION_STATUS: IN_PROGRESS؛ authoritative task state در TASK INDEX MAP و شواهد در Ledger است.
+- PLAN_STATUS: DESIGN_COMPLETE؛ EXECUTION_STATUS: BLOCKED؛ authoritative task state در TASK INDEX MAP و شواهد در Ledger است.
 - آغاز بررسی: 2026-10-18؛ ادامه و تکمیل: 2026-10-19، Asia/Tehran؛ نسخه طرح: 1؛ نویسنده هم‌زمان: فقط همین نشست.
 - مسیر canonical: LOCAL_PATH_REDACTED
 - ریشه سورس: LOCAL_PATH_REDACTED
-- SOURCE_BASE (historical): e66c8c9c74ec73efca2eb1f7f23bd5bc2e6ee1b4؛ accepted runtime source: 965a5cb641af40f1768f6fe3512d8332662ab28c؛ current LOCAL_MAIN / ORIGIN_MAIN / LIVE_GITHUB_MAIN: 7ef385b67cbb416a66cee159ee0136a3591ef46f.
-- Branch: perf/batch-claim-connection-lifetime in the original checkout, based on main 7ef385b. Runtime changes committed through ae895d4 and locally verified; documentation publication and hosted gates follow. uv.lock remains unrelated/untracked.
+- SOURCE_BASE (historical): e66c8c9c74ec73efca2eb1f7f23bd5bc2e6ee1b4؛ accepted runtime subject: 60983058e7dde81973d7c7acfa9009cb2c6612ae after all ten same-SHA main checks. Later documentation-only publication can advance main without changing this runtime subject.
+- Runtime checkpoint: main 60983058e7dde81973d7c7acfa9009cb2c6612ae in the original checkout; PR #84 and all ten PR/main checks are complete. Documentation publication heads are tracked separately in GitHub. uv.lock remains unrelated/untracked.
 - PR #81 merged into the historical source base; PR #82 merged as 965a5cb. No release or tag is part of this continuation.
 - release پایدار v0.8.0 روی e4930a77c60b844a7845a82997e178c16694562e است. main جدیدتر از release است.
-- hosted main: all ten applicable checks succeeded on 7ef385b; the additional publication workflow detected a non-release commit and skipped release publication. No new tag or release.
+- hosted runtime main: all ten applicable checks succeeded on 60983058e7dde81973d7c7acfa9009cb2c6612ae; the publication workflow detected a non-release commit and skipped actual build/publication steps. No new tag or release.
 - تغییرات از قبل موجود: panel HTML and the two reviewed LSP reports were preserved and committed in PR #82; uv.lock remains untracked and is not used by requirements-based installation.
-- CURRENT_PHASE: owned-connection and post-wait eligibility corrections passed local full safety validation; hosted acceptance is pending. P15-04 remains BLOCKED because final production p95 overhead exceeds the unchanged 5 ms gate.
-- NEXT_TASK_ID: publish the locally verified batch improvements and collect ten current-head hosted gates before conditional merge. Preserve P15-04 BLOCKED and the separate P05 budget/grading gate.
+- CURRENT_PHASE: runtime safety corrections, local/hosted acceptance, evidence archival and verified diagnostic cleanup are complete. Remaining conditional plan gates are BLOCKED/DEFERRED; P15-04 still exceeds the unchanged 5 ms tail-latency allowance.
+- NEXT_TASK_ID: a safety-preserving solution for the P15-04 tail-latency gate, or separately budgeted/client-pinned/independently graded P05 evaluation. No ungated feature activation or invented acceptance.
 - P14 mandatory scope remains VERIFIED; P14-05 is DEFERRED and P14-06 BLOCKED. P15-02 safety is VERIFIED; P15-04 final performance acceptance is BLOCKED and P15-03 DEFERRED.
 - Historical P08 evidence: P08 local closure2298passed28skipped1known unrelated test-isolation warning540.96s; full Ruff/mypy293/compileall/startup151/health5 PASS. Full catalogue209326->191656bytes; ten schemas48706->31036bytes; normalized fixed byte/token allowances PASS in all profiles. Small-profile actual growthcoding30.09percent/core58.19percent disclosed. No Git publication or live activation.
 - Real LSP follow-up evidence (2026-10-26): Python/Pyright1.1.403, TLS5.3.0+TS5.9.3 and PHP/Intelephense1.18.5 all exit0. Exact cross-file definition; declaration/call references3/3/2; real clean0→type-error1→repair0 diagnostics; version/hash/edit; complete cycle after fresh restart; owned process/fixture cleanup PASS. Full pytest2338PASS28SKIP518.06s, independent243PASS1SKIP, full Ruff/mypy297/compileall/startup151/health5 PASS. [Acceptance appendix](#real-lsp-provider-acceptance-20261026) and repo docs/development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md. Hosted/other-platform/production activation NOT RUN.
@@ -4311,3 +4311,27 @@ FINAL-AUDIT-PASS — 2026-10-19: strict UTF-8؛43 جفت task marker یکتا و
 - Focused suite86pass6platformskip1unrelatedsmokedeselected; full Ruff, mypy306, compileall, startup151, health5 and Full Doctor including browser PASS. Independent static review PASS after deterministic eligibility/shutdown regressions. No runtime/test source changed after these checks.
 - README, CHANGELOG, tooling docs and the authorized path-redacted Coding Agent plan snapshot record the actual improved measurements and the still-failed tail-latency acceptance. No default profile, durability setting, operator state or Tunnel change. uv.lock is untracked and excluded.
 - Index remains43 VERIFIED,6 BLOCKED,5 DEFERRED. EXACT_NEXT_ACTION: push reviewed focused commits, create Draft PR, verify all ten checks at its final head, then conditionally merge and verify new main workflows. No tag/release.
+
+### EVIDENCE-26 — PR84 published; ten exact-head gates IN_PROGRESS (2026-10-27)
+
+- Focused commits77a275b,99edec1,ae895d4 plus reviewed documentation8b133cd2b9ecf4eb0306b6e91553cd13de3afbe1 pushed on perf/batch-claim-connection-lifetime. Draft PR #84 is mergeable without conflicts. All ten hosted checks are queued/running on that exact head; no hosted PASS or merge claimed yet.
+- Local full2444pass28skip, static checks306files, startup/health151, Full Doctor/browser and production benchmark evidence are archived. Original workspace has only the pre-existing untracked uv.lock. GitHub retrieval connector returned bad credentials; authenticated gh uses the existing dibbed account, without credential/trust/permission changes.
+- EXACT_NEXT_ACTION: verify all ten checks and review/conflict state on8b133cd, then mark ready and merge only if safe; verify post-merge main checks. Keep numericP15-04 BLOCKED; do not create a tag/release.
+
+
+### EVIDENCE-27 — PR84 MERGED; main6098305 gates IN_PROGRESS (2026-10-27)
+
+- All ten checks succeeded on8b133cd2b9ecf4eb0306b6e91553cd13de3afbe1. No blocking review or conflict; Ready followed by guarded merge commit60983058e7dde81973d7c7acfa9009cb2c6612ae at11:28:05UTC. No history rewrite, branch deletion, tag or release.
+- Original main fast-forwarded to the same origin/main SHA; tracked tree clean, only original uv.lock untracked with unchanged SHA256e9bbee1693a12ebdde82d62ef98722036e5b14db754842bd6c865375594e56aa. New main workflows started and are not yet accepted.
+- Plan states remain43 VERIFIED,6 BLOCKED,5 DEFERRED. P15-04 tail gate remains BLOCKED despite the safe improvement merge; no profile activation.
+- EXACT_NEXT_ACTION: verify all ten main checks and publication skip on6098305, then perform only hash-verified Recycle Bin cleanup of the three owned diagnostic copies and finalize the report/archives.
+
+
+### EVIDENCE-28 — Runtime acceptance and verified cleanup complete (2026-10-27)
+
+- All ten required checks succeeded on runtime main60983058e7dde81973d7c7acfa9009cb2c6612ae, independently of the ten PR checks on8b133cd. The additional publish job succeeded only in detection; Set up Python, same-SHA release verification, artifact building and Publish GitHub release steps were skipped. No tag/release. Merge tree equals the validated PR tree.
+- Public plugin healthy151/full, active/pending/quarantined resource requests0; supervisor running with MCP/Tunnel healthy and active_mutations0. Tunnel PID21372 and SHA2569d4d675276a9f2a57ba1912f5b4c81dd9c31bf77a7c63c7ade5fa11d7fa610d0 unchanged; no restart. New-source runtime checks remain isolated; no live activation claim.
+- Three owned synthetic diagnostic roots were archived:9files/709088bytes, identical source/archive hashes, no links/Git/source dependencies or active process references. All three archived SQLite databases passed immutable read-only integrity_check and held only released claims. Recycling was enabled on C; explicit SendToRecycleBin succeeded and all three named entries were verified there. No permanent deletion or permission bypass.
+- The original four Downloads evidence roots, five access-denied p1501 roots,57 nonempty main pytest roots, original state/databases/plans/personal data and unrelated uv.lock remain preserved. Earlier97-file evidence archive and six-file/two-root diagnostic cleanup remain recorded separately.
+- Runtime continuation is complete with43 VERIFIED,6 BLOCKED,5 DEFERRED; no passing median substituted for P15 tail acceptance and no missing model/provider/isolation gates invented. This snapshot records the verified runtime subject; final documentation-only publication can advance Git HEAD separately.
+- EXACT_NEXT_ACTION: publish this reviewed final runtime checkpoint, then retain the11 explicit conditional gates for the next development decision. No additional runtime implementation is required for this delivery.
