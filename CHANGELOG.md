@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-27: Add default-off native file batching alongside the full tool catalog, live descriptor eligibility lookup and bounded phase timing. Extend the isolated production benchmark with client-parallel baselines, paired tail overhead, owned stdio/loopback HTTP transports and explicitly simulated per-call delay. Live activation remains gated on local and actual plugin acceptance.
 - 2026-10-27: Reuse one serialized SQLite connection for native read-batch resource claims, retaining FULL durability and rollback isolation. Retire the connection after actual batch draining, fence restarted reader generations, and check standalone benchmark connection cleanup. Normal WorkflowStore callers keep per-operation connections.
 - 2026-10-26: Add an isolated production native-read-batch benchmark alongside the existing prototype, measuring real MCP calls, response equivalence and drained batch counters.
 - 2026-10-26: Implement an unreleased, explicitly selected seven-tool `read_batch` profile and typed, bounded `native_read_batch` for independent local text windows. Reuse the native reader and durable resource claims; cap local paths, source/response bytes, concurrent reads and cancellation without changing legacy catalogs or activating the current operator server. Include actual MCP request-count and cancellation tests.

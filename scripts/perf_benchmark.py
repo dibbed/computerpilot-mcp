@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import platform
 import random
@@ -2497,7 +2498,98 @@ def _exec_cost_worker(repeats: int, include_jobs: bool) -> dict[str, Any]:
     }
 
 
-def _native_batch_worker(repeats: int, include_powershell: bool = True, *, production: bool = False) -> dict[str, Any]:
+def _paired_batch_overhead(direct: list[dict[str, Any]], batch: list[dict[str, Any]]) -> dict[str, Any]:
+    if not direct or len(direct) != len(batch) or any(a["round"] != b["round"] for a, b in zip(direct, batch, strict=True)):
+        raise ValueError("Paired benchmark rounds must match.")
+    differences = [float(b["elapsed_ms"]) - float(a["elapsed_ms"]) for a, b in zip(direct, batch, strict=True)]
+    tail = sorted(differences)[math.ceil(0.95 * len(differences)) - 1]
+    return {"count": len(differences), "method": "paired_nearest_rank", "limit_ms": 5,
+            "p50_ms": round(statistics.median(differences), 6), "p95_ms": round(tail, 6),
+            "max_ms": round(max(differences), 6), "samples_ms": differences, "passed": tail <= 5}
+
+
+def _require_native_batch_snapshot() -> None:
+    if (PROJECT_ROOT.name != "source" or not PROJECT_ROOT.parent.name.startswith("computerpilot-exec-cost-")
+            or PROJECT_ROOT.parent.parent.resolve() != Path(tempfile.gettempdir()).resolve()
+            or PROJECT_ROOT.resolve() != Path(__file__).resolve().parent.parent):
+        raise ValueError("Subprocess batch transports require an isolated production source snapshot.")
+
+
+def _native_batch_server(root: str, transport: str) -> None:
+    """Private owned benchmark child; never used by the production launcher."""
+    import hmac
+    import socket
+
+    import uvicorn
+
+    from tools.filesystem import service
+
+    _require_native_batch_snapshot()
+    credential = os.environ.get("CP_BENCH_HTTP_TOKEN", "")
+    if transport == "http" and not credential:
+        raise RuntimeError("The isolated HTTP benchmark credential is unavailable.")
+    server = create_server()
+    cast(Any, server).native_allowlist = frozenset({"read_file", "native_read_batch", "server_health"})
+    reader = cast(Any, server).native_read_batch_state
+    original_read = service.read_window
+    original_snapshot = reader.snapshot
+    counts = {"active": 0, "peak": 0}
+    lock = threading.Lock()
+    process = psutil.Process()
+    cpu_start = sum(process.cpu_times()[:2])
+
+    def observed_read(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        with lock:
+            counts["active"] += 1
+            counts["peak"] = max(counts["peak"], counts["active"])
+        try:
+            return original_read(*args, **kwargs)
+        finally:
+            with lock:
+                counts["active"] -= 1
+
+    def observed_snapshot() -> dict[str, int]:
+        return {**original_snapshot(), "benchmark_peak_reads": counts["peak"],
+                "benchmark_cpu_usec": int((sum(process.cpu_times()[:2]) - cpu_start) * 1_000_000),
+                "benchmark_rss_bytes": process.memory_info().rss}
+
+    service.read_window = observed_read
+    reader.snapshot = observed_snapshot
+    listener = socket.socket() if transport == "http" else None
+    try:
+        if listener is not None:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(128)
+        metadata = Path(root) / "server.json"
+        temporary_metadata = metadata.with_suffix(".tmp")
+        temporary_metadata.write_text(json.dumps({
+            "pid": process.pid, "created": process.create_time(), "port": listener.getsockname()[1] if listener else None,
+        }), encoding="utf-8")
+        os.replace(temporary_metadata, metadata)
+        if listener is None:
+            server.run(transport="stdio")
+        else:
+            from starlette.middleware.base import BaseHTTPMiddleware
+            from starlette.responses import Response
+
+            async def authenticate(request: Any, call_next: Any) -> Any:
+                if not hmac.compare_digest(request.headers.get("authorization", ""), "Bearer " + credential):
+                    return Response(status_code=401)
+                return await call_next(request)
+
+            app = server.streamable_http_app(json_response=True, stateless_http=True)
+            app.add_middleware(BaseHTTPMiddleware, dispatch=authenticate)
+            asyncio.run(uvicorn.Server(uvicorn.Config(app, log_level="critical", access_log=False)).serve(sockets=[listener]))
+    finally:
+        reader.close()
+        if listener is not None:
+            listener.close()
+
+
+def _native_batch_worker(
+    repeats: int, include_powershell: bool = True, *, production: bool = False, simulated_rtt_ms: int = 0,
+    transport_kind: Literal["memory", "stdio", "http"] = "memory",
+) -> dict[str, Any]:
     """Measure either the private prototype or the actual file-only batch tool."""
     import base64
 
@@ -2513,6 +2605,10 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
     from tools.filesystem.service import read_window
     from tools.terminal import registry as terminal_registry
 
+    if transport_kind != "memory":
+        if not production:
+            raise ValueError("Subprocess batch transports require the production suite.")
+        _require_native_batch_snapshot()
     root = PROJECT_ROOT / "native-batch-fixture"
     root.mkdir()
     contents = [f"fixture-{index}: alpha beta\n" * 16 for index in range(16)]
@@ -2521,6 +2617,7 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
         path.write_bytes(content.encode())
     counters = {"requests": 0, "responses": 0, "request_frame_bytes": 0, "response_frame_bytes": 0}
     workers = {"active": 0, "peak": 0}
+    client_calls = {"active": 0, "peak": 0}
     lock = threading.Lock()
     request_ids: set[Any] = set()
     message_adapter: TypeAdapter[Any] = TypeAdapter(cast(Any, JSONRPCMessage))
@@ -2573,7 +2670,7 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
         def __getattr__(self, name: str) -> Any:
             return getattr(self.stream, name)
 
-    powershell = include_powershell and bool(shutil.which("pwsh") or shutil.which("powershell"))
+    powershell = transport_kind == "memory" and include_powershell and bool(shutil.which("pwsh") or shutil.which("powershell"))
     batch_name = "native_read_batch" if production else "fixture_read_batch"
     allowed = frozenset({"read_file", batch_name, *({"run_powershell"} if powershell else set())})
     server = ExtensionMCPServer("native-batch-benchmark", native_allowlist=allowed)
@@ -2624,8 +2721,12 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
 
     samples: dict[str, list[dict[str, Any]]] = {}
     peaks: dict[str, int] = {}
+    client_peaks: dict[str, int] = {}
     expected: dict[int, str] = {}
     denied_dispatches = 0
+    remote_identity: dict[str, Any] = {}
+    remote_health: dict[str, Any] = {}
+    catalog_evidence: dict[str, Any] = {}
 
     def hidden_probe() -> dict[str, bool]:
         nonlocal denied_dispatches
@@ -2636,37 +2737,124 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
 
     @asynccontextmanager
     async def transport() -> Any:
-        async with InMemoryTransport(server) as (reader, writer):
-            yield FramedStream(reader), FramedStream(writer)
+        if transport_kind == "memory":
+            async with InMemoryTransport(server) as (read_stream, write_stream):
+                yield FramedStream(read_stream), FramedStream(write_stream)
+            return
+        from core.extensions.transport import bounded_stdio_transport
+        from core.process_ownership import spawn_owned_process
+
+        command = [sys.executable, "-c", "from scripts.perf_benchmark import _native_batch_server; "
+                   f"_native_batch_server({str(root)!r}, {transport_kind!r})"]
+        environment = {key: value for key, value in os.environ.items()
+                       if key.upper() in {"SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP", "HOME", "USERPROFILE", "COMSPEC"}}
+        environment.update({"PYTHONUTF8": "1", "MCP_TOOL_PROFILE": "full", "MCP_NATIVE_READ_BATCH_ENABLED": "1"})
+        if transport_kind == "stdio":
+            async with bounded_stdio_transport(command, cwd=PROJECT_ROOT, env=environment,
+                                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as (read_stream, write_stream):
+                yield FramedStream(read_stream), FramedStream(write_stream)
+        else:
+            import secrets
+
+            import httpx2
+            from mcp.client.streamable_http import streamable_http_client
+
+            credential = secrets.token_urlsafe(32)
+            environment["CP_BENCH_HTTP_TOKEN"] = credential
+            owned = spawn_owned_process(command, cwd=PROJECT_ROOT, env=environment, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), require_native=True)
+            try:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    if owned.poll() is not None:
+                        raise RuntimeError("Owned benchmark HTTP server exited before readiness.")
+                    if (root / "server.json").is_file():
+                        identity = json.loads((root / "server.json").read_text(encoding="utf-8"))
+                        try:
+                            _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", identity["port"]), timeout=0.5)
+                            writer.close()
+                            await writer.wait_closed()
+                            break
+                        except (OSError, TimeoutError):
+                            pass
+                    await asyncio.sleep(0.05)
+                else:
+                    raise RuntimeError("Owned benchmark HTTP server readiness timed out.")
+                url = f"http://127.0.0.1:{identity['port']}/mcp"
+                async with httpx2.AsyncClient(trust_env=False, timeout=5) as probe:
+                    denied = await probe.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+                    if denied.status_code != 401:
+                        raise RuntimeError("Unauthenticated benchmark HTTP access was not denied.")
+                    remote_identity["http_unauthenticated_denied"] = True
+                async with httpx2.AsyncClient(headers={"Authorization": "Bearer " + credential}, trust_env=False) as http_client:
+                    async with streamable_http_client(url, http_client=http_client) as streams:
+                        yield FramedStream(streams[0]), FramedStream(streams[1])
+            finally:
+                try:
+                    cleanup = owned.terminate_tree(force=True)
+                finally:
+                    owned.close_ownership()
+                if cleanup.get("alive_pids"):
+                    raise RuntimeError("Owned benchmark HTTP server cleanup is incomplete.")
+        remote_identity.update(json.loads((root / "server.json").read_text(encoding="utf-8")))
+        if same_process(remote_identity["pid"], remote_identity["created"]):
+            raise RuntimeError("Owned benchmark server survived transport shutdown.")
 
     async def run() -> None:
         rng = random.Random(1501)
         async with Client(transport()) as client:
+            catalog = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in (await client.list_tools()).tools]
+            catalog_evidence.update({"tool_count": len(catalog), "sha256": hashlib.sha256(
+                json.dumps(catalog, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()})
             invalid = {"root": str(root), "items": [], "max_parallel": 5} if production else {"paths": [], "parallel": 5}
             for name, arguments in (("hidden_probe", {}), (batch_name, invalid)):
                 denied = await client.call_tool(name, arguments)
                 assert denied.is_error
             assert denied_dispatches == 0 and workers["active"] == 0
             async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-                result = await client.call_tool(name, arguments)
-                value = result.structured_content
-                if not isinstance(value, dict) or value.get("ok") is False or result.is_error:
-                    raise RuntimeError("Native batch benchmark call failed.")
-                return value
+                client_calls["active"] += 1
+                client_calls["peak"] = max(client_calls["peak"], client_calls["active"])
+                try:
+                    if simulated_rtt_ms:
+                        await asyncio.sleep(simulated_rtt_ms / 2000)
+                    result = await client.call_tool(name, arguments)
+                    if simulated_rtt_ms:
+                        await asyncio.sleep(simulated_rtt_ms / 2000)
+                    value = result.structured_content
+                    if not isinstance(value, dict) or value.get("ok") is False or result.is_error:
+                        raise RuntimeError("Native batch benchmark call failed.")
+                    return value
+                finally:
+                    client_calls["active"] -= 1
 
             for count in (1, 4, 8, 16):
                 expected[count] = hashlib.sha256(json.dumps(contents[:count], ensure_ascii=False).encode()).hexdigest()
-                variants = ["direct", "batch1", "batch2", "batch4", *(["powershell"] if powershell else [])]
+                variants = ["direct", "direct_parallel2", "direct_parallel4", "batch1", "batch2", "batch4",
+                            *(["powershell"] if powershell else [])]
                 for round_index in range(5 + repeats):
                     rng.shuffle(variants)
                     for variant in variants:
                         for key in counters:
                             counters[key] = 0
                         workers["peak"] = 0
+                        client_calls["peak"] = 0
+                        cpu_sample = sum(process.cpu_times()[:2])
+                        rss_sample = process.memory_info().rss
                         started = time.perf_counter()
                         if variant == "direct":
-                            values = [(await call("read_file", {"path": str(path), "max_chars": 4096}))["content"]
+                            values = [(await call("read_file", {"path": str(path), "max_chars": 4096, "encoding": "utf-8"}))["content"]
                                       for path in paths[:count]]
+                        elif variant.startswith("direct_parallel"):
+                            semaphore = asyncio.Semaphore(int(variant[-1]))
+
+                            async def one_file(path: Path, limiter: asyncio.Semaphore = semaphore) -> str:
+                                async with limiter:
+                                    value = await call("read_file", {"path": str(path), "max_chars": 4096, "encoding": "utf-8"})
+                                    assert value["truncated"] is False
+                                    return str(value["content"])
+
+                            values = await asyncio.gather(*(one_file(path) for path in paths[:count]))
                         elif variant == "powershell":
                             encoded = base64.b64encode(json.dumps([str(p) for p in paths[:count]]).encode()).decode()
                             script = (
@@ -2679,22 +2867,32 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
                         else:
                             if production:
                                 result = await call(batch_name, {
-                                    "root": str(root), "items": [{"id": str(i), "path": path.name}
+                                    "root": str(root), "items": [{"id": str(i), "path": path.name, "encoding": "utf-8"}
                                                                   for i, path in enumerate(paths[:count])],
                                     "max_parallel": int(variant[-1]),
                                 })
+                                assert result["complete"] and not result["truncated"]
                                 values = [item["content"] for item in result["items"]]
                             else:
                                 values = (await call(batch_name, {
                                     "paths": [str(path) for path in paths[:count]], "parallel": int(variant[-1]),
                                 }))["contents"]
                         sample = {"elapsed_ms": (time.perf_counter() - started) * 1000, **counters,
+                                  "cpu_sec": sum(process.cpu_times()[:2]) - cpu_sample,
+                                  "rss_before_after_max_bytes": max(rss_sample, process.memory_info().rss),
                                   "sha256": hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).hexdigest()}
                         assert sample["sha256"] == expected[count] and workers["active"] == 0
                         if round_index >= 5:
+                            sample["round"] = round_index - 5
                             key = f"{count}/{variant}"
                             samples.setdefault(key, []).append(sample)
+                            client_peaks[key] = max(client_peaks.get(key, 0), client_calls["peak"])
                             peaks[key] = max(peaks.get(key, 0), workers["peak"])
+            if transport_kind != "memory":
+                health = await call("server_health", {})
+                assert health["tool_count"] == catalog_evidence["tool_count"] and health["tool_profile"] == "full"
+                remote_health.update(health["native_read_batch"])
+                assert all(remote_health[key] == 0 for key in ("active_batches", "active_reads", "reserved_response_bytes"))
 
     process = psutil.Process()
     cpu_before = sum(process.cpu_times()[:2])
@@ -2709,7 +2907,11 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
     for key, values in samples.items():
         count = int(key.split("/")[0])
         summary = _exec_cost_summary(values, expected[count])
-        summary["peak_workers"] = peaks[key] if "/batch" in key else None
+        summary["peak_workers"] = peaks[key] if "/batch" in key and transport_kind == "memory" else None
+        summary["peak_client_calls"] = client_peaks[key]
+        summary["cpu_scope"] = "client_and_server" if transport_kind == "memory" else "client_only"
+        summary["cpu_sec"] = sum(sample["cpu_sec"] for sample in values)
+        summary["rss_before_after_max_bytes"] = max(sample["rss_before_after_max_bytes"] for sample in values)
         summary["synthetic_wait_saving_percent"] = {
             str(latency): (0 if latency == 0 else 100 * (count - values[0]["requests"]) / count)
             for latency in (0, 20, 100, 250)
@@ -2718,10 +2920,23 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
     batch_counters = reader.snapshot() if production else None
     claim_keys = ("active_resource_request_count", "pending_resource_request_count", "quarantined_resource_request_count")
     claims = {key: claim_health[key] for key in claim_keys} if claim_health is not None else None
+    overhead = _paired_batch_overhead(samples["1/direct"], samples["1/batch1"])
     return {"warmups": 5, "repeats": repeats, "seed": 1501, "order": "paired_randomized",
+            "acceptance_eligible": repeats >= 30 and not simulated_rtt_ms,
+            "catalog": {**catalog_evidence, "scope": "full_opt_in" if transport_kind != "memory" else "bounded_native_fixture"},
+            "subprocess_call_allowlist": ["read_file", "native_read_batch", "server_health"] if transport_kind != "memory" else None,
+            "http_unauthenticated_denied": remote_identity.get("http_unauthenticated_denied"),
+            "transport": transport_kind, "measurement_kind": "SIMULATED" if simulated_rtt_ms else "LOCAL",
+            "server_peak_reads": remote_health.get("benchmark_peak_reads"),
+            "server_cpu_usec": remote_health.get("benchmark_cpu_usec"), "server_rss_bytes": remote_health.get("benchmark_rss_bytes"),
+            "server_process_exited": not remote_identity or not same_process(remote_identity["pid"], remote_identity["created"]),
+            "simulated_rtt_ms": simulated_rtt_ms, "delay_scope": "independent client call before/after MCP dispatch",
+            "paired_single_file_overhead": overhead,
             "prototype_only": not production,
-            "scope": "actual in-process MCP calls; synthetic RTT is arithmetic, not tunnel latency",
-            "wire_scope": "NDJSON roundtrip of actual SDK messages; in-memory transport, no tunnel",
+            "scope": "actual local MCP calls; no live tunnel or model latency",
+            "wire_scope": ("NDJSON roundtrip of actual SDK messages; in-memory transport, no tunnel" if transport_kind == "memory"
+                           else "encoded MCP message bytes; excludes HTTP headers, TCP and TLS overhead"),
+            "wire_overhead_excluded": "HTTP headers, TCP, TLS",
             "denied_dispatches": denied_dispatches, "tokenizer": "NOT_MEASURED",
             "cpu_sec": sum(process.cpu_times()[:2]) - cpu_before,
             "rss_before_after_max_bytes": max(rss_before, process.memory_info().rss),
@@ -2734,9 +2949,14 @@ def _native_batch_worker(repeats: int, include_powershell: bool = True, *, produ
 
 def _exec_cost_once(
     repeats: int, include_jobs: bool, *, suite: Literal["exec_cost", "native_batch", "native_batch_production"] = "exec_cost",
+    native_batch_transport: Literal["memory", "stdio", "http"] = "memory", native_batch_rtt_ms: int = 0,
 ) -> dict[str, Any]:
     if not 1 <= repeats <= 100:
         raise ValueError("exec_cost requires 1..100 paired repeats.")
+    if native_batch_transport not in {"memory", "stdio", "http"} or native_batch_rtt_ms not in {0, 20, 100, 250}:
+        raise ValueError("Invalid native batch transport or simulated RTT.")
+    if suite != "native_batch_production" and (native_batch_transport != "memory" or native_batch_rtt_ms):
+        raise ValueError("Transport options require the production batch suite.")
     # A source copy isolates hardcoded PROJECT_ROOT state, including detached job workers.
     temporary = Path(tempfile.mkdtemp(prefix="computerpilot-exec-cost-"))
     cleanup_verified = False
@@ -2777,7 +2997,8 @@ def _exec_cost_once(
             + str(repeats)
             + ", "
             + str(include_jobs if suite == "exec_cost" else True)
-            + (", production=True)))" if suite == "native_batch_production" else ")))"),
+            + (f", production=True, transport_kind={native_batch_transport!r}, simulated_rtt_ms={native_batch_rtt_ms})))"
+               if suite == "native_batch_production" else ")))"),
         ]
         env = {key: "" for key in os.environ if key.upper().startswith(("MCP_", "PYTHON"))}
         env.update({"MCP_TOOL_PROFILE": "full", "MCP_LSP_PERSISTENT_ENABLED": "0", "MCP_WORKFLOW_DAG_ENABLED": "0"})
@@ -2818,6 +3039,8 @@ def run_benchmarks(
     suites: set[str],
     include_jobs: bool,
     include_browser: bool,
+    native_batch_transport: Literal["memory", "stdio", "http"] = "memory",
+    native_batch_rtt_ms: int = 0,
 ) -> dict[str, Any]:
     if profile not in PROFILE_LIMITS:
         raise ValueError(f"Unknown profile: {profile}")
@@ -2828,6 +3051,8 @@ def run_benchmarks(
         raise ValueError(f"Unknown suites: {sorted(unknown)}")
     if "native_batch_production" in suites and suites != {"native_batch_production"}:
         raise ValueError("The production batch benchmark must run without other suites.")
+    if (native_batch_transport != "memory" or native_batch_rtt_ms) and suites != {"native_batch_production"}:
+        raise ValueError("Transport options require only the production batch suite.")
     limits = PROFILE_LIMITS[profile]
     stale_temp_dirs_removed = 0 if suites <= {"exec_cost", "native_batch", "native_batch_production"} else _cleanup_stale_temp_roots()
     results: list[dict[str, Any]] = []
@@ -2837,7 +3062,8 @@ def run_benchmarks(
     if "native_batch" in suites:
         results.append(_exec_cost_once(runs, False, suite="native_batch"))
     if "native_batch_production" in suites:
-        results.append(_exec_cost_once(runs, False, suite="native_batch_production"))
+        results.append(_exec_cost_once(runs, False, suite="native_batch_production",
+                                       native_batch_transport=native_batch_transport, native_batch_rtt_ms=native_batch_rtt_ms))
 
     if "catalog" in suites:
         results.append(measure("tool_catalog", _catalog_once, runs))
@@ -3192,6 +3418,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-browser", action="store_true", help="Launch real Playwright browser sessions.")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--stdout", action="store_true", help="Also print the JSON report to stdout.")
+    parser.add_argument("--native-batch-transport", choices=("memory", "stdio", "http"), default="memory")
+    parser.add_argument("--native-batch-rtt-ms", type=int, choices=(0, 20, 100, 250), default=0,
+                        help="SIMULATED per-call round-trip delay; never a live Tunnel measurement.")
     return parser
 
 
@@ -3209,6 +3438,8 @@ def main(argv: list[str] | None = None) -> int:
         suites=suites,
         include_jobs=args.include_jobs,
         include_browser=args.include_browser,
+        native_batch_transport=args.native_batch_transport,
+        native_batch_rtt_ms=args.native_batch_rtt_ms,
     )
     output = args.output or _default_output()
     if not output.is_absolute():
