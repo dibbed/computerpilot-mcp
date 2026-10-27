@@ -457,13 +457,148 @@ def test_pin_paths_blocks_retention_until_release(tmp_path: Path) -> None:
 
     with manager.pin_paths((old,)):
         manager.schedule()
-        assert manager.flush(3)
+        assert not manager.flush(0.1)
         assert old.is_file() and newer.is_file()
 
-    manager.schedule()
     assert manager.flush(3)
     assert not old.exists()
     assert newer.is_file()
+
+
+def test_cross_process_cleanup_waits_for_backup_checkpoint(tmp_path: Path) -> None:
+    from core import recovery
+
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    old, newest = directory / "old.bak", directory / "newest.bak"
+    journal = tmp_path / "operation-recovery.jsonl"
+    recovery.OPERATION_RECOVERY.configure(journal, "backup-parent")
+    manager = BackupRetentionManager(directory, _policy(max_count=1))
+    child_script = """
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+from core import recovery
+import core.backups as backups
+from core.backups import BackupPolicy, BackupRetentionManager
+root, journal = map(Path, sys.argv[1:])
+recovery.OPERATION_RECOVERY.configure(journal, 'backup-child')
+manager = BackupRetentionManager(root, BackupPolicy(0, 0, 0, 0, 1))
+original_lock = backups.exclusive_file_lock
+@contextmanager
+def observed_lock(*args, **kwargs):
+    print('locking', flush=True)
+    with original_lock(*args, **kwargs):
+        yield
+backups.exclusive_file_lock = observed_lock
+print('ready', flush=True)
+if sys.stdin.readline().strip() != 'go':
+    raise RuntimeError('missing start')
+manager.schedule()
+if not manager.flush(8):
+    raise RuntimeError('cleanup did not drain')
+if manager.snapshot()['last_error'] is not None or manager.snapshot()['last_result'] is None:
+    raise RuntimeError('cleanup did not succeed')
+print('done', flush=True)
+"""
+    process = None
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_script, str(directory), str(journal)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert process.stdout is not None and process.stdout.readline().strip() == "ready"
+        handle = recovery.OPERATION_RECOVERY.begin("workspace_edit")
+        assert handle is not None
+        with manager.pin_paths((old,)):
+            _backup(old, 10, 100)
+            _backup(newest, 10, 200)
+            assert process.stdin is not None
+            process.stdin.write("go\n")
+            process.stdin.flush()
+            assert process.stdout.readline().strip() == "locking"
+            with pytest.raises(subprocess.TimeoutExpired):
+                process.wait(timeout=0.5)
+            assert old.exists()
+            evidence = recovery.WorkspaceEditEvidence(files=(recovery.WorkspaceEditFile(
+                path=str((tmp_path / "target.py").resolve()), before_sha256="a" * 64, after_sha256="b" * 64,
+                backup_path=str(old.resolve()),
+            ),))
+            recovery.OPERATION_RECOVERY.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+        stdout, stderr = process.communicate(timeout=8)
+        assert process.returncode == 0, stderr
+        assert "done" in stdout and old.exists()
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+
+def test_owner_death_releases_backup_lock_and_preserves_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+    from typing import Any
+
+    from core import recovery
+
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    old, newest = directory / "old.bak", directory / "newest.bak"
+    _backup(old, 10, 100)
+    _backup(newest, 10, 200)
+    journal = tmp_path / "operation-recovery.jsonl"
+    recovery.OPERATION_RECOVERY.configure(journal, "backup-owner-death")
+    handle = recovery.OPERATION_RECOVERY.begin("workspace_edit")
+    assert handle is not None
+    evidence = recovery.WorkspaceEditEvidence(files=(recovery.WorkspaceEditFile(
+        path=str((tmp_path / "target.py").resolve()), before_sha256="a" * 64, after_sha256="b" * 64,
+        backup_path=str(old.resolve()),
+    ),))
+    recovery.OPERATION_RECOVERY.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+    child_script = """
+import os, sys
+from pathlib import Path
+from core.backups import BackupPolicy, BackupRetentionManager
+root = Path(sys.argv[1])
+manager = BackupRetentionManager(root, BackupPolicy(0, 0, 0, 0, 1))
+with manager.pin_paths((root / 'old.bak',)):
+    print('ready', flush=True)
+    sys.stdin.readline()
+    os._exit(0)
+"""
+    attempted = threading.Event()
+    original_lock = backups.exclusive_file_lock
+
+    @contextmanager
+    def observed_lock(*args: Any, **kwargs: Any) -> Iterator[None]:
+        attempted.set()
+        with original_lock(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(backups, "exclusive_file_lock", observed_lock)
+    process = subprocess.Popen(
+        [sys.executable, "-c", child_script, str(directory)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        assert process.stdout is not None and process.stdout.readline().strip() == "ready"
+        manager = BackupRetentionManager(directory, _policy(max_count=1))
+        manager.schedule()
+        assert attempted.wait(5) and not manager.flush(0.1)
+        assert process.stdin is not None
+        process.stdin.write("exit\n")
+        process.stdin.flush()
+        stdout, stderr = process.communicate(timeout=8)
+        assert process.returncode == 0, (stdout, stderr)
+        assert manager.flush(8)
+        assert manager.snapshot()["last_error"] is None and manager.snapshot()["last_result"] is not None
+        assert old.exists() and newest.exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        recovery.OPERATION_RECOVERY.configure(None, None)
 
 
 def test_pin_paths_rejects_paths_outside_backup_directory(tmp_path: Path) -> None:
@@ -549,7 +684,8 @@ def test_retention_skips_cleanup_when_recovery_journal_is_unavailable(
     _backup(newest, 10, 200)
     manager = BackupRetentionManager(directory, _policy(max_count=1, recent_grace_sec=0))
 
-    def unavailable() -> set[Path]:
+    def unavailable(*, expected_journal: Path | None = None) -> set[Path]:
+        del expected_journal
         raise ToolError("operation_journal_unavailable", "journal unavailable")
 
     monkeypatch.setattr(OPERATION_RECOVERY, "protected_workspace_backups", unavailable)
@@ -557,6 +693,113 @@ def test_retention_skips_cleanup_when_recovery_journal_is_unavailable(
     assert manager.flush(3)
     assert old.is_file() and newest.is_file()
     assert str(manager.snapshot()["last_error"]).startswith("recovery_unavailable")
+
+
+def test_cleanup_fails_closed_when_existing_journal_is_not_configured(tmp_path: Path) -> None:
+    from core import recovery
+
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    old, newest = directory / "old.bak", directory / "newest.bak"
+    _backup(old, 10, 100)
+    _backup(newest, 10, 200)
+    journal = tmp_path / "operation-recovery.jsonl"
+    journal.write_text("", encoding="utf-8")
+    recovery.OPERATION_RECOVERY.configure(None, None)
+    manager = BackupRetentionManager(directory, _policy(max_count=1))
+    manager.schedule()
+    assert manager.flush(3)
+    assert old.exists() and newest.exists()
+    assert str(manager.snapshot()["last_error"]).startswith("recovery_unavailable")
+
+
+@pytest.mark.parametrize("malformed_json", [True, False])
+def test_cleanup_preserves_backups_when_workspace_journal_is_corrupt(tmp_path: Path, malformed_json: bool) -> None:
+    from core import recovery
+
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    old, newest = directory / "old.bak", directory / "newest.bak"
+    _backup(old, 10, 100)
+    _backup(newest, 10, 200)
+    journal = tmp_path / "operation-recovery.jsonl"
+    recovery.OPERATION_RECOVERY.configure(journal, "corrupt-backup-test")
+    handle = recovery.OPERATION_RECOVERY.begin("workspace_edit")
+    assert handle is not None
+    try:
+        with journal.open("ab") as stream:
+            if malformed_json:
+                stream.write(b'{"schema_version":1,"type":"checkpoint"')
+            else:
+                stream.write((json.dumps({
+                    "schema_version": 1, "type": "checkpoint", "operation_id": handle.operation_id,
+                    "workspace_edit": {"files": "invalid"},
+                }) + "\n").encode())
+        manager = BackupRetentionManager(directory, _policy(max_count=1))
+        manager.schedule()
+        assert manager.flush(3)
+        assert old.exists() and newest.exists()
+        assert str(manager.snapshot()["last_error"]).startswith("recovery_unavailable")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+
+@pytest.mark.parametrize("replace_with_directory", [False, True])
+def test_cleanup_preserves_backups_when_configured_journal_disappears(
+    tmp_path: Path, replace_with_directory: bool,
+) -> None:
+    from core import recovery
+
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    old, newest = directory / "old.bak", directory / "newest.bak"
+    _backup(old, 10, 100)
+    _backup(newest, 10, 200)
+    journal = tmp_path / "operation-recovery.jsonl"
+    recovery.OPERATION_RECOVERY.configure(journal, "missing-backup-test")
+    assert recovery.OPERATION_RECOVERY.begin("workspace_edit") is not None
+    journal.rename(tmp_path / "preserved-journal.jsonl")
+    if replace_with_directory:
+        journal.mkdir()
+    try:
+        manager = BackupRetentionManager(directory, _policy(max_count=1))
+        manager.schedule()
+        assert manager.flush(3)
+        assert old.exists() and newest.exists()
+        assert str(manager.snapshot()["last_error"]).startswith("recovery_unavailable")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+
+@pytest.mark.parametrize("record_type", ["result", "reconciliation", "acknowledged", "checkpoint"])
+def test_cleanup_preserves_backups_when_recovery_record_loses_evidence(tmp_path: Path, record_type: str) -> None:
+    from core import recovery
+
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    old, newest = directory / "old.bak", directory / "newest.bak"
+    _backup(old, 10, 100)
+    _backup(newest, 10, 200)
+    journal = tmp_path / "operation-recovery.jsonl"
+    recovery.OPERATION_RECOVERY.configure(journal, "invalid-record-test")
+    handle = recovery.OPERATION_RECOVERY.begin("workspace_edit")
+    assert handle is not None
+    evidence = recovery.WorkspaceEditEvidence(files=(recovery.WorkspaceEditFile(
+        path=str((tmp_path / "target.py").resolve()), before_sha256="a" * 64,
+        after_sha256="b" * 64, backup_path=str(old.resolve()),
+    ),))
+    try:
+        recovery.OPERATION_RECOVERY.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+        with journal.open("ab") as stream:
+            stream.write((json.dumps({"schema_version": 1, "type": record_type,
+                                      "operation_id": handle.operation_id}) + "\n").encode())
+        manager = BackupRetentionManager(directory, _policy(max_count=1))
+        manager.schedule()
+        assert manager.flush(3)
+        assert old.exists() and newest.exists()
+        assert str(manager.snapshot()["last_error"]).startswith("recovery_unavailable")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
 
 
 def test_retention_protects_unresolved_workspace_edit_backups(

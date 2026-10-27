@@ -624,6 +624,9 @@ class OperationRecoveryJournal:
                 assert path is not None
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with self._journal_transaction() as records:
+                    if path.exists():
+                        records = list(self._iter_records_locked(strict=True))
+                        self._validate_workspace_records(records)
                     self._record_count = len(records)
                     self._recover_previous_unlocked(records)
                 self._maybe_compact_locked()
@@ -822,14 +825,18 @@ class OperationRecoveryJournal:
                 hint="Do not retry a possibly-started mutation blindly; inspect runtime storage first.",
             ) from exc
 
-    def _iter_records_locked(self) -> Iterator[dict[str, Any]]:
+    def _iter_records_locked(self, *, strict: bool = False) -> Iterator[dict[str, Any]]:
         path = self._path
         if path is None or not path.is_file():
+            if strict:
+                raise ToolError("operation_journal_unavailable", "Could not read the operation recovery journal.")
             return
         try:
             with path.open("rb") as handle:
                 while raw := handle.readline(_MAX_LINE_BYTES + 1):
                     if len(raw) > _MAX_LINE_BYTES:
+                        if strict:
+                            raise ToolError("operation_journal_invalid", "The operation recovery journal contains an invalid record.")
                         while not raw.endswith(b"\n"):
                             raw = handle.readline(_MAX_LINE_BYTES + 1)
                             if not raw:
@@ -839,9 +846,17 @@ class OperationRecoveryJournal:
                         record = json.loads(raw.decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         # A crash can leave only the final append truncated.
+                        if strict:
+                            raise ToolError(
+                                "operation_journal_invalid", "The operation recovery journal contains an invalid record.",
+                            ) from None
                         continue
                     if isinstance(record, dict) and record.get("schema_version") == JOURNAL_SCHEMA_VERSION:
+                        if strict and not raw.endswith(b"\n"):
+                            raise ToolError("operation_journal_invalid", "The operation recovery journal contains an incomplete record.")
                         yield record
+                    elif strict:
+                        raise ToolError("operation_journal_invalid", "The operation recovery journal contains an invalid record.")
         except OSError as exc:
             raise ToolError(
                 "operation_journal_unavailable",
@@ -1035,7 +1050,10 @@ class OperationRecoveryJournal:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         try:
             with _interprocess_journal_lock(path):
-                records = self._load_locked()
+                if not path.exists():
+                    return
+                records = list(self._iter_records_locked(strict=True))
+                self._validate_workspace_records(records)
                 state = self._state(records)
                 now = datetime.now(timezone.utc)
                 max_age = timedelta(days=max(0, self._max_external_terminal_days))
@@ -1720,15 +1738,78 @@ class OperationRecoveryJournal:
                 workspace = _workspace_edit_metadata(checkpoint.get("workspace_edit"))
                 return workspace["dispatch_stage"] if workspace is not None else None
 
-    def protected_workspace_backups(self) -> set[Path]:
+    @staticmethod
+    def _validate_workspace_records(records: list[dict[str, Any]]) -> None:
+        known: set[str] = set()
+        workspace_evidence: dict[str, dict[str, Any]] = {}
+        terminal: set[str] = set()
+        for record in records:
+            operation_id = record.get("operation_id")
+            kind = record.get("type")
+            if not isinstance(operation_id, str) or kind not in {
+                "begin", "checkpoint", "result", "uncertain", "reconciliation", "acknowledged",
+            }:
+                raise ToolError("operation_journal_invalid", "The operation recovery journal contains an invalid record.")
+            if kind == "begin":
+                if operation_id in known:
+                    raise ToolError("operation_journal_invalid", "The operation recovery journal contains a duplicate operation.")
+                known.add(operation_id)
+            elif operation_id not in known:
+                raise ToolError("operation_journal_invalid", "The operation recovery journal contains an incomplete operation.")
+            if kind == "checkpoint":
+                if operation_id in terminal:
+                    raise ToolError("operation_journal_invalid", "A completed operation has a later checkpoint.")
+                workspace = _workspace_edit_metadata(record.get("workspace_edit"))
+                previous = workspace_evidence.get(operation_id)
+                if ("workspace_edit" in record and workspace is None) or (
+                    previous is not None and (workspace is None or workspace["files"] != previous["files"]
+                    or (previous["dispatch_stage"] == "may_dispatch" and workspace["dispatch_stage"] != "may_dispatch"))
+                ):
+                    raise ToolError("operation_journal_invalid", "The workspace recovery checkpoint is invalid.")
+                if workspace is not None:
+                    workspace_evidence[operation_id] = workspace
+            if kind in {"result", "reconciliation", "acknowledged"} and operation_id in workspace_evidence:
+                valid = record.get("status") == "completed" and all(
+                    isinstance(record.get(field), str) and record[field]
+                    for field in ("runtime_id", "finished_at" if kind == "result" else "recorded_at")
+                )
+                if kind == "result":
+                    valid = valid and isinstance(record.get("known_result"), str) and bool(record["known_result"])
+                else:
+                    evidence = record.get("evidence")
+                    states = {"succeeded", "failed", "unresolvable"} if kind == "reconciliation" else {
+                        "acknowledged", "unresolvable",
+                    }
+                    valid = valid and record.get("state") in states and isinstance(evidence, dict) and bool(
+                        evidence.get("source") and isinstance(evidence.get("data"), dict) and evidence["data"]
+                    )
+                    if kind == "reconciliation":
+                        valid = valid and isinstance(record.get("postcondition"), dict)
+                        if record.get("state") in {"succeeded", "failed"} and isinstance(evidence, dict):
+                            valid = valid and isinstance(evidence.get("data"), dict) and evidence["data"].get("conclusive") is True
+                if not valid:
+                    raise ToolError("operation_journal_invalid", "The workspace recovery outcome is invalid.")
+            if kind in {"result", "reconciliation", "acknowledged"}:
+                terminal.add(operation_id)
+
+    def protected_workspace_backups(self, *, expected_journal: Path | None = None) -> set[Path]:
         with self._lock:
+            if expected_journal is not None and os.path.lexists(expected_journal) and (
+                not self._enabled or self._path is None
+                or self._path.resolve(strict=False) != expected_journal.resolve(strict=False)
+            ):
+                raise ToolError("recovery_unavailable", "The backup recovery journal is not configured.")
             if not self._enabled or self._path is None:
                 return set()
-            state = self._state(self._load_locked())
+            with _interprocess_journal_lock(self._path):
+                records = list(self._iter_records_locked(strict=True))
+            self._validate_workspace_records(records)
+            state = self._state(records)
             protected: set[Path] = set()
             for item in state.values():
                 begin = item.get("begin")
-                if not begin or item.get("result") or item.get("reconciliation") or item.get("acknowledged"):
+                reconciliation = item.get("reconciliation") or {}
+                if not begin or item.get("result") or reconciliation.get("state") in {"succeeded", "failed"}:
                     continue
                 checkpoint = item.get("checkpoint") or {}
                 workspace = _workspace_edit_metadata(checkpoint.get("workspace_edit"))

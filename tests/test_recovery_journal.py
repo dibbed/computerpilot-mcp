@@ -705,7 +705,7 @@ def test_known_result_persists_bounded_file_postcondition(tmp_path: Path) -> Non
     assert inspected["postcondition"] == postcondition
 
 
-def test_truncated_final_record_is_ignored_and_pending_begin_recovers(tmp_path: Path) -> None:
+def test_truncated_final_record_blocks_recovery_and_compaction(tmp_path: Path) -> None:
     path = tmp_path / "operations.jsonl"
     journal = OperationRecoveryJournal()
     journal.configure(path, "runtime-a")
@@ -716,10 +716,13 @@ def test_truncated_final_record_is_ignored_and_pending_begin_recovers(tmp_path: 
         stream.flush()
         os.fsync(stream.fileno())
 
-    journal.configure(path, "runtime-b")
-    summary = journal.summary()
-    assert summary["uncertain_count"] == 1
-    assert summary["uncertain"][0]["operation_id"] == handle.operation_id
+    evidence = path.read_bytes()
+    with pytest.raises(ToolError, match="invalid record"):
+        journal.compact()
+    assert path.read_bytes() == evidence
+    with pytest.raises(ToolError, match="invalid record"):
+        journal.configure(path, "runtime-b")
+    assert path.read_bytes() == evidence
 
 
 def test_begin_fails_closed_when_durable_journal_write_fails(
