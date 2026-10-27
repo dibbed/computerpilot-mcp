@@ -74,6 +74,9 @@ def _meta(
 TOOL_EXECUTION_METADATA: dict[str, ToolExecutionMetadata] = {
     # Filesystem
     "read_file": _meta("read_file", "filesystem", RouteClass.NATIVE_FILESYSTEM, 5, RiskClass.LOW, RecoverabilityClass.STRONG),
+    "native_read_batch": _meta(
+        "native_read_batch", "filesystem", RouteClass.NATIVE_FILESYSTEM, 5, RiskClass.LOW, RecoverabilityClass.STRONG,
+    ),
     "write_file": _meta("write_file", "filesystem", RouteClass.NATIVE_FILESYSTEM, 5, RiskClass.MEDIUM, RecoverabilityClass.STRONG),
     "create_file": _meta("create_file", "filesystem", RouteClass.NATIVE_FILESYSTEM, 5, RiskClass.MEDIUM, RecoverabilityClass.STRONG),
     "delete_file": _meta("delete_file", "filesystem", RouteClass.NATIVE_FILESYSTEM, 5, RiskClass.HIGH, RecoverabilityClass.STRONG),
@@ -247,6 +250,14 @@ INTENT_ROUTE_RULES: dict[str, tuple[IntentRouteRule, ...]] = {
         "replace_exact",
         RiskClass.MEDIUM,
     ),
+    "filesystem.edit_batch": (
+        _rule("filesystem.edit_batch", RouteClass.NATIVE_FILESYSTEM, "safe_refactor", 5, RiskClass.MEDIUM,
+              RecoverabilityClass.STRONG, 5, 1, 1, 0),
+    ),
+    "filesystem.patch": (
+        _rule("filesystem.patch", RouteClass.NATIVE_FILESYSTEM, "apply_patch", 5, RiskClass.MEDIUM,
+              RecoverabilityClass.STRONG, 5, 1, 1, 0),
+    ),
     "code.rename": _native_semantic_raw(
         "code.rename",
         RouteClass.NATIVE_CODE,
@@ -276,6 +287,14 @@ INTENT_ROUTE_RULES: dict[str, tuple[IntentRouteRule, ...]] = {
     ),
     "process.run": (
         _rule("process.run", RouteClass.NATIVE_PROCESS, "run_process", 5, RiskClass.MEDIUM, RecoverabilityClass.MEDIUM, 5, 1, 1, 0),
+    ),
+    "process.powershell": (
+        _rule("process.powershell", RouteClass.NATIVE_PROCESS, "run_powershell", 5, RiskClass.MEDIUM,
+              RecoverabilityClass.MEDIUM, 5, 3, 3, 0, required_capabilities=("powershell",)),
+    ),
+    "process.durable": (
+        _rule("process.durable", RouteClass.NATIVE_PROCESS, "submit_job", 5, RiskClass.MEDIUM,
+              RecoverabilityClass.STRONG, 5, 3, 3, 0),
     ),
     "system.inspect": (
         _rule("system.inspect", RouteClass.NATIVE_SYSTEM, "system_info", 5, RiskClass.LOW, RecoverabilityClass.STRONG, 5, 1, 1, 0),

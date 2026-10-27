@@ -9,10 +9,26 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from extension_test_utils import write_catalog_epoch
 from mcp import ClientSession, types
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 FIXTURE = Path(__file__).parent / "fixtures" / "fake_mcp_server.py"
+
+
+def test_catalog_epoch_is_published_only_after_complete_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "catalog_epoch"
+    target.write_text("2", encoding="utf-8")
+    original_replace = Path.replace
+
+    def check_before_replace(path: Path, destination: Any) -> Path:
+        assert target.read_text(encoding="utf-8") == "2"
+        assert path.read_text(encoding="utf-8") == "0"
+        return original_replace(path, destination)
+
+    monkeypatch.setattr(Path, "replace", check_before_replace)
+    write_catalog_epoch(tmp_path, 0)
+    assert target.read_text(encoding="utf-8") == "0"
 
 
 def test_fixture_public_session_pages_exact_args_and_one_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -161,10 +177,10 @@ def test_fixture_refresh_and_flood_modes_complete(tmp_path: Path, mode: str) -> 
                 elif mode == "remove":
                     assert "read_value" not in names
                 elif mode == "catalog_change":
-                    (tmp_path / "catalog_epoch").write_text("1", encoding="utf-8")
+                    write_catalog_epoch(tmp_path, 1)
                     changed = await session.list_tools()
                     assert next(t.input_schema for t in changed.tools if t.name == "read_value") != listed.tools[1].input_schema
-                    (tmp_path / "catalog_epoch").write_text("2", encoding="utf-8")
+                    write_catalog_epoch(tmp_path, 2)
                     assert "read_value" not in [t.name for t in (await session.list_tools()).tools]
                 else:
                     assert (await _call(session, "read_value", {})).structured_content

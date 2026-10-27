@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server import MCPServer
 from pydantic import Field
@@ -17,9 +19,9 @@ from core.artifacts import deliver_text
 from core.audit import audit_action
 from core.config import PROJECT_ROOT, SETTINGS, resolve_path
 from core.errors import ToolError
-from core.job_scheduler import ensure_job_scheduler
-from core.jobs import JobStore
+from core.jobs import JobStore, lazy_job_store
 from core.resource_claims import coordination_claim, managed_resource_claims, path_claim
+from core.response_models import validate_tool_output
 from core.runtime_capacity import acquire_runtime_capacity
 from core.tooling import OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 from core.workflow_store import WorkflowStore
@@ -27,6 +29,7 @@ from tools.testing import runners as _runners
 from tools.testing.background import VerificationRequest, submit_verification
 from tools.testing.diagnostics import merge_diagnostics
 from tools.testing.impact import select_affected_tests
+from tools.testing.models import AffectedTestsResult, VerificationResult
 from tools.testing.runners import run_mypy_summary, run_pytest_summary, run_ruff_summary
 from tools.testing.verification import _CHECKS, Check, verify_changed_repository
 
@@ -39,9 +42,10 @@ def _cwd(value: str | None) -> Path:
     return resolve_path(value) if value else PROJECT_ROOT
 
 
-def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
-    watch_store = JobStore()
-    ensure_job_scheduler(watch_store)
+def register(
+    mcp: MCPServer, *, background_enabled: bool = False, store_getter: Callable[[], JobStore] | None = None,
+) -> None:
+    get_store = store_getter or lazy_job_store(lambda: JobStore())
 
     if background_enabled:
 
@@ -53,6 +57,7 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
             changed_paths: Annotated[list[str] | None, Field(max_length=1_000)] = None,
             base: Annotated[str | None, Field(min_length=1, max_length=500)] = None,
             checks: Annotated[list[Check] | None, Field(max_length=4)] = None,
+            test_backend: Literal["python", "auto"] = "python",
             affected_only: bool = True,
             fallback_policy: Literal["report", "select_full_suite"] = "select_full_suite",
             fail_fast: bool = True,
@@ -71,12 +76,13 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
             working = _cwd(repo)
             request = VerificationRequest(
                 repo=str(working), changed_paths=changed_paths, base=base, checks=checks,
+                test_backend=test_backend,
                 affected_only=affected_only, fallback_policy=fallback_policy, fail_fast=fail_fast,
                 maxfail=maxfail, stage_timeout_sec=stage_timeout_sec, total_timeout_sec=total_timeout_sec,
                 ruff_fix=ruff_fix, diagnostic_cap=diagnostic_cap, max_parallel_checks=max_parallel_checks,
             )
             audit_action("start_verification", target=working, details={"check_count": len(checks) if checks is not None else len(_CHECKS)})
-            return submit_verification(watch_store, request, idempotency_key, queue_timeout_sec)
+            return submit_verification(get_store(), request, idempotency_key, queue_timeout_sec)
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("start_validation_watch")
@@ -108,7 +114,7 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
         ]
         request_key = idempotency_key or f"validation-watch-{fingerprint}"
         audit_action("start_validation_watch", target=working, details={"request_key": request_key})
-        return watch_store.submit(
+        return get_store().submit(
             [_runners.python_for(working), *args],
             working,
             max_runtime_sec + 120,
@@ -312,9 +318,10 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
         max_results: Annotated[int, Field(ge=1, le=5_000)] = 500,
         include_changed_tests: bool = True,
         fallback_policy: Literal["report", "select_full_suite"] = "report",
-    ) -> dict[str, Any]:
-        """Select tests affected by changed Python modules and report conservative full-suite fallbacks."""
-        return select_affected_tests(
+        test_backend: Literal["python", "auto"] = "python",
+    ) -> AffectedTestsResult:
+        """Select Python tests; opt into package runner plans with explicit multilingual coverage gaps."""
+        result = select_affected_tests(
             _cwd(repo),
             changed_paths=changed_paths,
             base=base,
@@ -323,7 +330,9 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
             max_results=max_results,
             include_changed_tests=include_changed_tests,
             fallback_policy=fallback_policy,
+            test_backend=test_backend,
         )
+        return cast(AffectedTestsResult, validate_tool_output(AffectedTestsResult, result, operation="affected_tests"))
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("verify_changes")
@@ -332,6 +341,7 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
         changed_paths: Annotated[list[str] | None, Field(max_length=1_000)] = None,
         base: Annotated[str | None, Field(min_length=1, max_length=500)] = None,
         checks: Annotated[list[Check] | None, Field(max_length=4)] = None,
+        test_backend: Literal["python", "auto"] = "python",
         affected_only: bool = True,
         fallback_policy: Literal["report", "select_full_suite"] = "select_full_suite",
         fail_fast: bool = True,
@@ -342,8 +352,13 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
         diagnostic_cap: Annotated[int, Field(ge=1, le=200)] = 30,
         max_parallel_checks: Annotated[int, Field(ge=1, le=3)] = 1,
         delivery: Literal["inline", "file", "auto"] = "inline",
-    ) -> dict[str, Any]:
+    ) -> VerificationResult:
         """Verify changed Python code with syntax, Ruff, mypy, and the narrowest sound pytest scope."""
+        if any(not math.isfinite(value) or value <= 0 for value in (stage_timeout_sec, total_timeout_sec)):
+            raise ValueError("Verification deadlines must be positive finite values")
+        if test_backend == "auto" and (stage_timeout_sec > 600 or total_timeout_sec > 1800):
+            raise ValueError("auto verification requires stage_timeout_sec<=600 and total_timeout_sec<=1800")
+        deadline = time.monotonic() + total_timeout_sec
         working = _cwd(repo)
         audit_action(
             "verify_changes",
@@ -356,25 +371,32 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
                 "requested_parallel_checks": max_parallel_checks,
             },
         )
+        admission_budget = deadline - time.monotonic()
+        if admission_budget <= 0:
+            raise TimeoutError("Verification deadline expired before resource admission.")
         with managed_resource_claims(
             [
                 coordination_claim(),
                 path_claim(working, "write", scope="subtree"),
             ],
             category="native.testing.verify",
-            timeout_sec=total_timeout_sec,
+            timeout_sec=admission_budget,
         ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Verification deadline expired during resource admission.")
             response = verify_changed_repository(
                 working,
                 changed_paths=changed_paths,
                 base=base,
                 checks=checks,
+                test_backend=test_backend,
                 affected_only=affected_only,
                 fallback_policy=fallback_policy,
                 fail_fast=fail_fast,
                 maxfail=maxfail,
                 stage_timeout_sec=stage_timeout_sec,
-                total_timeout_sec=total_timeout_sec,
+                total_timeout_sec=remaining,
                 ruff_fix=ruff_fix,
                 diagnostic_cap=diagnostic_cap,
                 max_parallel_checks=max_parallel_checks,
@@ -386,4 +408,4 @@ def register(mcp: MCPServer, *, background_enabled: bool = False) -> None:
             if delivered["delivery"] == "file":
                 response["artifact"] = delivered
         audit_action("verify_changes", target=working, outcome="completed", details={"ok": response["ok"], "mode": response["mode"]})
-        return response
+        return cast(VerificationResult, validate_tool_output(VerificationResult, response, operation="verify_changes"))

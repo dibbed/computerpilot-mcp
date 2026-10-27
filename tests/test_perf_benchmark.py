@@ -5,12 +5,15 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
+import scripts.perf_benchmark as perf_benchmark
 from core.jobs import JobStore
 from core.registry import create_server
 from scripts.perf_benchmark import (
@@ -31,6 +34,8 @@ from scripts.perf_benchmark import (
     _job_wait_change_once,
     _job_wait_timeout_once,
     _launcher_validation_once,
+    _lsp_session_case,
+    _one_shot_request,
     _output_once,
     _prepare_python_fixture,
     _prepare_workflow_history_fixture,
@@ -47,6 +52,7 @@ from scripts.perf_benchmark import (
     _workflow_start_once,
     _workflow_status_once,
     _workflow_store_reopen_once,
+    build_parser,
     measure,
     run_benchmarks,
 )
@@ -71,8 +77,367 @@ def test_benchmark_profiles_cover_planned_scale_points() -> None:
     assert full["artifact_files"] == [5_000]
     assert full["job_history_rows"] == [2_000]
     assert full["extension_counts"] == [1, 2, 4]
+    assert full["lsp_requests"] == [1, 10, 100]
+    assert full["lsp_workspaces"] == [1, 2]
     quick = PROFILE_LIMITS["quick"]
     assert quick["extension_counts"] == [1, 2]
+    assert quick["lsp_requests"] == [1, 10]
+
+
+def test_native_batch_benchmark_counts_requests_and_checks_equal_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_benchmark, "PROJECT_ROOT", tmp_path)
+    report = perf_benchmark._native_batch_worker(1, include_powershell=False)
+    assert report["workers_cleaned"] is True
+    assert report["warmups"] == 5
+    assert report["wire_scope"] == "NDJSON roundtrip of actual SDK messages; in-memory transport, no tunnel"
+    assert report["denied_dispatches"] == 0
+    assert report["tokenizer"] == "NOT_MEASURED"
+    for count in (1, 4, 8, 16):
+        direct = report["cases"][f"{count}/direct"]
+        assert direct["peak_workers"] is None
+        for parallel in (1, 2, 4):
+            batch = report["cases"][f"{count}/batch{parallel}"]
+            assert batch["errors"] == 0 and batch["output_sha256"] == direct["output_sha256"]
+            assert batch["samples"][0]["requests"] == batch["samples"][0]["responses"] == 1
+            assert direct["samples"][0]["requests"] == count
+            assert batch["samples"][0]["request_frame_bytes"] > 0
+            assert batch["samples"][0]["response_frame_bytes"] > 0
+            assert 0 < batch["peak_workers"] <= parallel
+            if count >= 4:
+                assert batch["synthetic_wait_saving_percent"]["100"] >= 50
+
+
+def test_production_batch_benchmark_dispatches_real_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    from core import config
+    from tools.filesystem.batch import BatchReader
+
+    monkeypatch.setattr(perf_benchmark, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path / "state", memory_dir=tmp_path / "memory"))
+    calls: list[int] = []
+    original = BatchReader.execute
+
+    async def observed(self: Any, root: str, items: Any, max_parallel: int = 1, timeout_sec: float = 10) -> Any:
+        calls.append(len(items))
+        return await original(self, root, items, max_parallel, timeout_sec)
+
+    monkeypatch.setattr(BatchReader, "execute", observed)
+    report = perf_benchmark._native_batch_worker(1, include_powershell=False, production=True)
+    assert report["prototype_only"] is False
+    assert set(calls) == {1, 4, 8, 16} and len(calls) == 4 * 3 * 6
+    for count in (1, 4, 8, 16):
+        direct = report["cases"][f"{count}/direct"]
+        assert direct["peak_workers"] is None
+        for parallel in (1, 2, 4):
+            batch = report["cases"][f"{count}/batch{parallel}"]
+            assert batch["errors"] == 0 and batch["output_sha256"] == direct["output_sha256"]
+            assert batch["samples"][0]["requests"] == batch["samples"][0]["responses"] == 1
+    assert report["workers_cleaned"] is True
+    assert report["production_batch_counters_final"] == {
+        "active_batches": 0, "active_reads": 0, "reserved_response_bytes": 0,
+    }
+    assert report["production_claims_final"] == {
+        "active_resource_request_count": 0, "pending_resource_request_count": 0, "quarantined_resource_request_count": 0,
+    }
+
+
+def test_production_benchmark_requires_explicit_report_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_benchmark, "_cleanup_managed_reports", lambda: pytest.fail("Touched managed report state"))
+    with pytest.raises(SystemExit):
+        perf_benchmark.main(["--suite", "native_batch_production", "--runs", "1"])
+
+
+def test_production_benchmark_rejects_mixed_suites_before_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_benchmark, "_cleanup_stale_temp_roots", lambda: pytest.fail("Touched managed benchmark state"))
+    with pytest.raises(ValueError, match="production"):
+        perf_benchmark.run_benchmarks(
+            profile="quick", runs=1, suites={"native_batch_production", "catalog"}, include_jobs=False, include_browser=False,
+        )
+
+
+def test_production_benchmark_does_not_write_parent_timing_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import timings
+
+    for directory in ("core", "tools", "scripts"):
+        (tmp_path / directory).mkdir()
+    monkeypatch.setattr(perf_benchmark, "PROJECT_ROOT", tmp_path)
+    timing_log = tmp_path / "operator-timings.jsonl"
+    monkeypatch.setenv("MCP_TIMINGS", "1")
+    monkeypatch.setenv("MCP_TIMINGS_FILE", str(timing_log))
+    enqueued: list[Any] = []
+    monkeypatch.setattr(timings, "_enqueue_record", lambda *args: enqueued.append(args))
+
+    def simulated_run(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        timings.record_timing("benchmark-test", 1)
+        return {"exit_code": 0, "stdout": {"text": json.dumps({"workers_cleaned": True, "cases": {}})}}
+
+    monkeypatch.setattr(perf_benchmark, "run_bounded", simulated_run)
+    result = perf_benchmark._exec_cost_once(1, False, suite="native_batch_production")
+    assert result["status"] == "ok" and not enqueued and not timing_log.exists()
+
+
+def test_benchmark_unreadable_launcher_does_not_weaken_strict_hashing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    launcher = tmp_path / "pwsh.EXE"
+    launcher.write_bytes(b"executable")
+    digest, status = perf_benchmark._benchmark_launcher_fingerprint(str(launcher))
+    assert status == "verified" and len(digest or "") == 64
+
+    def fail_to_open(_: Path) -> str:
+        raise OSError(22, "unreadable Windows Store launcher")
+
+    monkeypatch.setattr(perf_benchmark, "_hash_file", fail_to_open)
+    assert perf_benchmark._benchmark_launcher_fingerprint(str(launcher)) == (None, "unreadable_launcher")
+    assert perf_benchmark._benchmark_launcher_fingerprint(None) == (None, "unavailable")
+    with pytest.raises(OSError):
+        perf_benchmark._hash_file(launcher)
+
+
+def test_exec_cost_suite_rejects_unequal_or_failed_samples() -> None:
+    summarize = perf_benchmark._exec_cost_summary
+    good = {"elapsed_ms": 2.0, "sha256": "a" * 64, "process_launches": 0, "claim_wait_ms": 0.0}
+    result = summarize([good, {**good, "elapsed_ms": 4.0}], "a" * 64)
+    assert result["status"] == "ok"
+    assert result["p50_ms"] == 3.0
+    assert result["p95_ms"] >= result["p50_ms"]
+    assert result["p99_exploratory"] is True
+    for samples in ([{**good, "sha256": "b" * 64}], [{"error": "canary-private-payload"}], []):
+        failed = summarize(samples, "a" * 64)
+        assert failed["status"] == "error"
+        assert failed["comparable"] is False
+        assert "p50_ms" not in failed
+        assert "canary-private-payload" not in json.dumps(failed)
+
+
+def test_exec_cost_registered_suite_uses_requested_repeats(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, bool]] = []
+
+    def fake(repeats: int, include_jobs: bool) -> dict[str, Any]:
+        calls.append((repeats, include_jobs))
+        return {"name": "exec_cost", "status": "ok"}
+
+    monkeypatch.setattr(perf_benchmark, "_exec_cost_once", fake)
+    monkeypatch.setattr(perf_benchmark, "_cleanup_stale_temp_roots", lambda: 0)
+    assert build_parser().parse_args(["--suite", "exec_cost"]).suites == ["exec_cost"]
+    report = run_benchmarks(profile="quick", runs=30, suites={"exec_cost"}, include_jobs=True, include_browser=False)
+    assert calls == [(30, True)]
+    assert report["results"] == [{"name": "exec_cost", "status": "ok"}]
+
+
+def test_exec_cost_real_sdk_paths_are_equivalent_and_isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(perf_benchmark.subprocess, "check_output", lambda *a, **k: pytest.fail("benchmark requires Git metadata"))
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path / "must-not-create"))
+    monkeypatch.setenv("MCP_WORKFLOW_DAG_ENABLED", "1")
+    monkeypatch.setenv("MCP_TOOL_PROFILE", "coding_core")
+    from core.resource_claims import coordination_claim, managed_resource_claims, path_claim
+    from core.workflow_store import WorkflowStore
+
+    parent = WorkflowStore(tmp_path / "parent" / "workflows.sqlite3", recover=False)
+    with managed_resource_claims(
+        (coordination_claim(exclusive=True), path_claim(tmp_path, "write", scope="subtree")),
+        category="test", store=parent,
+    ):
+        report = perf_benchmark._exec_cost_once(1, True)
+        assert parent.health_summary()["active_resource_request_count"] == 1
+    assert parent.health_summary()["active_resource_request_count"] == 0
+    assert report["status"] == "ok"
+    assert report["workers_cleaned"] is True
+    assert not (tmp_path / "must-not-create").exists()
+    assert len(report["cases"]) == (12 if report["powershell_available"] else 10)
+    for case in report["cases"].values():
+        assert case["status"] == "ok"
+        assert case["count"] == 1
+        assert case["errors"] == 0
+    assert report["cases"]["short/job"]["output_sha256"] == report["cases"]["short/direct"]["output_sha256"]
+
+
+@pytest.mark.parametrize("repeats", [0, 101])
+def test_exec_cost_bounds_work_before_launch(repeats: int) -> None:
+    with pytest.raises(ValueError, match="paired repeats"):
+        perf_benchmark._exec_cost_once(repeats, False)
+
+
+def test_exec_cost_retains_failed_fixture_without_raw_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs["env"]["MCP_WORKFLOW_DAG_ENABLED"] == "0"
+        return {"exit_code": 1, "stderr": {"text": "secret-canary"}}
+
+    monkeypatch.setattr(perf_benchmark, "run_bounded", fail)
+    report = perf_benchmark._exec_cost_once(1, False)
+    retained = Path(report["retained_fixture"])
+    try:
+        assert report["status"] == "error"
+        assert report["comparable"] is False
+        assert retained.is_dir()
+        assert "secret-canary" not in json.dumps(report)
+    finally:
+        # This fake never spawned a worker; its disposable fixture can be removed.
+        import shutil
+
+        assert retained.parent.resolve() == Path(perf_benchmark.tempfile.gettempdir()).resolve()
+        shutil.rmtree(retained)
+
+
+_LSP_DETAIL_KEYS = {
+    "elapsed",
+    "p50",
+    "p95",
+    "p99",
+    "spawns",
+    "restarts",
+    "max_queue",
+    "peak_rss",
+    "open_handles",
+    "errors",
+}
+
+
+def test_lsp_benchmark_reports_spawn_counts_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    persistent = _lsp_session_case(4, 2, True)
+    warmed = _lsp_session_case(1, 2, True)
+    cold = _lsp_session_case(1, 1, True)
+    one_shot = _lsp_session_case(2, 1, False)
+
+    assert persistent["spawns"] == 2
+    assert warmed["spawns"] == 2
+    assert cold["spawns"] == 1
+    assert one_shot["spawns"] == 2
+    for name, case in (
+        ("persistent", persistent),
+        ("warmed", warmed),
+        ("cold", cold),
+        ("one_shot", one_shot),
+    ):
+        assert set(case) == _LSP_DETAIL_KEYS, name
+        assert case["errors"] == 0, name
+        assert case["restarts"] == 0, name
+        assert cast(float, case["elapsed"]) > 0, name
+        assert 0 <= cast(float, case["p50"]) <= cast(float, case["p99"]), name
+        assert 0 <= cast(float, case["p95"]) <= cast(float, case["p99"]), name
+        assert cast(int, case["max_queue"]) >= 0, name
+        assert cast(float, case["peak_rss"]) > 0, name
+        assert cast(int, case["open_handles"]) > 0, name
+
+
+def test_one_shot_request_samples_while_request_is_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    release = threading.Event()
+
+    class FakeClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def request(self, *_args: object, **_kwargs: object) -> object:
+            assert release.wait(2)
+            return {}
+
+    def sample() -> None:
+        calls.append(1)
+        if len(calls) >= 2:
+            release.set()
+
+    monkeypatch.setattr(perf_benchmark, "LspClient", FakeClient)
+    monkeypatch.setattr(perf_benchmark, "command_for", lambda _provider: ["python"])
+    sampler: Any = SimpleNamespace(_sample_once=sample)
+    succeeded, elapsed_ms = _one_shot_request(cast(Any, object()), tmp_path, 0, sampler)
+
+    assert succeeded is True
+    assert elapsed_ms > 0
+    assert len(calls) >= 2
+
+
+def test_lsp_benchmark_fails_closed_on_request_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+
+    class FailingClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def request(self, *args: object, **kwargs: object) -> object:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(perf_benchmark, "LspClient", FailingClient)
+    result = measure("lsp_failure", lambda: _lsp_session_case(1, 1, False), 1)
+    assert result["status"] == "error"
+    assert result["error"] == "RuntimeError"
+    assert "LSP request" in result["message"]
+
+
+def test_lsp_persistent_benchmark_fails_closed_on_request_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+
+    async def failing_arequest(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(perf_benchmark.LspSessionManager, "arequest", failing_arequest)
+    result = measure("lsp_persistent_failure", lambda: _lsp_session_case(1, 1, True), 1)
+    assert result["status"] == "error"
+    assert result["error"] == "RuntimeError"
+    assert "LSP request" in result["message"]
+
+
+def test_lsp_persistent_benchmark_fails_closed_on_warmup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    calls = 0
+
+    async def warmup_failing_arequest(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("warmup boom")
+        return {"ok": True}
+
+    monkeypatch.setattr(perf_benchmark.LspSessionManager, "arequest", warmup_failing_arequest)
+    result = measure("lsp_warmup_failure", lambda: _lsp_session_case(1, 1, True), 1)
+    assert result["status"] == "error"
+    assert result["error"] == "RuntimeError"
+    assert "LSP request" in result["message"]
+    assert calls == 2
+
+
+def test_lsp_suite_runs_through_benchmark_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(perf_benchmark, "SETTINGS", SimpleNamespace(state_dir=tmp_path))
+    parser = build_parser()
+    assert parser.parse_args(["--suite", "lsp"]).suites == ["lsp"]
+
+    report = run_benchmarks(
+        profile="quick",
+        runs=1,
+        suites={"lsp"},
+        include_jobs=False,
+        include_browser=False,
+    )
+    cases = {item["name"]: item for item in report["results"]}
+    expected_spawns = {
+        f"lsp_persistent_{requests}_requests_{workspaces}_workspaces": workspaces
+        for requests in (1, 10)
+        for workspaces in (1, 2)
+    }
+    expected_spawns.update({
+        f"lsp_one_shot_{requests}_requests_{workspaces}_workspaces": requests
+        for requests in (1, 10)
+        for workspaces in (1, 2)
+    })
+    assert set(cases) == set(expected_spawns)
+    assert len(report["results"]) == len(expected_spawns)
+    assert all(item["status"] == "ok" for item in report["results"])
+    for name, expected in expected_spawns.items():
+        details = cases[name]["details"]
+        assert details["errors"] == 0, name
+        assert details["spawns"] == expected, name
 
 
 def test_browser_pool_details_report_instances_contexts_and_keys() -> None:
@@ -196,6 +561,12 @@ def test_catalog_benchmark_uses_complete_wire_tool_models() -> None:
     wire_catalog = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
     expected = len(json.dumps(wire_catalog, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     assert result["details"]["catalog_json_bytes"] == expected
+    expected_output_bytes = sum(
+        len(json.dumps(tool["outputSchema"], ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        for tool in wire_catalog if "outputSchema" in tool
+    )
+    assert 0 < expected_output_bytes < expected
+    assert result["details"]["output_schema_json_bytes"] == expected_output_bytes
 
 
 def test_resilience_benchmarks_cover_recovery_uia_and_workflow(tmp_path: Path) -> None:

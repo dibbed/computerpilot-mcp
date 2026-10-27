@@ -17,7 +17,7 @@ from core.recovery import (
     uses_native_uia_dispatch_protocol,
 )
 from core.response import failure
-from core.timings import tool_timing
+from core.timings import tool_timing, trace_operation
 from core.tool_activity import TOOL_ACTIVITY
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
@@ -150,12 +150,22 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                                     target,
                                     native_uia_protocol=uses_native_uia_dispatch_protocol(operation),
                                 )
+                                recovery_scope = None
                                 try:
-                                    with operation_recovery_context(handle):
+                                    with (
+                                        operation_recovery_context(handle) as recovery_scope,
+                                        trace_operation(handle.operation_id if handle is not None else None),
+                                    ):
                                         result = await fn(*args, **kwargs)
                                 except BaseException:
                                     try:
-                                        OPERATION_RECOVERY.finish(handle, known_result="raised")
+                                        if (
+                                            recovery_scope is not None
+                                            and recovery_scope.native_test_dispatch.is_set()
+                                        ):
+                                            OPERATION_RECOVERY.mark_uncertain(handle, "native_test_execution_outcome_unknown")
+                                        else:
+                                            OPERATION_RECOVERY.finish(handle, known_result="raised")
                                     except Exception:
                                         pass
                                     raise
@@ -179,12 +189,22 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                                 target,
                                 native_uia_protocol=uses_native_uia_dispatch_protocol(operation),
                             )
+                            recovery_scope = None
                             try:
-                                with operation_recovery_context(handle):
+                                with (
+                                    operation_recovery_context(handle) as recovery_scope,
+                                    trace_operation(handle.operation_id if handle is not None else None),
+                                ):
                                     result = fn(*args, **kwargs)
                             except BaseException:
                                 try:
-                                    OPERATION_RECOVERY.finish(handle, known_result="raised")
+                                    if (
+                                        recovery_scope is not None
+                                        and recovery_scope.native_test_dispatch.is_set()
+                                    ):
+                                        OPERATION_RECOVERY.mark_uncertain(handle, "native_test_execution_outcome_unknown")
+                                    else:
+                                        OPERATION_RECOVERY.finish(handle, known_result="raised")
                                 except Exception:
                                     pass
                                 raise

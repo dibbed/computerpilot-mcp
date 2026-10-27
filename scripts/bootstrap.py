@@ -75,8 +75,21 @@ def imports_healthy() -> bool:
     return all(importlib.util.find_spec(name) is not None for name in _required_imports())
 
 
-def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=ROOT, text=True, check=False)
+def _run(command: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    if timeout is None:
+        return subprocess.run(command, cwd=ROOT, text=True, check=False)
+    try:
+        from core.process_ownership import spawn_owned_process
+
+        process = spawn_owned_process(
+            command, cwd=ROOT, env=None, stdin=None, stdout=None, stderr=None, creationflags=0, require_native=True,
+        )
+        try:
+            return subprocess.CompletedProcess(command, process.wait(timeout=timeout))
+        finally:
+            process.close_ownership()
+    except Exception as exc:
+        raise BootstrapError(f"Startup Doctor: {type(exc).__name__}; watchdog budget {timeout:g}s.", 15) from None
 
 
 def _mode() -> str:
@@ -125,7 +138,9 @@ def _resolve_tunnel() -> str:
 
 
 def _doctor_check(mode: str, profile: str) -> bool:
-    result = _run([sys.executable, "-m", "scripts.doctor", "--check", "--mode", mode, "--profile", profile])
+    if not imports_healthy():
+        return False
+    result = _run([sys.executable, "-m", "scripts.doctor", "--check", "--mode", mode, "--profile", profile], timeout=30)
     return result.returncode == 0
 
 
@@ -166,7 +181,7 @@ def _ensure_dependencies() -> None:
 
 
 def _full_doctor(mode: str, profile: str) -> None:
-    result = _run([sys.executable, "-m", "scripts.doctor", "--mode", mode, "--profile", profile])
+    result = _run([sys.executable, "-m", "scripts.doctor", "--mode", mode, "--profile", profile], timeout=900)
     if result.returncode:
         raise BootstrapError("Full doctor failed; run python -m scripts.doctor for diagnosis.", 15)
 

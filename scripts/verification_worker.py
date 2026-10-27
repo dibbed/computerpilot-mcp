@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from core.config import SETTINGS
+from core.errors import ToolError
+from core.recovery import native_test_dispatched
 from tools.testing.background import (
     MAX_EVENT_BYTES,
     MAX_REQUEST_BYTES,
@@ -35,6 +37,9 @@ def _bounded(value: Any, depth: int = 0) -> Any:
 
 def run_request(payload: str) -> int:
     sent = 0
+    execution_uncertain = False
+    execution_possible = False
+    result_received = False
 
     def emit(event: str, data: dict[str, Any], *, force: bool = False) -> None:
         nonlocal sent
@@ -56,12 +61,21 @@ def run_request(payload: str) -> int:
         print(line, flush=True)
         sent += size
 
+    def stage_event(event: str, data: dict[str, Any]) -> None:
+        nonlocal execution_possible
+        try:
+            execution_possible = native_test_dispatched() or execution_possible
+        except ToolError:
+            pass
+        emit(event, data)
+
     try:
         if len(payload.encode("utf-8")) > MAX_REQUEST_BYTES:
             raise ValueError("Request quota exceeded")
         request = VerificationRequest.model_validate_json(payload)
         repo = request_root(request)
-        before = source_fingerprint(repo, changed_paths=request.changed_paths)
+        snapshot_paths = request.snapshot_input_paths if request.snapshot_input_paths is not None else request.changed_paths
+        before = source_fingerprint(repo, changed_paths=snapshot_paths)
         emit("started", {"source_fingerprint": request.source_fingerprint})
         if before != request.source_fingerprint:
             emit("result", {"ok": False, "required_unknown": True, "freshness": "stale", "stages": []})
@@ -69,30 +83,41 @@ def run_request(payload: str) -> int:
         with tempfile.TemporaryDirectory(prefix="computerpilot-verification-", ignore_cleanup_errors=True) as temporary:
             result = verify_changed_repository(
                 repo, **request.options(),
-                stage_callback=lambda event, data: emit(event, data),
+                stage_callback=stage_event,
                 max_parallel_checks=request.max_parallel_checks,
+                runner_specs=request.runner_specs,
                 analyzer_capacity_db=SETTINGS.workflow_db,
                 analyzer_capacity_limit=SETTINGS.max_running_analyzers,
                 pytest_extra_args=["--basetemp", str(Path(temporary) / "pytest"), "-o", f"cache_dir={temporary}/cache"],
             )
-        after = source_fingerprint(repo, changed_paths=request.changed_paths)
+            execution_uncertain = bool(result.get("execution_uncertain"))
+            result_received = True
+        after = source_fingerprint(repo, changed_paths=snapshot_paths)
         fresh = before == after
         emit("result", {
             "ok": bool(result["ok"] and fresh), "required_unknown": bool(result["required_unknown"] or not fresh),
             "freshness": "current" if fresh else "stale", "source_fingerprint": before,
             "final_fingerprint": after, "mode": result["mode"], "stages": result["stages"],
             "duration_ms": result["duration_ms"],
+            "tests_executed": bool(result.get("tests_executed")), "claim_testing": bool(result.get("claim_testing")),
+            **({"execution_uncertain": True} if execution_uncertain else {}),
         })
         return 0 if result["ok"] and fresh else 1
     except Exception as exc:
+        execution_uncertain = execution_uncertain or (execution_possible and not result_received)
         # Native worker errors must not echo request contents or arbitrary analyzer payloads.
         try:
-            emit("result", {"ok": False, "required_unknown": True, "freshness": "unknown", "error": type(exc).__name__}, force=True)
+            emit("result", {
+                "ok": False, "required_unknown": True, "freshness": "unknown", "error": type(exc).__name__,
+                **({"execution_uncertain": True} if execution_uncertain else {}),
+            }, force=True)
         except Exception:
             fallback = (
                 '{"schema_version":1,"event":"result","ok":false,"required_unknown":true,'
                 '"freshness":"unknown","error":"FatalWorkerError"}'
             )
+            if execution_uncertain:
+                fallback = fallback[:-1] + ',"execution_uncertain":true}'
             print(fallback, flush=True)
         return 1
 

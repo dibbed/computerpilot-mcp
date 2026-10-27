@@ -10,6 +10,7 @@ from pathlib import Path
 import anyio
 import psutil
 import pytest
+from extension_test_utils import write_catalog_epoch
 from mcp import Client, ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.shared.subscriptions import ToolsListChanged
@@ -112,13 +113,13 @@ def test_actual_http_entrypoint_exposes_modern_external_tools(tmp_path: Path) ->
                     assert not result.is_error and result.structured_content is not None
                     assert result.structured_content["structured_content"]["arguments"] == arguments
                     async with client.listen(tools_list_changed=True) as subscription:
-                        (tmp_path / "catalog_epoch").write_text("2", encoding="utf-8")
+                        write_catalog_epoch(tmp_path, 2)
                         with anyio.fail_after(5):
                             while True:
                                 assert isinstance(await subscription.__anext__(), ToolsListChanged)
                                 if NAME not in {tool.name for tool in (await client.list_tools()).tools}:
                                     break
-                        (tmp_path / "catalog_epoch").write_text("0", encoding="utf-8")
+                        write_catalog_epoch(tmp_path, 0)
                         with anyio.fail_after(5):
                             while True:
                                 assert isinstance(await subscription.__anext__(), ToolsListChanged)

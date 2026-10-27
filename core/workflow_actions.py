@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import math
 import subprocess
 import time
 import urllib.error
@@ -49,6 +50,7 @@ class VerifyChangesInput(_ActionInput):
     changed_paths: list[str] | None = None
     base: str | None = None
     checks: list[str] | None = None
+    test_backend: Literal["python", "auto"] = "python"
     affected_only: bool = True
     fallback_policy: str = "select_full_suite"
     fail_fast: bool = False
@@ -225,6 +227,7 @@ def _verify_changes(arguments: dict[str, Any], timeout_sec: float) -> dict[str, 
             "changed_paths",
             "base",
             "checks",
+            "test_backend",
             "affected_only",
             "fallback_policy",
             "fail_fast",
@@ -236,28 +239,44 @@ def _verify_changes(arguments: dict[str, Any], timeout_sec: float) -> dict[str, 
             "max_parallel_checks",
         }
     }
-    deadline = time.monotonic() + timeout_sec
-    allowed["total_timeout_sec"] = min(float(allowed.get("total_timeout_sec", timeout_sec)), timeout_sec)
+    stage_budget = float(allowed.get("stage_timeout_sec", 300))
+    total_budget = float(allowed.get("total_timeout_sec", timeout_sec))
+    if any(not math.isfinite(value) or value <= 0 for value in (stage_budget, total_budget, timeout_sec)):
+        raise ValueError("Verification deadlines must be positive finite values")
+    if allowed.get("test_backend") == "auto" and (stage_budget > 600 or total_budget > 1800):
+        raise ValueError("auto verification requires stage_timeout_sec<=600 and total_timeout_sec<=1800")
+    if stage_budget > 3600 or total_budget > 7200:
+        raise ValueError("Verification deadlines exceed the supported limits")
+    effective_budget = min(total_budget, timeout_sec)
+    deadline = time.monotonic() + effective_budget
+    allowed["total_timeout_sec"] = effective_budget
     repo = resolve_path(str(arguments.get("cwd", ".")))
     # Sequential workflows do not inherit a DAG resource capability. The
     # verifier may write via pytest or Ruff fix, so coordinate its full subtree
     # before invoking any analyzer; DAG callers safely reuse the parent claim.
-    with managed_resource_claims(
-        (coordination_claim(), path_claim(repo, "write", scope="subtree")),
-        category="workflow.verify_changes",
-        timeout_sec=timeout_sec,
-        db_path=SETTINGS.workflow_db,
-    ):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("Workflow verification deadline expired during resource admission.")
-        allowed["total_timeout_sec"] = min(float(allowed["total_timeout_sec"]), remaining)
-        result = verify_changed_repository(
-            repo,
-            **allowed,
-            analyzer_capacity_db=SETTINGS.workflow_db,
-            analyzer_capacity_limit=SETTINGS.max_running_analyzers,
-        )
+    try:
+        with managed_resource_claims(
+            (coordination_claim(), path_claim(repo, "write", scope="subtree")),
+            category="workflow.verify_changes",
+            timeout_sec=effective_budget,
+            db_path=SETTINGS.workflow_db,
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Workflow verification deadline expired during resource admission.")
+            allowed["total_timeout_sec"] = min(float(allowed["total_timeout_sec"]), remaining)
+            result = verify_changed_repository(
+                repo,
+                **allowed,
+                analyzer_capacity_db=SETTINGS.workflow_db,
+                analyzer_capacity_limit=SETTINGS.max_running_analyzers,
+            )
+    except ToolError as error:
+        if error.code == "process_cleanup_incomplete":
+            raise SideEffectUncertain("Verification process cleanup could not be confirmed.") from None
+        raise
+    if result.get("execution_uncertain"):
+        raise SideEffectUncertain("Verification ended without a known execution result.")
     if not result.get("ok"):
         raise ToolError("workflow_verification_failed", "Change-aware verification did not pass.")
     return result

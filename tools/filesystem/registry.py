@@ -7,7 +7,7 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,8 +20,11 @@ from core.media import image_tool_result, inspect_image
 from core.resource_claims import coordination_claim, managed_path_claims, managed_resource_claims, path_claim
 from core.resource_locks import RESOURCE_LOCKS
 from core.response import ok, page
+from core.response_models import validate_tool_output
 from core.tooling import DESTRUCTIVE, MUTATING, READ_ONLY, PathArg, compact_errors
 from tools.filesystem import service
+from tools.filesystem.batch import BatchReader, BatchResult, ReadItem
+from tools.filesystem.models import SearchFilesResult
 from tools.filesystem.patches import PatchLimits, apply_patch_transaction
 from tools.filesystem.search_snapshots import SEARCH_SNAPSHOTS, search_fingerprint
 from tools.project.index import PYTHON_METADATA_CACHE
@@ -97,7 +100,22 @@ def _model_image_result(target: Path) -> dict[str, Any]:
     return image_tool_result(metadata, target, delivery="auto")
 
 
-def register(mcp: MCPServer) -> None:
+def register(mcp: MCPServer, *, batch_enabled: bool = False) -> None:
+    if batch_enabled:
+        reader = BatchReader(mcp)
+        cast(Any, mcp).native_read_batch_state = reader
+
+        @mcp.tool(annotations=READ_ONLY, structured_output=True)
+        @compact_errors("native_read_batch")
+        async def native_read_batch(
+            root: PathArg,
+            items: Annotated[list[ReadItem], Field(min_length=1, max_length=16)],
+            max_parallel: Annotated[int, Field(strict=True, ge=1, le=4)] = 1,
+            timeout_sec: Annotated[float, Field(strict=True, gt=0, le=60, allow_inf_nan=False)] = 10,
+        ) -> BatchResult:
+            """Read independent local text windows in one bounded response; no shared snapshot or hard I/O timeout."""
+            return await reader.execute(root, items, max_parallel, timeout_sec)
+
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("view_image")
     def view_image(path: PathArg) -> dict[str, Any]:
@@ -313,8 +331,11 @@ def register(mcp: MCPServer) -> None:
         max_results: Annotated[int, Field(ge=1, le=500)] = 50,
         max_scan_files: Annotated[int, Field(ge=100, le=500_000)] = 100_000,
         timeout_sec: Annotated[float, Field(gt=0, le=300)] = 30,
-    ) -> dict[str, Any]:
+    ) -> SearchFilesResult:
         """Search files with optional fast first-page mode or immutable snapshot cursors."""
+
+        def wire(result: dict[str, Any]) -> SearchFilesResult:
+            return cast(SearchFilesResult, validate_tool_output(SearchFilesResult, result, operation="search_files"))
 
         root = resolve_path(path)
         fingerprint = search_fingerprint(
@@ -338,12 +359,12 @@ def register(mcp: MCPServer) -> None:
             if offset != 0:
                 raise ToolError("ambiguous_search_pagination", "offset must remain 0 when continuing with cursor.")
             snapshot_page = SEARCH_SNAPSHOTS.read_page(cursor, fingerprint=fingerprint, limit=max_results)
-            return {
+            return wire({
                 "ok": True,
                 "root": str(root),
                 "scanned_files": 0,
                 **SEARCH_SNAPSHOTS.public_page(snapshot_page),
-            }
+            })
 
         if not root.is_dir():
             raise NotADirectoryError(f"Directory not found: {root}")
@@ -378,12 +399,12 @@ def register(mcp: MCPServer) -> None:
                     total_count=None,
                 )
                 snapshot_page = SEARCH_SNAPSHOTS.first_page(handle, fingerprint=fingerprint, limit=max_results)
-                return {
+                return wire({
                     "ok": True,
                     "root": str(root),
                     "snapshot_created": True,
                     **SEARCH_SNAPSHOTS.public_page(snapshot_page),
-                }
+                })
 
             streamed = service.search_by_name_streaming(
                 root,
@@ -399,7 +420,7 @@ def register(mcp: MCPServer) -> None:
             )
             items = [{"path": str(item), "matched_in": ["name"]} for item in streamed.items]
             next_offset = offset + len(items) if streamed.continuation_available else None
-            return {
+            return wire({
                 "ok": True,
                 "root": str(root),
                 "scan_truncated": streamed.scan_truncated,
@@ -414,7 +435,7 @@ def register(mcp: MCPServer) -> None:
                 "next_offset": next_offset,
                 "cursor": None,
                 "truncated": streamed.has_more,
-            }
+            })
 
         matches: dict[str, set[str]] = {}
         truncated = False
@@ -461,17 +482,17 @@ def register(mcp: MCPServer) -> None:
                 total_count=total,
             )
             snapshot_page = SEARCH_SNAPSHOTS.first_page(handle, fingerprint=fingerprint, limit=max_results)
-            return {
+            return wire({
                 "ok": True,
                 "root": str(root),
                 "snapshot_created": True,
                 **SEARCH_SNAPSHOTS.public_page(snapshot_page),
-            }
+            })
 
         total = len(ordered)
         result = page(ordered[offset : offset + max_results], total=total, offset=offset, limit=max_results)
         result["truncated"] = bool(result["truncated"] or truncated)
-        return {
+        return wire({
             "ok": True,
             "root": str(root),
             "scan_truncated": truncated,
@@ -479,7 +500,7 @@ def register(mcp: MCPServer) -> None:
             "result_order": "path",
             "cursor": None,
             **result,
-        }
+        })
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("list_directory")
@@ -551,7 +572,7 @@ def register(mcp: MCPServer) -> None:
         backup: bool = True,
         validate_python: bool = True,
     ) -> dict[str, Any]:
-        """Replace an exact small fragment only when its match count is known."""
+        """Replace an exact fragment with a known match count. For independent edits: safe_refactor (one file), apply_patch (files)."""
         with managed_path_claims(path, category="native.filesystem"), RESOURCE_LOCKS.sync(path):
             target, before, used_encoding = service.load_text(path, encoding)
             after, count = service.exact_replace(before, old, new, expected_count)

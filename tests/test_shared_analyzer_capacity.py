@@ -7,11 +7,21 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from tools.testing import verification
+
+
+@pytest.fixture(autouse=True)
+def _isolated_runtime_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import config
+
+    settings = replace(config.SETTINGS, state_dir=tmp_path / "runtime-state")
+    monkeypatch.setattr(config, "SETTINGS", settings)
+    monkeypatch.setattr(verification, "SETTINGS", settings)
 
 
 @pytest.mark.parametrize("storage_failure", [False, True])
@@ -191,9 +201,10 @@ def test_parallel_verifications_share_durable_analyzer_capacity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "a.py").write_text("value = 1\n", encoding="utf-8")
+    repos = [tmp_path / "first", tmp_path / "second"]
+    for repo in repos:
+        repo.mkdir()
+        (repo / "a.py").write_text("value = 1\n", encoding="utf-8")
     capacity_db = tmp_path / "capacity.sqlite3"
     lock = threading.Lock()
     active = 0
@@ -222,25 +233,24 @@ def test_parallel_verifications_share_durable_analyzer_capacity(
     monkeypatch.setattr(verification, "run_mypy_summary", fake_runner)
     monkeypatch.setattr(verification, "run_pytest_summary", fake_runner)
 
-    def run_one() -> dict[str, object]:
+    def run_one(repo: Path) -> dict[str, object]:
         return verification.verify_changed_repository(
             repo,
             changed_paths=["a.py"],
-            checks=["ruff", "mypy", "pytest"],
+            checks=["ruff"],
             affected_only=False,
             fail_fast=False,
             total_timeout_sec=5,
-            max_parallel_checks=3,
             analyzer_capacity_db=capacity_db,
-            analyzer_capacity_limit=2,
+            analyzer_capacity_limit=1,
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        first, second = list(pool.map(lambda _: run_one(), range(2)))
+        first, second = list(pool.map(run_one, repos))
 
     assert first["ok"] is True
     assert second["ok"] is True
-    assert peak == 2
+    assert peak == 1
 
 
 def test_analyzer_capacity_is_enforced_across_os_processes(tmp_path: Path) -> None:

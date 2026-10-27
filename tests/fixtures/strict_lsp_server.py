@@ -85,6 +85,20 @@ while True:
                     }
                 )
                 continue
+        if method == "textDocument/diagnostic":
+            diagnostic_result: dict[str, object]
+            if isinstance(params, dict) and params.get("previousResultId") == "fixture-v1":
+                diagnostic_result = {"kind": "unchanged", "resultId": "fixture-v1"}
+            else:
+                diagnostic_result = {
+                    "kind": "full", "resultId": "fixture-v1", "items": [{
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                        "severity": 2, "message": "Fixture warning", "source": "fixture",
+                        "data": {"token": "private-protocol-canary"},
+                    }],
+                }
+            write_message({"jsonrpc": "2.0", "id": message["id"], "result": diagnostic_result})
+            continue
         write_message(
             {
                 "jsonrpc": "2.0",

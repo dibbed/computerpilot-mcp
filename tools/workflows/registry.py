@@ -6,8 +6,9 @@ import asyncio
 import os
 import uuid
 from dataclasses import asdict
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
+import anyio
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -16,9 +17,11 @@ from core.config import SETTINGS
 from core.errors import ToolError
 from core.execution_router import build_route_planner
 from core.platform import detect_capabilities
+from core.recovery import bind_operation_recovery
+from core.response_models import WorkflowStatusResult, validate_tool_output
 from core.tooling import MUTATING, READ_ONLY, compact_errors
 from core.workflow_actions import get_action_descriptor, validate_workflow_definition
-from core.workflow_models import OperationState
+from core.workflow_models import OperationState, StepState
 from core.workflow_reconciliation import acknowledge_operation, reconcile_operation
 from core.workflow_store import redact_inputs
 from core.workflows import StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, workflow_store
@@ -137,9 +140,14 @@ def register(mcp: MCPServer) -> None:
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("workflow_status")
-    def workflow_status(workflow_id: Annotated[str, Field(min_length=1, max_length=128)]) -> dict[str, Any]:
+    def workflow_status(workflow_id: Annotated[str, Field(min_length=1, max_length=128)]) -> WorkflowStatusResult:
         """Return durable workflow state, redacted inputs, and step checkpoints."""
-        return workflow_store(SETTINGS.workflow_db).get(workflow_id)
+        result = workflow_store(SETTINGS.workflow_db).get(workflow_id)
+        if result.get("state") not in WorkflowState._value2member_map_ or any(
+            step.get("state") not in StepState._value2member_map_ for step in result.get("steps", [])
+        ):
+            raise ToolError("output_version_unsupported", "The stored workflow status version is unsupported.")
+        return cast(WorkflowStatusResult, validate_tool_output(WorkflowStatusResult, result, operation="workflow_status"))
 
     @mcp.tool(annotations=MUTATING, structured_output=True)
     @compact_errors("workflow_execute")
@@ -176,13 +184,25 @@ def register(mcp: MCPServer) -> None:
         )
 
         executor = WorkflowExecutor(store, route_planner=route_planner)
-        result = await asyncio.to_thread(
-            executor.execute,
-            workflow_id,
-            owner_id=_mcp_owner_id(),
-            dry_run=False,
-            lease_ttl_sec=lease_ttl_sec,
-        )
+        owner_id = _mcp_owner_id()
+        call = bind_operation_recovery(lambda: executor.execute(
+            workflow_id, owner_id=owner_id, dry_run=False, lease_ttl_sec=lease_ttl_sec,
+        ))
+        cancelled = False
+        try:
+            with anyio.CancelScope(shield=True):
+                worker = asyncio.create_task(anyio.to_thread.run_sync(call, abandon_on_cancel=False))
+                while True:
+                    try:
+                        result = await asyncio.shield(worker)
+                        break
+                    except asyncio.CancelledError:
+                        if worker.cancelled():
+                            raise
+                        cancelled = True
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError
         if not dry_run:
             audit_action("workflow_execute", target=workflow_id, details={"state": result["state"]}, durable=True)
         return result

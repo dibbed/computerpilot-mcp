@@ -12,6 +12,14 @@ from itertools import islice
 from pathlib import Path
 from typing import Any
 
+try:
+    import tomllib as _toml
+except ImportError:  # Python 3.10 may have the compatible optional tomli package.
+    try:
+        import tomli as _toml
+    except ImportError:
+        _toml = None
+
 from core.errors import ToolError
 from tools.project.index import PYTHON_METADATA_CACHE, PythonFileMetadata
 
@@ -21,8 +29,11 @@ EXCLUDED_DIRS = {
     ".venv",
     "venv",
     "node_modules",
+    "vendor",
     "__pycache__",
     ".agent_state",
+    ".real_lsp_tools",
+    ".real_lsp_runs",
     ".playwright-cli",
     ".pytest_cache",
     ".pytest-tmp",
@@ -90,9 +101,15 @@ def iter_files(root: Path, max_files: int) -> tuple[list[Path], bool]:
     if root.is_file():
         return [root], False
     files: list[Path] = []
-    for current, directories, names in os.walk(root):
-        directories[:] = [name for name in directories if name not in EXCLUDED_DIRS and not name.startswith(".pytest-tmp-")]
-        for name in names:
+    for current, directories, names in os.walk(root, followlinks=False):
+        directories[:] = sorted(
+            name
+            for name in directories
+            if name not in EXCLUDED_DIRS
+            and not name.startswith(".pytest-tmp-")
+            and not (Path(current) / name).is_symlink()
+        )
+        for name in sorted(names):
             files.append(Path(current) / name)
             if len(files) >= max_files:
                 return files, True
@@ -145,9 +162,9 @@ def _read_dependencies(root: Path) -> tuple[set[str], list[str]]:
     pyproject = root / "pyproject.toml"
     if pyproject.is_file():
         try:
-            import tomllib
-
-            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            if _toml is None:
+                raise ValueError("TOML parser unavailable")
+            data = _toml.loads(pyproject.read_text(encoding="utf-8"))
             project = data.get("project", {})
             for value in project.get("dependencies", []):
                 name = _dependency_name(str(value))
@@ -181,9 +198,9 @@ def _read_dependencies(root: Path) -> tuple[set[str], list[str]]:
     cargo = root / "Cargo.toml"
     if cargo.is_file():
         try:
-            import tomllib
-
-            data = tomllib.loads(cargo.read_text(encoding="utf-8"))
+            if _toml is None:
+                raise ValueError("TOML parser unavailable")
+            data = _toml.loads(cargo.read_text(encoding="utf-8"))
             dependencies.update(data.get("dependencies", {}).keys())
         except (OSError, ValueError):
             pass

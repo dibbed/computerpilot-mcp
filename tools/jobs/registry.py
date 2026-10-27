@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import time
-from typing import Annotated, Any, Literal
+from collections.abc import Callable
+from typing import Annotated, Any, Literal, cast, get_args
 
 from mcp.server import MCPServer
 from pydantic import Field
@@ -11,16 +12,24 @@ from pydantic import Field
 from core.artifacts import default_delivery
 from core.audit import audit_action
 from core.config import resolve_path
-from core.job_scheduler import ensure_job_scheduler
-from core.jobs import JOB_PROGRESS_CHUNK_BYTES, JOB_WAIT_HEARTBEAT_SEC, MAX_JOB_PROGRESS_CHUNK_BYTES, MAX_JOB_WAIT_SEC, JobStore
+from core.errors import ToolError
+from core.jobs import (
+    JOB_PROGRESS_CHUNK_BYTES,
+    JOB_WAIT_HEARTBEAT_SEC,
+    MAX_JOB_PROGRESS_CHUNK_BYTES,
+    MAX_JOB_WAIT_SEC,
+    JobStore,
+    lazy_job_store,
+)
+from core.response_models import JobStatus, JobStatusResult, validate_tool_output
+from core.timings import record_timing, timings_enabled
 from core.tooling import DESTRUCTIVE, OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 
 JobId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
 
 
-def register(mcp: MCPServer) -> None:
-    store = JobStore()
-    ensure_job_scheduler(store)
+def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = None) -> None:
+    get_store = store_getter or lazy_job_store(lambda: JobStore())
     output_default = default_delivery()
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
@@ -34,9 +43,9 @@ def register(mcp: MCPServer) -> None:
         encoding: Annotated[str, Field(min_length=1, max_length=40)] = "utf-8",
         queue_timeout_sec: Annotated[float | None, Field(gt=0, le=86400)] = None,
     ) -> dict[str, Any]:
-        """Submit a retry-safe durable command. Execution timeout starts after launch; optional queue timeout bounds pre-launch waiting."""
+        """Retry-safe durable jobs; timeout starts at launch; queue_timeout_sec bounds waiting. Use job_wait; short/stdin: run_process."""
         audit_action("submit_job", target=resolve_path(cwd), details={"executable": executable})
-        return store.submit(
+        result = get_store().submit(
             [executable, *(args or [])],
             resolve_path(cwd),
             timeout_sec,
@@ -44,12 +53,23 @@ def register(mcp: MCPServer) -> None:
             encoding,
             queue_timeout_sec=queue_timeout_sec,
         )
+        try:
+            audit_action(
+                "submit_job", outcome="completed",
+                details={"job_id": result["job_id"], "deduplicated": result["deduplicated"]},
+            )
+        except Exception:
+            pass
+        return result
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_status")
-    def job_status(job_id: JobId) -> dict[str, Any]:
-        """Read a durable job status by ID after reconnect or server restart."""
-        return {"ok": True, **store.get(job_id)}
+    def job_status(job_id: JobId) -> JobStatusResult:
+        """Read a durable job status by ID after reconnect or server restart. Prefer job_wait to poll."""
+        result = {"ok": True, **get_store().get(job_id)}
+        if result.get("status") not in get_args(JobStatus):
+            raise ToolError("output_version_unsupported", "The stored job status version is unsupported.")
+        return cast(JobStatusResult, validate_tool_output(JobStatusResult, result, operation="job_status"))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_wait")
@@ -64,6 +84,7 @@ def register(mcp: MCPServer) -> None:
     ) -> dict[str, Any]:
         """Wait for job state with bounded silence, plus incremental stdout/stderr progress and resumable cursors."""
         started = time.monotonic()
+        store = get_store()
         state = store.wait(job_id, after_version, 0)
         progress = store.progress(
             job_id,
@@ -93,6 +114,11 @@ def register(mcp: MCPServer) -> None:
 
         if state["timed_out"] and (heartbeat or progressed):
             state = {**state, "timed_out": False}
+        if timings_enabled():
+            record_timing(
+                "job_wait", (time.monotonic() - started) * 1_000,
+                metadata={"job_id": job_id, "job_correlation_id": store.trace_metadata(job_id).get("correlation_id")},
+            )
         return {
             **state,
             "heartbeat": heartbeat,
@@ -106,7 +132,7 @@ def register(mcp: MCPServer) -> None:
     def list_jobs(offset: Annotated[int, Field(ge=0)] = 0,
                   max_items: Annotated[int, Field(ge=1, le=500)] = 50) -> dict[str, Any]:
         """List persistent jobs, newest first, with pagination."""
-        return store.list(offset, max_items)
+        return get_store().list(offset, max_items)
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("job_output")
@@ -114,11 +140,11 @@ def register(mcp: MCPServer) -> None:
                    stderr_since_byte: Annotated[int, Field(ge=0)] = 0,
                    delivery: Literal["inline", "file", "auto"] = output_default) -> dict[str, Any]:
         """Read full or incremental durable output; file/auto returns a snapshot path and SHA-256."""
-        return store.output(job_id, since_byte, stderr_since_byte, delivery)
+        return get_store().output(job_id, since_byte, stderr_since_byte, delivery)
 
     @mcp.tool(annotations=DESTRUCTIVE, structured_output=True)
     @compact_errors("cancel_job")
     def cancel_job(job_id: JobId) -> dict[str, Any]:
         """Request cancellation of a job and its command process tree."""
         audit_action("cancel_job", target=job_id, durable=True)
-        return store.cancel(job_id)
+        return get_store().cancel(job_id)

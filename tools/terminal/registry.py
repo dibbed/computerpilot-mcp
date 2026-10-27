@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-from contextlib import AbstractContextManager
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -25,15 +27,21 @@ def _cwd(value: str | None) -> Path:
     return resolve_path(value) if value else PROJECT_ROOT
 
 
-def _managed_command_claims(working: Path) -> AbstractContextManager[str]:
-    return managed_resource_claims(
+@contextmanager
+def _managed_command_claims(working: Path, timeout_sec: float) -> Iterator[float]:
+    deadline = time.monotonic() + timeout_sec
+    with managed_resource_claims(
         [
             coordination_claim(exclusive=True),
             path_claim(working, "write", scope="subtree"),
         ],
         category="native.command",
-        timeout_sec=3_600,
-    )
+        timeout_sec=timeout_sec,
+    ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ToolError("resource_admission_timeout", "Command timeout expired before process dispatch.")
+        yield remaining
 
 
 def _audit_command(operation: str, command: list[str], cwd: Path, *, script_chars: int | None = None) -> None:
@@ -65,17 +73,17 @@ def register(mcp: MCPServer) -> None:
         stdin_text: Annotated[str | None, Field(max_length=100_000)] = None,
         delivery: Literal["inline", "file", "auto"] = output_default,
     ) -> dict[str, Any]:
-        """Run an executable with a timeout and optional per-stream output limits."""
+        """Run an executable with a timeout and optional per-stream output limits. Prefer read_file/search_files/git_* for native work."""
 
         working = _cwd(cwd)
         process_args = args or []
         command = [executable, *process_args]
         _audit_command("run_process", command, working)
-        with _managed_command_claims(working):
+        with _managed_command_claims(working, timeout_sec) as remaining:
             result = run_bounded(
                 command,
                 cwd=working,
-                timeout_sec=timeout_sec,
+                timeout_sec=remaining,
                 stdout_limit=stdout_limit,
                 stderr_limit=stderr_limit,
                 output_mode=output_mode,
@@ -99,7 +107,9 @@ def register(mcp: MCPServer) -> None:
         env: Annotated[dict[str, str] | None, Field(max_length=100)] = None,
         delivery: Literal["inline", "file", "auto"] = output_default,
     ) -> dict[str, Any]:
-        """Run PowerShell non-interactively with optional output limits and a hard timeout."""
+        """Run PowerShell non-interactively with optional output limits and a hard timeout.
+        For cmdlets/pipelines; prefer run_process or native file/search/Git tools.
+        """
 
         executable = shutil.which("pwsh") or shutil.which("powershell")
         if executable is None:
@@ -110,11 +120,11 @@ def register(mcp: MCPServer) -> None:
             command.extend(["-ExecutionPolicy", "Bypass"])
         command.extend(["-Command", script])
         _audit_command("run_powershell", command, working, script_chars=len(script))
-        with _managed_command_claims(working):
+        with _managed_command_claims(working, timeout_sec) as remaining:
             result = run_bounded(
                 command,
                 cwd=working,
-                timeout_sec=timeout_sec,
+                timeout_sec=remaining,
                 stdout_limit=stdout_limit,
                 stderr_limit=stderr_limit,
                 output_mode=output_mode,
@@ -148,11 +158,11 @@ def register(mcp: MCPServer) -> None:
             working = _cwd(cwd)
             command = [executable, "/d", "/s", "/c", command_text]
             _audit_command("run_cmd", command, working, script_chars=len(command_text))
-            with _managed_command_claims(working):
+            with _managed_command_claims(working, timeout_sec) as remaining:
                 result = run_bounded(
                     command,
                     cwd=working,
-                    timeout_sec=timeout_sec,
+                    timeout_sec=remaining,
                     stdout_limit=stdout_limit,
                     stderr_limit=stderr_limit,
                     output_mode=output_mode,
@@ -188,11 +198,11 @@ def register(mcp: MCPServer) -> None:
             working = _cwd(cwd)
             command = [executable, "-c", command_text]
             _audit_command("run_shell", command, working, script_chars=len(command_text))
-            with _managed_command_claims(working):
+            with _managed_command_claims(working, timeout_sec) as remaining:
                 result = run_bounded(
                     command,
                     cwd=working,
-                    timeout_sec=timeout_sec,
+                    timeout_sec=remaining,
                     stdout_limit=stdout_limit,
                     stderr_limit=stderr_limit,
                     output_mode=output_mode,

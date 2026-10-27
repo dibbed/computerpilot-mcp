@@ -20,6 +20,7 @@ if not exist "%~dp0.venv\Scripts\python.exe" (
 )
 
 :start_mcp
+if exist "%~dp0.agent_state\runtime-settings.cmd" call "%~dp0.agent_state\runtime-settings.cmd"
 rem The trailing CALL clears cmd.exe's pending Ctrl+C batch-confirmation state.
 rem Save ERRORLEVEL first because CALL intentionally resets it.
 "%~dp0.venv\Scripts\python.exe" -m scripts.bootstrap --start & set "MCP_EXIT_CODE=!ERRORLEVEL!" & call;

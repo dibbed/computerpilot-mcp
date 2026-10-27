@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import sqlite3
@@ -21,14 +22,15 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 import psutil
+from pydantic import Field
 
 from core.artifact_retention import ArtifactPolicy, cleanup_artifacts
 from core.audit import AuditPolicy, AuditWriter
@@ -41,7 +43,9 @@ from core.job_retention import JobHistoryPolicy, cleanup_job_history
 from core.jobs import JobStore, same_process
 from core.recovery import OperationRecoveryJournal
 from core.registry import create_server
+from core.resource_claims import RESOURCE_CAPABILITY_ENV
 from core.state_paths import unlinked_directory_tree, unlinked_regular_file
+from core.timings import suppress_timings
 from core.workflows import NATIVE_ONLY_ROUTING, StepDefinition, WorkflowDefinition, WorkflowExecutor, WorkflowState, WorkflowStore
 from tools.desktop.uia import ElementLocator, UIAutomationService, WindowLocator
 from tools.filesystem.patches import PatchLimits, apply_patch_transaction
@@ -49,9 +53,11 @@ from tools.filesystem.search_snapshots import SearchSnapshotStore, search_finger
 from tools.filesystem.service import search_by_name, search_by_name_streaming
 from tools.git.service import run_git
 from tools.language.edits import prepare_workspace_edit
-from tools.language.lsp import _frame, _parse_frames
+from tools.language.lsp import LspClient, _frame, _parse_frames
+from tools.language.providers import LspProvider, command_for
+from tools.language.sessions import LspSessionManager
 from tools.project.context import lookup_code_context
-from tools.project.service import parse_python
+from tools.project.service import iter_files, parse_python
 from tools.testing.diagnostics import merge_diagnostics
 from tools.testing.impact import select_affected_tests
 from tools.testing.verification import build_verification_plan
@@ -70,6 +76,8 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "artifact_files": [1_000],
         "job_history_rows": [500],
         "extension_counts": [1, 2],
+        "lsp_requests": [1, 10],
+        "lsp_workspaces": [1, 2],
     },
     "full": {
         "output_sizes": [1_024, MiB, 100 * MiB],
@@ -82,9 +90,14 @@ PROFILE_LIMITS: dict[str, dict[str, list[int]]] = {
         "artifact_files": [5_000],
         "job_history_rows": [2_000],
         "extension_counts": [1, 2, 4],
+        "lsp_requests": [1, 10, 100],
+        "lsp_workspaces": [1, 2],
     },
 }
 SUITES = (
+    "exec_cost",
+    "native_batch",
+    "native_batch_production",
     "catalog",
     "startup",
     "output",
@@ -98,6 +111,7 @@ SUITES = (
     "resilience",
     "workflow",
     "extensions",
+    "lsp",
 )
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 STALE_TEMP_MAX_AGE_SEC = 24 * 60 * 60
@@ -285,6 +299,10 @@ def _catalog_once() -> dict[str, Any]:
     return {
         "tool_count": len(tools),
         "catalog_json_bytes": len(payload),
+        "output_schema_json_bytes": sum(
+            len(json.dumps(tool["outputSchema"], ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            for tool in catalog if "outputSchema" in tool
+        ),
         "serialization_ms": round(serialization_ms, 3),
     }
 
@@ -776,9 +794,16 @@ def _prepare_impact_fixture(root: Path, count: int) -> None:
 
 def _impact_once(root: Path, count: int) -> dict[str, Any]:
     result = select_affected_tests(root, changed_paths=["app/module_0000.py"], max_files=count + count // 5 + 10, max_depth=20)
-    if result["decision"] not in {"focused", "focused_plus_full_recommended"}:
-        raise RuntimeError(f"affected_tests correctness mismatch: {result['decision']!r}")
-    return {"files": count, "tests": result["test_count"], "modules_traversed": result["modules_traversed"]}
+    decision = result["decision"]
+    if decision not in {"focused", "focused_plus_full_recommended", "full_suite"}:
+        raise RuntimeError(f"affected_tests correctness mismatch: {decision!r}")
+    if decision == "full_suite" and not result.get("full_suite_reasons"):
+        raise RuntimeError("Full-suite fallback lacks explicit coverage evidence.")
+    return {
+        "files": count, "tests": result["test_count"], "modules_traversed": result["modules_traversed"],
+        "decision": decision, "unknown_coverage": result.get("unknown_coverage", False),
+        "full_suite_reasons": result.get("full_suite_reasons", []),
+    }
 
 
 def _verification_plan_once(root: Path) -> dict[str, Any]:
@@ -795,6 +820,303 @@ def _lsp_protocol_once() -> dict[str, Any]:
     if parsed != [payload]:
         raise RuntimeError("LSP framing correctness mismatch.")
     return {"bytes": len(framed), "messages": len(parsed)}
+
+
+@dataclass(slots=True)
+class _LspSample:
+    peak_rss_bytes: int
+    peak_handles: int
+    spawns: int
+    max_queue: int
+
+
+class _LspSampler:
+    """Sample only LSP fixture descendants, excluding the benchmark process itself."""
+
+    def __init__(
+        self,
+        entrypoint: Path,
+        *,
+        queue_depth: Callable[[], int] | None = None,
+        interval_sec: float = 0.01,
+    ) -> None:
+        self._entrypoint_real = os.path.realpath(entrypoint)
+        self._entrypoint_name = entrypoint.name
+        self._queue_depth = queue_depth
+        self._interval_sec = interval_sec
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._peak_rss = 0
+        self._peak_handles = 0
+        self._pids: set[int] = set()
+        self._max_queue = 0
+
+    def _matches_entrypoint(self, argument: str) -> bool:
+        """Match the fixture despite POSIX symlink rewrites such as /var -> /private/var."""
+
+        if not argument:
+            return False
+        try:
+            if os.path.realpath(argument) == self._entrypoint_real:
+                return True
+        except OSError:
+            pass
+        return os.path.basename(argument) == self._entrypoint_name
+
+    @staticmethod
+    def _descends_from(process: psutil.Process, parent_pid: int) -> bool:
+        seen: set[int] = set()
+        try:
+            current = process.ppid()
+            while current not in (0, parent_pid):
+                if current in seen:
+                    return False
+                seen.add(current)
+                current = psutil.Process(current).ppid()
+            return current == parent_pid
+        except psutil.Error:
+            return False
+
+    def _sample_once(self) -> None:
+        rss = 0
+        handles = 0
+        pids: list[int] = []
+        benchmark = psutil.Process()
+        benchmark_pid = benchmark.pid
+        try:
+            children = benchmark.children(recursive=True)
+        except psutil.Error:
+            try:
+                children = list(psutil.process_iter())
+            except psutil.Error:
+                children = []
+        for child in children:
+            try:
+                if not any(self._matches_entrypoint(argument) for argument in child.cmdline()):
+                    continue
+                if not self._descends_from(child, benchmark_pid):
+                    continue
+                if child.ppid() == benchmark_pid:
+                    pids.append(child.pid)
+                rss += child.memory_info().rss
+                num_handles = getattr(child, "num_handles", None)
+                handles += int(num_handles()) if num_handles is not None else int(child.num_fds())
+            except (psutil.Error, AttributeError, OSError):
+                continue
+        queue_depth = int(self._queue_depth()) if self._queue_depth is not None else 0
+        with self._lock:
+            self._peak_rss = max(self._peak_rss, rss)
+            self._peak_handles = max(self._peak_handles, handles)
+            self._pids.update(pids)
+            self._max_queue = max(self._max_queue, queue_depth)
+
+    def _sample(self) -> None:
+        while not self._stop.wait(self._interval_sec):
+            self._sample_once()
+
+    def start(self) -> None:
+        self._sample_once()
+        self._thread = threading.Thread(target=self._sample, name="lsp-fixture-sampler", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> _LspSample:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._sample_once()
+        with self._lock:
+            return _LspSample(self._peak_rss, self._peak_handles, len(self._pids), self._max_queue)
+
+
+def _lsp_percentile(samples: list[float], fraction: float) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    return round(ordered[max(int(len(ordered) * fraction) - 1, 0)], 3)
+
+
+def _lsp_case_details(
+    *,
+    started: float,
+    latencies_ms: list[float],
+    spawns: int,
+    restarts: int,
+    max_queue: int,
+    peak_rss: int,
+    open_handles: int,
+    errors: int,
+) -> dict[str, object]:
+    return {
+        "elapsed": round(time.perf_counter() - started, 3),
+        "p50": _lsp_percentile(latencies_ms, 0.50),
+        "p95": _lsp_percentile(latencies_ms, 0.95),
+        "p99": _lsp_percentile(latencies_ms, 0.99),
+        "spawns": spawns,
+        "restarts": restarts,
+        "max_queue": max_queue,
+        "peak_rss": round(peak_rss / MiB, 3),
+        "open_handles": open_handles,
+        "errors": errors,
+    }
+
+
+def _one_shot_request(
+    provider: LspProvider,
+    workspace: Path,
+    index: int,
+    sampler: _LspSampler,
+) -> tuple[bool, float]:
+    """Run one one-shot request while sampling its short-lived child from this thread."""
+    started = time.perf_counter()
+    outcome: list[bool] = []
+
+    def run() -> None:
+        try:
+            LspClient(list(command_for(provider)), workspace, timeout_sec=30).request(
+                "workspace/symbol", {"query": f"benchmark-{index}"},
+            )
+            outcome.append(True)
+        except Exception:
+            outcome.append(False)
+
+    worker = threading.Thread(target=run, name="lsp-one-shot-request", daemon=True)
+    worker.start()
+    while worker.is_alive():
+        sampler._sample_once()
+        worker.join(timeout=0.002)
+    worker.join()
+    return (outcome[0] if outcome else False), (time.perf_counter() - started) * 1_000
+
+
+def _lsp_session_case(requests: int, workspaces: int, persistent: bool) -> dict[str, object]:
+    """Measure the reviewed local fixture only; this is not real-provider coverage.
+
+    Persistent cases warm one session per workspace before timing; one-shot cases are
+    the cold baseline. Per-session requests stay serial, so latency excludes queueing.
+    """
+
+    if type(requests) is not int or not 1 <= requests <= 1_000:
+        raise ValueError("requests must be an integer between 1 and 1000")
+    if type(workspaces) is not int or not 1 <= workspaces <= 2:
+        raise ValueError("workspaces must be 1 or 2")
+    fixture = PROJECT_ROOT / "tests" / "fixtures" / "persistent_lsp_server.py"
+    if not fixture.is_file():
+        raise BenchmarkSkip("The persistent LSP fixture is unavailable.")
+    executable = Path(sys.executable).resolve()
+    started = time.perf_counter()
+    with _temporary_root("lsp-session") as temporary:
+        root = Path(temporary)
+        entrypoint = root / "lsp_benchmark_server.py"
+        shutil.copyfile(fixture, entrypoint)
+        provider = LspProvider(
+            provider_id="pyright",
+            languages=("python",),
+            executable=executable,
+            executable_sha256=_hash_file(executable),
+            entrypoint=entrypoint,
+            entrypoint_sha256=_hash_file(entrypoint),
+            declared_version="fixture",
+            trusted_roots=(root,),
+        )
+        workspace_roots = [root / f"workspace_{index}" for index in range(workspaces)]
+        for workspace in workspace_roots:
+            workspace.mkdir()
+        latencies_ms: list[float] = []
+        errors = 0
+        peak_rss = 0
+        open_handles = 0
+        max_queue = 0
+
+        if persistent:
+            manager = LspSessionManager((provider,), generation=f"benchmark-{uuid.uuid4().hex}")
+            sampler = _LspSampler(entrypoint, queue_depth=lambda: manager.snapshot()["queue_depth"])
+            sampler.start()
+
+            async def run_requests() -> None:
+                nonlocal errors
+                for workspace in workspace_roots:
+                    try:
+                        await manager.arequest(
+                            workspace, "python", "workspace/symbol",
+                            {"query": "warmup"}, timeout_sec=30,
+                        )
+                    except Exception:
+                        errors += 1
+
+                async def run_workspace(workspace: Path, indices: list[int]) -> None:
+                    nonlocal errors
+                    for index in indices:
+                        request_started = time.perf_counter()
+                        try:
+                            await manager.arequest(
+                                workspace, "python", "workspace/symbol",
+                                {"query": f"benchmark-{index}"}, timeout_sec=30,
+                            )
+                        except Exception:
+                            errors += 1
+                        latencies_ms.append((time.perf_counter() - request_started) * 1_000)
+
+                assignments = [
+                    [index for index in range(requests) if index % workspaces == workspace_index]
+                    for workspace_index in range(workspaces)
+                ]
+                await asyncio.gather(*(
+                    run_workspace(workspace, indices)
+                    for workspace, indices in zip(workspace_roots, assignments, strict=True)
+                ))
+
+            live_rss = 0
+            try:
+                try:
+                    asyncio.run(run_requests())
+                    live_rss = manager.snapshot()["rss_bytes"]
+                finally:
+                    manager.close_all(timeout_sec=5)
+            finally:
+                sample = sampler.stop()
+            snapshot = manager.snapshot()
+            if snapshot["active"] or snapshot["quarantined"]:
+                raise RuntimeError("Persistent LSP sessions were not fully cleaned up.")
+            spawns = snapshot["spawn_count"]
+            restarts = snapshot["restart_count"]
+            max_queue = sample.max_queue
+            peak_rss = max(sample.peak_rss_bytes, live_rss)
+            open_handles = sample.peak_handles
+        else:
+            spawns = 0
+            for index in range(requests):
+                workspace = workspace_roots[index % workspaces]
+                sampler = _LspSampler(entrypoint)
+                sampler.start()
+                try:
+                    succeeded, elapsed_ms = _one_shot_request(provider, workspace, index, sampler)
+                finally:
+                    sample = sampler.stop()
+                latencies_ms.append(elapsed_ms)
+                if not succeeded:
+                    errors += 1
+                peak_rss = max(peak_rss, sample.peak_rss_bytes)
+                open_handles = max(open_handles, sample.peak_handles)
+                if succeeded:
+                    # A completed one-shot request always launched the server; this
+                    # minimum covers a child that exited between sampler ticks.
+                    spawns += max(sample.spawns, 1)
+            restarts = 0
+
+        if errors:
+            raise RuntimeError(f"{errors} LSP request(s) failed; benchmark case must fail closed.")
+
+        return _lsp_case_details(
+            started=started,
+            latencies_ms=latencies_ms,
+            spawns=spawns,
+            restarts=restarts,
+            max_queue=max_queue,
+            peak_rss=peak_rss,
+            open_handles=open_handles,
+            errors=errors,
+        )
 
 
 def _workspace_edit_plan_once(root: Path) -> dict[str, Any]:
@@ -1426,6 +1748,18 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _benchmark_launcher_fingerprint(executable: str | None) -> tuple[str | None, str]:
+    """Only benchmark metadata may tolerate an unreadable OS command shim."""
+    if executable is None:
+        return None, "unavailable"
+    try:
+        return _hash_file(Path(executable)), "verified"
+    except OSError:
+        # Windows Store App Execution Aliases can launch but cannot be opened.
+        # Do not weaken _hash_file for security-sensitive callers.
+        return None, "unreadable_launcher"
+
+
 def _backup_inventory_once(directory: Path) -> dict[str, Any]:
     counts: dict[str, int] = {}
     sizes: dict[str, int] = {}
@@ -1888,6 +2222,590 @@ def _temporary_root(name: str) -> Iterator[str]:
             yield directory
 
 
+def _exec_cost_summary(samples: list[dict[str, Any]], expected: str) -> dict[str, Any]:
+    errors = sum("error" in sample or sample.get("sha256") != expected for sample in samples)
+    if errors or not samples:
+        return {"status": "error", "comparable": False, "errors": max(errors, 1)}
+    elapsed = sorted(float(sample["elapsed_ms"]) for sample in samples)
+
+    def percentile(fraction: float) -> float:
+        position = (len(elapsed) - 1) * fraction
+        low = int(position)
+        return round(elapsed[low] + (elapsed[min(low + 1, len(elapsed) - 1)] - elapsed[low]) * (position - low), 3)
+
+    return {
+        "status": "ok",
+        "comparable": True,
+        "errors": 0,
+        "count": len(samples),
+        "p50_ms": percentile(0.5),
+        "p95_ms": percentile(0.95),
+        "p99_ms": percentile(0.99),
+        "p99_exploratory": True,
+        "output_sha256": expected,
+        "samples": samples,
+    }
+
+
+def _exec_cost_worker(repeats: int, include_jobs: bool) -> dict[str, Any]:
+    """Run only in the owned source copy: all default state paths then stay isolated."""
+    import difflib
+
+    from mcp import Client
+
+    from core import resource_claims
+    from tools.terminal import registry as terminal_registry
+
+    root = PROJECT_ROOT / "fixture"
+    root.mkdir()
+    text = "alpha\nbeta\ngamma\ndelta\n"
+    (root / "sample.txt").write_text(text, encoding="utf-8", newline="\n")
+    for index in range(32):
+        (root / f"item-{index:02}.txt").write_text(str(index), encoding="utf-8")
+    after = text.upper()
+    search = "\n".join(f"item-{index:02}.txt" for index in range(32))
+    workloads = {
+        "read": ["native", "python", "powershell"],
+        "search": ["native", "python", "powershell"],
+        "edit": ["sequential", "patch"],
+    }
+    if include_jobs:
+        workloads.update({"short": ["direct", "job"], "medium": ["direct", "job"]})
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if not powershell:
+        for workload in ("read", "search"):
+            workloads[workload].remove("powershell")
+    expected = {
+        name: hashlib.sha256(value.encode()).hexdigest()
+        for name, value in (
+            ("read", text),
+            ("search", search),
+            ("edit", after),
+            ("short", "completed"),
+            ("medium", "completed"),
+        )
+    }
+    samples: dict[str, list[dict[str, Any]]] = {f"{w}/{v}": [] for w, variants in workloads.items() for v in variants}
+    waits: list[float] = []
+    managed = resource_claims.managed_resource_claims
+
+    @contextmanager
+    def observed_claims(*args: Any, **kwargs: Any) -> Iterator[str]:
+        started = time.perf_counter()
+        with managed(*args, **kwargs) as capability:
+            waits.append((time.perf_counter() - started) * 1_000)
+            yield capability
+
+    resource_claims.managed_resource_claims = observed_claims
+    terminal_registry.managed_resource_claims = observed_claims
+    job_ids: list[str] = []
+    store: JobStore | None = None
+    host_load = {"cpu_percent": psutil.cpu_percent(interval=0.1), "memory_percent": psutil.virtual_memory().percent}
+
+    async def run() -> None:
+        nonlocal store
+        server = create_server()
+        async with Client(server) as client:
+
+            async def call(name: str, **arguments: Any) -> dict[str, Any]:
+                result = await client.call_tool(name, arguments)
+                payload = result.structured_content
+                if not isinstance(payload, dict) or payload.get("ok") is False or result.is_error:
+                    if isinstance(payload, dict):
+                        raise RuntimeError(f"Benchmark tool failed: {name} {payload.get('error')}")
+                    raise RuntimeError("Benchmark tool did not return a successful structured result.")
+                return payload
+
+            if include_jobs:
+                store = server.job_store_getter()  # type: ignore[attr-defined]
+            rng = random.Random(1401)
+            for round_index in range(5 + repeats):
+                for workload, variants in workloads.items():
+                    order = list(variants)
+                    rng.shuffle(order)
+                    for variant in order:
+                        target = root / "edit.txt"
+                        if workload == "edit":
+                            target.write_text(text, encoding="utf-8", newline="\n")
+                        waits.clear()
+                        started = time.perf_counter()
+                        launches = 0
+                        output = ""
+                        try:
+                            if workload in {"read", "search"}:
+                                if variant == "native":
+                                    if workload == "read":
+                                        output = str((await call("read_file", path=str(root / "sample.txt"), encoding="utf-8"))["content"])
+                                    else:
+                                        found = await call(
+                                            "search_files", path=str(root), query="item-", search_type="name", max_results=50
+                                        )
+                                        output = "\n".join(sorted(Path(item["path"]).name for item in found["items"]))
+                                else:
+                                    if variant == "python":
+                                        script = (
+                                            "from pathlib import Path; import sys; sys.stdout.write("
+                                            + (
+                                                "Path('sample.txt').read_text(encoding='utf-8')"
+                                                if workload == "read"
+                                                else "'\\n'.join(sorted(p.name for p in Path('.').glob('item-*')))"
+                                            )
+                                            + ")"
+                                        )
+                                        result = await call(
+                                            "run_process",
+                                            executable=sys.executable,
+                                            args=["-c", script],
+                                            cwd=str(root),
+                                            timeout_sec=15,
+                                            delivery="inline",
+                                        )
+                                    else:
+                                        script = (
+                                            "[Console]::Out.Write("
+                                            + (
+                                                "[IO.File]::ReadAllText((Join-Path (Get-Location) 'sample.txt'))"
+                                                if workload == "read"
+                                        else "((Get-ChildItem -File -Filter 'item-*' | Sort-Object Name | "
+                                        "ForEach-Object {$_.Name}) -join [char]10)"
+                                            )
+                                            + ")"
+                                        )
+                                        result = await call(
+                                            "run_powershell", script=script, cwd=str(root), timeout_sec=15, delivery="inline"
+                                        )
+                                    if result["exit_code"] != 0 or result["stdout"].get("truncated"):
+                                        raise RuntimeError("Benchmark process failed or truncated its output.")
+                                    launches = int(isinstance(result.get("pid"), int))
+                                    output = str(result["stdout"]["text"]).replace("\r\n", "\n")
+                            elif workload == "edit":
+                                if variant == "sequential":
+                                    for old in text.splitlines():
+                                        await call(
+                                            "replace_exact", path=str(target), old=old, new=old.upper(), expected_count=1, encoding="utf-8"
+                                        )
+                                else:
+                                    # Both variants validate the same exact preimage in this uncontended fixture.
+                                    patch = "diff --git a/edit.txt b/edit.txt\n" + "".join(
+                                        difflib.unified_diff(
+                                            text.splitlines(True),
+                                            after.splitlines(True),
+                                            fromfile="a/edit.txt",
+                                            tofile="b/edit.txt",
+                                        )
+                                    )
+                                    await call(
+                                        "apply_patch",
+                                        root=str(root),
+                                        patch=patch,
+                                        expected_sha256={"edit.txt": _hash_file(target)},
+                                        encoding="utf-8",
+                                    )
+                                output = target.read_text(encoding="utf-8")
+                            else:
+                                delay = 0.01 if workload == "short" else 0.2
+                                args = ["-c", f"import time; time.sleep({delay}); print('completed', end='')"]
+                                if variant == "direct":
+                                    result = await call(
+                                        "run_process",
+                                        executable=sys.executable,
+                                        args=args,
+                                        cwd=str(root),
+                                        timeout_sec=15,
+                                        delivery="inline",
+                                    )
+                                    if result["exit_code"] != 0:
+                                        raise RuntimeError("Direct benchmark failed.")
+                                    output = str(result["stdout"]["text"])
+                                    launches = int(isinstance(result.get("pid"), int))
+                                else:
+                                    submitted = await call(
+                                        "submit_job",
+                                        executable=sys.executable,
+                                        args=args,
+                                        cwd=str(root),
+                                        timeout_sec=15,
+                                        idempotency_key=uuid.uuid4().hex,
+                                    )
+                                    job_id = str(submitted["job_id"])
+                                    job_ids.append(job_id)
+                                    version = 0
+                                    deadline = time.monotonic() + 30
+                                    while time.monotonic() < deadline:
+                                        result = await call("job_wait", job_id=job_id, after_version=version, timeout=1)
+                                        version = int(result["version"])
+                                        if result["status"] in FINAL_JOB_STATES:
+                                            break
+                                    else:
+                                        raise RuntimeError("Benchmark job did not complete within its deadline.")
+                                    if result["status"] != "succeeded":
+                                        raise RuntimeError("Benchmark job failed.")
+                                    output = str((await call("job_output", job_id=job_id, delivery="inline"))["stdout"]["text"])
+                                    assert store is not None
+                                    row = store.raw(job_id)
+                                    launches = len({int(row["worker_pid"]), int(row["pid"])})
+                            sample = {
+                                "elapsed_ms": round((time.perf_counter() - started) * 1_000, 3),
+                                "sha256": hashlib.sha256(output.encode()).hexdigest(),
+                                "process_launches": launches,
+                                "claim_wait_ms": round(sum(waits), 3) if waits else None,
+                            }
+                        except Exception as exc:
+                            sample = {"error": type(exc).__name__}
+                        if sample.get("sha256") != expected[workload]:
+                            samples[f"{workload}/{variant}"].append(sample)
+                            raise RuntimeError(f"Non-equivalent benchmark sample: {workload}/{variant} {sample.get('error', 'checksum')}")
+                        if round_index >= 5:
+                            samples[f"{workload}/{variant}"].append(sample)
+
+    try:
+        asyncio.run(run())
+    finally:
+        resource_claims.managed_resource_claims = managed
+        terminal_registry.managed_resource_claims = managed
+        if store is not None:
+            for job_id in job_ids:
+                row = store.raw(job_id)
+                if row["status"] not in FINAL_JOB_STATES:
+                    store.cancel(job_id)
+            deadline = time.monotonic() + 20
+            while any(
+                same_process(store.raw(j)[pid], store.raw(j)[created])
+                for j in job_ids for pid, created in (("worker_pid", "worker_created"), ("pid", "pid_created"))
+            ):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Benchmark worker cleanup could not be verified.")
+                time.sleep(0.02)
+    powershell_hash, powershell_fingerprint_status = _benchmark_launcher_fingerprint(powershell)
+    return {
+        "warmups": 5,
+        "repeats": repeats,
+        "seed": 1401,
+        "order": "paired_randomized",
+        "host_load_at_start": host_load,
+        "host_load_at_end": {"cpu_percent": psutil.cpu_percent(), "memory_percent": psutil.virtual_memory().percent},
+        "runtime": {"python": platform.python_version(), "powershell_binary_sha256": powershell_hash,
+                    "powershell_binary_fingerprint_status": powershell_fingerprint_status},
+        "host_control": "shared host; exploratory timings, not a production SLA",
+        "scope": "in-process SDK calls; no client/model/network latency; short=10ms, medium=200ms",
+        "process_launch_scope": "controlled command roots plus durable workers; not OS helper processes",
+        "claim_wait_scope": "parent-process admission only; worker claim/SQLite/serialization NOT_MEASURED until P14-02",
+        "powershell_available": bool(powershell),
+        "job_cases_enabled": include_jobs,
+        "workers_cleaned": True,
+        "cases": {key: _exec_cost_summary(value, expected[key.split("/")[0]]) for key, value in samples.items()},
+    }
+
+
+def _native_batch_worker(repeats: int, include_powershell: bool = True, *, production: bool = False) -> dict[str, Any]:
+    """Measure either the private prototype or the actual file-only batch tool."""
+    import base64
+
+    from mcp import Client
+    from mcp.client._memory import InMemoryTransport
+    from mcp.server import MCPServer
+    from mcp.shared.message import SessionMessage
+    from mcp.types import JSONRPCMessage
+    from pydantic import TypeAdapter
+
+    from core.extensions.bridge import ExtensionMCPServer
+    from tools.filesystem import registry as filesystem_registry
+    from tools.filesystem.service import read_window
+    from tools.terminal import registry as terminal_registry
+
+    root = PROJECT_ROOT / "native-batch-fixture"
+    root.mkdir()
+    contents = [f"fixture-{index}: alpha beta\n" * 16 for index in range(16)]
+    paths = [root / f"item-{index}.txt" for index in range(16)]
+    for path, content in zip(paths, contents, strict=True):
+        path.write_bytes(content.encode())
+    counters = {"requests": 0, "responses": 0, "request_frame_bytes": 0, "response_frame_bytes": 0}
+    workers = {"active": 0, "peak": 0}
+    lock = threading.Lock()
+    request_ids: set[Any] = set()
+    message_adapter: TypeAdapter[Any] = TypeAdapter(cast(Any, JSONRPCMessage))
+
+    def frame(message: Any) -> Any:
+        if not isinstance(message, SessionMessage):
+            return message
+        encoded = message.message.model_dump_json(by_alias=True, exclude_none=True) + "\n"
+        value = json.loads(encoded)
+        if value.get("method") == "tools/call":
+            request_ids.add(value["id"])
+            counters["requests"] += 1
+            counters["request_frame_bytes"] += len(encoded.encode())
+        elif value.get("id") in request_ids and ("result" in value or "error" in value):
+            request_ids.remove(value["id"])
+            counters["responses"] += 1
+            counters["response_frame_bytes"] += len(encoded.encode())
+        return SessionMessage(message_adapter.validate_json(encoded), message.metadata)
+
+    class FramedStream:
+        def __init__(self, stream: Any) -> None:
+            self.stream = stream
+
+        async def send(self, message: Any) -> None:
+            await self.stream.send(frame(message))
+
+        async def receive(self) -> Any:
+            return frame(await self.stream.receive())
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> Any:
+            import anyio
+
+            try:
+                return await self.receive()
+            except anyio.EndOfStream:
+                raise StopAsyncIteration from None
+
+        async def aclose(self) -> None:
+            await self.stream.aclose()
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            await self.aclose()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.stream, name)
+
+    powershell = include_powershell and bool(shutil.which("pwsh") or shutil.which("powershell"))
+    batch_name = "native_read_batch" if production else "fixture_read_batch"
+    allowed = frozenset({"read_file", batch_name, *({"run_powershell"} if powershell else set())})
+    server = ExtensionMCPServer("native-batch-benchmark", native_allowlist=allowed)
+    filesystem_registry.register(server, batch_enabled=production)
+    if powershell:
+        terminal_registry.register(server)
+
+    def read(path: str) -> str:
+        with lock:
+            workers["active"] += 1
+            workers["peak"] = max(workers["peak"], workers["active"])
+        try:
+            return str(read_window(path, start_line=1, end_line=None, offset=0, max_chars=4096, encoding="utf-8")["content"])
+        finally:
+            with lock:
+                workers["active"] -= 1
+
+    if production:
+        reader = cast(Any, server).native_read_batch_state
+        original_read = reader._read
+
+        def observed_read(*args: Any, **kwargs: Any) -> Any:
+            with lock:
+                workers["active"] += 1
+                workers["peak"] = max(workers["peak"], workers["active"])
+            try:
+                return original_read(*args, **kwargs)
+            finally:
+                with lock:
+                    workers["active"] -= 1
+
+        reader._read = observed_read
+    else:
+        @server.tool()
+        async def fixture_read_batch(
+            paths: Annotated[list[str], Field(min_length=1, max_length=16)],
+            parallel: Annotated[int, Field(ge=1, le=4)],
+        ) -> dict[str, Any]:
+            # Only owned benchmark files enter this private, unexported prototype.
+            assert all(Path(path).parent == root for path in paths)
+            semaphore = asyncio.Semaphore(parallel)
+
+            async def one(path: str) -> str:
+                async with semaphore:
+                    return await asyncio.to_thread(read, path)
+
+            return {"ok": True, "contents": await asyncio.gather(*(one(path) for path in paths))}
+
+    samples: dict[str, list[dict[str, Any]]] = {}
+    peaks: dict[str, int] = {}
+    expected: dict[int, str] = {}
+    denied_dispatches = 0
+
+    def hidden_probe() -> dict[str, bool]:
+        nonlocal denied_dispatches
+        denied_dispatches += 1
+        return {"ok": True}
+
+    MCPServer.add_tool(server, hidden_probe)
+
+    @asynccontextmanager
+    async def transport() -> Any:
+        async with InMemoryTransport(server) as (reader, writer):
+            yield FramedStream(reader), FramedStream(writer)
+
+    async def run() -> None:
+        rng = random.Random(1501)
+        async with Client(transport()) as client:
+            invalid = {"root": str(root), "items": [], "max_parallel": 5} if production else {"paths": [], "parallel": 5}
+            for name, arguments in (("hidden_probe", {}), (batch_name, invalid)):
+                denied = await client.call_tool(name, arguments)
+                assert denied.is_error
+            assert denied_dispatches == 0 and workers["active"] == 0
+            async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                result = await client.call_tool(name, arguments)
+                value = result.structured_content
+                if not isinstance(value, dict) or value.get("ok") is False or result.is_error:
+                    raise RuntimeError("Native batch benchmark call failed.")
+                return value
+
+            for count in (1, 4, 8, 16):
+                expected[count] = hashlib.sha256(json.dumps(contents[:count], ensure_ascii=False).encode()).hexdigest()
+                variants = ["direct", "batch1", "batch2", "batch4", *(["powershell"] if powershell else [])]
+                for round_index in range(5 + repeats):
+                    rng.shuffle(variants)
+                    for variant in variants:
+                        for key in counters:
+                            counters[key] = 0
+                        workers["peak"] = 0
+                        started = time.perf_counter()
+                        if variant == "direct":
+                            values = [(await call("read_file", {"path": str(path), "max_chars": 4096}))["content"]
+                                      for path in paths[:count]]
+                        elif variant == "powershell":
+                            encoded = base64.b64encode(json.dumps([str(p) for p in paths[:count]]).encode()).decode()
+                            script = (
+                                "$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + encoded + "'))|ConvertFrom-Json;"
+                                "ConvertTo-Json -Compress -InputObject @($p|ForEach-Object{[IO.File]::ReadAllText($_)})"
+                            )
+                            value = await call("run_powershell", {"script": script, "cwd": str(root), "timeout_sec": 15})
+                            assert value["exit_code"] == 0 and not value["stdout"]["truncated"]
+                            values = json.loads(value["stdout"]["text"])
+                        else:
+                            if production:
+                                result = await call(batch_name, {
+                                    "root": str(root), "items": [{"id": str(i), "path": path.name}
+                                                                  for i, path in enumerate(paths[:count])],
+                                    "max_parallel": int(variant[-1]),
+                                })
+                                values = [item["content"] for item in result["items"]]
+                            else:
+                                values = (await call(batch_name, {
+                                    "paths": [str(path) for path in paths[:count]], "parallel": int(variant[-1]),
+                                }))["contents"]
+                        sample = {"elapsed_ms": (time.perf_counter() - started) * 1000, **counters,
+                                  "sha256": hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).hexdigest()}
+                        assert sample["sha256"] == expected[count] and workers["active"] == 0
+                        if round_index >= 5:
+                            key = f"{count}/{variant}"
+                            samples.setdefault(key, []).append(sample)
+                            peaks[key] = max(peaks.get(key, 0), workers["peak"])
+
+    process = psutil.Process()
+    cpu_before = sum(process.cpu_times()[:2])
+    rss_before = process.memory_info().rss
+    asyncio.run(run())
+    cases = {}
+    for key, values in samples.items():
+        count = int(key.split("/")[0])
+        summary = _exec_cost_summary(values, expected[count])
+        summary["peak_workers"] = peaks[key] if "/batch" in key else None
+        summary["synthetic_wait_saving_percent"] = {
+            str(latency): (0 if latency == 0 else 100 * (count - values[0]["requests"]) / count)
+            for latency in (0, 20, 100, 250)
+        }
+        cases[key] = summary
+    batch_counters = reader.snapshot() if production else None
+    claim_keys = ("active_resource_request_count", "pending_resource_request_count", "quarantined_resource_request_count")
+    claim_health = reader._store().health_summary() if production else None
+    claims = {key: claim_health[key] for key in claim_keys} if claim_health is not None else None
+    return {"warmups": 5, "repeats": repeats, "seed": 1501, "order": "paired_randomized",
+            "prototype_only": not production,
+            "scope": "actual in-process MCP calls; synthetic RTT is arithmetic, not tunnel latency",
+            "wire_scope": "NDJSON roundtrip of actual SDK messages; in-memory transport, no tunnel",
+            "denied_dispatches": denied_dispatches, "tokenizer": "NOT_MEASURED",
+            "cpu_sec": sum(process.cpu_times()[:2]) - cpu_before,
+            "rss_before_after_max_bytes": max(rss_before, process.memory_info().rss),
+            "workers_cleaned": workers["active"] == 0 and (
+                batch_counters is None or not any(batch_counters.values())
+            ) and (claims is None or not any(claims.values())),
+            "production_batch_counters_final": batch_counters, "production_claims_final": claims, "cases": cases}
+
+
+def _exec_cost_once(
+    repeats: int, include_jobs: bool, *, suite: Literal["exec_cost", "native_batch", "native_batch_production"] = "exec_cost",
+) -> dict[str, Any]:
+    if not 1 <= repeats <= 100:
+        raise ValueError("exec_cost requires 1..100 paired repeats.")
+    # A source copy isolates hardcoded PROJECT_ROOT state, including detached job workers.
+    temporary = Path(tempfile.mkdtemp(prefix="computerpilot-exec-cost-"))
+    cleanup_verified = False
+    try:
+        source = temporary / "source"
+        source.mkdir()
+        paths: list[Path] = []
+        for directory in ("core", "tools", "scripts"):
+            files, truncated = iter_files(PROJECT_ROOT / directory, 1_000)
+            if truncated:
+                raise RuntimeError("Benchmark source snapshot exceeded its file limit.")
+            paths.extend(path for path in files if path.suffix == ".py")
+        manifest: dict[str, str] = {}
+        remaining_bytes = 32 * MiB
+        for path in paths:
+            if not path.resolve().is_relative_to(PROJECT_ROOT.resolve()) or not unlinked_regular_file(path):
+                raise RuntimeError("Benchmark source is not a contained regular file.")
+            with path.open("rb") as stream:
+                content = stream.read(remaining_bytes + 1)
+            if len(content) > remaining_bytes:
+                raise RuntimeError("Benchmark source snapshot exceeded its byte limit.")
+            remaining_bytes -= len(content)
+            relative = path.relative_to(PROJECT_ROOT).as_posix()
+            manifest[relative] = hashlib.sha256(content).hexdigest()
+            destination = source / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+        fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        command = [
+            sys.executable,
+            "-c",
+            # Keep the parent's claim around this child, but never reuse its database inside the owned fixture.
+            f"import os,json; os.environ.pop({RESOURCE_CAPABILITY_ENV!r},None); "
+            "[os.environ.pop(k,None) for k in list(os.environ) if k.upper().startswith(('MCP_','PYTHON'))]; "
+            "from scripts.perf_benchmark import "
+            + ("_exec_cost_worker; print(json.dumps(_exec_cost_worker(" if suite == "exec_cost"
+               else "_native_batch_worker; print(json.dumps(_native_batch_worker(")
+            + str(repeats)
+            + ", "
+            + str(include_jobs if suite == "exec_cost" else True)
+            + (", production=True)))" if suite == "native_batch_production" else ")))"),
+        ]
+        env = {key: "" for key in os.environ if key.upper().startswith(("MCP_", "PYTHON"))}
+        env.update({"MCP_TOOL_PROFILE": "full", "MCP_LSP_PERSISTENT_ENABLED": "0", "MCP_WORKFLOW_DAG_ENABLED": "0"})
+        with suppress_timings() if suite == "native_batch_production" else nullcontext():
+            result = run_bounded(
+                command,
+                cwd=source,
+                timeout_sec=min(3_600, 120 + repeats * 30),
+                stdout_limit=2_000_000,
+                stderr_limit=2_000,
+                env=env,
+                delivery="inline",
+            )
+        if result["exit_code"] != 0:
+            return {
+                "name": suite, "status": "error", "comparable": False,
+                "error": "isolated_benchmark_failed", "retained_fixture": str(temporary),
+            }
+        details = json.loads(result["stdout"]["text"])
+        cleanup_verified = details.get("workers_cleaned") is True and all(
+            case.get("status") == "ok" for case in details["cases"].values()
+        )
+        if not cleanup_verified:
+            raise RuntimeError("Isolated benchmark cleanup or correctness is unverified; fixture retained.")
+        return {"name": suite, "status": "ok", "source_manifest_sha256": fingerprint, "source_files": len(manifest), **details}
+
+    finally:
+        if cleanup_verified:
+            if temporary.parent.resolve() != Path(tempfile.gettempdir()).resolve():
+                raise RuntimeError("Benchmark cleanup target escaped temporary storage.")
+            shutil.rmtree(temporary)
+
+
 def run_benchmarks(
     *,
     profile: str,
@@ -1903,9 +2821,18 @@ def run_benchmarks(
     unknown = suites - set(SUITES)
     if unknown:
         raise ValueError(f"Unknown suites: {sorted(unknown)}")
+    if "native_batch_production" in suites and suites != {"native_batch_production"}:
+        raise ValueError("The production batch benchmark must run without other suites.")
     limits = PROFILE_LIMITS[profile]
-    stale_temp_dirs_removed = _cleanup_stale_temp_roots()
+    stale_temp_dirs_removed = 0 if suites <= {"exec_cost", "native_batch", "native_batch_production"} else _cleanup_stale_temp_roots()
     results: list[dict[str, Any]] = []
+
+    if "exec_cost" in suites:
+        results.append(_exec_cost_once(runs, include_jobs))
+    if "native_batch" in suites:
+        results.append(_exec_cost_once(runs, False, suite="native_batch"))
+    if "native_batch_production" in suites:
+        results.append(_exec_cost_once(runs, False, suite="native_batch_production"))
 
     if "catalog" in suites:
         results.append(measure("tool_catalog", _catalog_once, runs))
@@ -2140,6 +3067,24 @@ def run_benchmarks(
             results.append(measure("extensions_fault_isolation", partial(_extension_fault_isolation_once, root), runs))
             results.append(measure("extensions_bounded_resources", partial(_extension_bounded_resources_once, root), runs))
 
+    if "lsp" in suites:
+        for requests in limits["lsp_requests"]:
+            for workspaces in limits["lsp_workspaces"]:
+                results.append(
+                    measure(
+                        f"lsp_persistent_{requests}_requests_{workspaces}_workspaces",
+                        partial(_lsp_session_case, requests, workspaces, True),
+                        runs,
+                    )
+                )
+                results.append(
+                    measure(
+                        f"lsp_one_shot_{requests}_requests_{workspaces}_workspaces",
+                        partial(_lsp_session_case, requests, workspaces, False),
+                        runs,
+                    )
+                )
+
     process = psutil.Process()
     return {
         "schema_version": 1,
@@ -2246,7 +3191,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.output is None and "native_batch_production" in (args.suites or ()):
+        parser.error("the native_batch_production suite requires an explicit --output path")
     if args.output is None:
         _cleanup_managed_reports()  # Also recover reports left by an earlier process.
     suites = set(args.suites or ("catalog", "startup", "output", "project", "search", "jobs", "browser", "audit", "resilience", "workflow"))

@@ -7,6 +7,7 @@ import codecs
 import difflib
 import fnmatch
 import hashlib
+import io
 import locale
 import os
 import re
@@ -14,18 +15,21 @@ import shutil
 import stat
 import tempfile
 import textwrap
+import threading
 import time
 from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from core.backups import BACKUP_RETENTION
 from core.config import SETTINGS, ensure_runtime_dirs, resolve_path
 from core.errors import ToolError
 from core.executor import run_bounded
 from core.response import page, sha256_bytes
+from core.state_paths import unlinked_directory_tree, unlinked_regular_file
 
 COMMON_EXCLUDES = {
     ".git",
@@ -65,6 +69,10 @@ def _replace_with_retry(source: Path, destination: Path) -> None:
 def detect_encoding(path: Path) -> str:
     with path.open("rb") as handle:
         sample = handle.read(65_536)
+    return _sample_encoding(sample, path)
+
+
+def _sample_encoding(sample: bytes, path: Path | None = None) -> str:
     if sample.startswith(codecs.BOM_UTF8):
         return "utf-8-sig"
     if sample.startswith(codecs.BOM_UTF32_LE) or sample.startswith(codecs.BOM_UTF32_BE):
@@ -72,7 +80,7 @@ def detect_encoding(path: Path) -> str:
     if sample.startswith(codecs.BOM_UTF16_LE) or sample.startswith(codecs.BOM_UTF16_BE):
         return "utf-16"
     if b"\x00" in sample:
-        raise ToolError("binary_file", f"File appears binary: {path}")
+        raise ToolError("binary_file", f"File appears binary: {path}" if path is not None else "File appears binary.")
     try:
         sample.decode("utf-8")
         return "utf-8"
@@ -87,6 +95,184 @@ def detect_encoding(path: Path) -> str:
     except ImportError:
         pass
     return locale.getpreferredencoding(False) or "cp1252"
+
+
+@dataclass(frozen=True)
+class ReadWindowLimits:
+    root: Path
+    root_identity: tuple[int, int]
+    source_bytes: int
+    deadline: float
+    cancelled: threading.Event
+
+    def check(self) -> None:
+        if self.cancelled.is_set():
+            raise ToolError("batch_cancelled", "The batch read was cancelled.")
+        if time.monotonic() >= self.deadline:
+            raise ToolError("batch_deadline", "The batch read deadline elapsed.")
+
+
+def local_read_path(path: Path) -> bool:
+    """Reject known remote mounts before reading; this is not an OS I/O timeout."""
+    if str(path).startswith(("\\\\", "//")):
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        return cast(Any, ctypes).windll.kernel32.GetDriveTypeW(str(path.absolute().anchor)) in {2, 3, 6}
+    import psutil
+
+    mounts = [p for p in psutil.disk_partitions(all=True) if path.absolute().is_relative_to(p.mountpoint)]
+    if not mounts:
+        return False
+    mount = max(mounts, key=lambda p: len(p.mountpoint))
+    return mount.fstype.casefold() not in {"nfs", "nfs4", "cifs", "smbfs", "smb3", "afpfs", "9p", "fuse.sshfs", "sshfs"}
+
+
+def _read_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    # Windows stat/fstat disagree on ctime; file identity and write time are comparable.
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, 0 if os.name == "nt" else info.st_ctime_ns
+
+
+@contextmanager
+def _open_contained(path: Path, limits: ReadWindowLimits) -> Iterator[Any]:
+    """Keep the open file rooted at the admitted directory through link races."""
+    relative = path.relative_to(limits.root)
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class FileInformation(ctypes.Structure):
+            _fields_ = [
+                ("attributes", wintypes.DWORD), ("created", wintypes.FILETIME),
+                ("accessed", wintypes.FILETIME), ("written", wintypes.FILETIME),
+                ("volume", wintypes.DWORD), ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD), ("links", wintypes.DWORD),
+                ("index_high", wintypes.DWORD), ("index_low", wintypes.DWORD),
+            ]
+
+        windows_ctypes = cast(Any, ctypes)
+        kernel = windows_ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                      wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.POINTER(FileInformation)]
+        kernel.GetFileInformationByHandle.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        read_attributes = 0x80
+        share_read_write = 3
+        open_existing = 3
+        open_reparse_point = 0x00200000
+        backup_semantics = 0x02000000
+        generic_read = 0x80000000
+        handles: list[int] = []
+        try:
+            # Denying delete sharing pins each parent while the next component opens.
+            for parent in reversed(path.parents):
+                limits.check()
+                handle = kernel.CreateFileW(
+                    str(parent), read_attributes, share_read_write, None, open_existing, backup_semantics | open_reparse_point, None,
+                )
+                if handle == ctypes.c_void_p(-1).value:
+                    raise windows_ctypes.WinError(windows_ctypes.get_last_error())
+                handles.append(handle)
+                info = FileInformation()
+                if not kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
+                    raise windows_ctypes.WinError(windows_ctypes.get_last_error())
+                if info.attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT or not info.attributes & stat.FILE_ATTRIBUTE_DIRECTORY:
+                    raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
+            root_info = limits.root.stat()
+            if (root_info.st_dev, root_info.st_ino) != limits.root_identity:
+                raise ToolError("batch_source_changed", "The batch source changed.")
+            handle = kernel.CreateFileW(str(path), generic_read, share_read_write, None, open_existing, open_reparse_point, None)
+            if handle == ctypes.c_void_p(-1).value:
+                raise windows_ctypes.WinError(windows_ctypes.get_last_error())
+            try:
+                info = FileInformation()
+                if not kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
+                    raise windows_ctypes.WinError(windows_ctypes.get_last_error())
+                if info.attributes & (stat.FILE_ATTRIBUTE_REPARSE_POINT | stat.FILE_ATTRIBUTE_DIRECTORY):
+                    raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
+                descriptor = cast(Any, msvcrt).open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            except BaseException:
+                kernel.CloseHandle(handle)
+                raise
+            try:
+                raw = os.fdopen(descriptor, "rb")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with raw:
+                yield raw
+        finally:
+            for handle in reversed(handles):
+                kernel.CloseHandle(handle)
+    else:
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY") or os.open not in os.supports_dir_fd:
+            raise ToolError("batch_path_denied", "Safe contained reads are unavailable.")
+        handles = []
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            root_fd = os.open(limits.root, flags)
+            handles.append(root_fd)
+            root_info = os.fstat(root_fd)
+            if (root_info.st_dev, root_info.st_ino) != limits.root_identity:
+                raise ToolError("batch_source_changed", "The batch source changed.")
+            current = root_fd
+            for part in relative.parts[:-1]:
+                limits.check()
+                current = os.open(part, flags, dir_fd=current)
+                handles.append(current)
+            descriptor = os.open(
+                relative.parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), dir_fd=current,
+            )
+            try:
+                raw = os.fdopen(descriptor, "rb")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with raw:
+                yield raw
+        finally:
+            for descriptor in reversed(handles):
+                os.close(descriptor)
+
+
+@contextmanager
+def _bounded_window(path: Path, encoding: str, limits: ReadWindowLimits) -> Iterator[tuple[io.StringIO, str, str]]:
+    limits.check()
+    if not local_read_path(path) or not path.resolve(strict=True).is_relative_to(limits.root):
+        raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
+    with _open_contained(path, limits) as raw:
+        if not unlinked_directory_tree(path.parent) or not unlinked_regular_file(path):
+            raise ToolError("batch_path_denied", "Only contained local regular files are accepted.")
+        before = _read_identity(path.stat())
+        if before[2] != limits.source_bytes or not 0 <= before[2] <= 2 * 1024 * 1024:
+            raise ToolError("batch_source_changed", "The batch source changed.")
+        if not stat.S_ISREG(os.fstat(raw.fileno()).st_mode) or _read_identity(os.fstat(raw.fileno())) != before:
+            raise ToolError("batch_source_changed", "The batch source changed.")
+        pieces: list[bytes] = []
+        captured = 0
+        while True:
+            limits.check()
+            piece = raw.read(min(65_536, limits.source_bytes + 1 - captured))
+            if not piece:
+                break
+            pieces.append(piece)
+            captured += len(piece)
+            if captured > limits.source_bytes:
+                raise ToolError("batch_source_changed", "The batch source changed.")
+        if _read_identity(os.fstat(raw.fileno())) != before:
+            raise ToolError("batch_source_changed", "The batch source changed.")
+        data = b"".join(pieces)
+        used_encoding = _sample_encoding(data[:65_536]) if encoding == "auto" else chosen_encoding(path, encoding)
+        with io.StringIO(data.decode(used_encoding, errors="strict"), newline="") as text:
+            yield text, used_encoding, hashlib.sha256(data).hexdigest()
+        limits.check()
+        if _read_identity(path.stat()) != before or not unlinked_directory_tree(path.parent) or not unlinked_regular_file(path):
+            raise ToolError("batch_source_changed", "The batch source changed.")
 
 
 def chosen_encoding(path: Path, requested: str) -> str:
@@ -107,13 +293,31 @@ def read_window(
     offset: int,
     max_chars: int | None,
     encoding: str,
+    limits: ReadWindowLimits | None = None,
 ) -> dict[str, Any]:
     path = resolve_path(path_value)
     if not path.is_file():
         raise FileNotFoundError(f"File not found: {path}")
     if end_line is not None and end_line < start_line:
         raise ToolError("invalid_line_range", "end_line must be greater than or equal to start_line.")
-    used_encoding = chosen_encoding(path, encoding)
+    used_encoding = chosen_encoding(path, encoding) if limits is None else encoding
+    bounded = _bounded_window(path, encoding, limits) if limits is not None else nullcontext(None)
+    read_sha256: str | None = None
+    with bounded as snapshot:
+        context: AbstractContextManager[Any]
+        if snapshot is not None:
+            stream, used_encoding, read_sha256 = snapshot
+            context = nullcontext(stream)
+        else:
+            context = path.open("r", encoding=used_encoding, errors="strict", newline="")
+        with context as handle:
+            return _read_text_window(handle, path, used_encoding, start_line, end_line, offset, max_chars, limits, read_sha256)
+
+
+def _read_text_window(
+    handle: Any, path: Path, used_encoding: str, start_line: int, end_line: int | None, offset: int,
+    max_chars: int | None, limits: ReadWindowLimits | None, read_sha256: str | None,
+) -> dict[str, Any]:
     remaining_offset = offset
     pieces: list[str] = []
     captured = 0
@@ -122,43 +326,44 @@ def read_window(
     has_more = False
     chunk_size = 65_536
     pending = ""
-    with path.open("r", encoding=used_encoding, errors="strict", newline="") as handle:
-        while True:
-            if end_line is not None and current_line > end_line:
-                break
-            fragment = pending + handle.readline(chunk_size - len(pending))
-            pending = ""
-            if not fragment:
-                break
-            if fragment.endswith("\r"):
-                following = handle.read(1)
-                if following == "\n":
-                    fragment += following
+    while True:
+        if limits is not None:
+            limits.check()
+        if end_line is not None and current_line > end_line:
+            break
+        fragment = pending + handle.readline(chunk_size - len(pending))
+        pending = ""
+        if not fragment:
+            break
+        if fragment.endswith("\r"):
+            following = handle.read(1)
+            if following == "\n":
+                fragment += following
+            else:
+                pending = following
+        line_ended = fragment.endswith(("\n", "\r"))
+        if current_line >= start_line:
+            last_line = current_line
+            if remaining_offset:
+                skipped = min(len(fragment), remaining_offset)
+                fragment = fragment[skipped:]
+                remaining_offset -= skipped
+            if fragment:
+                if max_chars is None:
+                    pieces.append(fragment)
+                    captured += len(fragment)
                 else:
-                    pending = following
-            line_ended = fragment.endswith(("\n", "\r"))
-            if current_line >= start_line:
-                last_line = current_line
-                if remaining_offset:
-                    skipped = min(len(fragment), remaining_offset)
-                    fragment = fragment[skipped:]
-                    remaining_offset -= skipped
-                if fragment:
-                    if max_chars is None:
-                        pieces.append(fragment)
-                        captured += len(fragment)
-                    else:
-                        available = max_chars + 1 - captured
-                        if available <= 0:
-                            has_more = True
-                            break
-                        pieces.append(fragment[:available])
-                        captured += min(len(fragment), available)
-                        if len(fragment) > available or captured > max_chars:
-                            has_more = True
-                            break
-            if line_ended:
-                current_line += 1
+                    available = max_chars + 1 - captured
+                    if available <= 0:
+                        has_more = True
+                        break
+                    pieces.append(fragment[:available])
+                    captured += min(len(fragment), available)
+                    if len(fragment) > available or captured > max_chars:
+                        has_more = True
+                        break
+        if line_ended:
+            current_line += 1
     content = "".join(pieces)
     if max_chars is not None and len(content) > max_chars:
         content = content[:max_chars]
@@ -174,6 +379,7 @@ def read_window(
         "offset": offset,
         "truncated": has_more,
         "next_offset": offset + len(content) if has_more else None,
+        **({"read_sha256": read_sha256, "source_bytes": limits.source_bytes} if limits is not None else {}),
     }
 
 
@@ -195,10 +401,23 @@ def _hash_path(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _backup_file(path: Path, digest: str) -> str:
+def _backup_file(path: Path, digest: str, *, destination: Path | None = None) -> str:
     ensure_runtime_dirs()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    backup = SETTINGS.backup_dir / f"{stamp}_{digest[:12]}_{path.name}.bak"
+    exclusive = destination is not None
+    if destination is None:
+        backup = SETTINGS.backup_dir / f"{stamp}_{digest[:12]}_{path.name}.bak"
+    else:
+        backup = Path(destination)
+        root = SETTINGS.backup_dir.resolve(strict=False)
+        if not backup.is_absolute() or backup.is_symlink():
+            raise ToolError("backup_path_invalid", "Reserved backups must be absolute direct children of the backup directory.")
+        resolved = backup.resolve(strict=False)
+        if resolved.parent != root:
+            raise ToolError("backup_path_invalid", "Reserved backups must be direct children of the backup directory.")
+        backup = resolved
+        if backup.exists():
+            raise ToolError("backup_conflict", "Reserved backup destination already exists.")
     descriptor, temp_name = tempfile.mkstemp(prefix=f".{backup.name}.", suffix=".tmp", dir=str(SETTINGS.backup_dir))
     os.close(descriptor)
     temp = Path(temp_name)
@@ -207,7 +426,15 @@ def _backup_file(path: Path, digest: str) -> str:
         with temp.open("rb+") as handle:
             handle.flush()
             os.fsync(handle.fileno())
-        _replace_with_retry(temp, backup)
+        if exclusive:
+            try:
+                os.link(temp, backup)
+            except FileExistsError as exc:
+                raise ToolError("backup_conflict", "Reserved backup destination already exists.") from exc
+            except OSError as exc:
+                raise ToolError("backup_publish_failed", "Reserved backup could not be published atomically.") from exc
+        else:
+            _replace_with_retry(temp, backup)
     finally:
         temp.unlink(missing_ok=True)
     return str(backup)

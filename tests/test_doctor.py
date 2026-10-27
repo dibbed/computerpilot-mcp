@@ -2,13 +2,79 @@
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from core import executor
 from core.platform import PlatformCapabilities
 from scripts import doctor
 from scripts.tunnel_runtime import TunnelRuntimeSelection
+
+
+@pytest.mark.parametrize("hang", [False, True])
+def test_timeout_does_not_wait_for_descendant_inherited_pipes(root: Path, hang: bool) -> None:
+    from core.process_ownership import spawn_owned_process
+
+    child_pid = root / "child.pid"
+    finished = root / "finished"
+    child = "import time; time.sleep(30)"
+    command = (
+        "import subprocess,sys,time;from pathlib import Path;"
+        f"p=subprocess.Popen([sys.executable,'-c',{child!r}]);"
+        f"Path({str(child_pid)!r}).write_text(str(p.pid));time.sleep({60 if hang else 0})"
+    )
+    harness = root / "timeout_probe.py"
+    harness.write_text(
+        "import sys,psutil;from pathlib import Path\n"
+        f"sys.path.insert(0,{str(doctor.ROOT)!r})\n"
+        "from scripts import doctor\n"
+        "try:\n"
+        f" doctor._run(Path({str(root)!r}),'MCP filesystem and terminal smoke',[sys.executable,'-c',{command!r}],timeout=1)\n"
+        "except RuntimeError:\n"
+        " outcome='timed out'\n"
+        "else:\n"
+        " outcome='passed'\n"
+        "try:\n"
+        f" child=psutil.Process(int(Path({str(child_pid)!r}).read_text()))\n"
+        " assert not child.is_running() or child.status()==psutil.STATUS_ZOMBIE\n"
+        "except psutil.NoSuchProcess:\n"
+        " pass\n"
+        f"Path({str(finished)!r}).write_text(outcome)\n",
+        encoding="utf-8",
+    )
+    process = spawn_owned_process(
+        [sys.executable, str(harness)], cwd=root, env=None, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0, require_native=True,
+    )
+    try:
+        try:
+            assert process.wait(timeout=6) == 0
+        except subprocess.TimeoutExpired:
+            pytest.fail("Doctor timeout waited for inherited descendant pipes")
+    finally:
+        process.close_ownership()
+    assert child_pid.is_file(), "Fixture never reached descendant dispatch"
+    assert finished.read_text() == ("timed out" if hang else "passed")
+
+
+def test_run_announces_active_check_before_dispatch(
+    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[bool] = []
+
+    def run(*args: object, **kwargs: object) -> dict[str, object]:
+        assert "RUN MCP filesystem and terminal smoke" in capsys.readouterr().out
+        assert kwargs["require_native"] is True
+        assert kwargs["stdout_limit"] == kwargs["stderr_limit"] == 0
+        calls.append(True)
+        return {"ok": True, "exit_code": 0, "timed_out": False, "capture_complete": True}
+
+    monkeypatch.setattr(executor, "run_bounded", run)
+    doctor._run(root, "MCP filesystem and terminal smoke", [sys.executable, "-c", "pass"])
+    assert calls == [True]
+    assert "PASS MCP filesystem and terminal smoke" in capsys.readouterr().out
 
 
 @pytest.fixture
@@ -143,9 +209,10 @@ def test_search_backend_diagnostics_reports_python_fallback(monkeypatch: pytest.
 def test_search_backend_diagnostics_reports_ripgrep(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor.shutil, "which", lambda name: r"C:\\Tools\\rg.exe")
     monkeypatch.setattr(
-        doctor.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "ripgrep 14.1.0\nfeatures", ""),
+        executor,
+        "run_bounded",
+        lambda *args, **kwargs: {"ok": True, "exit_code": 0, "capture_complete": True, "timed_out": False,
+                                 "stdout": {"text": "ripgrep 14.1.0\nfeatures", "truncated": False}},
     )
     assert doctor.search_backend_diagnostics() == {
         "content_search_backend": "ripgrep",
@@ -154,10 +221,27 @@ def test_search_backend_diagnostics_reports_ripgrep(monkeypatch: pytest.MonkeyPa
     }
 
 def test_subprocess_failure_redacts_output(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(doctor.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 7, b"secret", b"secret"))
+    monkeypatch.setattr(executor, "run_bounded", lambda *args, **kwargs: {
+        "ok": False, "exit_code": 7, "capture_complete": True, "timed_out": False, "stdout": "secret", "stderr": "secret",
+    })
     with pytest.raises(RuntimeError, match="exit 7") as error:
         doctor._run(root, "Tunnel", ["fake"])
     assert "secret" not in str(error.value)
+
+
+def test_native_cleanup_failure_never_passes_or_echoes_payload(
+    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    import traceback
+
+    def denied(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("secret-canary")
+
+    monkeypatch.setattr(executor, "run_bounded", denied)
+    with pytest.raises(RuntimeError) as error:
+        doctor._run(root, "MCP filesystem and terminal smoke", ["fixture"])
+    assert "secret-canary" not in "".join(traceback.format_exception(error.value))
+    assert "PASS" not in capsys.readouterr().out
 
 
 def test_cache_probe_never_runs_full_validation(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tools.testing import verification
+
+
+@pytest.fixture(autouse=True)
+def _isolated_runtime_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import config
+
+    settings = replace(config.SETTINGS, state_dir=tmp_path / "runtime-state")
+    monkeypatch.setattr(config, "SETTINGS", settings)
+    monkeypatch.setattr(verification, "SETTINGS", settings)
 
 
 def test_checks_overlap_with_bounded_capacity_and_ordered_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -139,12 +149,9 @@ def test_parallel_catches_unhandled_exception(tmp_path: Path, monkeypatch: pytes
     assert events == ["stage_started", "stage_finished"]
 
 
-def test_analyze_short_circuits_on_total_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_negative_total_timeout_is_rejected_before_admission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
     monkeypatch.setattr(verification, "run_ruff_summary", lambda *a, **kw: pytest.fail("should not run"))
-    result = verification.verify_changed_repository(
-        tmp_path, changed_paths=["app.py"], checks=["ruff"], total_timeout_sec=-1.0,
-    )
-    assert not result["ok"]
-    assert result["required_unknown"] is True
-    assert result["stages"][0]["status"] == "timed_out"
+    monkeypatch.setattr(verification, "run_native_operation", lambda *a, **kw: pytest.fail("invalid budget was admitted"))
+    with pytest.raises(ValueError, match="budgets"):
+        verification.verify_changed_repository(tmp_path, changed_paths=["app.py"], checks=["ruff"], total_timeout_sec=-1.0)

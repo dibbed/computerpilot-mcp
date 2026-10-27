@@ -9,6 +9,7 @@ from typing import Any
 
 import anyio
 import pytest
+from extension_test_utils import write_catalog_epoch
 from mcp import Client, types
 from mcp.server.context import ServerRequestContext
 from mcp.shared.subscriptions import ToolsListChanged
@@ -209,7 +210,7 @@ def test_live_changed_removed_and_readded_schema_keeps_the_first_runtime_contrac
             assert original is not None
             for epoch in (1, 2, 1, 3, 0):
                 previous = manager.registry.manager_generation
-                (tmp_path / "catalog_epoch").write_text(str(epoch), encoding="utf-8")
+                write_catalog_epoch(tmp_path, epoch)
                 with anyio.fail_after(3):
                     while manager.registry.manager_generation == previous or owner.state != ExtensionState.HEALTHY:
                         await anyio.sleep(0.01)

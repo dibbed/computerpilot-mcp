@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, is_dataclass
@@ -100,26 +101,331 @@ def test_lookup_code_context_reports_ambiguous_short_names_and_scan_limits(tmp_p
     assert limited["complete"] is False
 
 
+_RELATIONSHIP_CATEGORIES = ("callers", "callees", "references", "imports", "tests")
+
+
+def _flatten_relationships(result: dict[str, Any]) -> list[tuple[str, str]]:
+    return [
+        (category, str(item))
+        for category in _RELATIONSHIP_CATEGORIES
+        for item in cast(list[dict[str, Any]], result[category])
+    ]
+
+
 def test_lookup_code_context_paginates_relationships_across_categories(tmp_path: Path) -> None:
     from tools.project.context import lookup_code_context
 
     _write_project(tmp_path)
 
+    baseline = _flatten_relationships(lookup_code_context(tmp_path, "app.service.create", max_relationships=1000))
     first = lookup_code_context(tmp_path, "app.service.create", max_relationships=1, offset=0)
     second = lookup_code_context(tmp_path, "app.service.create", max_relationships=1, offset=1)
 
     def identities(result: dict[str, Any]) -> set[tuple[str, str]]:
         rows: set[tuple[str, str]] = set()
-        for category in ("callers", "callees", "references", "imports", "tests"):
+        for category in _RELATIONSHIP_CATEGORIES:
             for item in cast(list[dict[str, Any]], result[category]):
                 rows.add((category, str(item)))
         return rows
 
+    assert _flatten_relationships(first) == baseline[:1]
+    assert _flatten_relationships(second) == baseline[1:2]
+    assert first["total"] == second["total"] == len(baseline)
     assert first["relationships_truncated"] is True
     assert first["total"] >= 2
     assert len(identities(first)) == 1
     assert len(identities(second)) == 1
     assert identities(first).isdisjoint(identities(second))
+
+
+def test_lookup_code_context_paginates_every_category(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    _write_project(tmp_path)
+    baseline = _flatten_relationships(
+        lookup_code_context(tmp_path, "app.service.create", max_relationships=1000, include_source=False)
+    )
+    total = len(baseline)
+    assert total >= 5
+
+    for limit in (1, 2, 3):
+        for offset in range(total + 2):
+            page = lookup_code_context(
+                tmp_path,
+                "app.service.create",
+                max_relationships=limit,
+                offset=offset,
+                include_source=False,
+            )
+            assert _flatten_relationships(page) == baseline[offset : offset + limit]
+            assert page["count"] == sum(
+                len(cast(list[dict[str, Any]], page[category])) for category in _RELATIONSHIP_CATEGORIES
+            )
+            assert page["total"] == total
+            assert page["offset"] == offset
+            assert page["limit"] == limit
+            assert page["relationships_truncated"] is (offset + limit < total)
+            if offset >= total:
+                assert all(cast(list[dict[str, Any]], page[category]) == [] for category in _RELATIONSHIP_CATEGORIES)
+
+
+def test_lookup_code_context_pagination_has_no_duplicate_or_missing_rows(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    _write_project(tmp_path)
+    baseline = _flatten_relationships(
+        lookup_code_context(tmp_path, "app.service.create", max_relationships=1000, include_source=False)
+    )
+    pages = [
+        _flatten_relationships(
+            lookup_code_context(
+                tmp_path,
+                "app.service.create",
+                max_relationships=1,
+                offset=offset,
+                include_source=False,
+            )
+        )
+        for offset in range(len(baseline) + 1)
+    ]
+    concatenated = [row for page in pages for row in page]
+
+    assert concatenated == baseline
+    assert len(set(concatenated)) == len(baseline)
+
+
+def test_context_parse_errors_prevent_complete(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    (tmp_path / "valid.py").write_text("def save() -> None:\n    pass\n", encoding="utf-8")
+    (tmp_path / "broken.py").write_text("def save(:\n    pass\n", encoding="utf-8")
+
+    result = lookup_code_context(tmp_path, "valid.save")
+
+    assert result["parse_errors"]
+    assert result["complete"] is False
+    assert "parse_errors" in result["incomplete_reasons"]
+
+
+def test_context_name_only_is_inferred(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    (tmp_path / "a.py").write_text("def foo() -> None:\n    pass\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def caller() -> None:\n    foo()\n", encoding="utf-8")
+
+    result = lookup_code_context(tmp_path, "a.foo")
+
+    callers = cast(list[dict[str, Any]], result["callers"])
+    assert callers and callers[0]["evidence"] == "name_only"
+    assert callers[0]["confidence"] == "inferred"
+    assert callers[0]["source_kind"] == "python_ast"
+    assert result["semantic_complete"] is False
+    page_rows = [
+        row
+        for category in _RELATIONSHIP_CATEGORIES
+        for row in cast(list[dict[str, Any]], result[category])
+    ]
+    assert result["confidence_summary"]["inferred"] == sum(
+        1 for row in page_rows if row.get("confidence") == "inferred"
+    )
+    assert sum(result["confidence_summary"].values()) == len(page_rows)
+
+
+def test_context_tests_do_not_depend_on_caller_visibility(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    _write_project(tmp_path)
+
+    hidden = lookup_code_context(tmp_path, "app.service.create", include_callers=False, include_tests=True)
+
+    assert hidden["callers"] == []
+    assert any(item["file"] == "tests/test_service.py" for item in cast(list[dict[str, Any]], hidden["tests"]))
+
+
+def test_context_source_limit_reports_incomplete(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    _write_project(tmp_path)
+
+    result = lookup_code_context(tmp_path, "app.service.create", include_source=True, source_max_chars=0)
+
+    assert result["complete"] is False
+    assert "source_truncated" in result["incomplete_reasons"]
+    assert all(item["source_truncated"] is True for item in cast(list[dict[str, Any]], result["definitions"]))
+
+
+def test_context_imports_row_reports_binding_confidence(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "app" / "deps.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "app" / "service.py").write_text(
+        "from app import deps as d\n\ndef create() -> int:\n    return d.VALUE\n",
+        encoding="utf-8",
+    )
+
+    result = lookup_code_context(tmp_path, "app.service.create")
+    imports = cast(list[dict[str, Any]], result["imports"])
+
+    assert imports
+    assert {item["evidence"] for item in imports} == {"import_bound"}
+    assert {item["confidence"] for item in imports} == {"static_resolved"}
+    assert {item["source_kind"] for item in imports} == {"python_ast"}
+    assert result["semantic_complete"] is False
+    assert result["confidence_summary"]["static_resolved"] >= len(imports)
+
+
+def _write_depth_chain(root: Path) -> None:
+    (root / "a.py").write_text("from b import mid\n\ndef start():\n    return mid()\n", encoding="utf-8")
+    (root / "b.py").write_text("from c import leaf\n\ndef mid():\n    return leaf()\n", encoding="utf-8")
+    (root / "c.py").write_text("def leaf():\n    return 1\n", encoding="utf-8")
+
+
+def test_context_depth_zero_one_two(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    _write_depth_chain(tmp_path)
+
+    depth0 = lookup_code_context(tmp_path, "a.start", max_depth=0)
+    assert depth0["query_depth"] == 0
+    assert depth0["total"] == 0
+    assert depth0["relationships_truncated"] is False
+    assert depth0["complete"] is True
+    assert depth0["completeness_by_relation"] == {"definition": True}
+    assert all(depth0[category] == [] for category in _RELATIONSHIP_CATEGORIES)
+
+    depth1 = lookup_code_context(tmp_path, "a.start", max_depth=1)
+    assert [item["qualified_name"] for item in cast(list[dict[str, Any]], depth1["callees"])] == ["b.mid"]
+    assert depth1["query_depth"] == 1
+    assert all(item["depth"] == 1 for item in cast(list[dict[str, Any]], depth1["callees"]))
+
+    depth2 = lookup_code_context(tmp_path, "a.start", max_depth=2)
+    callees = cast(list[dict[str, Any]], depth2["callees"])
+    assert [item["qualified_name"] for item in callees] == ["b.mid", "c.leaf"]
+    assert [item["depth"] for item in callees] == [1, 2]
+    assert callees[1]["via_qualified_name"] == "b.mid"
+
+    incoming1 = lookup_code_context(tmp_path, "c.leaf", max_depth=1)
+    assert [item["qualified_name"] for item in cast(list[dict[str, Any]], incoming1["callers"])] == ["b.mid"]
+
+    incoming2 = lookup_code_context(tmp_path, "c.leaf", max_depth=2)
+    callers = cast(list[dict[str, Any]], incoming2["callers"])
+    assert [item["qualified_name"] for item in callers] == ["b.mid", "a.start"]
+    assert [item["depth"] for item in callers] == [1, 2]
+    assert callers[1]["via_qualified_name"] == "b.mid"
+
+
+def test_context_depth_cycle_is_finite(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    (tmp_path / "a.py").write_text("from b import g\n\ndef f():\n    return g()\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("from a import f\n\ndef g():\n    return f()\n", encoding="utf-8")
+
+    result = lookup_code_context(tmp_path, "a.f", max_depth=2)
+    callees = cast(list[dict[str, Any]], result["callees"])
+    names = [item["qualified_name"] for item in callees]
+
+    assert "b.g" in names
+    assert len(names) == len(set(names))
+    assert len(names) <= 2
+    assert result["traversal_truncated"] is False
+
+
+def test_context_inferred_edge_is_not_transitively_expanded(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    (tmp_path / "target.py").write_text("def target():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def caller():\n    return target()\n", encoding="utf-8")
+    (tmp_path / "c.py").write_text("from b import caller\n\ndef outer():\n    return caller()\n", encoding="utf-8")
+
+    result = lookup_code_context(tmp_path, "target.target", max_depth=2)
+    callers = cast(list[dict[str, Any]], result["callers"])
+    names = [item["qualified_name"] for item in callers]
+
+    assert names == ["b.caller"]
+    assert callers[0]["evidence"] == "name_only"
+    assert callers[0]["confidence"] == "inferred"
+    assert "c.outer" not in names
+
+
+def test_context_traversal_budget_reports_lower_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tools.project import context
+
+    (tmp_path / "target.py").write_text("def target():\n    return 1\n", encoding="utf-8")
+    calls = "".join("    target()\n" for _ in range(10_001))
+    (tmp_path / "caller.py").write_text("def caller():\n" + calls, encoding="utf-8")
+    monkeypatch.setattr(context.time, "monotonic", lambda: 0.0)
+
+    result = context.lookup_code_context(
+        tmp_path, "target.target", max_depth=1, max_relationships=10, include_source=False
+    )
+
+    assert result["traversal_truncated"] is True
+    assert result["total_exact"] is False
+    assert result["complete"] is False
+    assert "edge_budget" in result["incomplete_reasons"]
+    assert result["total"] >= context.MAX_TRAVERSAL_EDGES
+    assert len(cast(list[dict[str, Any]], result["callers"])) == 10
+
+
+def test_context_depth_pagination_is_deterministic(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    _write_depth_chain(tmp_path)
+    baseline = _flatten_relationships(
+        lookup_code_context(tmp_path, "a.start", max_depth=2, max_relationships=1000, include_source=False)
+    )
+    assert len(baseline) >= 2
+
+    for offset in range(len(baseline)):
+        page = lookup_code_context(
+            tmp_path,
+            "a.start",
+            max_depth=2,
+            max_relationships=1,
+            offset=offset,
+            include_source=False,
+        )
+        assert _flatten_relationships(page) == baseline[offset : offset + 1]
+        assert page["total"] == len(baseline)
+
+
+def test_context_depth_helper_rejects_out_of_range_and_bool(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    _write_depth_chain(tmp_path)
+
+    for invalid in (-1, 3, True):
+        with pytest.raises(ValueError):
+            lookup_code_context(tmp_path, "a.start", max_depth=cast(Any, invalid))
+
+
+def test_code_context_schema_depth_bounds_and_bool_rejection(tmp_path: Path) -> None:
+    from mcp import Client
+
+    from core.registry import create_server
+
+    _write_depth_chain(tmp_path)
+
+    async def scenario() -> None:
+        async with Client(create_server(), raise_exceptions=True) as client:
+            valid = await client.call_tool(
+                "code_context",
+                {"path": str(tmp_path), "symbol": "a.start", "max_depth": 0},
+            )
+            assert valid.is_error is not True
+            assert cast(dict[str, Any], valid.structured_content)["query_depth"] == 0
+            for invalid in (3, True):
+                result = await client.call_tool(
+                    "code_context",
+                    {"path": str(tmp_path), "symbol": "a.start", "max_depth": invalid},
+                )
+                assert result.is_error is True
+
+    asyncio.run(scenario())
 
 
 def test_context_index_refreshes_after_source_changes_and_singleflights_builds(
@@ -132,11 +438,11 @@ def test_context_index_refreshes_after_source_changes_and_singleflights_builds(
     calls = 0
     original = context._build_context_index
 
-    def observed(root: Path, files: tuple[Path, ...], scan_truncated: bool) -> ContextIndex:
+    def observed(root: Path, files: tuple[Path, ...], scan_truncated: bool, *, deadline: float | None = None) -> ContextIndex:
         nonlocal calls
         calls += 1
         time.sleep(0.02)
-        return original(root, files, scan_truncated)
+        return original(root, files, scan_truncated, deadline=deadline)
 
     monkeypatch.setattr(context, "_build_context_index", observed)
     with ThreadPoolExecutor(max_workers=12) as pool:
@@ -150,3 +456,86 @@ def test_context_index_refreshes_after_source_changes_and_singleflights_builds(
     refreshed = context.lookup_code_context(tmp_path, "app.service.remove")
     assert refreshed["definitions"][0]["qualified_name"] == "app.service.remove"
     assert calls == 2
+
+
+@pytest.mark.parametrize("metadata", ["package.json", ".git"])
+def test_context_snapshot_tracks_manifest_and_worktree_identity(tmp_path: Path, metadata: str) -> None:
+    import os
+
+    from tools.project import context
+
+    (tmp_path / "a.py").write_bytes(b"def alpha():\n    return 1\n")
+    target = tmp_path / metadata
+    target.write_bytes(b'{"name":"one"}' if metadata == "package.json" else b"gitdir: one\n")
+    first = context.lookup_code_context(tmp_path, "alpha")
+    before = target.stat()
+    target.write_bytes(b'{"name":"two"}' if metadata == "package.json" else b"gitdir: two\n")
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    second = context.lookup_code_context(tmp_path, "alpha")
+    assert first["snapshot_id"] != second["snapshot_id"]
+    assert first["definitions"][0]["qualified_name"] == second["definitions"][0]["qualified_name"]
+
+
+def test_ast_context_adds_explicit_evidence_without_inventing_utf16_columns(tmp_path: Path) -> None:
+    import hashlib
+
+    from tools.project.context import lookup_code_context
+
+    source = tmp_path / "a.py"
+    source.write_bytes(b"def alpha():\n    return 1\n")
+    result = lookup_code_context(tmp_path, "alpha", max_depth=0)
+    assert result["backend"] == "ast" and result["language_id"] == "python"
+    row = result["definitions"][0]
+    assert row["line"] == 1 and row["source_kind"] == "python_ast"
+    assert row["symbol_key"]["coordinate_system"] == "python_legacy"
+    assert row["symbol_key"]["start_line"] == 1 and row["symbol_key"]["start_character"] is None
+    assert row["snapshot"]["document_digest"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert row["snapshot"]["source_kind"] == "ast" and row["snapshot"]["document_version"] is None
+    assert result["snapshot"] == row["snapshot"]
+    assert result["semantic_complete"] is False and result["fallback_reason"] is None
+
+
+def test_context_evidence_reuses_verified_versions_without_rehashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.project import context
+
+    source = tmp_path / "a.py"
+    source.write_bytes(b"".join(f"def alpha{index}():\n    return {index}\n\n".encode() for index in range(12)))
+    context.build_context_index(tmp_path)
+    calls: list[Path] = []
+    original = context.file_version
+
+    def counted(path: Path) -> Any:
+        calls.append(path)
+        return original(path)
+
+    monkeypatch.setattr(context, "file_version", counted)
+    result = context.lookup_code_context(tmp_path, "alpha", match="contains", max_depth=0, include_source=False)
+    assert len(result["definitions"]) == 12
+    assert len(calls) <= 2
+
+
+def test_file_only_context_uses_the_parent_workspace_identity(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    first_source = tmp_path / "a.py"
+    second_source = tmp_path / "b.py"
+    first_source.write_bytes(b"def alpha():\n    return 1\n")
+    second_source.write_bytes(b"def alpha():\n    return 2\n")
+    first = lookup_code_context(first_source, "alpha", max_depth=0)["definitions"][0]
+    second = lookup_code_context(second_source, "alpha", max_depth=0)["definitions"][0]
+    assert first["symbol_key"]["canonical_workspace"] == second["symbol_key"]["canonical_workspace"]
+    assert first["snapshot"]["worktree_id"] == second["snapshot"]["worktree_id"]
+    assert (first["symbol_key"]["relative_uri"], second["symbol_key"]["relative_uri"]) == ("a.py", "b.py")
+
+
+def test_file_only_context_does_not_scan_sibling_project_inputs(tmp_path: Path) -> None:
+    from tools.project.context import lookup_code_context
+
+    source = tmp_path / "a.py"
+    source.write_bytes(b"def alpha():\n    return 1\n")
+    (tmp_path / "package.json").write_bytes(b"invalid sibling manifest")
+    result = lookup_code_context(source, "alpha", max_depth=0)
+    assert result["complete"] and result["definitions"][0]["symbol_key"]["relative_uri"] == "a.py"
+    assert not result["missing_inputs"]

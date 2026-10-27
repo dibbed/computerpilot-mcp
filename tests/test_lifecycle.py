@@ -33,6 +33,64 @@ def test_mutation_guard_set_matches_mcp_annotations() -> None:
     assert annotated_mutations == MUTATING_TOOL_OPERATIONS & names
 
 
+def test_direct_project_runner_denied_during_drain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.project.project_types import detect_project_types
+    from tools.testing import project_runners, runners
+
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    spec = project_runners.discover_test_runners(tmp_path, detect_project_types(tmp_path)).runners[0]
+    bound = project_runners.bind_runner_runtime(spec, workspace_root=tmp_path)
+    control = tmp_path / "control.json"
+    lifecycle = RuntimeLifecycle()
+    lifecycle.configure(control, tmp_path / "status.json")
+    _write_control(control, "drain", "runner-drain", time.time() + 5)
+    assert lifecycle.poll_control() == "DRAINING"
+    monkeypatch.setattr(lifecycle_module, "RUNTIME_LIFECYCLE", lifecycle)
+    monkeypatch.setattr(runners, "run_bounded", lambda *a, **k: pytest.fail("dispatched during drain"))
+    with pytest.raises(ToolError) as error:
+        runners.run_project_tests(bound, targets=[], deadline=time.monotonic() + 2, diagnostic_cap=10)
+    assert error.value.code == "runtime_draining"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_admitted_native_verification_reuses_during_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    from core import recovery, tooling
+
+    lifecycle = RuntimeLifecycle()
+    control = tmp_path / "control.json"
+    lifecycle.configure(control, tmp_path / "status.json")
+    journal = recovery.OperationRecoveryJournal()
+    path = tmp_path / "journal.jsonl"
+    journal.configure(path if enabled else None, "fixture" if enabled else None)
+    monkeypatch.setattr(lifecycle_module, "RUNTIME_LIFECYCLE", lifecycle)
+    monkeypatch.setattr(tooling, "RUNTIME_LIFECYCLE", lifecycle)
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+    monkeypatch.setattr(tooling, "OPERATION_RECOVERY", journal)
+
+    @tooling.compact_errors("verify_changes")
+    async def execute() -> dict[str, bool]:
+        _write_control(control, "drain", "admitted-verifier", time.time() + 5)
+        assert lifecycle.poll_control() == "DRAINING"
+
+        def work() -> dict[str, bool]:
+            assert lifecycle.snapshot()["active_mutations"] == 1
+            recovery.mark_native_test_dispatch()
+            return {"ok": True}
+
+        return await asyncio.to_thread(recovery.bind_operation_recovery(
+            lambda: recovery.run_native_operation("verify_changes", None, work),
+        ))
+
+    assert asyncio.run(execute()) == {"ok": True}
+    assert lifecycle.snapshot()["active_mutations"] == 0
+    if enabled:
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        assert sum(row.get("type") == "begin" for row in records) == 1
+        assert sum(row.get("type") == "result" for row in records) == 1
+
+
 def test_runtime_lifecycle_drains_active_mutation_and_rejects_new_work(tmp_path: Path) -> None:
     control = tmp_path / "control.json"
     status = tmp_path / "status.json"
@@ -307,5 +365,78 @@ def test_real_mutating_tool_stays_active_until_command_finishes(
                 await asyncio.sleep(0.01)
             assert payload["state"] == "DRAINING"
             assert payload["active_mutations"] == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_count,seal_error", [(0, False), (1, False), (2, False), (0, True)])
+def test_lsp_shutdown_survives_extension_error_and_parent_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_count: int, seal_error: bool,
+) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from core import audit, config, heartbeat
+
+    settings = replace(config.SETTINGS, state_dir=tmp_path / "state", memory_dir=tmp_path / "memory", extensions_enabled=False)
+    for module in (audit, config, heartbeat):
+        monkeypatch.setattr(module, "SETTINGS", settings)
+    for name in ("MCP_HEARTBEAT_FILE", "MCP_RUNTIME_HEALTH_FILE", "MCP_LIFECYCLE_CONTROL_FILE",
+                 "MCP_LIFECYCLE_STATUS_FILE", "MCP_TOOL_ACTIVITY_FILE", "MCP_RUNTIME_GENERATION_ID"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("schedule_artifact_retention", "schedule_job_history_retention", "schedule_workflow_history_retention"):
+        monkeypatch.setattr(heartbeat, name, lambda **_kwargs: None)
+    monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
+    monkeypatch.setattr(heartbeat.SEARCH_SNAPSHOTS, "cleanup", lambda: None)
+    closing, release, closed = threading.Event(), threading.Event(), threading.Event()
+    calls: list[float] = []
+    drained: list[bool] = []
+
+    def close_all(*, timeout_sec: float) -> None:
+        calls.append(timeout_sec)
+        if not timeout_sec and seal_error:
+            raise RuntimeError("fixture initial seal failure")
+        if timeout_sec:
+            closing.set()
+            assert release.wait(5)
+            closed.set()
+
+    class Extension:
+        async def start_all_async(self) -> None:
+            return None
+
+        async def drain_and_stop(self, *, timeout_sec: float) -> None:
+            drained.append(True)
+            raise RuntimeError("fixture extension drain failure")
+
+    server = SimpleNamespace(lsp_manager=SimpleNamespace(close_all=close_all), extension_manager=Extension())
+
+    async def run_lifespan() -> None:
+        async with heartbeat.lifespan(server):
+            pass
+
+    async def scenario() -> None:
+        task = asyncio.create_task(run_lifespan())
+        try:
+            assert await asyncio.to_thread(closing.wait, 5)
+            for _ in range(cancel_count):
+                task.cancel()
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            if cancel_count:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                await task
+            assert closed.is_set() and drained == [True]
+            assert calls == [0, 5.0]
+            assert server.runtime_started is False
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())

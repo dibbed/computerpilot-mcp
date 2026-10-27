@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,333 @@ from core.jobs import JobStore
 from tools.jobs import registry as jobs_registry
 from tools.testing import background, registry
 from tools.testing.background import VerificationRequest, source_fingerprint, submit_verification
+
+
+def _git_fixture(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def test_background_preserves_rename_import_owners_without_delayed_git_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from scripts import verification_worker
+    from tools.testing import verification
+
+    repo = tmp_path / "repo"
+    (repo / "app").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "app" / "original.py").write_text("value=1\n", encoding="utf-8")
+    (repo / "tests" / "test_consumer.py").write_text("from app.original import value\n", encoding="utf-8")
+    _git_fixture(repo, "init", "-q")
+    _git_fixture(repo, "-c", "user.name=Tests", "-c", "user.email=tests@example.invalid", "add", ".")
+    _git_fixture(repo, "-c", "user.name=Tests", "-c", "user.email=tests@example.invalid", "commit", "-qm", "initial")
+    _git_fixture(repo, "mv", "app/original.py", "app/renamed.py")
+    direct = verification.build_verification_plan(repo)
+    expected = {item["path"] for item in direct["affected"]["tests"]}
+    assert direct["changed_paths"] == ["app/renamed.py"]
+    assert "tests/test_consumer.py" in expected
+    commands: list[list[str]] = []
+    store = JobStore(tmp_path / "state" / "jobs.sqlite3")
+
+    def submit(command: list[str], *args: Any, **kwargs: Any) -> dict[str, str]:
+        commands.append(command)
+        return {"job_id": "rename"}
+
+    monkeypatch.setattr(store, "submit", submit)
+    submit_verification(store, VerificationRequest(repo=str(repo), checks=["syntax"]), "rename")
+    monkeypatch.setattr(verification, "discover_changed_paths", lambda *a, **kw: pytest.fail("rediscovered delayed Git paths"))
+    selected: set[str] = set()
+
+    def verify(root: Path, **options: Any) -> dict[str, Any]:
+        plan = verification.build_verification_plan(root, changed_paths=options["changed_paths"])
+        selected.update(item["path"] for item in plan["affected"]["tests"])
+        return {"ok": True, "required_unknown": False, "stages": [], "mode": plan["mode"], "duration_ms": 1}
+
+    monkeypatch.setattr(verification_worker, "verify_changed_repository", verify)
+    assert verification_worker.run_request(commands[0][-1]) == 0
+    capsys.readouterr()
+    assert selected == expected
+
+
+def test_background_pins_resolved_base_before_delayed_execution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("docs", encoding="utf-8")
+    _git_fixture(repo, "init", "-q")
+    _git_fixture(repo, "add", ".")
+    _git_fixture(repo, "-c", "user.name=Tests", "-c", "user.email=tests@example.invalid", "commit", "-qm", "initial")
+    _git_fixture(repo, "branch", "baseline")
+    expected = _git_fixture(repo, "rev-parse", "HEAD")
+    commands: list[list[str]] = []
+    store = JobStore(tmp_path / "state" / "jobs.sqlite3")
+
+    def submit(command: list[str], *args: Any, **kwargs: Any) -> dict[str, str]:
+        commands.append(command)
+        return {"job_id": "base"}
+
+    monkeypatch.setattr(store, "submit", submit)
+    submit_verification(store, VerificationRequest(repo=str(repo), changed_paths=["README.md"], base="baseline"), "base")
+    _git_fixture(repo, "-c", "user.name=Tests", "-c", "user.email=tests@example.invalid", "commit", "--allow-empty", "-qm", "later")
+    _git_fixture(repo, "branch", "-f", "baseline", "HEAD")
+    assert _git_fixture(repo, "rev-parse", "baseline") != expected
+    request = VerificationRequest.model_validate_json(commands[0][-1])
+    assert request.base == expected
+
+
+def test_old_request_defaults_to_python_and_keeps_pins_out_of_options() -> None:
+    request = VerificationRequest.model_validate_json('{"repo":"."}')
+    assert request.test_backend == "python"
+    assert request.runner_specs == ()
+    assert "runner_specs" not in request.options()
+    assert "snapshot_input_paths" not in request.options()
+
+
+def test_background_submission_uses_target_scope_and_isolated_trusted_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("x=1\n", encoding="utf-8")
+    captured: dict[str, Any] = {}
+    store = JobStore(tmp_path / "state" / "jobs.sqlite3")
+
+    def submit(command: list[str], cwd: Path, *args: Any, **kwargs: Any) -> dict[str, str]:
+        captured.update(command=command, cwd=cwd)
+        return {"job_id": "trusted"}
+
+    monkeypatch.setattr(store, "submit", submit)
+    submit_verification(store, VerificationRequest(repo=str(repo), changed_paths=["app.py"], checks=["syntax"]), "trusted")
+    assert captured["cwd"] == repo.resolve()
+    assert captured["command"][1:3] == ["-I", "-c"]
+    request = VerificationRequest.model_validate_json(captured["command"][-1])
+    assert request.changed_paths == ["app.py"]
+    assert request.snapshot_input_paths == ["app.py"]
+
+
+def test_worker_forwards_original_pins_and_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from scripts import verification_worker
+
+    request = VerificationRequest(repo=str(tmp_path), source_fingerprint=source_fingerprint(tmp_path))
+    captured: dict[str, Any] = {}
+
+    def check(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"ok": False, "required_unknown": True, "execution_uncertain": True,
+                "stages": [], "mode": "focused", "duration_ms": 1}
+
+    monkeypatch.setattr(verification_worker, "verify_changed_repository", check)
+    assert verification_worker.run_request(request.model_dump_json()) == 1
+    assert captured["runner_specs"] == ()
+    assert captured["test_backend"] == "python"
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["execution_uncertain"] is True
+
+
+@pytest.mark.parametrize("executed_unknown", [False, True])
+def test_worker_keeps_execution_uncertainty_when_final_snapshot_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], executed_unknown: bool,
+) -> None:
+    from scripts import verification_worker
+
+    request = VerificationRequest(repo=str(tmp_path), source_fingerprint=source_fingerprint(tmp_path))
+    snapshots = 0
+
+    def snapshot(*args: Any, **kwargs: Any) -> str:
+        nonlocal snapshots
+        snapshots += 1
+        if snapshots > 1:
+            raise ValueError("snapshot failed")
+        return request.source_fingerprint
+
+    def verify(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        kwargs["stage_callback"]("stage_finished", {"name": "pytest_full", "status": "passed"})
+        return {"ok": not executed_unknown, "required_unknown": executed_unknown, "execution_uncertain": executed_unknown,
+                "stages": [], "mode": "focused", "duration_ms": 1}
+
+    monkeypatch.setattr(verification_worker, "source_fingerprint", snapshot)
+    monkeypatch.setattr(verification_worker, "native_test_dispatched", lambda: True)
+    monkeypatch.setattr(verification_worker, "verify_changed_repository", verify)
+    assert verification_worker.run_request(request.model_dump_json()) == 1
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert result["freshness"] == "unknown"
+    assert result.get("execution_uncertain", False) is executed_unknown
+
+
+def test_worker_reports_uncertainty_if_dispatched_stage_loses_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+
+    from scripts import verification_worker
+
+    request = VerificationRequest(repo=str(tmp_path), source_fingerprint=source_fingerprint(tmp_path))
+
+    def dumps(value: Any, **kwargs: Any) -> str:
+        if value.get("event") == "stage_finished":
+            raise ValueError("callback output failed")
+        return json.dumps(value, **kwargs)
+
+    def verify(*args: Any, **kwargs: Any) -> None:
+        kwargs["stage_callback"]("stage_finished", {"name": "pytest_full", "status": "passed"})
+
+    monkeypatch.setattr(verification_worker, "native_test_dispatched", lambda: True, raising=False)
+    monkeypatch.setattr(verification_worker, "json", SimpleNamespace(dumps=dumps))
+    monkeypatch.setattr(verification_worker, "verify_changed_repository", verify)
+    assert verification_worker.run_request(request.model_dump_json()) == 1
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert result["execution_uncertain"] is True
+
+
+def test_external_repository_worker_cannot_shadow_trusted_modules(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    marker = tmp_path / "untrusted-import"
+    malicious = f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\nraise RuntimeError('UNTRUSTED_MODULE_CANARY')\n"
+    (repo / "sitecustomize.py").write_text(malicious, encoding="utf-8")
+    for package in ("scripts", "core"):
+        (repo / package).mkdir()
+        (repo / package / "__init__.py").write_text(malicious, encoding="utf-8")
+    (repo / "app.py").write_text("x=1\n", encoding="utf-8")
+    store = JobStore(tmp_path / "state" / "jobs.sqlite3")
+    job = submit_verification(store, VerificationRequest(
+        repo=str(repo), changed_paths=["app.py"], checks=["syntax"], total_timeout_sec=20,
+    ), "external-shadow")
+    deadline = time.monotonic() + 30
+    while store.get(job["job_id"])["status"] in {"queued", "running"}:
+        assert time.monotonic() < deadline, store.output(job["job_id"])
+        time.sleep(0.03)
+    output = store.output(job["job_id"])
+    assert store.get(job["job_id"])["status"] == "succeeded", output
+    assert not marker.exists()
+    assert "UNTRUSTED_MODULE_CANARY" not in json.dumps(output)
+
+
+def test_snapshot_tracks_selected_installed_inputs_without_changing_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from scripts import verification_worker
+    from tools.testing import verification
+    from tools.testing.project_runners import RunnerRuntime, RunnerSpec
+
+    repo = tmp_path / "repo"
+    installed = repo / "node_modules" / "jest"
+    installed.mkdir(parents=True)
+    entrypoint = installed / "cli.js"
+    entrypoint.write_text("// approved", encoding="utf-8")
+    metadata = installed / "package.json"
+    metadata.write_text('{"name":"jest"}', encoding="utf-8")
+    runtime = tmp_path / "node.exe"
+    runtime.write_bytes(b"pinned runtime")
+    spec = RunnerSpec(
+        "jest", repo, "f" * 64, ("jest.config.json",), entrypoint, "1",
+        ("installed:node_modules/jest/package.json",), True, (), workspace_root=repo,
+        workspace_id="approved-workspace", runtime=RunnerRuntime(runtime, "a" * 64, runtime), entrypoint_sha256="b" * 64,
+    )
+    monkeypatch.setattr(verification, "bind_verification_runners", lambda *args: (spec,))
+    commands: list[list[str]] = []
+    store = JobStore(tmp_path / "state" / "jobs.sqlite3")
+
+    def submit(command: list[str], *args: Any, **kwargs: Any) -> dict[str, str]:
+        commands.append(command)
+        return {"job_id": "stale"}
+
+    monkeypatch.setattr(store, "submit", submit)
+    submit_verification(store, VerificationRequest(
+        repo=str(repo), changed_paths=["src/app.js"], checks=["pytest"], test_backend="auto",
+    ), "stale")
+    request = VerificationRequest.model_validate_json(commands[0][-1])
+    assert request.changed_paths == ["src/app.js"]
+    assert {"jest.config.json", "node_modules/jest/package.json", "node_modules/jest/cli.js"} <= set(request.snapshot_input_paths or [])
+    assert request.runner_specs == (spec,)
+    metadata.write_text('{"name":"changed"}', encoding="utf-8")
+    monkeypatch.setattr(verification_worker, "verify_changed_repository", lambda *a, **kw: pytest.fail("stale runner was dispatched"))
+    assert verification_worker.run_request(commands[0][-1]) == 1
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["freshness"] == "stale"
+
+
+@pytest.mark.parametrize("options", [{"stage_timeout_sec": 601}, {"total_timeout_sec": 1801}])
+def test_auto_background_rejects_runner_budget_above_native_caps(options: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="auto verification"):
+        VerificationRequest(repo=".", test_backend="auto", **options)
+
+
+@pytest.mark.parametrize("backend", [None, "auto"])
+@pytest.mark.parametrize("tool", ["verify_changes", "start_verification"])
+def test_registered_verification_tools_forward_backend_and_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str | None, tool: str,
+) -> None:
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    captured: dict[str, Any] = {}
+    admissions = 0
+    admission_budgets: list[float] = []
+
+    @contextmanager
+    def claims(*args: Any, **kwargs: Any) -> Iterator[None]:
+        nonlocal admissions
+        admissions += 1
+        admission_budgets.append(kwargs["timeout_sec"])
+        time.sleep(0.02)
+        yield
+
+    def verify(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {
+            "ok": True, "mode": "focused", "stages": [], "duration_ms": 1,
+            "required_unknown": False, "changed_paths": [], "affected": {},
+            "execution_uncertain": False, "tests_executed": False, "claim_testing": False,
+        }
+
+    def submit(store: Any, request: VerificationRequest, *args: Any) -> dict[str, Any]:
+        captured.update(request.options())
+        return {"accepted": True}
+
+    monkeypatch.setattr(registry, "managed_resource_claims", claims)
+    monkeypatch.setattr(registry, "verify_changed_repository", verify)
+    monkeypatch.setattr(registry, "submit_verification", submit)
+    store = JobStore(tmp_path / "state" / "jobs.sqlite3")
+    server = MCPServer("verification-forwarding")
+    registry.register(server, background_enabled=True, store_getter=lambda: store)
+
+    async def scenario() -> None:
+        args: dict[str, Any] = {"repo": str(tmp_path), "checks": ["syntax"], "total_timeout_sec": 1}
+        if backend is not None:
+            args["test_backend"] = backend
+        if tool == "start_verification":
+            args["idempotency_key"] = "forwarding"
+        async with Client(server, raise_exceptions=True) as client:
+            response = (await client.call_tool(tool, args)).structured_content
+            assert response and (response.get("ok") or response.get("accepted"))
+
+    asyncio.run(scenario())
+    assert captured["test_backend"] == (backend or "python")
+    if tool == "verify_changes":
+        assert admissions == 1
+        assert 0 < admission_budgets[0] <= 1
+        assert 0 < captured["total_timeout_sec"] < admission_budgets[0]
+
+
+@pytest.mark.parametrize("tool", ["verify_changes", "start_verification"])
+def test_registered_auto_budget_is_rejected_before_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str,
+) -> None:
+    monkeypatch.setattr(registry, "managed_resource_claims", lambda *args, **kwargs: pytest.fail("admitted invalid budget"))
+    monkeypatch.setattr(registry, "submit_verification", lambda *args, **kwargs: pytest.fail("queued invalid budget"))
+    server = MCPServer("verification-budget")
+    registry.register(server, background_enabled=True)
+
+    async def scenario() -> None:
+        args: dict[str, Any] = {"repo": str(tmp_path), "test_backend": "auto", "stage_timeout_sec": 601}
+        if tool == "start_verification":
+            args["idempotency_key"] = "bad-budget"
+        async with Client(server, raise_exceptions=True) as client:
+            response = (await client.call_tool(tool, args)).structured_content
+            assert response and response["ok"] is False
+
+    asyncio.run(scenario())
 
 
 def test_request_rejects_unsafe_parallel_modes() -> None:
@@ -323,7 +651,9 @@ def test_cancel_running_verification_reaps_test_process(tmp_path: Path) -> None:
     marker = tmp_path / "test-pid"
     (repo / "test_cancel.py").write_text(
         "import os,time\nfrom pathlib import Path\ndef test_wait():\n"
-        f"    Path({str(marker)!r}).write_text(str(os.getpid()))\n"
+        f"    pending = Path({str(marker.with_suffix('.pending'))!r})\n"
+        "    pending.write_text(str(os.getpid()))\n"
+        f"    pending.replace(Path({str(marker)!r}))\n"
         "    time.sleep(60)\n", encoding="utf-8",
     )
     store = JobStore(tmp_path / "state" / "jobs.sqlite3")

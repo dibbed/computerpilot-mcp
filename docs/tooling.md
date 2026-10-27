@@ -8,6 +8,8 @@ Available profiles:
 
 - `minimal`
 - `coding`
+- `coding_core` (unreleased opt-in; model UX pilot pending)
+- `read_batch` (unreleased, explicit opt-in; seven fixed read/discovery tools)
 - `git`
 - `testing`
 - `documents`
@@ -24,6 +26,20 @@ MCP_TOOL_PROFILE=<profile>
 
 `discover_tool_domains` reports the requested/active domains and platform capabilities. `recommend_tools` searches only the tools actually registered in the active profile and attaches shared execution metadata when known.
 
+`coding_core` uses the coding domains with an exact 43-tool native catalog covering discovery, files, project/LSP context, verification, Git, recovery and job observation/cancellation. Set it before startup and restart; clients can cache the catalog for the whole session. Choose `coding` or `full` and restart when broader capabilities are needed. Hidden native tools are rejected before dispatch, and extensions need explicit `coding_core` profile eligibility. Profiles are capability filters, not security sandboxes; visible mutations keep their existing policy, lifecycle and recovery guards. Static SDK journeys pass, but the separately budgeted live-model UX comparison is unverified; this profile does not change the default.
+
+### Opt-in native read batching
+
+The unreleased `read_batch` profile contains only `read_file`, `native_read_batch` and five existing discovery, health and advisory route tools. Select `MCP_TOOL_PROFILE=read_batch` **before starting the server** and reconnect/restart clients that cache `tools/list`. The default `full`, `coding`, `coding_core` and `minimal` catalogs are unchanged; the feature is not available from those profiles. This profile is a tool filter, not an OS security sandbox.
+
+`native_read_batch` accepts an explicit local `root` and 1–16 ordered, uniquely identified `read_file` windows. Each item has `path`, optional line window, offset, encoding and `max_chars` (default 4096, maximum 16384). `max_parallel` is 1–4 (default 1); cooperative `timeout_sec` is at most 60 seconds (default 10). The server accepts at most four simultaneous batches and four in-flight reads across them. Each regular file is limited to 2 MiB; aggregate source data to 8 MiB, requested result text to 64 KiB, and the encoded response to 192 KiB. Invalid request shapes are rejected before dispatch, while valid independent items can return separate errors.
+
+Results preserve input order and report bounded per-item status, completeness, truncation, read hash and source size. **There is no atomic snapshot across files**. Detected source changes, symlink or network paths, unavailable/hidden tools and resource exhaustion fail closed. Cancellation/deadline stops admission of new work and suppresses late success, but cannot forcibly interrupt a blocking OS file read; resource slots remain occupied until actual completion. This tool does not execute commands, write files, accept arbitrary tool names or wrap Git/search. An SDK client may issue one `native_read_batch` call instead of multiple `read_file` calls for independent local windows; a fixed-profile client without catalog refresh must reconnect after profile changes. **Do not assume a local speedup:** in the controlled Windows production-dispatcher in-process SDK run (30 measured pairs, 5 warmups), four direct reads had p50 5.229 ms versus batch p50 58.593 ms, and 16 direct reads p50 18.573 ms versus batch p50 226.985 ms. Batch reduces the number of requests from N to 1, so it can save time across sufficiently high-latency transport hops, but live Tunnel and model end-to-end latency have not been measured.
+
+Each read opens files relative to the admitted directory on POSIX. On Windows, parent handles prevent directory replacement during the read and reparse-point files are rejected. A conflicting rename or delete can therefore fail until the read finishes. These checks do not make the server an OS sandbox.
+
+For an isolated comparison of the actual batch tool with direct MCP reads and PowerShell, run `python -m scripts.perf_benchmark --suite native_batch_production --runs 30 --output native-batch-production.json`. The older `native_batch` suite measures a private prototype, not the production dispatcher. Both use in-memory transport; synthetic round-trip savings are estimates, not Tunnel measurements.
+
 ## Adaptive execution routing
 
 Use the routing diagnostics when an agent or workflow needs to decide *how* an intent should be executed without executing it yet:
@@ -33,7 +49,11 @@ Use the routing diagnostics when an agent or workflow needs to decide *how* an i
 
 Supported initial structured intents are:
 
-`filesystem.read`, `filesystem.write`, `code.rename`, `git.read`, `git.write`, `process.run`, `system.inspect`, `document.excel.read`, `document.excel.write`, `document.docx.read`, `document.docx.write`, `document.pdf.read`, `document.pdf.create`, `browser.interact`, `desktop.semantic.interact`, and `desktop.raw.interact`.
+`filesystem.read`, `filesystem.write`, `filesystem.edit_batch`, `filesystem.patch`, `code.rename`, `git.read`, `git.write`, `process.run`, `process.powershell`, `process.durable`, `system.inspect`, `document.excel.read`, `document.excel.write`, `document.docx.read`, `document.docx.write`, `document.pdf.read`, `document.pdf.create`, `browser.interact`, `desktop.semantic.interact`, and `desktop.raw.interact`.
+
+Use native file/search/Git tools for their structured operations, `process.run` for an executable, and `process.powershell` for cmdlets or pipelines. The PowerShell intent requires the PowerShell capability and has no executable fallback. Existing cost/latency tiers are ordinal planning estimates informed by the local execution-cost benchmark; they do not measure network or model latency. Recommendations never dispatch a tool or grant permission.
+
+For known independent edits, `filesystem.edit_batch` recommends `safe_refactor` within one file and `filesystem.patch` recommends the guarded multi-file `apply_patch`. Edits depending on earlier results need separate calls. These intents do not merge requests or change backup, hash, rollback or recovery rules. `process.durable` recommends `submit_job` for work that must survive a client disconnect; collect progress with `job_wait`. Keep short commands and bounded stdin on `process.run`, which does not provide an interactive terminal session.
 
 The planning client maps a request such as "write cells in Excel" to a canonical intent before calling `execution_recommend`:
 
@@ -94,7 +114,9 @@ Language tools add LSP-based:
 - transactional rename;
 - code-action workspace edits.
 
-The language layer uses a trusted discovered `pyright-langserver --stdio` executable and bounds one-shot protocol requests.
+The default language layer uses a trusted discovered `pyright-langserver --stdio` executable and bounds one-shot protocol requests. Opt-in persistent sessions require reviewed local configuration through `MCP_LSP_PROVIDERS_CONFIG` and `MCP_LSP_PERSISTENT_ENABLED=true`. The configuration accepts at most four explicit provider identities: `pyright`, `typescript`, `phpactor`, and `intelephense`; executable and entrypoint SHA-256 pins and trusted workspace roots are checked before launch. Configuring two providers for the same language and root is ambiguous and fails before dispatch.
+
+For native Windows PHP, `intelephense` uses a pinned Node executable plus its pinned `lib/intelephense.js` entrypoint with `--stdio`; PHPActor remains available for supported operator-selected runtimes. [Intelephense](https://intelephense.net/docs) provides definition, references and push diagnostics without a premium licence. Sessions isolate its caches and licence lookup under their private runtime directory, and remove that directory after confirmed process cleanup. Premium operations, including rename and code actions, are outside this free-provider acceptance; no licence is loaded or activated. Provider configuration is never enabled automatically. See [real-provider acceptance](development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md) for tested versions, reproduction and limitations.
 
 ## Git
 
@@ -129,6 +151,25 @@ Testing tools integrate:
 - change-aware verification;
 - durable validation watches.
 
+`affected_tests` keeps Python selection by default and accepts `test_backend="auto"` for read-only package runner plans.
+JavaScript, TypeScript, PHP and other executable or unclassified changes always report unknown coverage, including in the
+default Python mode. Auto mode uses bounded package/runner metadata and source fingerprints; it recommends package full
+suites and broadens across packages when dependency coverage is unavailable. It never starts an LSP provider or executes
+package scripts/configuration. `package_selections`, `missing_inputs`, `source_fingerprint`, Git/worktree identity and
+`total_exact` describe the evidence and its limits. Renames preserve destination-only `changed_paths` and expose both
+paths through `touched_paths`; deleted tests are not suggested as runnable files. The result cap applies across flat
+Python tests and package selections. A full-suite recommendation or `tests=[]` with incomplete evidence is not test success.
+Verification entrypoints keep Python selection by default and accept opt-in `test_backend="auto"` to add the selected package runners after the Python pytest scope. Auto mode validates the plan and every runner identity before dispatch, never installs dependencies or runs package scripts, and reports unknown coverage when a required runner is unavailable or the plan is incomplete.
+
+Internal runner helpers bind the current workspace, installed entrypoint and host runtime to hashes, then revalidate
+them under managed package claims before each direct invocation. They use fixed argv for Jest 29, Vitest 3,
+PHPUnit 11 and Pest 3; unsupported versions remain unavailable. Python keeps its virtual-environment invocation path,
+and unittest requires an explicit selection. Package scripts, shell launchers and automatic installs are excluded.
+Reports use private temporary storage and bounded parsing; missing, invalid or zero-test results remain unknown.
+Package runners receive a private temporary home directory through `HOME` and `USERPROFILE`; credential and loader variables remain scrubbed. Project discovery excludes Composer `vendor` dependencies alongside `node_modules`; explicitly selected installed runner metadata is still validated.
+Timeouts use the existing owned process-tree cleanup and never retry a possibly completed run. These helpers do not
+establish sandbox isolation or prove that an installed foreign runner has passed its real integration gate.
+
 Recommended code-change loop:
 
 ```text
@@ -141,12 +182,13 @@ affected_tests
 verify_changes
 ```
 
-`verify_changes` can run syntax, Ruff, mypy, and the narrowest sound pytest scope. Shared/repository-wide changes can fall back to the full suite. Foreground verification stays serial by default with `max_parallel_checks=1`. Read-only analyzer work can opt into capacity 2–3 only with `fail_fast=false` and `ruff_fix=false`; incompatible combinations are rejected before planning or analyzer dispatch. Parallel foreground verification is synchronous and non-durable, so client disconnects do not turn it into a background job. `stage_timeout_sec` remains a per-stage ceiling while `total_timeout_sec` bounds the verification run but is not a hard thread-kill deadline, and participating analyzer invocations also consume the shared MCP_MAX_RUNNING_ANALYZERS budget; unrelated external processes remain outside that cooperative limit.
+`verify_changes` can run syntax, Ruff, mypy, and the narrowest sound pytest scope. Shared/repository-wide changes can fall back to the full suite. Omitted `test_backend` remains `"python"`; opt-in `test_backend="auto"` also dispatches the selected package runners under the same resource claims, shared analyzer capacity, and deadlines. A required runner that is unavailable or a package plan that cannot be completed makes the result unknown rather than passed. Foreground verification stays serial by default with `max_parallel_checks=1`. Read-only analyzer work can opt into capacity 2–3 only with `fail_fast=false` and `ruff_fix=false`; incompatible combinations are rejected before planning or analyzer dispatch. Parallel foreground verification is synchronous and non-durable, so client disconnects do not turn it into a background job. `stage_timeout_sec` remains a per-stage ceiling while `total_timeout_sec` bounds the verification run but is not a hard thread-kill deadline, and participating analyzer invocations also consume the shared MCP_MAX_RUNNING_ANALYZERS budget; unrelated external processes remain outside that cooperative limit.
 
 `collect_diagnostics` also stays serial by default. Set `max_parallel_checks` to 2 or 3 to run independent Ruff, mypy, and pytest backends concurrently while preserving request-order stages and the existing deterministic merged diagnostic ordering. `timeout_sec` remains a per-backend ceiling. Optional `total_timeout_sec` (up to 10800 seconds) includes queue time and clamps each backend's effective timeout; a backend that has not started before the total deadline is reported timed out and `required_unknown=true`. Backend exceptions are isolated as unavailable stages so successful sibling diagnostics are retained. Thread cleanup can outlive the exact deadline while an already-running owned analyzer is terminating, so the total deadline is a scheduling/result bound rather than a promise to kill Python threads at that instant.
 
 For long checks, `start_verification` accepts the verification inputs plus a required `idempotency_key`, optional
-`queue_timeout_sec`, and `max_parallel_checks` (1–3, default 1). It is available when both testing and jobs domains are
+`queue_timeout_sec`, and `max_parallel_checks` (1–3, default 1). The inputs include `test_backend`; omitted or previously
+stored requests without it continue to run Python verification. It is available when both testing and jobs domains are
 active, including `coding` and `full`; existing profiles and foreground response contracts are unchanged.
 
 Start the job, retain its ID, and continue independent work. Collect `job_wait`/`job_output` when the result is needed.
@@ -159,7 +201,7 @@ Output uses schema version 1 events: `started`, `stage_started`, `stage_finished
 interpreter; analyzers select the target project's interpreter. Test caches and temporary directories are isolated per run.
 
 Input snapshots hash a conservative tree excluding standard dependency/runtime/cache directories, bounded to 10,000 files,
-64 MiB and 10 seconds per snapshot. Explicit changed files are included even inside an excluded directory; missing explicit paths are also bound so creating them invalidates the snapshot. The same limits apply to these inputs. Inaccessible inputs, symlinks, changing files and exhausted bounds fail closed.
+64 MiB and 10 seconds per snapshot. Explicit changed files are included even inside an excluded directory; missing explicit paths are also bound so creating them invalidates the snapshot. The same limits apply to these inputs. Inaccessible inputs, symlinks, changing files and exhausted bounds fail closed. Auto verification also records bounded runner identities separately from the repository snapshot; the worker revalidates those pins and the input fingerprint before dispatch, and a changed manifest, runner configuration or entrypoint rejects the run as stale instead of replaying it.
 Requests are limited to 64 KiB and the native Windows command-line limit. Use a new idempotency key after changing the
 request or input revision. Deduplication lasts only as long as the existing job record is retained.
 
@@ -328,6 +370,14 @@ Use it to inspect:
 Detailed panel endpoints are control-token guarded. The panel is intended for loopback use, not direct untrusted-network exposure.
 
 ## Health and discovery
+
+Ten native tools publish validated output schemas: `code_context`, `affected_tests`, `search_files`, `project_summary`, `job_status`, `workflow_status`, `server_health`, `verify_changes`, `language_diagnostics`, and `execution_recommend`. Their existing dictionaries remain the wire format; no extra SDK `result` wrapper is added. The other tools retain their current contracts.
+
+These generated native output schemas omit descriptive annotations and redundant string-literal types, and collapse simple nullable unions only when their constraints still apply correctly. Literal data, property names, local `$defs`/`$ref` identities, validation ranges and conditional non-null requirements are preserved. Compaction does not change native inputs, tool names, descriptions, annotations, other discovery metadata, runtime validation, payloads or absent-versus-null behavior. A shared tool advertises the same output schema in every profile; native counts remain `full=151`, `coding=96`, `coding_core=43` on Windows.
+
+The P08 catalog allowance is an increase of at most 32,284 UTF-8 JSON bytes per profile over the committed baseline (`full=161424`, `coding=100462`, `coding_core=47156` bytes), serialized with `ensure_ascii=False`, sorted keys and compact separators. This retains the full-profile 20% ceiling and applies its absolute allowance to smaller profiles because the shared output definitions have a fixed cost. External encoding checks similarly allow increases of at most 7,487 `cl100k_base` and 7,882 `o200k_base` tokens per profile against that baseline, using tiktoken 0.7.0 and hash-verified vocabularies. These are catalog encoding counts, not complete client prompts, billed usage or evidence of live-model quality or UX. The existing catalog benchmark separately reports `output_schema_json_bytes`, the sum of compact UTF-8 JSON sizes of present wire output schemas; it excludes catalog keys and other tool metadata and adds no tokenizer dependency.
+
+An unsuccessful verification is a valid report with stages and explicit unknown outcomes. A recommendation with no eligible route remains an advisory result and grants no permission. Workflow status retains its existing state/checkpoint shape, including uncertainty. Health supports full snapshots, bounded summaries, and the compact unavailable response. Language diagnostics retain full versus unchanged pull reports, UTF-16 ranges, and any explicit completeness flag; opaque diagnostic data is redacted before validation. Unsupported stored job/workflow states return `output_version_unsupported`; malformed output returns a fixed `output_contract_violation` without echoing its payload.
 
 `server_health` reports runtime/platform capability state plus resource/job/browser/workflow/recovery summaries and a bounded in-memory `execution_router` snapshot with policy, route distribution, fallback/no-route/rejection counts, native/semantic/raw usage, latency, and recent decisions.
 

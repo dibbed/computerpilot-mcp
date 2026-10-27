@@ -16,7 +16,11 @@ This page highlights the settings most users are likely to change.
 | `CONTROL_PLANE_API_KEY` | tunnel control-plane credential | unset |
 | `MCP_TUNNEL_PROFILE` | explicit tunnel profile | auto-detected / `default` |
 
-Named tool profiles are `minimal`, `coding`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, and `full`. The `documents` profile keeps filesystem, native document, recovery, and workflow domains together. Router candidate generation always uses the tools actually registered in the selected profile; catalog metadata does not bypass profile or platform filtering. Unsupported router policy names fail closed only when router APIs/routed steps are invoked and do not prevent the MCP server from starting.
+Named tool profiles are `minimal`, `coding`, `coding_core`, `read_batch`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, and `full`. The `documents` profile keeps filesystem, native document, recovery, and workflow domains together. Router candidate generation always uses the tools actually registered in the selected profile; catalog metadata does not bypass profile or platform filtering. Unsupported router policy names fail closed only when router APIs/routed steps are invoked and do not prevent the MCP server from starting.
+
+Unreleased opt-in `coding_core` keeps a fixed 43-tool subset of the coding catalog. Set `MCP_TOOL_PROFILE=coding_core` before startup and restart to select it; switch back to `coding`/`full` with another restart. Extensions require explicit eligibility for the new profile. Its live-model UX pilot is pending separate budget/authorization; `full` remains the default. See [profiles](tooling.md#profiles).
+
+The unreleased opt-in `read_batch` profile adds one bounded read-only `native_read_batch` tool alongside `read_file` and five existing discovery/health/routing tools (seven total). It must be selected explicitly before server startup, followed by a client reconnect to refresh a cached catalog. The existing `full` default and its tool count do not change. See [native read batching](tooling.md#opt-in-native-read-batching) for file, response, concurrency, timeout and cancellation limits.
 
 ## Managed tunnel runtime
 
@@ -145,6 +149,24 @@ MCP_TIMINGS=1
 ```
 
 Timing records are local metadata/durations; they are not intended to log command bodies, file contents, secrets, or typed UI values.
+
+Tool invocations have an internal 32-hex `correlation_id`, including when timing is disabled. Audit records and enabled timing records share this ID. `parent_operation_id` is present when a recovery operation exists; it is an observation reference, not an execution capability. Durable jobs keep bounded `trace_schema_version=1` metadata privately in their existing spec, outside the command's idempotency fingerprint. The scheduler and worker restore it explicitly across process boundaries. Older jobs without this metadata remain linked by `job_id`; their original request trace cannot be reconstructed.
+
+Timing phases describe different intervals and must not be added together:
+
+| Phase | Measured interval |
+|---|---|
+| `request_pipeline` | MCP dispatch through the typed result, before transport delivery |
+| `serialization` | Existing JSON serialization probe, not socket/network latency |
+| `claim_wait` | Resource admission after path/database setup, ending at admission or denial |
+| `worker_launch` | Launching the durable worker process |
+| `process_spawn` | Starting the owned command process |
+| `process_execution` | Command wait/polling, including bounded termination when needed; excludes later ownership release and output drain |
+| `job_worker` | Worker control flow after trace lookup; overlaps its command phases |
+| `job_wait` | Long-poll and progress collection before trace lookup and response delivery |
+
+Timing is best-effort: a missing observation does not establish that an operation was not executed. Timing failures do not change durable job/recovery outcomes. Existing retention and queue limits still apply.
+
 ## Extension configuration (v0.8)
 
 The offline reader is opt-in: `MCP_EXTENSIONS_ENABLED` defaults `false`; only `1`, `true`, `yes`, or `on` enable it. `MCP_EXTENSIONS_CONFIG` may specify an absolute local JSON path; omit it for `config_home() / 'computerpilot-mcp' / 'extensions.json'`. The existing platform helper gives XDG precedence, then Windows APPDATA, macOS Application Support, or POSIX `~/.config`. This does not move native `.agent_state`.

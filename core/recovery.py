@@ -11,13 +11,13 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from core.errors import ToolError
 from core.file_lock import exclusive_file_lock
@@ -34,10 +34,17 @@ JOURNAL_SCHEMA_VERSION = 1
 EXTERNAL_METADATA_VERSION = 1
 COMPACT_AFTER_RECORDS = 4_096
 MAX_UNRESOLVED_EXTERNAL_OPERATIONS = 128
+MAX_UNRESOLVED_WORKSPACE_EDITS = 64
 MAX_EXTERNAL_TERMINAL_HISTORY = 1_000
 MAX_EXTERNAL_TERMINAL_DAYS = 30
 _MAX_LINE_BYTES = 32_768
 _MAX_TARGET_CHARS = 1_000
+_MAX_WORKSPACE_EDIT_FILES = 100
+_MAX_WORKSPACE_EVIDENCE_BYTES = 32 * 1024
+_MAX_WORKSPACE_PROTECTED_PATHS = 10_000
+_WORKSPACE_EDIT_EVIDENCE_VERSION = 1
+_WORKSPACE_EDIT_STAGES = frozenset({"prepared", "may_dispatch"})
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _JOURNAL_LOCK_WAIT_SEC = 10.0
 _EXTERNAL_DISPATCH_DEADLINE: ContextVar[float | None] = ContextVar("external_dispatch_deadline", default=None)
 
@@ -304,11 +311,27 @@ class OperationHandle:
     started_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class WorkspaceEditFile:
+    path: str
+    before_sha256: str
+    after_sha256: str
+    backup_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceEditEvidence:
+    files: tuple[WorkspaceEditFile, ...]
+
+
 @dataclass(slots=True)
 class _OperationRecoveryScope:
     handle: OperationHandle | None
     owner: tuple[int, int | None]
     active: bool = True
+    rolled_back: bool = False
+    parent: _OperationRecoveryScope | None = None
+    native_test_dispatch: threading.Event = field(default_factory=threading.Event)
 
 
 def _execution_owner() -> tuple[int, int | None]:
@@ -323,17 +346,88 @@ _CURRENT_OPERATION_SCOPE: ContextVar[_OperationRecoveryScope | None] = ContextVa
     "current_operation_recovery_scope",
     default=None,
 )
+_T = TypeVar("_T")
+
+
+def _scope_live(scope: _OperationRecoveryScope) -> bool:
+    current: _OperationRecoveryScope | None = scope
+    while current is not None:
+        if not current.active:
+            return False
+        current = current.parent
+    return True
 
 
 @contextmanager
-def operation_recovery_context(handle: OperationHandle | None) -> Iterator[None]:
-    scope = _OperationRecoveryScope(handle, _execution_owner())
+def operation_recovery_context(
+    handle: OperationHandle | None, *, _parent: _OperationRecoveryScope | None = None,
+) -> Iterator[_OperationRecoveryScope]:
+    scope = _OperationRecoveryScope(handle, _execution_owner(), parent=_parent)
     token = _CURRENT_OPERATION_SCOPE.set(scope)
     try:
-        yield
+        yield scope
     finally:
         scope.active = False
         _CURRENT_OPERATION_SCOPE.reset(token)
+
+
+def bind_operation_recovery(call: Callable[[], _T]) -> Callable[[], _T]:
+    """Explicitly transfer the current owning call's recovery context to a worker."""
+    scope = _CURRENT_OPERATION_SCOPE.get()
+    if scope is None or not _scope_live(scope) or scope.owner != _execution_owner():
+        return call
+
+    def run() -> _T:
+        if not _scope_live(scope):
+            raise ToolError("invalid_operation_handle", "The enclosing recovery operation has finished.")
+        with operation_recovery_context(scope.handle, _parent=scope):
+            return call()
+
+    return run
+
+
+def native_test_dispatched() -> bool:
+    scope = _CURRENT_OPERATION_SCOPE.get()
+    if scope is None or not _scope_live(scope) or scope.owner != _execution_owner():
+        raise ToolError("invalid_operation_handle", "Native test dispatch requires a live owning recovery scope.")
+    return scope.native_test_dispatch.is_set()
+
+
+def mark_native_test_dispatch() -> None:
+    """Record possible dispatch in this owned attempt and its explicitly bound ancestors."""
+    native_test_dispatched()
+    scope = _CURRENT_OPERATION_SCOPE.get()
+    while scope is not None:
+        scope.native_test_dispatch.set()
+        scope = scope.parent
+    native_test_dispatched()
+
+
+def run_native_operation(operation: str, target: str | None, call: Callable[[], _T]) -> _T:
+    """Guard native verification while retaining an enclosing mutation's admission."""
+    from core.lifecycle import RUNTIME_LIFECYCLE
+
+    parent = _CURRENT_OPERATION_SCOPE.get()
+    reuse = parent is not None and parent.owner == _execution_owner()
+    if reuse and parent is not None and not _scope_live(parent):
+        raise ToolError("invalid_operation_handle", "The enclosing recovery operation has finished.")
+    with nullcontext() if reuse else RUNTIME_LIFECYCLE.mutation(operation):
+        handle = parent.handle if reuse and parent is not None else OPERATION_RECOVERY.begin(operation, target)
+        with operation_recovery_context(handle, _parent=parent if reuse else None) as current:
+            try:
+                result = call()
+            except BaseException:
+                try:
+                    if handle is not None and handle.operation_type == "verify_changes" and current.native_test_dispatch.is_set():
+                        OPERATION_RECOVERY.mark_uncertain(handle, "native_test_execution_outcome_unknown")
+                    elif not reuse:
+                        OPERATION_RECOVERY.finish(handle, known_result="raised")
+                except Exception:
+                    pass  # Leave the begin pending if uncertain settlement cannot be persisted.
+                raise
+        if not reuse:
+            OPERATION_RECOVERY.finish_returned(handle, result)
+        return result
 
 
 def _parse_iso_utc(value: Any) -> datetime | None:
@@ -384,6 +478,111 @@ def _native_uia_view(checkpoint: dict[str, Any]) -> dict[str, Any]:
     return {"native": native, "target": NativeUIATarget(**identity).label()}
 
 
+def _workspace_path(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or "\x00" in value or len(value) > 32_767:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return None
+    return str(candidate.resolve(strict=False))
+
+
+def _workspace_edit_metadata(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {"evidence_version", "dispatch_stage", "files"}:
+        return None
+    stage = value["dispatch_stage"]
+    if (
+        type(value["evidence_version"]) is not int
+        or value["evidence_version"] != _WORKSPACE_EDIT_EVIDENCE_VERSION
+        or not isinstance(stage, str)
+        or stage not in _WORKSPACE_EDIT_STAGES
+    ):
+        return None
+    raw_files = value["files"]
+    if not isinstance(raw_files, list) or not 1 <= len(raw_files) <= _MAX_WORKSPACE_EDIT_FILES:
+        return None
+    files: list[dict[str, str]] = []
+    for item in raw_files:
+        if not isinstance(item, dict) or set(item) != {"path", "before_sha256", "after_sha256", "backup_path"}:
+            return None
+        path = _workspace_path(item["path"])
+        backup_path = _workspace_path(item["backup_path"])
+        before = item["before_sha256"]
+        after = item["after_sha256"]
+        if (
+            path is None or backup_path is None
+            or not isinstance(before, str) or not _SHA256_HEX.fullmatch(before)
+            or not isinstance(after, str) or not _SHA256_HEX.fullmatch(after)
+        ):
+            return None
+        files.append({
+            "path": path,
+            "before_sha256": before,
+            "after_sha256": after,
+            "backup_path": backup_path,
+        })
+    return {
+        "evidence_version": _WORKSPACE_EDIT_EVIDENCE_VERSION,
+        "dispatch_stage": value["dispatch_stage"],
+        "files": files,
+    }
+
+
+def _workspace_edit_record(evidence: WorkspaceEditEvidence, stage: str) -> dict[str, Any]:
+    if stage not in _WORKSPACE_EDIT_STAGES:
+        raise ToolError("invalid_workspace_edit_evidence", "Invalid workspace edit recovery stage.")
+    if not isinstance(evidence, WorkspaceEditEvidence):
+        raise ToolError("invalid_workspace_edit_evidence", "Invalid workspace edit evidence.")
+    files: list[dict[str, str]] = []
+    for item in evidence.files:
+        if not isinstance(item, WorkspaceEditFile):
+            raise ToolError("invalid_workspace_edit_evidence", "Invalid workspace edit evidence.")
+        path = _workspace_path(item.path)
+        backup_path = _workspace_path(item.backup_path)
+        if (
+            path is None or backup_path is None
+            or not isinstance(item.before_sha256, str) or not _SHA256_HEX.fullmatch(item.before_sha256)
+            or not isinstance(item.after_sha256, str) or not _SHA256_HEX.fullmatch(item.after_sha256)
+        ):
+            raise ToolError("invalid_workspace_edit_evidence", "Invalid workspace edit evidence.")
+        files.append({
+            "path": path,
+            "before_sha256": item.before_sha256,
+            "after_sha256": item.after_sha256,
+            "backup_path": backup_path,
+        })
+    if not 1 <= len(files) <= _MAX_WORKSPACE_EDIT_FILES:
+        raise ToolError("invalid_workspace_edit_evidence", "Workspace edit evidence file count is out of bounds.")
+    record = {
+        "evidence_version": _WORKSPACE_EDIT_EVIDENCE_VERSION,
+        "dispatch_stage": stage,
+        "files": files,
+    }
+    payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    if len(payload) > _MAX_WORKSPACE_EVIDENCE_BYTES:
+        raise ToolError("lsp_edit_evidence_too_large", "Workspace edit recovery evidence exceeded 32 KiB.")
+    return record
+
+
+def _workspace_edit_view(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    workspace = _workspace_edit_metadata(checkpoint.get("workspace_edit"))
+    if workspace is None:
+        return {}
+    return {"workspace_edit": workspace}
+
+
+def validate_workspace_edit_evidence(evidence: WorkspaceEditEvidence) -> None:
+    """Reject unbounded or malformed workspace evidence before any backup or write."""
+    _workspace_edit_record(evidence, "prepared")
+
+
+def mark_workspace_edit_rolled_back() -> None:
+    """Record that the active workspace edit restored every file it wrote."""
+    scope = _CURRENT_OPERATION_SCOPE.get()
+    if scope is not None:
+        scope.rolled_back = True
+
+
 class OperationRecoveryJournal:
     """Append-only fsync journal; incomplete previous-runtime mutations become uncertain."""
 
@@ -391,6 +590,7 @@ class OperationRecoveryJournal:
         self,
         *,
         max_unresolved_external: int = MAX_UNRESOLVED_EXTERNAL_OPERATIONS,
+        max_unresolved_workspace: int = MAX_UNRESOLVED_WORKSPACE_EDITS,
         max_external_terminal_history: int = MAX_EXTERNAL_TERMINAL_HISTORY,
         max_external_terminal_days: int = MAX_EXTERNAL_TERMINAL_DAYS,
     ) -> None:
@@ -403,6 +603,7 @@ class OperationRecoveryJournal:
         self._hmac_key: bytes = os.urandom(32)
         self._hmac_key_id: str = os.urandom(8).hex()
         self._max_unresolved_external = max_unresolved_external
+        self._max_unresolved_workspace = max_unresolved_workspace
         self._max_external_terminal_history = max_external_terminal_history
         self._max_external_terminal_days = max_external_terminal_days
         self._cached_stat_key: tuple[int, int] | None = None
@@ -423,6 +624,9 @@ class OperationRecoveryJournal:
                 assert path is not None
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with self._journal_transaction() as records:
+                    if path.exists():
+                        records = list(self._iter_records_locked(strict=True))
+                        self._validate_workspace_records(records)
                     self._record_count = len(records)
                     self._recover_previous_unlocked(records)
                 self._maybe_compact_locked()
@@ -521,6 +725,44 @@ class OperationRecoveryJournal:
         finally:
             self._lock.release()
 
+    @staticmethod
+    def _is_unresolved_workspace_item(item: Mapping[str, Any]) -> bool:
+        begin = item.get("begin")
+        if not isinstance(begin, dict):
+            return False
+        if item.get("result") is not None or item.get("reconciliation") is not None or item.get("acknowledged") is not None:
+            return False
+        checkpoint = item.get("checkpoint")
+        if isinstance(checkpoint, dict) and "workspace_edit" in checkpoint:
+            return True
+        return begin.get("operation_type") == "workspace_edit"
+
+    def unresolved_workspace_count(self) -> int:
+        with self._lock:
+            if not self._enabled or self._path is None:
+                return 0
+            state = self._state(self._load_locked())
+            return sum(1 for item in state.values() if self._is_unresolved_workspace_item(item))
+
+    def has_workspace_edit_capacity(self) -> bool:
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if not self._enabled or self._path is None:
+                return False
+            return self.unresolved_workspace_count() < self._max_unresolved_workspace
+        finally:
+            self._lock.release()
+
+    def ensure_workspace_edit_capacity(self) -> None:
+        if not self._enabled:
+            return
+        if not self.has_workspace_edit_capacity():
+            raise ToolError(
+                "workspace_edit_limit",
+                f"Unresolved workspace-edit limit ({self._max_unresolved_workspace}) reached; reconcile before retrying.",
+            )
+
     def _append_unlocked_file(self, record: dict[str, Any]) -> None:
         path = self._path
         if not self._enabled or path is None:
@@ -583,14 +825,18 @@ class OperationRecoveryJournal:
                 hint="Do not retry a possibly-started mutation blindly; inspect runtime storage first.",
             ) from exc
 
-    def _iter_records_locked(self) -> Iterator[dict[str, Any]]:
+    def _iter_records_locked(self, *, strict: bool = False) -> Iterator[dict[str, Any]]:
         path = self._path
         if path is None or not path.is_file():
+            if strict:
+                raise ToolError("operation_journal_unavailable", "Could not read the operation recovery journal.")
             return
         try:
             with path.open("rb") as handle:
                 while raw := handle.readline(_MAX_LINE_BYTES + 1):
                     if len(raw) > _MAX_LINE_BYTES:
+                        if strict:
+                            raise ToolError("operation_journal_invalid", "The operation recovery journal contains an invalid record.")
                         while not raw.endswith(b"\n"):
                             raw = handle.readline(_MAX_LINE_BYTES + 1)
                             if not raw:
@@ -600,9 +846,17 @@ class OperationRecoveryJournal:
                         record = json.loads(raw.decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         # A crash can leave only the final append truncated.
+                        if strict:
+                            raise ToolError(
+                                "operation_journal_invalid", "The operation recovery journal contains an invalid record.",
+                            ) from None
                         continue
                     if isinstance(record, dict) and record.get("schema_version") == JOURNAL_SCHEMA_VERSION:
+                        if strict and not raw.endswith(b"\n"):
+                            raise ToolError("operation_journal_invalid", "The operation recovery journal contains an incomplete record.")
                         yield record
+                    elif strict:
+                        raise ToolError("operation_journal_invalid", "The operation recovery journal contains an invalid record.")
         except OSError as exc:
             raise ToolError(
                 "operation_journal_unavailable",
@@ -694,6 +948,32 @@ class OperationRecoveryJournal:
                 continue
             if begin.get("runtime_id") == runtime_id:
                 continue
+            checkpoint = item.get("checkpoint")
+            workspace_raw_present = isinstance(checkpoint, dict) and "workspace_edit" in checkpoint
+            workspace = (
+                _workspace_edit_metadata(checkpoint.get("workspace_edit"))
+                if isinstance(checkpoint, dict)
+                else None
+            )
+            workspace_before_dispatch = (
+                begin.get("operation_type") == "workspace_edit"
+                and (checkpoint is None or (isinstance(checkpoint, dict) and not workspace_raw_present))
+            ) or (
+                workspace is not None and workspace["dispatch_stage"] == "prepared"
+            )
+            if workspace_before_dispatch:
+                self._append_unlocked_file({
+                    "schema_version": JOURNAL_SCHEMA_VERSION,
+                    "type": "result",
+                    "status": "completed",
+                    "operation_id": operation_id,
+                    "runtime_id": begin.get("runtime_id"),
+                    "recovered_by_runtime_id": runtime_id,
+                    "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "known_result": "returned_error",
+                    "reason": "runtime_ended_before_workspace_edit_dispatch",
+                })
+                continue
             native_protocol = begin.get("native_recovery")
             if (
                 begin.get("operation_type") in _NATIVE_UIA_OPERATIONS
@@ -770,7 +1050,10 @@ class OperationRecoveryJournal:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         try:
             with _interprocess_journal_lock(path):
-                records = self._load_locked()
+                if not path.exists():
+                    return
+                records = list(self._iter_records_locked(strict=True))
+                self._validate_workspace_records(records)
                 state = self._state(records)
                 now = datetime.now(timezone.utc)
                 max_age = timedelta(days=max(0, self._max_external_terminal_days))
@@ -903,6 +1186,7 @@ class OperationRecoveryJournal:
             "evidence": evidence,
         }
         view.update(_native_uia_view(checkpoint or {}))
+        view.update(_workspace_edit_view(checkpoint or {}))
         if checkpoint is not None and isinstance(checkpoint.get("postcondition"), dict):
             view["postcondition"] = checkpoint["postcondition"]
         if result is not None and isinstance(result.get("postcondition"), dict):
@@ -1370,6 +1654,176 @@ class OperationRecoveryJournal:
                 })
             self._maybe_compact_locked()
 
+    def checkpoint_workspace_edit(
+        self,
+        handle: OperationHandle | None,
+        evidence: WorkspaceEditEvidence,
+        *,
+        stage: Literal["prepared", "may_dispatch"],
+    ) -> None:
+        if handle is None:
+            raise ToolError(
+                "recovery_unavailable",
+                "Workspace edits require an enabled operation recovery journal.",
+            )
+        record = _workspace_edit_record(evidence, stage)
+        with self._lock:
+            if not self._enabled or self._path is None:
+                raise ToolError(
+                    "recovery_unavailable",
+                    "Workspace edits require an enabled operation recovery journal.",
+                )
+            with self._journal_transaction(operation_id=handle.operation_id) as records:
+                state = self._state(records)
+                current = state.get(handle.operation_id)
+                begin = current.get("begin") if current else None
+                if (
+                    not begin or handle.runtime_id != self._runtime_id
+                    or begin.get("runtime_id") != handle.runtime_id
+                ):
+                    raise ToolError("invalid_operation_handle", "Workspace edit recovery requires its active operation.")
+                assert current is not None
+                if any(current.get(key) is not None for key in ("result", "uncertain", "reconciliation", "acknowledged")):
+                    raise ToolError("operation_already_completed", "Operation already has a known or uncertain outcome.")
+                previous = current.get("checkpoint") or {}
+                existing_raw = previous.get("workspace_edit")
+                existing = _workspace_edit_metadata(existing_raw)
+                if existing_raw is not None and existing is None:
+                    raise ToolError("operation_checkpoint_conflict", "Workspace edit checkpoint is invalid.")
+                if existing is not None:
+                    if existing["files"] != record["files"]:
+                        raise ToolError("operation_checkpoint_conflict", "Workspace edit checkpoint identity changed.")
+                    if existing["dispatch_stage"] == record["dispatch_stage"]:
+                        return
+                    if existing["dispatch_stage"] == "may_dispatch" or record["dispatch_stage"] == "prepared":
+                        raise ToolError("operation_checkpoint_conflict", "Workspace edit checkpoint stage changed.")
+                elif record["dispatch_stage"] != "prepared":
+                    raise ToolError("operation_checkpoint_conflict", "Prepare workspace edit evidence before dispatch.")
+                if existing is None and record["dispatch_stage"] == "prepared":
+                    unresolved = sum(
+                        1
+                        for operation_id, item in self._state(self._load_locked()).items()
+                        if operation_id != handle.operation_id and self._is_unresolved_workspace_item(item)
+                    )
+                    if unresolved >= self._max_unresolved_workspace:
+                        raise ToolError(
+                            "workspace_edit_limit",
+                            f"Unresolved workspace-edit limit ({self._max_unresolved_workspace}) reached; reconcile before retrying.",
+                        )
+                self._append_unlocked_file({
+                    **previous,
+                    "schema_version": JOURNAL_SCHEMA_VERSION,
+                    "type": "checkpoint",
+                    "status": "in_progress",
+                    "operation_id": handle.operation_id,
+                    "runtime_id": handle.runtime_id,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "workspace_edit": record,
+                })
+            self._maybe_compact_locked()
+
+    def workspace_edit_stage(self, handle: OperationHandle | None) -> str | None:
+        if handle is None:
+            return None
+        with self._lock:
+            if not self._enabled or self._path is None:
+                return None
+            with self._journal_transaction(operation_id=handle.operation_id) as records:
+                current = self._state(records).get(handle.operation_id)
+                if current is None:
+                    return None
+                if any(current.get(key) is not None for key in ("result", "uncertain", "reconciliation", "acknowledged")):
+                    return "completed"
+                checkpoint = current.get("checkpoint") or {}
+                workspace = _workspace_edit_metadata(checkpoint.get("workspace_edit"))
+                return workspace["dispatch_stage"] if workspace is not None else None
+
+    @staticmethod
+    def _validate_workspace_records(records: list[dict[str, Any]]) -> None:
+        known: set[str] = set()
+        workspace_evidence: dict[str, dict[str, Any]] = {}
+        terminal: set[str] = set()
+        for record in records:
+            operation_id = record.get("operation_id")
+            kind = record.get("type")
+            if not isinstance(operation_id, str) or kind not in {
+                "begin", "checkpoint", "result", "uncertain", "reconciliation", "acknowledged",
+            }:
+                raise ToolError("operation_journal_invalid", "The operation recovery journal contains an invalid record.")
+            if kind == "begin":
+                if operation_id in known:
+                    raise ToolError("operation_journal_invalid", "The operation recovery journal contains a duplicate operation.")
+                known.add(operation_id)
+            elif operation_id not in known:
+                raise ToolError("operation_journal_invalid", "The operation recovery journal contains an incomplete operation.")
+            if kind == "checkpoint":
+                if operation_id in terminal:
+                    raise ToolError("operation_journal_invalid", "A completed operation has a later checkpoint.")
+                workspace = _workspace_edit_metadata(record.get("workspace_edit"))
+                previous = workspace_evidence.get(operation_id)
+                if ("workspace_edit" in record and workspace is None) or (
+                    previous is not None and (workspace is None or workspace["files"] != previous["files"]
+                    or (previous["dispatch_stage"] == "may_dispatch" and workspace["dispatch_stage"] != "may_dispatch"))
+                ):
+                    raise ToolError("operation_journal_invalid", "The workspace recovery checkpoint is invalid.")
+                if workspace is not None:
+                    workspace_evidence[operation_id] = workspace
+            if kind in {"result", "reconciliation", "acknowledged"} and operation_id in workspace_evidence:
+                valid = record.get("status") == "completed" and all(
+                    isinstance(record.get(field), str) and record[field]
+                    for field in ("runtime_id", "finished_at" if kind == "result" else "recorded_at")
+                )
+                if kind == "result":
+                    valid = valid and isinstance(record.get("known_result"), str) and bool(record["known_result"])
+                else:
+                    evidence = record.get("evidence")
+                    states = {"succeeded", "failed", "unresolvable"} if kind == "reconciliation" else {
+                        "acknowledged", "unresolvable",
+                    }
+                    valid = valid and record.get("state") in states and isinstance(evidence, dict) and bool(
+                        evidence.get("source") and isinstance(evidence.get("data"), dict) and evidence["data"]
+                    )
+                    if kind == "reconciliation":
+                        valid = valid and isinstance(record.get("postcondition"), dict)
+                        if record.get("state") in {"succeeded", "failed"} and isinstance(evidence, dict):
+                            valid = valid and isinstance(evidence.get("data"), dict) and evidence["data"].get("conclusive") is True
+                if not valid:
+                    raise ToolError("operation_journal_invalid", "The workspace recovery outcome is invalid.")
+            if kind in {"result", "reconciliation", "acknowledged"}:
+                terminal.add(operation_id)
+
+    def protected_workspace_backups(self, *, expected_journal: Path | None = None) -> set[Path]:
+        with self._lock:
+            if expected_journal is not None and os.path.lexists(expected_journal) and (
+                not self._enabled or self._path is None
+                or self._path.resolve(strict=False) != expected_journal.resolve(strict=False)
+            ):
+                raise ToolError("recovery_unavailable", "The backup recovery journal is not configured.")
+            if not self._enabled or self._path is None:
+                return set()
+            with _interprocess_journal_lock(self._path):
+                records = list(self._iter_records_locked(strict=True))
+            self._validate_workspace_records(records)
+            state = self._state(records)
+            protected: set[Path] = set()
+            for item in state.values():
+                begin = item.get("begin")
+                reconciliation = item.get("reconciliation") or {}
+                if not begin or item.get("result") or reconciliation.get("state") in {"succeeded", "failed"}:
+                    continue
+                checkpoint = item.get("checkpoint") or {}
+                workspace = _workspace_edit_metadata(checkpoint.get("workspace_edit"))
+                if workspace is None:
+                    continue
+                for item_file in workspace["files"]:
+                    protected.add(Path(item_file["backup_path"]))
+                    if len(protected) > _MAX_WORKSPACE_PROTECTED_PATHS:
+                        raise ToolError(
+                            "workspace_backup_protection_limit",
+                            "Too many unresolved workspace-edit backups to clean safely.",
+                        )
+            return protected
+
     def finish(
         self,
         handle: OperationHandle | None,
@@ -1396,6 +1850,18 @@ class OperationRecoveryJournal:
                         "Cannot mark an uncertain operation as completed without reconciliation or acknowledgment.",
                     )
                 checkpoint = (current or {}).get("checkpoint") or {}
+                workspace = _workspace_edit_metadata(checkpoint.get("workspace_edit"))
+                if (
+                    workspace is not None and workspace["dispatch_stage"] == "may_dispatch"
+                    and known_result == "raised"
+                ):
+                    self._append_unlocked_file({
+                        "schema_version": JOURNAL_SCHEMA_VERSION, "type": "uncertain", "status": "uncertain",
+                        "operation_id": handle.operation_id, "runtime_id": handle.runtime_id,
+                        "marked_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                        "reason": "workspace_edit_dispatch_without_known_result",
+                    })
+                    return
                 native = _native_uia_metadata(checkpoint.get("native"))
                 if (
                     native is not None and native["dispatch_stage"] == "may_dispatch"
@@ -1435,6 +1901,12 @@ class OperationRecoveryJournal:
             self._maybe_compact_locked()
 
     def finish_returned(self, handle: OperationHandle | None, result: Any) -> None:
+        if (
+            handle is not None and handle.operation_type == "verify_changes"
+            and isinstance(result, dict) and result.get("execution_uncertain") is True
+        ):
+            self.mark_uncertain(handle, "native_test_execution_outcome_unknown")
+            return
         if isinstance(result, dict) and isinstance(result.get("ok"), bool):
             known_result = "ok" if result["ok"] else "returned_error"
         else:
@@ -1489,6 +1961,7 @@ class OperationRecoveryJournal:
                 }
                 checkpoint = item.get("checkpoint") or {}
                 entry.update(_native_uia_view(checkpoint))
+                entry.update(_workspace_edit_view(checkpoint))
                 external = self._merged_external_metadata(item)
                 if external is not None:
                     entry["external"] = external
@@ -1545,6 +2018,50 @@ def native_uia_mutation(operation: str, target: NativeUIATarget) -> Iterator[Non
                         hint=f"Inspect recovery operation {handle.operation_id}.",
                     ) from None
                 raise
+
+
+@contextmanager
+def workspace_edit_mutation(paths: tuple[Path, ...]) -> Iterator[OperationHandle]:
+    """Guard direct workspace edits, reusing the enclosing live mutation when present."""
+    from core.lifecycle import RUNTIME_LIFECYCLE
+
+    if not paths or len(paths) > _MAX_WORKSPACE_EDIT_FILES or any(not isinstance(path, Path) for path in paths):
+        raise ToolError("invalid_workspace_edit_evidence", "Invalid workspace edit recovery paths.")
+    OPERATION_RECOVERY.ensure_workspace_edit_capacity()
+    scope = _CURRENT_OPERATION_SCOPE.get()
+    owner = _execution_owner()
+    owned = scope is None or not scope.active or scope.owner != owner
+    admission = RUNTIME_LIFECYCLE.mutation("workspace_edit") if owned else nullcontext()
+    with admission:
+        handle = scope.handle if scope is not None and not owned else None
+        if owned:
+            handle = OPERATION_RECOVERY.begin("workspace_edit", f"{len(paths)} file(s)")
+        if handle is None:
+            raise ToolError(
+                "recovery_unavailable",
+                "Workspace edits require an enabled operation recovery journal.",
+                hint="Run through the supervised runtime or configure operation recovery before editing.",
+            )
+        with operation_recovery_context(handle) as current:
+            try:
+                yield handle
+            except BaseException:
+                if owned:
+                    try:
+                        stage = OPERATION_RECOVERY.workspace_edit_stage(handle)
+                        if stage == "may_dispatch" and not current.rolled_back:
+                            OPERATION_RECOVERY.mark_uncertain(handle, "workspace_edit_outcome_uncertain")
+                        elif stage != "completed":
+                            OPERATION_RECOVERY.finish(handle, known_result="returned_error")
+                    except Exception:
+                        pass  # A durable prepared/may_dispatch checkpoint remains unresolved.
+                raise
+            else:
+                if owned:
+                    try:
+                        OPERATION_RECOVERY.finish(handle, known_result="ok")
+                    except Exception:
+                        pass  # The verified effect is complete; the may_dispatch checkpoint remains for reconciliation.
 
 
 def checkpoint_current_postcondition(postcondition: dict[str, Any]) -> None:

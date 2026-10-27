@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
+from uuid import uuid4
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict
 
-from core.config import SETTINGS, ensure_runtime_dirs
+from core.config import SETTINGS
+from core.errors import ToolError
 from core.execution_models import ExecutionIntent, ExternalRouteMetadata
 from core.execution_router import ExecutionRouter
 from core.extensions.bridge import ExtensionMCPServer
 from core.health_snapshot import collect_server_health
 from core.heartbeat import lifespan
+from core.jobs import JobStore, lazy_job_store
 from core.platform import available_domains, detect_capabilities
 from core.recovery import OPERATION_RECOVERY
 from core.resource_health import collect_resource_metrics
+from core.response_models import HealthResult, RouteRecommendation, validate_tool_output
 from core.timings import ToolRequestTimingMiddleware, install_sdk_timing_hooks
 from core.tool_catalog import ToolExecutionMetadata, external_tool_execution_metadata, tool_execution_metadata
 from core.tool_profiles import ALL_DOMAINS, PREFERRED_USE, PROFILE_DOMAINS, resolve_profile
@@ -30,6 +35,8 @@ from tools.filesystem import register as register_filesystem
 from tools.git import register as register_git
 from tools.jobs import register as register_jobs
 from tools.language import register as register_language
+from tools.language.providers import load_lsp_providers
+from tools.language.sessions import LspSessionManager
 from tools.memory import register as register_memory
 from tools.process import register as register_process
 from tools.project import register as register_project
@@ -64,12 +71,13 @@ def create_server() -> MCPServer:
     install_sdk_timing_hooks()
     ArgModelBase.model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
     ArgModelBase.model_rebuild(force=True)
-    ensure_runtime_dirs()
     profile = resolve_profile(SETTINGS.tool_profile)
     capabilities = detect_capabilities()
     active_domains = available_domains(profile.domains, capabilities)
+    store_getter = lazy_job_store(lambda: JobStore()) if {"jobs", "testing"}.intersection(active_domains) else None
     server = ExtensionMCPServer(
         tool_profile=profile.name,
+        native_allowlist=profile.native_allowlist,
         name=SETTINGS.server_name,
         title="ComputerPilot MCP",
         description="Cross-platform computer-use and developer-automation MCP backend with structured output.",
@@ -87,11 +95,22 @@ def create_server() -> MCPServer:
         lifespan=lifespan,
         middleware=[ToolRequestTimingMiddleware()],
     )
+    server.job_store_getter = store_getter
     for domain in active_domains:
         registrar = REGISTRARS.get(domain)
         if registrar is not None:
-            if domain == "testing":
-                register_testing(server, background_enabled="jobs" in active_domains)
+            if domain == "filesystem" and profile.name == "read_batch":
+                register_filesystem(server, batch_enabled=True)
+            elif domain == "testing":
+                register_testing(server, background_enabled="jobs" in active_domains, store_getter=store_getter)
+            elif domain == "jobs":
+                register_jobs(server, store_getter=store_getter)
+            elif domain == "language" and SETTINGS.persistent_enabled:
+                if not SETTINGS.providers_config:
+                    raise ToolError("lsp_configuration_invalid", "Persistent language tools require a provider configuration.")
+                manager = LspSessionManager(load_lsp_providers(Path(SETTINGS.providers_config)), generation=uuid4().hex)
+                cast(Any, server).lsp_manager = manager
+                register_language(server, manager=manager)
             else:
                 registrar(server)
 
@@ -251,7 +270,7 @@ def create_server() -> MCPServer:
         requires_macro_preservation: bool = False,
         allow_raw_desktop: bool = False,
         preferred_tool: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> RouteRecommendation:
         """Recommend one explainable execution route without executing it."""
 
         router = await _execution_router()
@@ -264,22 +283,36 @@ def create_server() -> MCPServer:
             allow_raw_desktop=allow_raw_desktop,
             preferred_tool=preferred_tool,
         )
-        return router.recommend(
+        result = router.recommend(
             request,
             explain=SETTINGS.execution_router_explain if explain is None else explain,
             max_candidates=max_candidates,
         )
+        return cast(RouteRecommendation, validate_tool_output(RouteRecommendation, result, operation="execution_recommend"))
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("server_health")
-    async def server_health() -> dict[str, Any]:
-        return await collect_server_health(
-            server,
-            settings=SETTINGS,
-            browser_manager=BROWSER_MANAGER,
-            resource_collector=collect_resource_metrics,
-            recovery=OPERATION_RECOVERY,
-            workflow_store_factory=workflow_store,
-        )
+    async def server_health() -> HealthResult:
+        if not getattr(server, "runtime_started", False):
+            native = await MCPServer.list_tools(server)
+            result = {
+                "ok": True, "health_status": "unavailable", "snapshot_reason": "runtime_not_started",
+                "server": SETTINGS.server_name, "version": SETTINGS.version, "tool_profile": profile.name,
+                "tool_count": len(native), "unique_tool_names": len({tool.name for tool in native}) == len(native),
+            }
+        else:
+            result = await collect_server_health(
+                server,
+                settings=SETTINGS,
+                browser_manager=BROWSER_MANAGER,
+                resource_collector=collect_resource_metrics,
+                recovery=OPERATION_RECOVERY,
+                workflow_store_factory=workflow_store,
+            )
+        if profile.name == "read_batch":
+            result["native_read_batch"] = cast(Any, server).native_read_batch_state.snapshot()
+        return cast(HealthResult, validate_tool_output(HealthResult, result, operation="server_health"))
 
+    if profile.native_allowlist is not None and server.native_registered_names != profile.native_allowlist:
+        raise ToolError("profile_invalid", "The static profile's native tool registrations are incomplete.")
     return server

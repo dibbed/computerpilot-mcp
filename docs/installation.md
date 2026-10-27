@@ -150,6 +150,13 @@ Full local Doctor:
 python -m scripts.doctor --mode local-http
 ```
 
+Doctor prints `RUN` with each check's timeout before dispatch and `PASS` only after the owned process tree is cleaned up.
+The health smoke allows 30 seconds per response and 90 seconds overall; run it directly to see the active phase on stderr.
+Its server uses disposable state and memory initialized before server imports, so the probe does not open operator job/workflow databases.
+Bootstrap bounds the cached fingerprint probe to 30 seconds and the full Doctor to 900 seconds. Timeout and cleanup
+failures in full validation stop startup without recording success. A cache miss requires full validation;
+native process cleanup may add bounded drain time.
+
 Cross-platform release validation:
 
 ```sh

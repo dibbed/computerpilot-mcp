@@ -12,6 +12,7 @@ import psutil
 
 from core.config import PROJECT_ROOT, SETTINGS
 from core.jobs import JobStore
+from core.timings import invocation_trace, timing_span
 
 _SCHEDULERS: dict[str, JobScheduler] = {}
 _SCHEDULERS_LOCK = threading.Lock()
@@ -65,6 +66,10 @@ class JobScheduler:
         self._wake.set()
 
     def _launch_worker(self, job_id: str, launch_token: str) -> None:
+        with invocation_trace(self.store.trace_metadata(job_id), new=True):
+            self._launch_traced_worker(job_id, launch_token)
+
+    def _launch_traced_worker(self, job_id: str, launch_token: str) -> None:
         directory = self.store.output_dir / job_id
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "stdout.bin").touch(exist_ok=True)
@@ -77,22 +82,24 @@ class JobScheduler:
         )
         try:
             with (directory / "worker.log").open("ab") as log:
-                process = subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-m",
-                        "scripts.job_worker",
-                        str(self.store.path.resolve()),
-                        job_id,
-                        launch_token,
-                    ],
-                    cwd=PROJECT_ROOT,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=log,
-                    creationflags=flags,
-                    start_new_session=os.name != "nt",
-                )
+                with timing_span("worker_launch", metadata={"job_id": job_id}):
+                    process = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-m",
+                            "scripts.job_worker",
+                            str(self.store.path.resolve()),
+                            job_id,
+                            launch_token,
+                        ],
+                        cwd=PROJECT_ROOT,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=log,
+                        creationflags=flags,
+                        start_new_session=os.name != "nt",
+                    )
+
                 _start_worker_reaper(process)
             try:
                 created = psutil.Process(process.pid).create_time()

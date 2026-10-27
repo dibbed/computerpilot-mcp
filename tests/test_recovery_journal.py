@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +25,407 @@ from core.tooling import _mutation_target
 
 def _records(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _workspace_evidence(tmp_path: Path, count: int = 1) -> recovery.WorkspaceEditEvidence:
+    return recovery.WorkspaceEditEvidence(
+        files=tuple(
+            recovery.WorkspaceEditFile(
+                path=str((tmp_path / f"file-{index}.py").resolve()),
+                before_sha256="a" * 64,
+                after_sha256="b" * 64,
+                backup_path=str((tmp_path / "backups" / f"{index}.bak").resolve()),
+            )
+            for index in range(count)
+        )
+    )
+
+
+def test_workspace_edit_checkpoint_survives_restart_and_compaction(tmp_path: Path) -> None:
+    path = tmp_path / "workspace.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "before")
+    handle = journal.begin("workspace_edit", "2 files")
+    assert handle is not None
+    evidence = _workspace_evidence(tmp_path, 2)
+    journal.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+    journal.checkpoint_workspace_edit(handle, evidence, stage="may_dispatch")
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+    recovered.compact()
+
+    operation = recovered.inspect(handle.operation_id)
+    assert operation["state"] == "uncertain"
+    assert operation["workspace_edit"]["dispatch_stage"] == "may_dispatch"
+    assert operation["workspace_edit"]["files"] == [
+        {
+            "path": item.path,
+            "before_sha256": item.before_sha256,
+            "after_sha256": item.after_sha256,
+            "backup_path": item.backup_path,
+        }
+        for item in evidence.files
+    ]
+    assert recovered.protected_workspace_backups() == {
+        Path(item.backup_path) for item in evidence.files
+    }
+    serialized = json.dumps(operation)
+    assert "newText" not in serialized
+    assert "before content" not in serialized
+
+
+def test_workspace_edit_prepared_crash_recovers_failed_without_replay(tmp_path: Path) -> None:
+    path = tmp_path / "workspace.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "before")
+    handle = journal.begin("workspace_edit")
+    assert handle is not None
+    journal.checkpoint_workspace_edit(handle, _workspace_evidence(tmp_path), stage="prepared")
+    journal.finish(handle, known_result="raised")
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+    operation = recovered.inspect(handle.operation_id)
+    assert operation["state"] == "failed"
+    assert recovered.protected_workspace_backups() == set()
+
+
+def test_workspace_edit_checkpoint_rejects_invalid_or_unbounded_evidence(tmp_path: Path) -> None:
+    journal = OperationRecoveryJournal()
+    journal.configure(tmp_path / "workspace.jsonl", "runtime")
+    handle = journal.begin("workspace_edit")
+    assert handle is not None
+
+    with pytest.raises(ToolError) as stage:
+        journal.checkpoint_workspace_edit(handle, _workspace_evidence(tmp_path), stage="may_dispatch")
+    assert stage.value.code == "operation_checkpoint_conflict"
+
+    relative = recovery.WorkspaceEditEvidence(
+        files=(recovery.WorkspaceEditFile("relative.py", "a" * 64, "b" * 64, str(tmp_path / "x.bak")),)
+    )
+    with pytest.raises(ToolError) as bad_path:
+        journal.checkpoint_workspace_edit(handle, relative, stage="prepared")
+    assert bad_path.value.code == "invalid_workspace_edit_evidence"
+
+    oversized = recovery.WorkspaceEditEvidence(
+        files=tuple(
+            recovery.WorkspaceEditFile(
+                path=str(tmp_path / ("p" * 400)),
+                before_sha256="a" * 64,
+                after_sha256="b" * 64,
+                backup_path=str(tmp_path / f"{index}.bak"),
+            )
+            for index in range(100)
+        )
+    )
+    with pytest.raises(ToolError) as too_large:
+        journal.checkpoint_workspace_edit(handle, oversized, stage="prepared")
+    assert too_large.value.code == "lsp_edit_evidence_too_large"
+
+
+def test_protected_workspace_backups_fail_closed_over_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(recovery, "_MAX_WORKSPACE_PROTECTED_PATHS", 1)
+    journal = OperationRecoveryJournal()
+    journal.configure(tmp_path / "workspace.jsonl", "runtime")
+    handle = journal.begin("workspace_edit")
+    assert handle is not None
+    evidence = _workspace_evidence(tmp_path, 2)
+    journal.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+    journal.checkpoint_workspace_edit(handle, evidence, stage="may_dispatch")
+
+    with pytest.raises(ToolError) as raised:
+        journal.protected_workspace_backups()
+    assert raised.value.code == "workspace_backup_protection_limit"
+
+
+def test_workspace_edit_mutation_reuses_only_same_task_scope(tmp_path: Path) -> None:
+    path = tmp_path / "workspace.jsonl"
+    recovery.OPERATION_RECOVERY.configure(path, "scope-runtime")
+    try:
+        outer = recovery.OPERATION_RECOVERY.begin("outer_tool")
+        assert outer is not None
+
+        with recovery.operation_recovery_context(outer):
+            with recovery.workspace_edit_mutation((tmp_path / "first.txt",)) as reused:
+                assert reused.operation_id == outer.operation_id
+
+            async def child() -> str:
+                with recovery.workspace_edit_mutation((tmp_path / "second.txt",)) as owned:
+                    assert owned.operation_id != outer.operation_id
+                    return owned.operation_id
+
+            child_id = asyncio.run(child())
+        recovery.OPERATION_RECOVERY.finish(outer, known_result="ok")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+    records = _records(path)
+    begins = [record for record in records if record.get("type") == "begin"]
+    assert {record["operation_id"] for record in begins} == {outer.operation_id, child_id}
+    assert next(record for record in begins if record["operation_id"] == child_id)["operation_type"] == "workspace_edit"
+
+
+def test_workspace_edit_mutation_reuses_owning_task_in_worker_thread(tmp_path: Path) -> None:
+    path = tmp_path / "workspace.jsonl"
+    recovery.OPERATION_RECOVERY.configure(path, "worker-runtime")
+    try:
+        outer = recovery.OPERATION_RECOVERY.begin("rename_symbol")
+        assert outer is not None
+
+        def use_workspace_edit() -> str:
+            with recovery.workspace_edit_mutation((tmp_path / "worker.txt",)) as handle:
+                return handle.operation_id
+
+        async def scenario() -> str:
+            with recovery.operation_recovery_context(outer):
+                return await asyncio.to_thread(recovery.bind_operation_recovery(use_workspace_edit))
+
+        worker_id = asyncio.run(scenario())
+        recovery.OPERATION_RECOVERY.finish(outer, known_result="ok")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+    assert worker_id == outer.operation_id
+    begins = [record for record in _records(path) if record.get("type") == "begin"]
+    assert [record["operation_id"] for record in begins] == [outer.operation_id]
+
+
+@pytest.mark.parametrize("bind_in_child", [False, True])
+def test_child_task_offload_cannot_reuse_parent_recovery(
+    tmp_path: Path, bind_in_child: bool,
+) -> None:
+    path = tmp_path / "child-offload.jsonl"
+    recovery.OPERATION_RECOVERY.configure(path, "child-runtime")
+    try:
+        outer = recovery.OPERATION_RECOVERY.begin("rename_symbol")
+        assert outer is not None
+
+        def mutate() -> str:
+            with recovery.workspace_edit_mutation((tmp_path / "child.txt",)) as handle:
+                return handle.operation_id
+
+        async def child() -> str:
+            call = recovery.bind_operation_recovery(mutate) if bind_in_child else mutate
+            return await asyncio.to_thread(call)
+
+        async def scenario() -> str:
+            with recovery.operation_recovery_context(outer):
+                return await asyncio.create_task(child())
+
+        child_id = asyncio.run(scenario())
+        assert child_id != outer.operation_id
+        recovery.OPERATION_RECOVERY.finish(outer, known_result="ok")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+    begins = [record for record in _records(path) if record.get("type") == "begin"]
+    assert {record["operation_id"] for record in begins} == {outer.operation_id, child_id}
+
+
+def test_bound_recovery_worker_rejects_finished_scope(tmp_path: Path) -> None:
+    calls: list[bool] = []
+    with recovery.operation_recovery_context(None):
+        call = recovery.bind_operation_recovery(lambda: calls.append(True))
+    with pytest.raises(ToolError) as raised:
+        call()
+    assert raised.value.code == "invalid_operation_handle"
+    assert calls == []
+
+
+@pytest.mark.parametrize("dispatch,unknown,ok,expected", [
+    (True, True, False, "uncertain"), (False, True, False, "failed"),
+    (True, False, True, "succeeded"), (True, False, False, "failed"),
+])
+def test_native_test_guard_preserves_execution_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dispatch: bool, unknown: bool, ok: bool, expected: str,
+) -> None:
+    journal = OperationRecoveryJournal()
+    path = tmp_path / "testing.jsonl"
+    journal.configure(path, "native-testing")
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+
+    def execute() -> dict[str, bool]:
+        if dispatch:
+            recovery.mark_native_test_dispatch()
+        return {"ok": ok, "required_unknown": unknown, "execution_uncertain": dispatch and unknown}
+
+    result = recovery.run_native_operation("verify_changes", None, execute)
+    assert result["execution_uncertain"] is (dispatch and unknown)
+    begins = [row for row in _records(path) if row.get("type") == "begin"]
+    assert len(begins) == 1
+    assert journal.inspect(str(begins[0]["operation_id"]))["state"] == expected
+
+
+@pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
+def test_native_test_guard_keeps_postdispatch_exception_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[BaseException],
+) -> None:
+    journal = OperationRecoveryJournal()
+    journal.configure(tmp_path / "testing.jsonl", "native-testing")
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+
+    def execute() -> None:
+        recovery.mark_native_test_dispatch()
+        raise error("fixture")
+
+    with pytest.raises(error):
+        recovery.run_native_operation("verify_changes", None, execute)
+    assert journal.summary()["uncertain_count"] == 1
+
+
+def test_bound_native_dispatch_propagates_without_finishing_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    journal = OperationRecoveryJournal()
+    journal.configure(tmp_path / "testing.jsonl", "native-testing")
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+    outer = journal.begin("verify_changes")
+    assert outer is not None
+    with recovery.operation_recovery_context(outer):
+        def execute() -> dict[str, bool]:
+            recovery.mark_native_test_dispatch()
+            return {"ok": True}
+
+        bound = recovery.bind_operation_recovery(lambda: recovery.run_native_operation("verify_changes", None, execute))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(bound).result() == {"ok": True}
+        assert recovery.native_test_dispatched()
+        assert journal.inspect(outer.operation_id)["state"] == "running"
+    journal.finish_returned(outer, {"ok": True})
+
+
+def test_native_dispatch_rejects_unbound_copied_scope() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+
+    with recovery.operation_recovery_context(None), ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(copy_context().run, recovery.mark_native_test_dispatch)
+        with pytest.raises(ToolError, match="owning"):
+            future.result()
+
+
+def test_bound_native_dispatch_rejects_parent_ended_while_worker_waited() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered, release = threading.Event(), threading.Event()
+    dispatched: list[bool] = []
+
+    def work() -> None:
+        entered.set()
+        assert release.wait(5)
+        recovery.mark_native_test_dispatch()
+        dispatched.append(True)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            with recovery.operation_recovery_context(None):
+                future = pool.submit(recovery.bind_operation_recovery(work))
+                assert entered.wait(5)
+        finally:
+            release.set()
+        with pytest.raises(ToolError, match="owning"):
+            future.result()
+    assert not dispatched
+
+
+def test_compact_native_test_error_never_completes_after_uncertain_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core import tooling
+
+    journal = OperationRecoveryJournal()
+    path = tmp_path / "testing.jsonl"
+    journal.configure(path, "native-testing")
+    monkeypatch.setattr(recovery, "OPERATION_RECOVERY", journal)
+    monkeypatch.setattr(tooling, "OPERATION_RECOVERY", journal)
+
+    def denied(*args: object, **kwargs: object) -> None:
+        raise OSError("fixture journal failure")
+
+    monkeypatch.setattr(journal, "mark_uncertain", denied)
+
+    @tooling.compact_errors("verify_changes")
+    def execute() -> dict[str, bool]:
+        recovery.mark_native_test_dispatch()
+        raise RuntimeError("fixture")
+
+    assert not execute()["ok"]
+    assert not any(row.get("type") == "result" for row in _records(path))
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after-restart")
+    assert recovered.summary()["uncertain_count"] == 1
+
+
+def test_workspace_edit_mutation_denies_when_unresolved_quota_is_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "workspace.jsonl"
+    recovery.OPERATION_RECOVERY.configure(path, "quota-runtime")
+    monkeypatch.setattr(recovery.OPERATION_RECOVERY, "_max_unresolved_workspace", 0)
+    try:
+        with pytest.raises(ToolError) as raised:
+            with recovery.workspace_edit_mutation((tmp_path / "denied.txt",)):
+                pytest.fail("workspace edit admission must be denied before any operation starts")
+    finally:
+        recovery.OPERATION_RECOVERY.configure(None, None)
+
+    assert raised.value.code == "workspace_edit_limit"
+    assert not path.exists() or not any(record.get("type") == "begin" for record in _records(path))
+
+
+def test_workspace_edit_checkpoint_denies_second_unresolved_operation(tmp_path: Path) -> None:
+    journal = OperationRecoveryJournal(max_unresolved_workspace=1)
+    path = tmp_path / "workspace.jsonl"
+    journal.configure(path, "quota-runtime")
+    try:
+        first = journal.begin("workspace_edit")
+        assert first is not None
+        evidence = _workspace_evidence(tmp_path)
+        journal.checkpoint_workspace_edit(first, evidence, stage="prepared")
+        second = journal.begin("workspace_edit")
+        assert second is not None
+
+        with pytest.raises(ToolError) as raised:
+            journal.checkpoint_workspace_edit(second, evidence, stage="prepared")
+        assert raised.value.code == "workspace_edit_limit"
+        assert journal.workspace_edit_stage(second) is None
+    finally:
+        journal.configure(None, None)
+
+
+def test_old_journal_records_and_new_checkpoint_compact_without_loss(tmp_path: Path) -> None:
+    path = tmp_path / "workspace.jsonl"
+    journal = OperationRecoveryJournal()
+    journal.configure(path, "before")
+    legacy = journal.begin("legacy_tool")
+    assert legacy is not None
+    journal.finish(legacy, known_result="ok")
+    handle = journal.begin("workspace_edit")
+    assert handle is not None
+    evidence = _workspace_evidence(tmp_path)
+    journal.checkpoint_workspace_edit(handle, evidence, stage="prepared")
+    journal.checkpoint_workspace_edit(handle, evidence, stage="may_dispatch")
+
+    journal.compact()
+
+    recovered = OperationRecoveryJournal()
+    recovered.configure(path, "after")
+    operation = recovered.inspect(handle.operation_id)
+    assert operation["state"] == "uncertain"
+    assert operation["workspace_edit"]["dispatch_stage"] == "may_dispatch"
+    assert recovered.protected_workspace_backups() == {Path(evidence.files[0].backup_path)}
+
+
+def test_workspace_edit_mutation_requires_enabled_recovery(tmp_path: Path) -> None:
+    recovery.OPERATION_RECOVERY.configure(None, None)
+    with pytest.raises(ToolError) as raised:
+        with recovery.workspace_edit_mutation((tmp_path / "target.txt",)):
+            pass
+    assert raised.value.code == "recovery_unavailable"
 
 
 def test_mutation_target_includes_workflow_and_operation_identity() -> None:
@@ -303,7 +705,7 @@ def test_known_result_persists_bounded_file_postcondition(tmp_path: Path) -> Non
     assert inspected["postcondition"] == postcondition
 
 
-def test_truncated_final_record_is_ignored_and_pending_begin_recovers(tmp_path: Path) -> None:
+def test_truncated_final_record_blocks_recovery_and_compaction(tmp_path: Path) -> None:
     path = tmp_path / "operations.jsonl"
     journal = OperationRecoveryJournal()
     journal.configure(path, "runtime-a")
@@ -314,10 +716,13 @@ def test_truncated_final_record_is_ignored_and_pending_begin_recovers(tmp_path: 
         stream.flush()
         os.fsync(stream.fileno())
 
-    journal.configure(path, "runtime-b")
-    summary = journal.summary()
-    assert summary["uncertain_count"] == 1
-    assert summary["uncertain"][0]["operation_id"] == handle.operation_id
+    evidence = path.read_bytes()
+    with pytest.raises(ToolError, match="invalid record"):
+        journal.compact()
+    assert path.read_bytes() == evidence
+    with pytest.raises(ToolError, match="invalid record"):
+        journal.configure(path, "runtime-b")
+    assert path.read_bytes() == evidence
 
 
 def test_begin_fails_closed_when_durable_journal_write_fails(

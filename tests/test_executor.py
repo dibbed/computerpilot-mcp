@@ -10,6 +10,38 @@ from core import artifacts
 from core.executor import OutputCapture, _read_pipe, run_bounded
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_explicit_native_ownership_fails_closed_without_resource_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit: bool,
+) -> None:
+    from core import executor
+    from core.process_ownership import NativeOwnershipRequiredError
+
+    def denied(*args: object, **kwargs: object) -> object:
+        assert kwargs["require_native"] is True
+        raise NativeOwnershipRequiredError("fixture ownership unavailable")
+
+    monkeypatch.setattr(executor, "spawn_owned_process", denied)
+    monkeypatch.setattr(executor, "resource_requires_native_ownership", lambda: not explicit)
+    with pytest.raises(NativeOwnershipRequiredError):
+        run_bounded([sys.executable, "-c", "pass"], cwd=tmp_path, timeout_sec=1, require_native=explicit)
+
+
+def test_explicit_native_ownership_does_not_skip_inherited_dispatch_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core import executor
+    from core.errors import ToolError
+
+    def denied() -> bool:
+        raise ToolError("workflow_dispatch_barrier_required", "Missing dispatch barrier")
+
+    monkeypatch.setattr(executor, "resource_requires_native_ownership", denied)
+    monkeypatch.setattr(executor, "spawn_owned_process", lambda *args, **kwargs: pytest.fail("denied process dispatched"))
+    with pytest.raises(ToolError, match="Missing dispatch barrier"):
+        run_bounded([sys.executable, "-c", "pass"], cwd=tmp_path, timeout_sec=1, require_native=True)
+
+
 def test_reused_background_pid_closes_previous_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from core import executor
 

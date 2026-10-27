@@ -80,6 +80,39 @@ def test_native_code_and_filesystem_beat_ui_fallbacks() -> None:
     assert read["representative_tool"] == "read_file"
 
 
+def test_native_direct_and_powershell_intents_keep_explicit_workload_boundaries() -> None:
+    router = _router({"read_file", "git_status", "run_process", "run_powershell"})
+    expected = {"filesystem.read": "read_file", "git.read": "git_status", "process.run": "run_process",
+                "process.powershell": "run_powershell"}
+    for intent, tool in expected.items():
+        result = router.recommend(ExecutionIntent(intent))
+        assert result["ok"] and result["representative_tool"] == tool
+    direct = router.candidates(ExecutionIntent("process.run"))["items"][0]
+    shell = router.candidates(ExecutionIntent("process.powershell"))["items"][0]
+    assert direct["cost_tier"] < shell["cost_tier"]
+    assert direct["latency_tier"] < shell["latency_tier"]
+
+
+def test_powershell_intent_does_not_fall_back_to_an_incompatible_executable() -> None:
+    result = _router({"run_process", "run_powershell"}, caps=_linux_caps()).recommend(
+        ExecutionIntent("process.powershell"),
+    )
+    assert result["ok"] is False
+    assert result["representative_tool"] is None
+    assert result["candidates"][0]["rejection_code"] == "capability_unavailable"
+
+
+def test_known_independent_edits_and_durable_commands_use_existing_typed_tools() -> None:
+    router = _router({"replace_exact", "safe_refactor", "apply_patch", "run_process", "submit_job"})
+    for intent, tool in (("filesystem.edit_batch", "safe_refactor"), ("filesystem.patch", "apply_patch"),
+                         ("process.durable", "submit_job"), ("process.run", "run_process")):
+        selected = router.recommend(ExecutionIntent(intent))
+        assert selected["ok"] and selected["representative_tool"] == tool
+    for intent in ("filesystem.edit_batch", "filesystem.patch", "process.durable"):
+        hidden = _router({"replace_exact", "run_process"}).recommend(ExecutionIntent(intent))
+        assert hidden["ok"] is False and hidden["representative_tool"] is None
+
+
 def test_semantic_browser_beats_raw_desktop_when_both_are_available() -> None:
     router = _router({"browser_click_semantic", "mouse_click"})
     result = router.recommend(ExecutionIntent("browser.interact", allow_raw_desktop=True))
