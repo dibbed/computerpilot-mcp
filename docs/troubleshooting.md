@@ -32,6 +32,50 @@ Startup validation uses a fingerprint of relevant runtime inputs. Source, depend
 
 A full Doctor after a meaningful change is expected.
 
+## Native Read Batch activation on Windows
+
+The default `full` catalog remains at 151 tools. `native_read_batch` becomes the
+152nd native tool only with `MCP_NATIVE_READ_BATCH_ENABLED=1` before runtime startup.
+This is an opt-in operational setting, not a requirement for a working MCP server.
+
+On a **healthy, running** Tunnel Supervisor, use the reviewed script in this
+same workspace:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\activate_native_read_batch.ps1 -CheckOnly
+```
+
+`-CheckOnly` checks tracked Git state, the local active-work guard, a unique
+152-tool startup catalog, and full Tunnel Doctor without stopping the current service.
+The `CheckOnly` invocation must run in an ordinary, independent PowerShell
+session, **not** as a detached child of an MCP-owned job.
+
+After preflight passes, execute the same script without `-CheckOnly` in a separate
+operator PowerShell session. It saves the original settings bytes under
+`.agent_state/native-read-batch/`, asks the authenticated loopback panel to
+gracefully drain the existing Supervisor, and restarts the **existing** `START_MCP.bat`
+in this workspace. It does not copy a repository or install another Tunnel.
+
+The live switch intentionally disconnects MCP and its Tunnel temporarily.
+Do **not** spawn it from a long-running MCP tool call or a managed subprocess.
+If a script must be started via a desktop automation integration, remove
+`COMPUTERPILOT_INTERNAL_RESOURCE_CAPABILITY` from the detached launcher's
+environment first. This short-lived internal capability is valid only for its
+original owning operation; leaking it into a new Supervisor can cause Doctor
+`resource_capability_invalid` failures and crash-restart loops. Never bypass
+the capability check itself.
+
+Check `.agent_state/native-read-batch/status.json` after reconnect. The script
+restores previous settings bytes and attempts the original service launch if the
+new service fails readiness. A `healthy` status means only the local Supervisor
+and Tunnel are healthy. **It does not establish that ChatGPT refreshed its tool
+catalog or that Batch improves real-world latency.** Refresh/reconnect the
+ChatGPT plugin, then verify `server_health.tool_count == 152` and invoke
+`native_read_batch` from the refreshed catalog before accepting the feature.
+If the old catalog persists, stop and investigate rather than creating a second
+Supervisor. The existing `uv.lock`, `.secrets/`, and other runtime data must be
+preserved.
+
 ## Tunnel mode says the API key is unavailable
 
 Provide:
