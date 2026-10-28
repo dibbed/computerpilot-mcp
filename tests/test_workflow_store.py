@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import closing
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -25,15 +24,17 @@ def test_reused_connection_serializes_sql_without_serializing_claimed_work(
     from core.resource_claims import managed_resource_claims, path_claim
 
     store = WorkflowStore(tmp_path / "workflows.db", recover=False, reuse_connection=True)
-    original_connect = sqlite3.connect
+    # Count connections created by this store only. Instrumenting sqlite3.connect
+    # globally also counts independent background stores from other tests.
+    original_new_connection = store._new_connection
     connections: list[sqlite3.Connection] = []
 
-    def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
-        connection = original_connect(*args, **kwargs)
+    def connect(*, setup_wal: bool = False, shared: bool = False) -> sqlite3.Connection:
+        connection = original_new_connection(setup_wal=setup_wal, shared=shared)
         connections.append(connection)
         return connection
 
-    monkeypatch.setattr(sqlite3, "connect", connect)
+    monkeypatch.setattr(store, "_new_connection", connect)
     barrier = threading.Barrier(4)
 
     def work() -> None:
