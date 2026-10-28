@@ -765,6 +765,30 @@ def test_profile_eligibility_is_rechecked_between_items(tmp_path: Path, monkeypa
     assert result["items"][1]["error"] == "batch_hidden_tool"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows delete-sharing contract")
+def test_contained_read_pins_ancestors_and_file_until_read_finishes(tmp_path: Path) -> None:
+    import time
+
+    from tools.filesystem import service
+
+    root = tmp_path / "root"
+    child = root / "child"
+    child.mkdir(parents=True)
+    path = child / "data.txt"
+    path.write_bytes(b"inside")
+    info = root.stat()
+    limits = service.ReadWindowLimits(root, (info.st_dev, info.st_ino), 6, time.monotonic() + 10, threading.Event())
+    with service._open_contained(path, limits) as stream:
+        for target in (root, child, path):
+            with pytest.raises(PermissionError):
+                target.rename(target.with_name(target.name + "-moved"))
+        assert stream.read() == b"inside"
+    for target in (path, child, root):
+        moved = target.with_name(target.name + "-moved")
+        target.rename(moved)
+        moved.rename(target)
+
+
 def test_racing_directory_link_cannot_escape_batch_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import subprocess
 

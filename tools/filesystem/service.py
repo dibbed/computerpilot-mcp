@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import cache
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -134,6 +135,33 @@ def _read_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, 0 if os.name == "nt" else info.st_ctime_ns
 
 
+@cache
+def _windows_read_api() -> tuple[Any, Any]:
+    """Reuse immutable ctypes declarations; file handles and checks remain per read."""
+    import ctypes
+    from ctypes import wintypes
+
+    class FileInformation(ctypes.Structure):
+        _fields_ = [
+            ("attributes", wintypes.DWORD), ("created", wintypes.FILETIME),
+            ("accessed", wintypes.FILETIME), ("written", wintypes.FILETIME),
+            ("volume", wintypes.DWORD), ("size_high", wintypes.DWORD),
+            ("size_low", wintypes.DWORD), ("links", wintypes.DWORD),
+            ("index_high", wintypes.DWORD), ("index_low", wintypes.DWORD),
+        ]
+
+    windows_ctypes = cast(Any, ctypes)
+    kernel = windows_ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                  wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.POINTER(FileInformation)]
+    kernel.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    return kernel, FileInformation
+
+
 @contextmanager
 def _open_contained(path: Path, limits: ReadWindowLimits) -> Iterator[Any]:
     """Keep the open file rooted at the admitted directory through link races."""
@@ -141,26 +169,9 @@ def _open_contained(path: Path, limits: ReadWindowLimits) -> Iterator[Any]:
     if os.name == "nt":
         import ctypes
         import msvcrt
-        from ctypes import wintypes
-
-        class FileInformation(ctypes.Structure):
-            _fields_ = [
-                ("attributes", wintypes.DWORD), ("created", wintypes.FILETIME),
-                ("accessed", wintypes.FILETIME), ("written", wintypes.FILETIME),
-                ("volume", wintypes.DWORD), ("size_high", wintypes.DWORD),
-                ("size_low", wintypes.DWORD), ("links", wintypes.DWORD),
-                ("index_high", wintypes.DWORD), ("index_low", wintypes.DWORD),
-            ]
 
         windows_ctypes = cast(Any, ctypes)
-        kernel = windows_ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-                                      wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-        kernel.CreateFileW.restype = wintypes.HANDLE
-        kernel.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.POINTER(FileInformation)]
-        kernel.GetFileInformationByHandle.restype = wintypes.BOOL
-        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel.CloseHandle.restype = wintypes.BOOL
+        kernel, FileInformation = _windows_read_api()
         read_attributes = 0x80
         share_read_write = 3
         open_existing = 3
