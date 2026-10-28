@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Changed
+- 2026-10-28: Record actual GPT/Tunnel file-only Batch acceptance: 1,470 successful calls, complete equivalent results and 83.37% lower N16 p95 against direct parallel reads. Document persistent operator activation, unchanged resource budgets and retained load/measurement limits.
 - 2026-10-28: Reuse immutable Windows file API declarations across contained reads while retaining per-read handles, ancestor/reparse checks, source identity checks and durable claims. Add a Windows handle-lifetime regression covering ancestor/file rename denial and cleanup.
 - 2026-10-27: Add default-off native file batching alongside the full tool catalog, live descriptor eligibility lookup and bounded phase timing. Extend the isolated production benchmark with client-parallel baselines, paired tail overhead, owned stdio/loopback HTTP transports and explicitly simulated per-call delay. Live activation remains gated on local and actual plugin acceptance.
 - 2026-10-27: Reuse one serialized SQLite connection for native read-batch resource claims, retaining FULL durability and rollback isolation. Retire the connection after actual batch draining, fence restarted reader generations, and check standalone benchmark connection cleanup. Normal WorkflowStore callers keep per-operation connections.
