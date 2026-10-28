@@ -105,7 +105,7 @@ Key runtime invariants:
 
 A deeper component map is in [Architecture](docs/architecture.md).
 
-The unreleased, opt-in `read_batch` profile reduces independent file-window requests to one call. Its durable claims and shutdown guards are tested, but the final single-file performance gate remains open; use `read_file` for one file. See [batch limits and measured results](docs/tooling.md#opt-in-native-read-batching).
+The opt-in `native_read_batch` tool reduces multiple independent file-window requests to one call. The 2026-10-28 local single-file performance gate passed in uncontended memory, stdio and HTTP tests, but a loaded stdio run exceeded the target and real GPT/Tunnel performance must still be measured. Keep `read_file` for a single file. See [batch limits and measured results](docs/tooling.md#opt-in-native-read-batching).
 
 ## Platform Support
 
@@ -183,7 +183,7 @@ Unreleased opt-in `coding_core` keeps an exact 43-tool native coding catalog for
 
 The separate opt-in `read_batch` profile exposes bounded reads for independent local files in one MCP call. It does not provide an atomic multi-file snapshot or guarantee a local speedup; see [native read batching](docs/tooling.md#opt-in-native-read-batching).
 
-The coding evolution plan still has open acceptance gates: the controlled live-model comparison and the production batch single-file overhead target. Optional grounding, delegation and related extensions retain their separate design gates; the [reviewed plan snapshot](docs/development/CODING-AGENT-EVOLUTION-MASTER-PLAN-SNAPSHOT.fa.md) records the remaining decisions.
+The coding evolution plan still has open acceptance gates: the controlled live-model comparison and real GPT/Tunnel Batch measurements (the unloaded local single-file overhead target now passes, but contention remains). Optional grounding, delegation and related extensions retain their separate design gates; the [reviewed plan snapshot](docs/development/CODING-AGENT-EVOLUTION-MASTER-PLAN-SNAPSHOT.fa.md) records the remaining decisions.
 
 `discover_tool_domains` reports the current profile and platform capabilities. `recommend_tools` ranks tools that are actually registered in the active profile and enriches recognized tools with shared execution-route metadata. The read-only `execution_candidates` and `execution_recommend` diagnostics use that same registered catalog; metadata alone cannot make an unavailable tool routable.
 
