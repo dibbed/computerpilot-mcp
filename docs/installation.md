@@ -88,6 +88,8 @@ The launcher resolves a verified upstream runtime into `.agent_state/tunnel-runt
 
 ## Release archives
 
+For 0.9.0, read the [upgrade and rollback procedure](V0.9.0-RELEASE-NOTES.md#upgrade-and-rollback) before reusing 0.8.0 state. Workflow/job schemas migrate from 6/3 to 11/4. Drain owners, make consistent SQLite backups and upgrade sharing processes together. An older binary needs matching pre-upgrade state; disabling features does not reverse migrations.
+
 Published releases provide:
 
 - Windows amd64 ZIP
@@ -129,6 +131,8 @@ pyright-langserver --stdio
 on `PATH`.
 
 ComputerPilot MCP does not install a language server implicitly and does not accept an arbitrary language-server executable from an MCP caller.
+
+Persistent Python/TypeScript/PHP sessions in 0.9.0 are opt-in through reviewed local configuration, `MCP_LSP_PERSISTENT_ENABLED` and `MCP_LSP_PROVIDERS_CONFIG`. Catalog/health reads do not start them. See [configuration](configuration.md#persistent-language-providers) and [real-provider limits](development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md).
 
 ## Validate the installation
 

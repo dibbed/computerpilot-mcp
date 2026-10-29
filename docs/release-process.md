@@ -2,7 +2,7 @@
 
 ComputerPilot MCP uses guarded, same-SHA release publication.
 
-Contributors follow the [agent contract](../AGENTS.md) and [testing standards](development/TESTING-STANDARDS.md). The v0.8 master plan is local to the operator's Windows Downloads directory; extension acceptance and independent review requirements do not waive the existing release gates below.
+Contributors follow the [agent contract](../AGENTS.md) and [testing standards](development/TESTING-STANDARDS.md). Master plans remain local to the operator and outside release checkouts; extension acceptance and independent review requirements do not waive the existing release gates below.
 
 ## Normal change flow
 
@@ -61,6 +61,12 @@ It rejects forbidden tracked runtime/build-state paths, including local state, s
 It also rejects upstream tunnel-runtime executable/archive names at repository root.
 
 Each archive includes `RELEASE-MANIFEST.json` with the project, version, target, source commit, file count, and managed-runtime policy.
+
+## Version preparation and evidence
+
+Update both `pyproject.toml` and `core/config.py`, the active guides/changelog, versioned release notes and validation record. Preserve historical reports and state the tested SHA/configuration for reused measurements. Packaging validates both versions against the explicit Git ref, never dirty working files. Confirm migration/rollback notes before upgrading a live installation.
+
+Use a PR titled exactly `release: vX.Y.Z` and squash-merge with that exact subject only after all ten head checks pass; a conventional merge subject does not trigger publication. Record release-main SHA and all ten same-SHA checks, then verify the publication workflow, immutable tag target, six assets, independently recomputed archive checksums and manifest source/version/targets. Post-publication evidence may land in a separate docs PR without moving the tag.
 
 ## Release trigger
 

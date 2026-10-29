@@ -36,7 +36,7 @@ class Settings:
     """Small immutable runtime configuration."""
 
     server_name: str = "ali_windows_agent_mcp"
-    version: str = "0.8.0"
+    version: str = "0.9.0"
     tool_profile: str = os.getenv("MCP_TOOL_PROFILE", "full")
     native_read_batch_enabled: bool = os.getenv("MCP_NATIVE_READ_BATCH_ENABLED", "").strip().casefold() in {"1", "true", "yes", "on"}
     extensions_enabled: bool = os.getenv("MCP_EXTENSIONS_ENABLED", "").strip().casefold() in {"1", "true", "yes", "on"}

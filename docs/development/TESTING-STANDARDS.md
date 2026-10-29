@@ -1,6 +1,6 @@
 # Testing standards
 
-These standards describe current repository test patterns and the required v0.8 acceptance gates. New extension test paths remain planned until their roadmap units implement them. The [agent contract](../../AGENTS.md), [native tool guide](MCP-TOOL-AUTHORING.md), and [release process](../release-process.md) own their respective contracts.
+These standards describe current repository test patterns and the required v0.9 release gates. Native and extension tests exercise the implemented boundaries with isolated local fixtures. The [agent contract](../../AGENTS.md), [native tool guide](MCP-TOOL-AUTHORING.md), and [release process](../release-process.md) own their respective contracts.
 
 ## Isolation and existing patterns
 
@@ -15,7 +15,7 @@ Keep configuration, journals, artifacts, marker files and owned subprocesses dis
 ## Behavioral evidence
 
 - Input/authorization: invalid or denied calls prove the body/dispatch did not run and no effect marker exists.
-- Registration/profiles: public catalog/schema, strict unknown arguments, unique names, expected platform gates and all nine profiles. Windows/full has 151 native tools with background verification; POSIX counts differ.
+- Registration/profiles: public catalog/schema, strict unknown arguments, unique names, expected platform gates and all eleven profiles. Windows/full has 151 native tools by default and 152 with Batch enabled; coding_core has 43 and read_batch has seven. POSIX counts differ.
 - Mutations: duplicate, timeout, cancellation, storage failure, partial success and restart paths prove exact effect counts and durable outcomes. Lost response after effect stays uncertain; no replay/reroute.
 - Persistence: legacy fixtures, repeated migration, rollback/crash, concurrent CAS/admission and compaction preserve data and unresolved operations.
 - Process ownership: real child/grandchild trees, root exit, failed ownership before execution, forced stop, and no surviving reader threads/tasks/processes.
@@ -23,7 +23,7 @@ Keep configuration, journals, artifacts, marker files and owned subprocesses dis
 
 Synchronize using events, protocol acknowledgements or durable marker/control files. Avoid arbitrary sleeps and assumptions about interpreter startup timing. A timeout assertion must also check cleanup. Count provider-side durable effects independently of caller outcomes.
 
-The planned `tests/fixtures/fake_mcp_server.py` must exercise real public SDK sessions for valid cases and controlled raw bytes for malformed cases. It must have deterministic counters, finite controllable shutdown and no public-network dependency. Roadmap T01–T16 define acceptance, including no-network schema, generation/schema freeze, notification visibility, policy matrices, no-replay, authenticated panel and quota stress.
+Use the implemented `tests/fixtures/fake_mcp_server.py` and `tests/extension_test_utils.py` for public SDK sessions and controlled malformed bytes, deterministic effect counters and finite shutdown. Extension suites cover no-network schema, generation/schema freeze, notifications, policy matrices, no-replay, authenticated panel and quota stress. Native Batch tests verify real SDK byte bounds, full/profile eligibility, Unicode windows, cancellation and resource/connection draining. Packaging regressions verify all five pinned-ref archives ignore dirty files and private untracked state.
 
 ## Commands and scope
 
@@ -36,7 +36,7 @@ python -m mypy core tools scripts tests
 python -m compileall -q core tools scripts tests
 python main.py --check
 python -m scripts.health_check --json
-python -m pytest -o addopts= -q --basetemp=.pytest-tmp-v08
+python -m pytest -o addopts= -q --basetemp=.pytest-tmp-v09
 python -m scripts.doctor --mode local-http --browser
 ```
 

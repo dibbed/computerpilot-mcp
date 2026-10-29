@@ -6,6 +6,14 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-29
+
+### Release
+- Collect changes since 0.8.0: durable background verification, bounded parallel workflows and resource claims, persistent multilingual language intelligence, opt-in package-runner verification, compact typed outputs and native file batching. See [release notes](docs/V0.9.0-RELEASE-NOTES.md) for compatibility, upgrade/rollback and measured limits, and [validation](docs/V0.9.0-VALIDATION.md) for release-specific evidence.
+- Synchronize current documentation and add regressions for Unicode/window Batch equivalence and cleanup, five-target pinned-ref packaging, private untracked state exclusion and mismatched runtime/package versions.
+
+The dated entries below preserve implementation-time milestones and gates; the release notes describe the final shipped scope and acceptance.
+
 ### Changed
 - 2026-10-28: Record actual GPT/Tunnel file-only Batch acceptance: 1,470 successful calls, complete equivalent results and 83.37% lower N16 p95 against direct parallel reads. Document persistent operator activation, unchanged resource budgets and retained load/measurement limits.
 - 2026-10-28: Reuse immutable Windows file API declarations across contained reads while retaining per-read handles, ancestor/reparse checks, source identity checks and durable claims. Add a Windows handle-lifetime regression covering ancestor/file rename denial and cleanup.

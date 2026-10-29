@@ -27,10 +27,13 @@ This directory contains the public technical documentation and release evidence 
 
 Current release evidence:
 
-- [v0.8.0 release notes](V0.8.0-RELEASE-NOTES.md)
-- [v0.8.0 validation](V0.8.0-VALIDATION.md)
+- [v0.9.0 release notes and upgrade guide](V0.9.0-RELEASE-NOTES.md)
+- [v0.9.0 validation](V0.9.0-VALIDATION.md)
 
 Historical release evidence:
+
+- [v0.8.0 release notes](V0.8.0-RELEASE-NOTES.md)
+- [v0.8.0 validation](V0.8.0-VALIDATION.md)
 
 - [v0.7.1 release notes](V0.7.1-RELEASE-NOTES.md)
 - [v0.7.1 validation](V0.7.1-VALIDATION.md)
@@ -38,5 +41,7 @@ Historical release evidence:
 Versioned files such as `V0.8.0-RELEASE-NOTES.md` and `V0.8.0-VALIDATION.md` are immutable evidence for a specific release. They may contain version-specific counts or platform claims that should not be copied forward without re-validation.
 
 ## Internal development material
+
+Dated acceptance reports preserve their measured source, configuration and limits: [Batch plugin/Tunnel](development/NATIVE-READ-BATCH-LIVE-ACCEPTANCE-2026-10-28.md), [real LSP providers](development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md), [persistent LSP efficiency](development/FREE-PERSISTENT-LSP-EFFICIENCY-2026-10-26.md) and [profile evaluation](development/PROFILE-MODEL-EVALUATION-2026-10-26.md). The versioned validation record owns current release status. Older tracked roadmap snapshots are historical material, not current activation authority.
 
 Local planning directories such as `docs/roadmap/` and `docs/superpowers/` remain ignored by default. The v0.8 master plan is kept only in the operator's Windows Downloads directory, outside all checkouts and release packages. The [agent contract](../AGENTS.md) contains a brief resumable handoff; do not recreate a repository copy of the master plan.

@@ -4,6 +4,8 @@ Environment variables are the runtime configuration interface. [`.env.example`](
 
 This page highlights the settings most users are likely to change.
 
+`.env.example` is a reference, not an automatic loader: copying it to `.env` does not apply settings in the current launchers. Set variables in the launching process. On Windows, the normal `START_MCP.bat` start path also loads operator-local `.agent_state/runtime-settings.cmd` using CMD `set "NAME=value"` syntax; the validate-only path does not load that file. Keep it private and restart MCP after changes.
+
 ## Startup and tool catalog
 
 | Variable | Purpose | Default |
@@ -19,9 +21,18 @@ This page highlights the settings most users are likely to change.
 
 Named tool profiles are `minimal`, `coding`, `coding_core`, `read_batch`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, and `full`. The `documents` profile keeps filesystem, native document, recovery, and workflow domains together. Router candidate generation always uses the tools actually registered in the selected profile; catalog metadata does not bypass profile or platform filtering. Unsupported router policy names fail closed only when router APIs/routed steps are invoked and do not prevent the MCP server from starting.
 
-Unreleased opt-in `coding_core` keeps a fixed 43-tool subset of the coding catalog. Set `MCP_TOOL_PROFILE=coding_core` before startup and restart to select it; switch back to `coding`/`full` with another restart. Extensions require explicit eligibility for the new profile. Its live-model UX pilot is pending separate budget/authorization; `full` remains the default. See [profiles](tooling.md#profiles).
+The opt-in `coding_core` keeps a fixed 43-tool subset of the coding catalog. Set `MCP_TOOL_PROFILE=coding_core` before startup and restart to select it; switch back to `coding`/`full` with another restart. Extensions require explicit eligibility for the new profile. Its live-model UX pilot is pending separate budget/authorization; `full` remains the default. See [profiles](tooling.md#profiles).
 
-The unreleased opt-in `read_batch` profile contains `native_read_batch`, `read_file` and five discovery/health/routing tools (seven total). Alternatively, set `MCP_NATIVE_READ_BATCH_ENABLED=1` with `MCP_TOOL_PROFILE=full` to retain every existing tool and add only `native_read_batch`. Only `1`, `true`, `yes` and `on` enable the flag; other values leave it disabled. Enabling the flag with any profile except `full` or `read_batch` rejects startup before capability discovery. The flag is unnecessary for the existing `read_batch` profile. The default full catalog stays unchanged; opt-in adds one tool and at most 4 KiB of catalog data. Restart MCP and reconnect/refresh clients that cache the catalog. Activation remains subject to the documented performance acceptance. See [native read batching](tooling.md#opt-in-native-read-batching).
+The opt-in `read_batch` profile contains `native_read_batch`, `read_file` and five discovery/health/routing tools (seven total). Alternatively, set `MCP_NATIVE_READ_BATCH_ENABLED=1` with `MCP_TOOL_PROFILE=full` to retain every existing tool and add only `native_read_batch`. Only `1`, `true`, `yes` and `on` enable the flag; other values leave it disabled. Enabling the flag with any profile except `full` or `read_batch` rejects startup before capability discovery. The flag is unnecessary for the existing `read_batch` profile. The default full catalog stays unchanged; opt-in adds one tool and at most 4 KiB of catalog data. Restart MCP and reconnect/refresh clients that cache the catalog. The recorded Windows local and connected GPT/Tunnel acceptance passed; results are configuration/load-specific, and other installations should measure their own path. See [native read batching](tooling.md#opt-in-native-read-batching).
+
+## Persistent language providers
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `MCP_LSP_PERSISTENT_ENABLED` | bounded persistent native language-server sessions | disabled |
+| `MCP_LSP_PROVIDERS_CONFIG` | reviewed local provider configuration path | unset |
+
+Omitting these settings retains the one-shot Pyright path. Provider executable/entrypoint identity, language eligibility and cleanup ownership are validated before dispatch; listing, health and unavailable providers do not implicitly install or launch code. Configuration changes require restart. Python/TypeScript/PHP real-provider evidence is Windows-specific, and free PHP acceptance excludes premium operations. See [provider acceptance](development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md).
 
 ## Managed tunnel runtime
 

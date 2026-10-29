@@ -534,6 +534,43 @@ def test_actual_client_batch_replaces_four_read_calls(tmp_path: Path, monkeypatc
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("parallel", [1, 4])
+def test_full_profile_batch_matches_unicode_read_windows_and_drains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parallel: int,
+) -> None:
+    server = _server(tmp_path, monkeypatch, "full", enabled=True)
+    expected = ["سلام 🌍\nخط دوم\n", "café\n日本語\n", "αβγ\n🧪\n", "نهاية\n"]
+    for index, content in enumerate(expected):
+        (tmp_path / f"unicode-{index}.txt").write_bytes(("skip\n" + content).encode("utf-8"))
+
+    async def scenario() -> None:
+        async with Client(server) as client:
+            direct = [await client.call_tool("read_file", {
+                "path": str(tmp_path / f"unicode-{i}.txt"), "encoding": "utf-8", "start_line": 2,
+                "max_chars": 1024, "delivery": "inline",
+            }) for i in range(4)]
+            result = await client.call_tool("native_read_batch", {
+                "root": str(tmp_path), "max_parallel": parallel, "items": [
+                    {"id": str(i), "path": f"unicode-{i}.txt", "encoding": "utf-8", "start_line": 2, "max_chars": 1024}
+                    for i in range(4)
+                ],
+            })
+            wire = result.structured_content
+            assert wire and wire["ok"] and wire["complete"]
+            assert [item["id"] for item in wire["items"]] == [str(i) for i in range(4)]
+            assert [item["content"] for item in wire["items"]] == expected
+            assert [item.structured_content["content"] for item in direct] == expected
+            assert len(result.model_dump_json().encode("utf-8")) <= 192 * 1024
+            assert server.native_read_batch_state.snapshot() == {
+                "active_batches": 0, "active_reads": 0, "reserved_response_bytes": 0,
+            }
+            store = server.native_read_batch_state._claim_store
+            assert store is not None
+        assert store._closed and store._shared_connection is None
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("items", [
     [{"id": "a", "path": "one.txt", "kind": "run_process"}],
     [{"id": "a", "path": "one.txt"}, {"id": "a", "path": "one.txt"}],

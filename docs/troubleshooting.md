@@ -221,6 +221,10 @@ Use `server_health` and the control panel to inspect resource/storage budgets.
 
 Most generated stores have age/count/byte/TTL limits. Do not delete `.agent_state/` blindly when durable jobs, workflows, recovery evidence, or managed tunnel state matter.
 
+## An older version rejects the workflow or jobs database
+
+Version 0.9.0 migrates workflow schema 6 to 11 and job schema 3 to 4. Reusing that state with 0.8.0 is not supported. Drain all sharing processes, preserve journals/backups and use compatible binaries, or restore a consistent matching pre-upgrade state backup. Never delete claims, reset schema numbers or clear unresolved operations to force startup. See [upgrade and rollback](V0.9.0-RELEASE-NOTES.md#upgrade-and-rollback).
+
 ## Before opening an issue
 
 Include:

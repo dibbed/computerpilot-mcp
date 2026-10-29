@@ -1,6 +1,6 @@
 # Native MCP tool authoring
 
-This guide describes the native implementation, including unreleased language-tool changes since stable v0.8.0. The [agent contract](../../AGENTS.md) owns execution rules; [architecture](../architecture.md) owns runtime boundaries, and [release process](../release-process.md) owns publication.
+This guide describes the native implementation, including the language, verification and Batch contracts in v0.9.0. The [agent contract](../../AGENTS.md) owns execution rules; [architecture](../architecture.md) owns runtime boundaries, and [release process](../release-process.md) owns publication.
 
 ## Registration and caller contract
 
@@ -17,7 +17,7 @@ This excerpt shows the existing `tools/filesystem/registry.py` pattern, not a ru
 
 The live registry owns availability. Add required deterministic metadata to `core/tool_catalog.py` for discovery and routing, using the existing native risk/recoverability taxonomy. Metadata does not register the tool. `PROFILE_DOMAINS` in `core/tool_profiles.py` filters native domains; it is not authorization. Platform-specific imports and registration follow `core/platform` capability gates.
 
-The unreleased `coding_core` profile also supplies a fixed native allowlist. `ExtensionMCPServer.add_tool` preserves the public SDK registration signature and metadata while excluding other native names; startup requires the complete allowlist, and `call_tool` rejects hidden native names before dispatch. Other profiles retain `native_allowlist=None`. Keep registrations synchronous and inert, and use the existing external policy's explicit profile eligibility. This static capability filter is not a sandbox or a model-quality claim; the live-model UX pilot remains gated separately.
+The opt-in `coding_core` profile also supplies a fixed native allowlist. `ExtensionMCPServer.add_tool` preserves the public SDK registration signature and metadata while excluding other native names; startup requires the complete allowlist, and `call_tool` rejects hidden native names before dispatch. The seven-tool `read_batch` profile also uses a fixed allowlist; other profiles retain `native_allowlist=None`. Keep registrations synchronous and inert, and use the existing external policy's explicit profile eligibility. This static capability filter is not a sandbox or a model-quality claim; the live-model UX pilot remains gated separately.
 
 ## Classification, lifecycle and recovery
 
