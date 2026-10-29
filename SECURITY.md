@@ -101,6 +101,12 @@ Project memory records live under `memory/`.
 
 Do not publish these directories as release artifacts or attach them wholesale to issues. Sanitize logs and inspect screenshots/output before sharing.
 
+## Language providers and native resource claims
+
+Persistent language servers and installed package-test runners execute reviewed local code with the account's permissions; executable hashes, fixed protocol methods, environment filtering and process ownership are not an OS sandbox. Discovery never authorizes automatic installation. Keep provider configuration private and review the complete dependency supply chain.
+
+Native cooperative resource claims fence managed edits, jobs, workflows, analyzers and file batches. They do not lock out independent editors or unmanaged external programs. After timeout/crash, uncertain ownership remains quarantined until evidence-based resolution; do not delete SQLite rows or backups to make admission succeed. Before the 0.8-to-0.9 schema upgrade, drain owners and take consistent state backups; an older runtime must use its matching pre-upgrade backup.
+
 ## Recovery behavior
 
 The runtime deliberately avoids blind replay of ambiguous mutations.

@@ -2,7 +2,7 @@
 
 ComputerPilot MCP is a supervised local MCP runtime that combines typed developer/computer-use tools with durable jobs, explicit recovery, and platform capability detection.
 
-Authoring contracts are in [native tool authoring](development/MCP-TOOL-AUTHORING.md), [extension authoring](development/MCP-EXTENSION-AUTHORING.md), and [testing standards](development/TESTING-STANDARDS.md). The [agent contract](../AGENTS.md) records the brief v0.8 handoff; the full master plan stays outside the repository. This architecture describes current runtime behavior until implementation evidence warrants an update.
+Authoring contracts are in [native tool authoring](development/MCP-TOOL-AUTHORING.md), [extension authoring](development/MCP-EXTENSION-AUTHORING.md), and [testing standards](development/TESTING-STANDARDS.md). The [agent contract](../AGENTS.md) records the release handoff; the full master plan stays outside the repository. This architecture describes current runtime behavior until implementation evidence warrants an update.
 
 ## Runtime overview
 
@@ -59,7 +59,11 @@ The router does not launch applications, take screenshots, execute commands, mut
 
 The initial policy ranks valid candidates lexicographically by stronger determinism, recoverability, lower side-effect risk, capability confidence, lower cost/latency tiers, and stable route/tool tie-breakers. Hard constraints run first and cannot be overridden by ranking. In particular, stale semantic references do not fall back to coordinates, destructive ambiguous semantic actions fail closed, raw desktop requires explicit permission and is forbidden for destructive fallback, and document fidelity constraints such as macro preservation eliminate routes that cannot prove them.
 
-Public APIs are read-only `execution_candidates` and `execution_recommend`. v0.7 deliberately has no universal `execution_run` dispatcher. `visual.desktop` is reserved but unavailable until the visual-grounding phase.
+Public APIs are read-only `execution_candidates` and `execution_recommend`. The runtime deliberately has no universal `execution_run` dispatcher. `visual.desktop` is reserved but unavailable until the visual-grounding phase.
+
+## Native read batching
+
+`tools/filesystem/batch.py` reuses the contained native reader and durable resource admission for 1–16 independent text windows. Live SDK descriptor eligibility is rechecked after slot/claim waits and before dispatch. Four batches/four actual reads per server and source/text/SDK-response ceilings bound resources. Cancellation retains slots and claim connection ownership until actual I/O finishes; restart generations fence old cleanup. Only immutable Windows API declarations are reused; handles, path/reparse validation and source checks remain per read. The response makes no atomic snapshot claim. See [Batch contracts and measurements](tooling.md#opt-in-native-read-batching).
 
 ## Platform capability model
 
@@ -199,7 +203,7 @@ Python project analysis maintains bounded version-aware metadata rather than re-
 
 The LSP layer supports bounded one-shot intelligence and recoverable workspace edits. Its default path uses the discovered `pyright-langserver --stdio` command. The seven read tools accept either typed `request` or legacy `params`, preserve existing result envelopes, and validate both through the same fixed-method boundary before dispatch. No public argument selects an arbitrary executable or method; code-action commands and filesystem resource operations are never executed.
 
-Unreleased persistent support is opt-in through `MCP_LSP_PERSISTENT_ENABLED` (default false) and reviewed `MCP_LSP_PROVIDERS_CONFIG`. Each server owns one `LspSessionManager`; registration/listing/health are inert. The manager bounds native owners, preparation, queues, document versions/bytes, resource usage and restart attempts. One owner enters/exits each transport and session, and shutdown retains unresolved cleanup as quarantine. Timeout/cancellation retires possibly dispatched work without replay. Local fixture coverage is not real Python/TypeScript/PHP provider evidence.
+Persistent support is opt-in through `MCP_LSP_PERSISTENT_ENABLED` (default false) and reviewed `MCP_LSP_PROVIDERS_CONFIG`. Each server owns one `LspSessionManager`; registration/listing/health are inert. The manager bounds native owners, preparation, queues, document versions/bytes, resource usage and restart attempts. One owner enters/exits each transport and session, and shutdown retains unresolved cleanup as quarantine. Timeout/cancellation retires possibly dispatched work without replay. The [recorded provider acceptance](development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md) additionally covers real Python/TypeScript/PHP providers on Windows; Linux/macOS real-provider execution remains unverified.
 
 Workspace-edit plans require every touched file's SHA-256, strict UTF-16 positions and matching versions for versioned `documentChanges`. Persistent rename additionally requires every target's version and hash in its server snapshot: unopened targets absent from that snapshot fail closed with `lsp_result_stale`. Plans cap files at 100, edits at 1,000 and replacement UTF-8 at 2 MiB. Dry runs prepare without backups or writes. Shared native resource admission and locks protect the final precondition check; an enabled recovery journal and pinned, verified preimage backups precede durable `prepared`/`may_dispatch` checkpoints. Writes are atomic per file; rollback restores only this operation's byte-identical postimages. Crash/unknown/conflict outcomes preserve evidence and never replay the batch. Direct in-process application also requires recovery. Worker reuse of a parent's operation is explicit and bound in the owning task, so inherited child-task contexts cannot overwrite its evidence. Successful application invalidates Python/context caches and retires the workspace session. See the [language authoring contract](development/MCP-TOOL-AUTHORING.md#language-requests-and-workspace-edits) for compatibility, limits and errors.
 
@@ -253,6 +257,8 @@ ComputerPilot MCP v0.8 adds an extensibility and agent foundation enabling opera
 - **Observability**: Health and loopback panel projections read cached state with zero provider RPC. Bounded telemetry tracks the last 64 call outcomes per owner without per-provider dynamic labels.
 
 For authoring and contract details, see [External MCP extension authoring](development/MCP-EXTENSION-AUTHORING.md) and [Configuration](configuration.md).
+
+## Shared resource admission and DAG recovery
 
 Native file writes, surgical edits, copy/move/delete, document publication, and LSP workspace edits join durable resource admission before local locks. Directory removal and moves use subtree claims; command-backed refactors reserve exclusive host coordination. Paths are revalidated after admission so alias changes while waiting fail before mutation. Background processes started outside the durable job/managed foreground interfaces remain outside this cooperative guarantee, as do editors and other external writers.
 

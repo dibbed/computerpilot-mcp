@@ -8,8 +8,8 @@ Available profiles:
 
 - `minimal`
 - `coding`
-- `coding_core` (unreleased opt-in; model UX pilot pending)
-- `read_batch` (unreleased, explicit opt-in; seven fixed read/discovery tools)
+- `coding_core` (opt-in; model UX pilot pending)
+- `read_batch` (explicit opt-in; seven fixed read/discovery tools)
 - `git`
 - `testing`
 - `documents`
@@ -32,9 +32,9 @@ MCP_TOOL_PROFILE=<profile>
 
 The [2026-10-28 real GPT/Tunnel acceptance](development/NATIVE-READ-BATCH-LIVE-ACCEPTANCE-2026-10-28.md) measured 5 warmups and 30 rounds per case through the connected plugin. N16 p95 was 9.895 seconds for the fastest direct mode (parallel 4) versus 1.646 seconds for Batch 4, an 83.37% reduction. N4 improved from 4.587 to 1.680 seconds. All 1,470 calls returned correct, complete results and the service drained its active read/claim counters. The operator installation keeps Batch enabled across normal starts; other installations still opt in. These are measured connection results, not a general latency guarantee.
 
-The 2026-10-28 Windows follow-up reuses only immutable ctypes API declarations; every read still opens its own handles and performs the existing ancestor/reparse and source checks. With 5 warmups and 30 measured pairs, the production harness measured single-file paired p95 overhead of 4.5592 ms (memory), 4.6566 ms (stdio without concurrent validation load), and 4.6430 ms (local HTTP), below the unchanged 5 ms threshold. A stdio run overlapping static validation measured 7.7113 ms and is retained as a contention result. These local measurements do not establish GPT catalog availability or real Tunnel performance; those activation gates remain separate.
+The 2026-10-28 Windows follow-up reuses only immutable ctypes API declarations; every read still opens its own handles and performs the existing ancestor/reparse and source checks. With 5 warmups and 30 measured pairs, the production harness measured single-file paired p95 overhead of 4.5592 ms (memory), 4.6566 ms (stdio without concurrent validation load), and 4.6430 ms (local HTTP), below the unchanged 5 ms threshold. A stdio run overlapping static validation measured 7.7113 ms and is retained as a contention result. These local measurements do not establish GPT catalog availability or real Tunnel performance; the connected-plugin evidence is recorded separately above.
 
-The unreleased `read_batch` profile contains only `read_file`, `native_read_batch` and five existing discovery, health and advisory route tools. Select `MCP_TOOL_PROFILE=read_batch` **before starting the server**, or retain the complete full catalog with `MCP_TOOL_PROFILE=full` and `MCP_NATIVE_READ_BATCH_ENABLED=1`. Reconnect/refresh clients that cache `tools/list`; local SDK discovery does not prove the GPT plugin has refreshed. The default full catalog and the `coding`, `coding_core` and `minimal` catalogs stay unchanged. Other profiles reject an enabled flag before registration. Profiles are tool filters, not OS security sandboxes. Use `read_file` for a single file. Activation must first pass local verification; real GPT/Tunnel benefit remains an independent acceptance gate. On Windows, use the [controlled opt-in activation procedure](troubleshooting.md#native-read-batch-activation-on-windows) rather than directly restarting an MCP-owned process.
+The opt-in `read_batch` profile contains only `read_file`, `native_read_batch` and five existing discovery, health and advisory route tools. Select `MCP_TOOL_PROFILE=read_batch` **before starting the server**, or retain the complete full catalog with `MCP_TOOL_PROFILE=full` and `MCP_NATIVE_READ_BATCH_ENABLED=1`. Reconnect/refresh clients that cache `tools/list`; local SDK discovery does not prove the GPT plugin has refreshed. The default full catalog and the `coding`, `coding_core` and `minimal` catalogs stay unchanged. Other profiles reject an enabled flag before registration. Profiles are tool filters, not OS security sandboxes. Use `read_file` for a single file. The recorded Windows local and real GPT/Tunnel acceptance passed; new hosts/configurations require their own operational verification. On Windows, use the [controlled opt-in activation procedure](troubleshooting.md#native-read-batch-activation-on-windows) rather than directly restarting an MCP-owned process.
 
 `native_read_batch` accepts an explicit local `root` and 1–16 ordered, uniquely identified `read_file` windows. Each item has `path`, optional line window, offset, encoding and `max_chars` (default 4096, maximum 16384). `max_parallel` is 1–4 (default 1); cooperative `timeout_sec` is at most 60 seconds (default 10). The server accepts at most four simultaneous batches and four in-flight reads across them. Each regular file is limited to 2 MiB; aggregate source data to 8 MiB, requested result text to 64 KiB, and the encoded response to 192 KiB. Invalid request shapes are rejected before dispatch, while valid independent items can return separate errors.
 
@@ -79,9 +79,9 @@ Hard safety rules include:
 - stale semantic references cannot fall back to coordinates;
 - destructive ambiguous semantic targets fail closed;
 - macro-preservation requirements exclude routes that cannot prove fidelity;
-- `visual.desktop` is unavailable in v0.8.
+- `visual.desktop` is unavailable in v0.9.
 
-There is intentionally no `execution_run` tool in v0.8. The selected route still resolves to existing typed tools and their existing validation, lifecycle, audit, recovery, and permission behavior.
+There is intentionally no `execution_run` tool in v0.9. The selected route still resolves to existing typed tools and their existing validation, lifecycle, audit, recovery, and permission behavior.
 
 ## Filesystem and editing
 

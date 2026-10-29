@@ -2,6 +2,8 @@
 
 **Supervised computer use and developer automation over the Model Context Protocol.**
 
+Version **0.9.0** adds durable background verification, opt-in parallel DAG workflows, persistent multilingual LSP/context, package-runner verification and bounded native file batching. See [everything since 0.8.0](docs/V0.9.0-RELEASE-NOTES.md) and [release validation](docs/V0.9.0-VALIDATION.md). Optional capabilities keep their documented defaults and require operator configuration.
+
 [![Release](https://img.shields.io/github/v/release/dibbed/computerpilot-mcp?label=release)](https://github.com/dibbed/computerpilot-mcp/releases/latest)
 [![CI](https://github.com/dibbed/computerpilot-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dibbed/computerpilot-mcp/actions/workflows/ci.yml)
 [![Platform Validation](https://github.com/dibbed/computerpilot-mcp/actions/workflows/platform-validation.yml/badge.svg)](https://github.com/dibbed/computerpilot-mcp/actions/workflows/platform-validation.yml)
@@ -114,8 +116,8 @@ The opt-in `native_read_batch` tool reduces multiple independent file-window req
 | Windows amd64 | Supported | Python 3.10 + 3.12 | Yes | Full portable core plus Windows desktop capabilities |
 | Linux amd64 | Preview | Python 3.10 + 3.12 | No | Portable filesystem/documents/terminal/browser/Git/testing/jobs/recovery/workflows |
 | macOS arm64 | Preview | Python 3.10 + 3.12 | No | Portable core; browser is the UI automation path |
-| Linux arm64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed in v0.8.0 |
-| macOS amd64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed in v0.8.0 |
+| Linux arm64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed in v0.9.0 |
+| macOS amd64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed in v0.9.0 |
 
 The release workflow builds five target archives from the same tracked source. Platform claims and limitations are documented in [Platform support](docs/platform-support.md).
 
@@ -177,13 +179,13 @@ Built-in workflows include `implement_and_verify`, `safe_git_commit`, and `prepa
 
 The default `full` profile preserves the complete catalog. Smaller profiles reduce the active domain set for specialized agents:
 
-`minimal`, `coding`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, `full`.
+`minimal`, `coding`, `coding_core`, `read_batch`, `git`, `testing`, `documents`, `desktop`, `browser`, `operations`, `full`.
 
-Unreleased opt-in `coding_core` keeps an exact 43-tool native coding catalog for a client that lists tools once. It includes guarded file/LSP edits, verification, Git, recovery and job observation; extensions need explicit profile eligibility. Its static SDK journey is tested, while the separately budgeted live-model UX pilot remains unverified. It does not change the default. See the [profile contract](docs/tooling.md#profiles).
+The opt-in `coding_core` keeps an exact 43-tool native coding catalog for a client that lists tools once. It includes guarded file/LSP edits, verification, Git, recovery and job observation; extensions need explicit profile eligibility. Its static SDK journey is tested, while the separately budgeted live-model UX pilot remains unverified. It does not change the default. See the [profile contract](docs/tooling.md#profiles).
 
 The separate opt-in `read_batch` profile exposes bounded reads for independent local files in one MCP call. It does not provide an atomic multi-file snapshot or guarantee a local speedup; see [native read batching](docs/tooling.md#opt-in-native-read-batching).
 
-The coding evolution plan still has open acceptance gates, including the separately controlled live-model comparison. The file-only Batch feature passed its quiet local and real GPT/Tunnel acceptance; contention limits remain documented. Optional grounding, delegation and related extensions retain their separate design gates; the [reviewed plan snapshot](docs/development/CODING-AGENT-EVOLUTION-MASTER-PLAN-SNAPSHOT.fa.md) records the remaining decisions.
+The coding evolution plan still has open acceptance gates, including the separately controlled live-model comparison. The file-only Batch feature passed its quiet local and real GPT/Tunnel acceptance; contention limits remain documented. Optional grounding, delegation and related extensions retain their separate design gates. The [reviewed plan snapshot](docs/development/CODING-AGENT-EVOLUTION-MASTER-PLAN-SNAPSHOT.fa.md) is historical; current release scope and evidence are in the [0.9.0 notes](docs/V0.9.0-RELEASE-NOTES.md) and [validation](docs/V0.9.0-VALIDATION.md).
 
 `discover_tool_domains` reports the current profile and platform capabilities. `recommend_tools` ranks tools that are actually registered in the active profile and enriches recognized tools with shared execution-route metadata. The read-only `execution_candidates` and `execution_recommend` diagnostics use that same registered catalog; metadata alone cannot make an unavailable tool routable.
 
@@ -206,7 +208,7 @@ Initial route classes are:
 - native: filesystem, code/LSP, Git, process, system, Excel, DOCX, and PDF;
 - semantic: browser and Windows UI Automation;
 - `raw.desktop`, only when the request explicitly permits raw desktop fallback and the action is not destructive;
-- `visual.desktop`, reserved for a later visual-grounding phase and unavailable in v0.8.
+- `visual.desktop`, reserved for a later visual-grounding phase and unavailable in v0.9.
 
 The public diagnostics are read-only:
 
@@ -326,7 +328,7 @@ Release preparation also has:
 - **Release Packaging Smoke** that builds all five archives and validates `SHA256SUMS.txt`;
 - exact-SHA publication gates for release commits.
 
-Release-specific evidence is stored under `docs/V*-VALIDATION.md`. The current release evidence is [v0.8.0 validation](docs/V0.8.0-VALIDATION.md); earlier releases remain in the same directory and [docs/README.md](docs/README.md) lists them.
+Release-specific evidence is stored under `docs/V*-VALIDATION.md`. The current release evidence is [v0.9.0 validation](docs/V0.9.0-VALIDATION.md); earlier releases remain in the same directory and [docs/README.md](docs/README.md) lists them.
 
 Run the common checks locally:
 
@@ -379,12 +381,12 @@ Historical release notes and validation records remain under `docs/`. Internal l
 
 - Native desktop screenshot/input and semantic UI Automation are Windows-only.
 - Linux and macOS support is still labeled preview.
-- Linux arm64 and macOS amd64 are package targets without a dedicated native hosted-runner claim in v0.7.1 / v0.8.0.
+- Linux arm64 and macOS amd64 are package targets without a dedicated native hosted-runner claim in v0.9.0.
 - Browser automation requires Playwright and installed browser runtimes.
 - Excel document tools support `.xlsx` and `.xlsm`; macro mutation is accepted only when VBA bytes can be verified unchanged.
 - DOCX mutation is intentionally conservative: `.docm`, tracked changes, comments, headers/footers, arbitrary XML edits, and ambiguous mixed-format replacements are not supported.
 - PDF creation uses built-in PDF fonts and a limited Markdown subset; complex-script shaping and arbitrary editing of existing PDFs are not supported.
-- LSP tools require a trusted `pyright-langserver --stdio` command already available on `PATH`; the MCP does not install it implicitly.
+- LSP tools default to trusted `pyright-langserver --stdio` on `PATH`; opt-in persistent providers use reviewed local configuration. The MCP does not install providers implicitly; real-provider acceptance is Windows-specific.
 - The local HTTP endpoint and control panel are intended for loopback use, not direct exposure to untrusted networks.
 - Built-in workflows deliberately avoid blind push/tag/deploy behavior.
 

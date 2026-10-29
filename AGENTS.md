@@ -6,6 +6,8 @@ ComputerPilot MCP is a cross-platform, typed computer-use and developer-automati
 
 The published stable boundary is v0.8.0 (Extensibility & Agent Foundation), released 2026-10-14. Read current package/config versions and Git state; do not assume your checkout equals stable. Visual Grounding, delegated browser agents, arbitrary execution_run, arbitrary external workflow actions, and nested autonomy remain outside the released scope.
 
+The authorized v0.9.0 release preparation collects the intervening merged changes; its [release notes](docs/V0.9.0-RELEASE-NOTES.md) and [validation](docs/V0.9.0-VALIDATION.md) own the new scope and exact-SHA publication status. A package version bump alone does not establish publication. Historical v0.8 handoff evidence below remains intact.
+
 Portable Core must import and operate on Windows, Linux, and macOS. Windows desktop/UIA stays capability-gated. External stdio support must preserve both existing inbound stdio and streamable-http transports.
 
 ## Sources of truth

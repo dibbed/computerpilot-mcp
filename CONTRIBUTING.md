@@ -4,7 +4,7 @@ Thanks for helping improve ComputerPilot MCP.
 
 This repository contains a cross-platform MCP runtime with platform-specific adapters, durable local state, process execution, browser/desktop automation, recovery, workflows, and release automation. Changes should preserve those boundaries rather than making one platform or one execution path the implicit default.
 
-Read the [agent and contributor contract](AGENTS.md), [native tool authoring guide](docs/development/MCP-TOOL-AUTHORING.md), and [testing standards](docs/development/TESTING-STANDARDS.md) before implementation. The [extension authoring contract](docs/development/MCP-EXTENSION-AUTHORING.md) describes the verified v0.8 extensibility contracts; the agent contract's brief handoff, current source and CI identify verified progress. The master plan remains outside the repository in the operator's Windows Downloads directory.
+Read the [agent and contributor contract](AGENTS.md), [native tool authoring guide](docs/development/MCP-TOOL-AUTHORING.md), and [testing standards](docs/development/TESTING-STANDARDS.md) before implementation. The [extension authoring contract](docs/development/MCP-EXTENSION-AUTHORING.md) describes the extensibility contracts retained in v0.9; the agent contract's brief handoff, current source and CI identify verified progress. The master plan remains outside the repository in the operator's Windows Downloads directory.
 
 ## Development environment
 
@@ -171,6 +171,10 @@ A useful pull request explains:
 - documentation impact.
 
 Use the repository pull request template and keep the scope reviewable.
+
+## Release preparation
+
+See [release process](docs/release-process.md). Version bumps must agree in `pyproject.toml` and `core/config.py`; include migration/rollback notes and exact-SHA validation. Preserve historical evidence. The guarded workflow creates tags/releases after the ten release-main checks; never replace it with an ad-hoc tag or release command.
 
 ## Documentation
 
