@@ -4,6 +4,8 @@ Environment variables are the runtime configuration interface. [`.env.example`](
 
 This page highlights the settings most users are likely to change.
 
+`.env.example` is a reference, not an automatic loader: copying it to `.env` does not apply settings in the current launchers. Set variables in the launching process. On Windows, the normal `START_MCP.bat` start path also loads operator-local `.agent_state/runtime-settings.cmd` using CMD `set "NAME=value"` syntax; the validate-only path does not load that file. Keep it private and restart MCP after changes.
+
 ## Startup and tool catalog
 
 | Variable | Purpose | Default |
