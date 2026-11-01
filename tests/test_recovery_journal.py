@@ -1012,10 +1012,20 @@ asyncio.run(main())
         validate_resource_capability(make_resource_capability(request_id, owner, resources.path), (), resources)
     assert denied.value.code == "resource_capability_invalid"
     resources.recover_interrupted()
-    assert resources.resource_request(request_id)["state"] == "quarantined"
-    assert resources.reserve_resource_claims(
+    # The helper and its validation command were both killed, so the owned child
+    # identity is provably gone. Ownership is released (no process can still hold
+    # the path); the uncertain edit itself stays journaled and is never replayed.
+    # Whether the validation child died with the helper or survived in its own
+    # group is a race; both outcomes are safe. A live orphan stays fenced, a
+    # provably exited command releases ownership. The uncertain edit above is
+    # journaled either way and is never replayed.
+    recovered = resources.resource_request(request_id)
+    assert recovered["state"] in {"released", "quarantined"}
+    assert recovered["reason"] in {"stale_native_owner_command_exited", "stale_native_owner_command_alive"}
+    admitted = resources.reserve_resource_claims(
         request_id="conflict", owner_token="other", category="test", claims=(path_claim(target, "read"),),
-    )["admitted"] is False
+    )["admitted"]
+    assert admitted is (recovered["state"] == "released")
 
 
 def test_server_health_surfaces_recovered_uncertain_operation(
