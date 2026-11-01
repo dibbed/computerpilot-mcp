@@ -30,7 +30,7 @@ from core.workflow_models import (
     workflow_topological_order,
 )
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 GRAPH_CONTRACT_VERSION = 1
 _RESOURCE_CAPABILITY_SQL = """
 SELECT r.* FROM workflow_resource_requests r
@@ -201,6 +201,7 @@ class WorkflowStore:
         self._reuse_connection = False
         self._shared_connection: sqlite3.Connection | None = None
         self._closed = False
+        self.last_native_recovery: dict[str, int] = {"released": 0, "quarantined": 0}
         path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self._reuse_connection = reuse_connection
@@ -328,6 +329,9 @@ class WorkflowStore:
                 if version < 11:
                     self._migrate_v11(connection)
                     version = 11
+                if version < 12:
+                    self._migrate_v12(connection)
+                    version = 12
             if version > SCHEMA_VERSION:
                 raise ToolError(
                     "workflow_schema_too_new",
@@ -657,6 +661,21 @@ class WorkflowStore:
                 ) THEN RAISE(ABORT,'resource_policy_incompatible') END;
             END;
             PRAGMA user_version = 11;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v12(connection: sqlite3.Connection) -> None:
+        """Record the owned child identity so stale native claims can be reconciled."""
+
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE workflow_resource_requests ADD COLUMN dispatch_pid INTEGER;
+            ALTER TABLE workflow_resource_requests ADD COLUMN dispatch_process_created REAL;
+            ALTER TABLE workflow_resource_requests ADD COLUMN dispatch_recorded_at TEXT;
+            PRAGMA user_version = 12;
             COMMIT;
             """
         )
@@ -1783,6 +1802,37 @@ class WorkflowStore:
                 raise ToolError("resource_request_not_found", "Resource request was not found.")
             claims = self._resource_claims_for_request(connection, request_id)
         return {**dict(row), "claims": [claim.public() for claim in claims]}
+
+    def record_resource_dispatch(
+        self, request_id: str, *, owner_token: str, process_pid: int, process_created: float,
+    ) -> bool:
+        """Persist the exact owned child identity immediately after spawn.
+
+        Recovery uses the creation time to reject PID reuse: a marker that still
+        verifies proves the orphaned command is alive, and a marker that no longer
+        verifies proves the command exited even though the owner died.
+        """
+
+        if process_pid <= 0 or process_created <= 0:
+            return False
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state, owner_token FROM workflow_resource_requests WHERE request_id = ?", (request_id,),
+            ).fetchone()
+            if row is None or str(row["owner_token"]) != owner_token or str(row["state"]) != "active":
+                connection.commit()
+                return False
+            updated = connection.execute(
+                """
+                UPDATE workflow_resource_requests
+                SET dispatch_pid = ?, dispatch_process_created = ?, dispatch_recorded_at = ?
+                WHERE request_id = ? AND owner_token = ? AND state = 'active'
+                """,
+                (process_pid, process_created, _now(), request_id, owner_token),
+            ).rowcount
+            connection.commit()
+        return updated > 0
 
     def bind_resource_request_attempt(
         self,
@@ -3183,33 +3233,98 @@ class WorkflowStore:
             (workflow_id, target.value, _canonical({"operation_count": len(operations)}), now),
         )
 
+    @staticmethod
+    def _process_identity_alive(pid: int, created: float) -> bool:
+        """Verify a PID belongs to the same, still-running process (never PID alone).
+
+        POSIX commands are spawned as their own process-group leader, so a live
+        group (even after the leader exits) still fences the claim: a detached
+        descendant may outlive the direct child and keep writing.
+        """
+
+        import psutil
+
+        try:
+            process = psutil.Process(pid)
+            if (
+                abs(process.create_time() - created) < 0.01
+                and process.is_running()
+                and process.status() != psutil.STATUS_ZOMBIE
+            ):
+                return True
+        except (psutil.Error, OSError):
+            pass
+        if os.name != "nt":
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                return False
+            except OSError:
+                return True
+            return True
+        return False
+
     def recover_interrupted(self) -> int:
         now = _now()
         with closing(self._connect()) as connection:
             native_rows = connection.execute(
-                "SELECT request_id,owner_token FROM workflow_resource_requests "
-                "WHERE workflow_id IS NULL AND state IN ('active','pending') AND owner_token LIKE 'native-owner-%'",
+                "SELECT request_id,owner_token,dispatch_pid,dispatch_process_created "
+                "FROM workflow_resource_requests "
+                "WHERE workflow_id IS NULL AND owner_token LIKE 'native-owner-%' "
+                "AND (state IN ('active','pending') "
+                "OR (state='quarantined' AND reason='stale_native_owner_command_alive'))",
             ).fetchall()
         owner_snapshots: dict[str, bool | None] = {}
-        stale_native: list[tuple[str, str]] = []
+        stale_native: list[tuple[str, str, int | None, float | None]] = []
         for native in native_rows:
             owner = str(native["owner_token"])
             identity = owner.rsplit("-", 1)[0]
             if identity not in owner_snapshots:
                 owner_snapshots[identity] = native_resource_owner_alive(owner)
             if owner_snapshots[identity] is False:
-                stale_native.append((str(native["request_id"]), owner))
+                raw_pid, raw_created = native["dispatch_pid"], native["dispatch_process_created"]
+                stale_native.append((
+                    str(native["request_id"]),
+                    owner,
+                    int(raw_pid) if raw_pid is not None else None,
+                    float(raw_created) if raw_created is not None else None,
+                ))
         native_count = 0
+        self.last_native_recovery = {"released": 0, "quarantined": 0}
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            for request_id, owner in stale_native:
-                native_count += connection.execute(
-                    "UPDATE workflow_resource_requests SET "
-                    "state=CASE WHEN state='pending' THEN 'released' ELSE 'quarantined' END, "
-                    "reason='native_owner_identity_unavailable', updated_at=? "
-                    "WHERE request_id=? AND owner_token=? AND workflow_id IS NULL AND state IN ('active','pending')",
-                    (now, request_id, owner),
+            for request_id, owner, dispatch_pid, dispatch_created in stale_native:
+                row = connection.execute(
+                    "SELECT state FROM workflow_resource_requests "
+                    "WHERE request_id=? AND owner_token=? AND workflow_id IS NULL "
+                    "AND state IN ('active','pending','quarantined')",
+                    (request_id, owner),
+                ).fetchone()
+                if row is None:
+                    continue
+                current_state = str(row["state"])
+                if current_state == "pending":
+                    reason, target_state = "stale_native_owner_never_dispatched", "released"
+                elif dispatch_pid is None or dispatch_created is None:
+                    reason, target_state = "stale_native_owner_dispatch_unknown", "quarantined"
+                elif self._process_identity_alive(dispatch_pid, dispatch_created):
+                    reason, target_state = "stale_native_owner_command_alive", "quarantined"
+                elif connection.execute(
+                    "SELECT 1 FROM runtime_capacity_requests WHERE resource_request_id=? AND state!='released' LIMIT 1",
+                    (request_id,),
+                ).fetchone() is not None:
+                    reason, target_state = "child_capacity_cleanup_unresolved", "quarantined"
+                else:
+                    reason, target_state = "stale_native_owner_command_exited", "released"
+                updated = connection.execute(
+                    "UPDATE workflow_resource_requests SET state=?, reason=?, updated_at=? "
+                    "WHERE request_id=? AND owner_token=? AND workflow_id IS NULL "
+                    "AND state IN ('active','pending','quarantined')",
+                    (target_state, reason, now, request_id, owner),
                 ).rowcount
+                native_count += updated
+                if updated:
+                    self.last_native_recovery[target_state if target_state == "released" else "quarantined"] += 1
             rows = connection.execute(
                 """
                 SELECT workflows.workflow_id, workflows.current_step, workflows.state, workflows.execution_mode,

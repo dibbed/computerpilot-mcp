@@ -145,9 +145,13 @@ async def collect_server_health(
         with _HEALTH_SYNC_LOCK:
             resources = resource_collector(browser_stats)
             workflows = workflow_store_factory(settings.workflow_db)
+            summary = workflows.health_summary()
+            summary["native_resource_recovery"] = dict(
+                getattr(workflows, "last_native_recovery", {}) or {},
+            )
             return (
                 resources,
-                workflows.health_summary(),
+                summary,
                 workflows.list(offset=0, limit=20),
                 recovery.summary(max_items=20),
                 extension_manager.recovery_journal.unresolved_external_count() if extension_manager is not None else 0,

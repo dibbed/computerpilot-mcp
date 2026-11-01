@@ -23,6 +23,7 @@ from core.lifecycle import RUNTIME_LIFECYCLE
 from core.recovery import OPERATION_RECOVERY
 from core.tool_activity import TOOL_ACTIVITY
 from core.workflow_retention import schedule_workflow_history_retention
+from core.workflow_store import workflow_store
 from tools.filesystem.search_snapshots import SEARCH_SNAPSHOTS
 
 RUNTIME_HEALTH_PUBLISH_INTERVAL_SEC = 10.0
@@ -31,6 +32,10 @@ RUNTIME_HEALTH_PUBLISH_INTERVAL_SEC = 10.0
 @asynccontextmanager
 async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
     ensure_runtime_dirs()
+    # Reconcile native command ownership left behind by an abrupt previous runtime
+    # before this process admits any work: provably exited commands release their
+    # claim, a still-running orphan stays fenced for explicit reconciliation.
+    await asyncio.to_thread(workflow_store, SETTINGS.workflow_db)
     batch_reader = getattr(server, "native_read_batch_state", None)
     if batch_reader is not None:
         batch_reader.start()
