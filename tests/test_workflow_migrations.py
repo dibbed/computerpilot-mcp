@@ -331,7 +331,7 @@ def test_v5_database_migrates_route_columns_without_losing_legacy_data(tmp_path:
     migrated = store.get("legacy-workflow")
     operations = store.list_operations("legacy-workflow")
 
-    assert SCHEMA_VERSION == 11
+    assert SCHEMA_VERSION == 12
     assert migrated["state"] == "completed"
     assert migrated["execution_mode"] == "sequential"
     assert migrated["graph_contract_version"] == 0
@@ -457,7 +457,7 @@ def test_v11_policy_migration_preserves_unknown_effects_and_denies_legacy_activa
     assert store.resource_request("legacy-pending")["state"] == "released"
     assert store.get("legacy-workflow")["version"] == 7
     with closing(sqlite3.connect(path)) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 12
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert db.execute("SELECT state FROM runtime_capacity_requests").fetchone()[0] == "active"

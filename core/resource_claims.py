@@ -247,6 +247,31 @@ def validate_resource_capability(
     return authority
 
 
+def record_native_dispatch_identity(pid: int) -> bool:
+    """Persist the owned child identity so stale-claim recovery can prove dispatch.
+
+    Returns ``False`` when no native capability is active or the marker could not
+    be persisted; recovery then treats the claim as dispatch-unknown instead of
+    releasing ownership that might still have a live command behind it.
+    """
+
+    token = current_resource_capability()
+    if token is None:
+        return False
+    try:
+        request_id, owner_token, db_path = _parse_resource_capability(token)
+        if not owner_token.startswith("native-owner-"):
+            return False
+        created = psutil.Process(pid).create_time()
+        from core.workflow_store import WorkflowStore
+
+        return WorkflowStore(db_path, recover=False).record_resource_dispatch(
+            request_id, owner_token=owner_token, process_pid=pid, process_created=created,
+        )
+    except Exception:
+        return False
+
+
 def resource_requires_native_ownership(token: str | None = None, store: WorkflowStore | None = None) -> bool:
     from core.errors import ToolError
 

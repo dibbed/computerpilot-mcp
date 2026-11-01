@@ -22,7 +22,12 @@ import psutil
 from core.artifacts import Delivery, deliver_stream
 from core.errors import ToolError
 from core.process_ownership import OwnedProcess, spawn_owned_process
-from core.resource_claims import RESOURCE_CAPABILITY_ENV, current_resource_capability, resource_requires_native_ownership
+from core.resource_claims import (
+    RESOURCE_CAPABILITY_ENV,
+    current_resource_capability,
+    record_native_dispatch_identity,
+    resource_requires_native_ownership,
+)
 from core.timings import timing_span
 
 OutputMode = Literal["head", "tail", "both"]
@@ -257,6 +262,8 @@ def run_bounded(
         raise ToolError("invalid_command", "An executable is required.")
     if not cwd.is_dir():
         raise ToolError("invalid_cwd", f"Working directory does not exist: {cwd}")
+    if cancel_event is not None and cancel_event.is_set():
+        raise ToolError("command_cancelled", "The command was cancelled before dispatch.")
     chosen_encoding = encoding or locale.getpreferredencoding(False) or "utf-8"
     stdout = OutputCapture(stdout_limit, output_mode)
     stderr = OutputCapture(stderr_limit, output_mode)
@@ -274,6 +281,7 @@ def run_bounded(
                 creationflags=_creation_flags(),
                 require_native=resource_requires_native_ownership() or require_native,
             )
+        record_native_dispatch_identity(process.pid)
         stdout_thread = threading.Thread(target=_read_pipe, args=(process.stdout, stdout), daemon=True)
         stderr_thread = threading.Thread(target=_read_pipe, args=(process.stderr, stderr), daemon=True)
         stdout_thread.start()
