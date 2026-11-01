@@ -78,6 +78,12 @@ no reservation lifecycle for client-chosen operation identities.
 - **Read-only concurrency is opt-in and still fenced.** `access="read"` takes a read coordination
   claim plus a read claim on the cwd subtree. It therefore overlaps other readers but conflicts with
   any writer in that subtree and with every exclusive command/job. Defaults remain exclusive.
+- **Caller-declared read access is not a privilege boundary.** `access="read"` grants no new OS
+  capability: the caller already supplies the command text and runs under the same account. It only
+  changes admission. A mislabeled writer can overlap with another mislabeled writer in the same
+  subtree, but it still conflicts with writer claims, cannot escape the claimed subtree, and is
+  capped by the gate. The exclusive default, per-subtree claims and this contract are the
+  mitigations; the catalogue annotation and description state the obligation.
 - **Bounded parallelism.** A process-local gate caps concurrent read-only commands at
   `MCP_COMMAND_SHARED_CONCURRENCY` (default 4). Waiters poll with cancellation and a timeout.
 - **Dispatch identity is durable.** Immediately after spawn, the child PID and creation time are
@@ -189,8 +195,11 @@ memory/FD numbers; the earlier audit measured 8→27 FDs (stable) and 122→127.
 
 ## 12. Remaining risks
 
-1. Read-only concurrency depends on the caller's `access="read"` assertion. A lying caller can
-   violate serialization; the classification is audited but not proven by the server.
+1. Read-only concurrency depends on the caller's `access="read"` assertion. This is a documented
+   trust boundary, not a privilege boundary (see the security review in section 3): a caller that
+   mislabels a writer can overlap with another mislabeled writer on the same subtree, which is
+   caller error with the same effect as supplying the wrong command. It cannot widen OS privileges,
+   bypass a writer's claim, or escape the claimed cwd subtree.
 2. Stateless HTTP still cannot observe disconnects; cancellation is explicit by design. A client that
    loses the operation id cannot cancel.
 3. Recovery fences live orphans rather than killing them; they require operator action.
@@ -215,7 +224,8 @@ History preserved on the branch (oldest first):
 | `36d3c28` | fix(recovery): reconcile stale native command claims against durable child identity |
 | `635844c` | feat(terminal): add explicit cancellation and bounded read-only concurrency |
 | `d5be09f` | docs: record Linux reliability, cancellation and concurrency hardening evidence |
-| this commit | docs: finalize verification evidence and caller-declared read review |
+| `fb56b32` | docs: finalize verification evidence and caller-declared read review |
+| this commit | docs: record the final green suite and the caller-declared read security review |
 
 Push target: `origin/fix/linux-reliability-hardening` only. No fast-forward into `main`, no force
 push, no history rewrite.
