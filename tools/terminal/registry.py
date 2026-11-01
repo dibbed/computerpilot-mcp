@@ -17,7 +17,6 @@ from pydantic import Field
 
 from core.artifacts import default_delivery
 from core.audit import audit_action
-from core.command_concurrency import SHARED_COMMANDS
 from core.config import PROJECT_ROOT, resolve_path
 from core.errors import ToolError
 from core.executor import run_bounded
@@ -33,14 +32,18 @@ def _cwd(value: str | None) -> Path:
 @contextmanager
 def _managed_command_claims(
     working: Path, timeout_sec: float, cancel_event: threading.Event | None = None,
-    access: Literal["exclusive", "read"] = "exclusive",
 ) -> Iterator[float]:
+    """Fence every terminal command as a writer until its process tree is reaped.
+
+    An arbitrary executable or shell string cannot be proven side-effect free:
+    arguments, environment, configuration, plugins and descendants can all write.
+    The caller-supplied ``access`` value is therefore a compatibility hint only;
+    it never weakens coordination. Native typed read tools keep their own read
+    claims and remain concurrent.
+    """
+
     deadline = time.monotonic() + timeout_sec
-    claims = (
-        [coordination_claim(exclusive=False), path_claim(working, "read", scope="subtree")]
-        if access == "read"
-        else [coordination_claim(exclusive=True), path_claim(working, "write", scope="subtree")]
-    )
+    claims = [coordination_claim(exclusive=True), path_claim(working, "write", scope="subtree")]
     with managed_resource_claims(
         claims,
         category="native.command",
@@ -52,14 +55,18 @@ def _managed_command_claims(
             raise ToolError("command_cancelled", "The command was cancelled before dispatch.")
         if remaining <= 0:
             raise ToolError("resource_admission_timeout", "Command timeout expired before process dispatch.")
-        if access == "read":
-            with SHARED_COMMANDS.slot(remaining, cancel_event):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise ToolError("resource_admission_timeout", "Command timeout expired before process dispatch.")
-                yield remaining
-        else:
-            yield remaining
+        yield remaining
+
+
+def _report_effective_access(
+    result: dict[str, Any], requested: Literal["exclusive", "read"],
+) -> dict[str, Any]:
+    """Expose the conservative classification instead of silently honoring a hint."""
+
+    if requested == "read":
+        result["effective_access"] = "exclusive"
+        result["access_reason"] = "terminal_command_read_untrusted"
+    return result
 
 
 def _audit_command(operation: str, command: list[str], cwd: Path, *, script_chars: int | None = None) -> None:
@@ -105,7 +112,7 @@ def register(mcp: MCPServer) -> None:
             process_args = args or []
             command = [executable, *process_args]
             _audit_command("run_process", command, working)
-            with _managed_command_claims(working, timeout_sec, cancel, access=access) as remaining:
+            with _managed_command_claims(working, timeout_sec, cancel) as remaining:
                 result = run_bounded(
                     command,
                     cwd=working,
@@ -118,6 +125,7 @@ def register(mcp: MCPServer) -> None:
                     delivery=delivery,
                     cancel_event=cancel,
                 )
+            result = _report_effective_access(result, access)
             result["command"] = {"executable": executable, "argument_count": len(process_args)}
             audit_action(
                 "run_process", target=working, outcome="completed",
@@ -155,7 +163,7 @@ def register(mcp: MCPServer) -> None:
                 command.extend(["-ExecutionPolicy", "Bypass"])
             command.extend(["-Command", script])
             _audit_command("run_powershell", command, working, script_chars=len(script))
-            with _managed_command_claims(working, timeout_sec, cancel, access=access) as remaining:
+            with _managed_command_claims(working, timeout_sec, cancel) as remaining:
                 result = run_bounded(
                     command,
                     cwd=working,
@@ -167,6 +175,7 @@ def register(mcp: MCPServer) -> None:
                     delivery=delivery,
                     cancel_event=cancel,
                 )
+            result = _report_effective_access(result, access)
             result["command"] = {"shell": Path(executable).name, "script_chars": len(script)}
             audit_action(
                 "run_powershell", target=working, outcome="completed",
@@ -200,7 +209,7 @@ def register(mcp: MCPServer) -> None:
                 working = _cwd(cwd)
                 command = [executable, "/d", "/s", "/c", command_text]
                 _audit_command("run_cmd", command, working, script_chars=len(command_text))
-                with _managed_command_claims(working, timeout_sec, cancel, access=access) as remaining:
+                with _managed_command_claims(working, timeout_sec, cancel) as remaining:
                     result = run_bounded(
                         command,
                         cwd=working,
@@ -212,6 +221,7 @@ def register(mcp: MCPServer) -> None:
                         delivery=delivery,
                         cancel_event=cancel,
                     )
+                result = _report_effective_access(result, access)
                 result["command"] = {"shell": "cmd.exe", "command_chars": len(command_text)}
                 audit_action(
                     "run_cmd",
@@ -246,7 +256,7 @@ def register(mcp: MCPServer) -> None:
                 working = _cwd(cwd)
                 command = [executable, "-c", command_text]
                 _audit_command("run_shell", command, working, script_chars=len(command_text))
-                with _managed_command_claims(working, timeout_sec, cancel, access=access) as remaining:
+                with _managed_command_claims(working, timeout_sec, cancel) as remaining:
                     result = run_bounded(
                         command,
                         cwd=working,
@@ -258,6 +268,7 @@ def register(mcp: MCPServer) -> None:
                         delivery=delivery,
                         cancel_event=cancel,
                     )
+                result = _report_effective_access(result, access)
                 result["command"] = {"shell": Path(executable).name, "command_chars": len(command_text)}
                 audit_action(
                     "run_shell",
