@@ -8,6 +8,12 @@ Status: **four confirmed defects fixed** (HTTP cancellation contract, over-broad
 serialization, unreconciled stale claims after SIGKILL, cancellation-before-spawn race), with
 regression tests and measured before/after behaviour.
 
+> **Superseded in part.** The caller-declared `access="read"` terminal contract described below was
+> replaced on `fix/cross-platform-runtime-hardening`: arbitrary terminal commands now always take
+> exclusive coordination, because their side effects cannot be proven. Native typed readers keep
+> their read claims. See
+> [CROSS-PLATFORM-RUNTIME-HARDENING-REPORT.md](CROSS-PLATFORM-RUNTIME-HARDENING-REPORT.md).
+
 ## 1. Original defects and root causes
 
 ### D1 — No cancellation contract over streamable HTTP
@@ -75,17 +81,17 @@ no reservation lifecycle for client-chosen operation identities.
   operation it owns. The executor polls every ≤100 ms, terminates the owned tree
   (`terminate_tree(force=True)`), closes ownership and pipes, then raises `command_cancelled`.
   Admission polling observes the same event and aborts before dispatch.
-- **Read-only concurrency is opt-in and still fenced.** `access="read"` takes a read coordination
-  claim plus a read claim on the cwd subtree. It therefore overlaps other readers but conflicts with
-  any writer in that subtree and with every exclusive command/job. Defaults remain exclusive.
-- **Caller-declared read access is not a privilege boundary.** `access="read"` grants no new OS
-  capability: the caller already supplies the command text and runs under the same account. It only
-  changes admission. A mislabeled writer can overlap with another mislabeled writer in the same
-  subtree, but it still conflicts with writer claims, cannot escape the claimed subtree, and is
-  capped by the gate. The exclusive default, per-subtree claims and this contract are the
-  mitigations; the catalogue annotation and description state the obligation.
-- **Bounded parallelism.** A process-local gate caps concurrent read-only commands at
-  `MCP_COMMAND_SHARED_CONCURRENCY` (default 4). Waiters poll with cancellation and a timeout.
+- **Read-only concurrency was opt-in and still fenced.** *(Superseded: arbitrary terminal commands
+  now always take exclusive coordination; see the cross-platform report.)* `access="read"` took a
+  read coordination claim plus a read claim on the cwd subtree. It therefore overlapped other
+  readers but conflicted with any writer in that subtree and with every exclusive command/job.
+- **Caller-declared read access was not a privilege boundary.** `access="read"` granted no new OS
+  capability: the caller already supplied the command text and ran under the same account. It only
+  changed admission. A mislabeled writer could overlap with another mislabeled writer in the same
+  subtree, but it still conflicted with writer claims. *(Superseded: this residual coordination
+  bypass is no longer accepted; terminal commands are exclusive and report the effective access.)*
+- **Bounded parallelism.** A process-local gate capped concurrent read-only commands at
+  `MCP_COMMAND_SHARED_CONCURRENCY` (default 4). *(Removed with the superseded contract.)*
 - **Dispatch identity is durable.** Immediately after spawn, the child PID and creation time are
   written to the active claim row. Recovery verifies PID **and** creation time, plus (POSIX) whether
   the owned process group still has members.
@@ -195,11 +201,9 @@ memory/FD numbers; the earlier audit measured 8→27 FDs (stable) and 122→127.
 
 ## 12. Remaining risks
 
-1. Read-only concurrency depends on the caller's `access="read"` assertion. This is a documented
-   trust boundary, not a privilege boundary (see the security review in section 3): a caller that
-   mislabels a writer can overlap with another mislabeled writer on the same subtree, which is
-   caller error with the same effect as supplying the wrong command. It cannot widen OS privileges,
-   bypass a writer's claim, or escape the claimed cwd subtree.
+1. ~~Read-only concurrency depends on the caller's `access="read"` assertion.~~ **Closed on
+   `fix/cross-platform-runtime-hardening`:** terminal commands now always take exclusive
+   coordination; `access` is a compatibility hint and cannot bypass a writer fence.
 2. Stateless HTTP still cannot observe disconnects; cancellation is explicit by design. A client that
    loses the operation id cannot cancel.
 3. Recovery fences live orphans rather than killing them; they require operator action.
