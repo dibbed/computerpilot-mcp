@@ -644,7 +644,7 @@ def test_ten_tool_output_schemas_preserve_catalog_identity(monkeypatch: pytest.M
             assert names <= tools.keys()
             if profile == "full":
                 # Windows-only tool domains are excluded by capability negotiation on POSIX.
-                assert len(tools) == (151 if os.name == "nt" else 137)
+                assert len(tools) == (152 if os.name == "nt" else 138)
             for name in names:
                 schema = tools[name].output_schema
                 assert schema is not None
@@ -918,7 +918,7 @@ def test_portable_catalogue_excludes_only_platform_gated_domains(
     monkeypatch.setattr(registry, "detect_capabilities", lambda: fake_posix)
 
     async def scenario() -> None:
-        for profile, count in (("full", 137), ("coding", 96), ("coding_core", 43)):
+        for profile, count in (("full", 138), ("coding", 97), ("coding_core", 43)):
             monkeypatch.setattr(registry, "SETTINGS", replace(registry.SETTINGS, tool_profile=profile))
             tools = await registry.create_server().list_tools()
             assert len(tools) == count
@@ -950,8 +950,8 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
     from core import registry
 
     baseline = {
-        "full": (151 if os.name == "nt" else 137, 161424, "dd943f86782309bdadfce181d99ff868ae7a1a496a2aeaadcb177ad3e47257e6"),
-        "coding": (96, 100462, "63d7cefc60e4f461de32b37fa45d3aeca267ada484e074114f9824d0d570e593"),
+        "full": (152 if os.name == "nt" else 138, 161424, "dd943f86782309bdadfce181d99ff868ae7a1a496a2aeaadcb177ad3e47257e6"),
+        "coding": (97, 100462, "63d7cefc60e4f461de32b37fa45d3aeca267ada484e074114f9824d0d570e593"),
         "coding_core": (43, 47156, "6bac11be7330500d44e2439fe434e216faf46e0ccd025b8c2cb7c7614b88275f"),
     }
     names = {"code_context", "affected_tests", "search_files", "project_summary", "job_status",
@@ -997,7 +997,11 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                         item = {**item, "description": original}
                     original_metadata.append(item)
                 assert growth < 1200
-                assert hashlib.sha256(encode(original_metadata)).hexdigest() == metadata_sha
+                # The frozen Windows baseline predates cancel_operation; keep the
+                # historical guard over the released catalogue and vet the new
+                # descriptor separately through the shared registration tests.
+                historical = [item for item in original_metadata if item["name"] != "cancel_operation"]
+                assert hashlib.sha256(encode(historical)).hexdigest() == metadata_sha
             catalogue = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
             if os.name == "nt":
                 # The frozen baseline includes historical generic output schemas.
