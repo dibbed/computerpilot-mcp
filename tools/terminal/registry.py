@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import anyio
+import anyio.to_thread
 from mcp.server import MCPServer
 from pydantic import Field
 
@@ -28,7 +31,9 @@ def _cwd(value: str | None) -> Path:
 
 
 @contextmanager
-def _managed_command_claims(working: Path, timeout_sec: float) -> Iterator[float]:
+def _managed_command_claims(
+    working: Path, timeout_sec: float, cancel_event: threading.Event | None = None,
+) -> Iterator[float]:
     deadline = time.monotonic() + timeout_sec
     with managed_resource_claims(
         [
@@ -37,11 +42,27 @@ def _managed_command_claims(working: Path, timeout_sec: float) -> Iterator[float
         ],
         category="native.command",
         timeout_sec=timeout_sec,
+        cancel_event=cancel_event,
     ):
         remaining = deadline - time.monotonic()
+        if cancel_event is not None and cancel_event.is_set():
+            raise ToolError("command_cancelled", "The command was cancelled before dispatch.")
         if remaining <= 0:
             raise ToolError("resource_admission_timeout", "Command timeout expired before process dispatch.")
         yield remaining
+
+
+async def _run_cancellable(action: Callable[[], dict[str, Any]], cancel: threading.Event) -> dict[str, Any]:
+    """Run one blocking owned command off-loop and reap it when the request is cancelled."""
+
+    try:
+        return await anyio.to_thread.run_sync(action, abandon_on_cancel=True)
+    except anyio.get_cancelled_exc_class():
+        # The owner (client cancellation, disconnect, or server shutdown) is gone:
+        # signal the worker so it terminates the owned process tree promptly
+        # instead of holding host-wide command ownership until the timeout.
+        cancel.set()
+        raise
 
 
 def _audit_command(operation: str, command: list[str], cwd: Path, *, script_chars: int | None = None) -> None:
@@ -61,7 +82,7 @@ def register(mcp: MCPServer) -> None:
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("run_process")
-    def run_process(
+    async def run_process(
         executable: Annotated[str, Field(min_length=1, max_length=32_767)],
         args: Annotated[list[str] | None, Field(max_length=200)] = None,
         cwd: Annotated[str | None, Field(max_length=32_767)] = None,
@@ -75,29 +96,38 @@ def register(mcp: MCPServer) -> None:
     ) -> dict[str, Any]:
         """Run an executable with a timeout and optional per-stream output limits. Prefer read_file/search_files/git_* for native work."""
 
-        working = _cwd(cwd)
-        process_args = args or []
-        command = [executable, *process_args]
-        _audit_command("run_process", command, working)
-        with _managed_command_claims(working, timeout_sec) as remaining:
-            result = run_bounded(
-                command,
-                cwd=working,
-                timeout_sec=remaining,
-                stdout_limit=stdout_limit,
-                stderr_limit=stderr_limit,
-                output_mode=output_mode,
-                env=env,
-                stdin_text=stdin_text,
-                delivery=delivery,
+        cancel = threading.Event()
+
+        def execute() -> dict[str, Any]:
+            working = _cwd(cwd)
+            process_args = args or []
+            command = [executable, *process_args]
+            _audit_command("run_process", command, working)
+            with _managed_command_claims(working, timeout_sec, cancel) as remaining:
+                result = run_bounded(
+                    command,
+                    cwd=working,
+                    timeout_sec=remaining,
+                    stdout_limit=stdout_limit,
+                    stderr_limit=stderr_limit,
+                    output_mode=output_mode,
+                    env=env,
+                    stdin_text=stdin_text,
+                    delivery=delivery,
+                    cancel_event=cancel,
+                )
+            result["command"] = {"executable": executable, "argument_count": len(process_args)}
+            audit_action(
+                "run_process", target=working, outcome="completed",
+                details={"pid": result["pid"], "exit_code": result["exit_code"]},
             )
-        result["command"] = {"executable": executable, "argument_count": len(process_args)}
-        audit_action("run_process", target=working, outcome="completed", details={"pid": result["pid"], "exit_code": result["exit_code"]})
-        return result
+            return result
+
+        return await _run_cancellable(execute, cancel)
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("run_powershell")
-    def run_powershell(
+    async def run_powershell(
         script: Annotated[str, Field(min_length=1, max_length=100_000)],
         cwd: Annotated[str | None, Field(max_length=32_767)] = None,
         timeout_sec: Annotated[float, Field(gt=0, le=3_600)] = 60,
@@ -111,36 +141,43 @@ def register(mcp: MCPServer) -> None:
         For cmdlets/pipelines; prefer run_process or native file/search/Git tools.
         """
 
-        executable = shutil.which("pwsh") or shutil.which("powershell")
-        if executable is None:
-            raise ToolError("powershell_not_found", "Neither pwsh nor powershell is available on PATH.")
-        working = _cwd(cwd)
-        command = [executable, "-NoLogo", "-NoProfile", "-NonInteractive"]
-        if os.name == "nt":
-            command.extend(["-ExecutionPolicy", "Bypass"])
-        command.extend(["-Command", script])
-        _audit_command("run_powershell", command, working, script_chars=len(script))
-        with _managed_command_claims(working, timeout_sec) as remaining:
-            result = run_bounded(
-                command,
-                cwd=working,
-                timeout_sec=remaining,
-                stdout_limit=stdout_limit,
-                stderr_limit=stderr_limit,
-                output_mode=output_mode,
-                env=env,
-                delivery=delivery,
+        cancel = threading.Event()
+
+        def execute() -> dict[str, Any]:
+            executable = shutil.which("pwsh") or shutil.which("powershell")
+            if executable is None:
+                raise ToolError("powershell_not_found", "Neither pwsh nor powershell is available on PATH.")
+            working = _cwd(cwd)
+            command = [executable, "-NoLogo", "-NoProfile", "-NonInteractive"]
+            if os.name == "nt":
+                command.extend(["-ExecutionPolicy", "Bypass"])
+            command.extend(["-Command", script])
+            _audit_command("run_powershell", command, working, script_chars=len(script))
+            with _managed_command_claims(working, timeout_sec, cancel) as remaining:
+                result = run_bounded(
+                    command,
+                    cwd=working,
+                    timeout_sec=remaining,
+                    stdout_limit=stdout_limit,
+                    stderr_limit=stderr_limit,
+                    output_mode=output_mode,
+                    env=env,
+                    delivery=delivery,
+                    cancel_event=cancel,
+                )
+            result["command"] = {"shell": Path(executable).name, "script_chars": len(script)}
+            audit_action(
+                "run_powershell", target=working, outcome="completed",
+                details={"pid": result["pid"], "exit_code": result["exit_code"]},
             )
-        result["command"] = {"shell": Path(executable).name, "script_chars": len(script)}
-        audit_action(
-            "run_powershell", target=working, outcome="completed", details={"pid": result["pid"], "exit_code": result["exit_code"]}
-        )
-        return result
+            return result
+
+        return await _run_cancellable(execute, cancel)
 
     if os.name == "nt":
         @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
         @compact_errors("run_cmd")
-        def run_cmd(
+        async def run_cmd(
             command_text: Annotated[str, Field(min_length=1, max_length=100_000)],
             cwd: Annotated[str | None, Field(max_length=32_767)] = None,
             timeout_sec: Annotated[float, Field(gt=0, le=3_600)] = 60,
@@ -152,35 +189,41 @@ def register(mcp: MCPServer) -> None:
         ) -> dict[str, Any]:
             """Run one Windows CMD command line with optional output limits and a hard timeout."""
 
-            executable = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
-            if not executable:
-                raise ToolError("cmd_not_found", "cmd.exe is unavailable.")
-            working = _cwd(cwd)
-            command = [executable, "/d", "/s", "/c", command_text]
-            _audit_command("run_cmd", command, working, script_chars=len(command_text))
-            with _managed_command_claims(working, timeout_sec) as remaining:
-                result = run_bounded(
-                    command,
-                    cwd=working,
-                    timeout_sec=remaining,
-                    stdout_limit=stdout_limit,
-                    stderr_limit=stderr_limit,
-                    output_mode=output_mode,
-                    env=env,
-                    delivery=delivery,
+            cancel = threading.Event()
+
+            def execute() -> dict[str, Any]:
+                executable = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
+                if not executable:
+                    raise ToolError("cmd_not_found", "cmd.exe is unavailable.")
+                working = _cwd(cwd)
+                command = [executable, "/d", "/s", "/c", command_text]
+                _audit_command("run_cmd", command, working, script_chars=len(command_text))
+                with _managed_command_claims(working, timeout_sec, cancel) as remaining:
+                    result = run_bounded(
+                        command,
+                        cwd=working,
+                        timeout_sec=remaining,
+                        stdout_limit=stdout_limit,
+                        stderr_limit=stderr_limit,
+                        output_mode=output_mode,
+                        env=env,
+                        delivery=delivery,
+                        cancel_event=cancel,
+                    )
+                result["command"] = {"shell": "cmd.exe", "command_chars": len(command_text)}
+                audit_action(
+                    "run_cmd",
+                    target=working,
+                    outcome="completed",
+                    details={"pid": result["pid"], "exit_code": result["exit_code"]},
                 )
-            result["command"] = {"shell": "cmd.exe", "command_chars": len(command_text)}
-            audit_action(
-                "run_cmd",
-                target=working,
-                outcome="completed",
-                details={"pid": result["pid"], "exit_code": result["exit_code"]},
-            )
-            return result
+                return result
+
+            return await _run_cancellable(execute, cancel)
     else:
         @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
         @compact_errors("run_shell")
-        def run_shell(
+        async def run_shell(
             command_text: Annotated[str, Field(min_length=1, max_length=100_000)],
             cwd: Annotated[str | None, Field(max_length=32_767)] = None,
             timeout_sec: Annotated[float, Field(gt=0, le=3_600)] = 60,
@@ -192,28 +235,34 @@ def register(mcp: MCPServer) -> None:
         ) -> dict[str, Any]:
             """Run one POSIX sh command line with explicit shell expansion and a hard timeout."""
 
-            executable = shutil.which("sh")
-            if executable is None:
-                raise ToolError("posix_shell_not_found", "A POSIX sh executable is unavailable on PATH.")
-            working = _cwd(cwd)
-            command = [executable, "-c", command_text]
-            _audit_command("run_shell", command, working, script_chars=len(command_text))
-            with _managed_command_claims(working, timeout_sec) as remaining:
-                result = run_bounded(
-                    command,
-                    cwd=working,
-                    timeout_sec=remaining,
-                    stdout_limit=stdout_limit,
-                    stderr_limit=stderr_limit,
-                    output_mode=output_mode,
-                    env=env,
-                    delivery=delivery,
+            cancel = threading.Event()
+
+            def execute() -> dict[str, Any]:
+                executable = shutil.which("sh")
+                if executable is None:
+                    raise ToolError("posix_shell_not_found", "A POSIX sh executable is unavailable on PATH.")
+                working = _cwd(cwd)
+                command = [executable, "-c", command_text]
+                _audit_command("run_shell", command, working, script_chars=len(command_text))
+                with _managed_command_claims(working, timeout_sec, cancel) as remaining:
+                    result = run_bounded(
+                        command,
+                        cwd=working,
+                        timeout_sec=remaining,
+                        stdout_limit=stdout_limit,
+                        stderr_limit=stderr_limit,
+                        output_mode=output_mode,
+                        env=env,
+                        delivery=delivery,
+                        cancel_event=cancel,
+                    )
+                result["command"] = {"shell": Path(executable).name, "command_chars": len(command_text)}
+                audit_action(
+                    "run_shell",
+                    target=working,
+                    outcome="completed",
+                    details={"pid": result["pid"], "exit_code": result["exit_code"]},
                 )
-            result["command"] = {"shell": Path(executable).name, "command_chars": len(command_text)}
-            audit_action(
-                "run_shell",
-                target=working,
-                outcome="completed",
-                details={"pid": result["pid"], "exit_code": result["exit_code"]},
-            )
-            return result
+                return result
+
+            return await _run_cancellable(execute, cancel)

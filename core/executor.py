@@ -245,8 +245,13 @@ def run_bounded(
     encoding: str | None = None,
     delivery: Delivery = "inline",
     require_native: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """Execute without shell expansion and optionally limit each output stream."""
+    """Execute without shell expansion and optionally limit each output stream.
+
+    ``cancel_event`` lets an owner (for example a cancelled MCP request) stop the
+    owned process tree without waiting for the command timeout to expire.
+    """
 
     if not command or not command[0]:
         raise ToolError("invalid_command", "An executable is required.")
@@ -280,13 +285,23 @@ def run_bounded(
             except BrokenPipeError:
                 pass
         timed_out = False
+        cancelled = False
         with timing_span("process_execution"):
-            try:
-                exit_code = process.wait(timeout=timeout_sec)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                process.terminate_tree(force=True)
-                exit_code = process.wait(timeout=5.0)
+            deadline = time.monotonic() + timeout_sec
+            while True:
+                try:
+                    exit_code = process.wait(timeout=min(0.1, max(deadline - time.monotonic(), 0.001)))
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
+                    elif time.monotonic() >= deadline:
+                        timed_out = True
+                    else:
+                        continue
+                    process.terminate_tree(force=True)
+                    exit_code = process.wait(timeout=5.0)
+                    break
         # Releasing platform ownership reaps descendants that outlived the root
         # and releases inherited pipe handles before drain.
         process.close_ownership()
@@ -294,6 +309,8 @@ def run_bounded(
             stdout_thread.join(timeout=2.0)
             stderr_thread.join(timeout=2.0)
         capture_complete = not (stdout_thread.is_alive() or stderr_thread.is_alive() or stdout.read_error or stderr.read_error)
+        if cancelled:
+            raise ToolError("command_cancelled", "The command was cancelled before completion.")
         with timing_span("output_delivery"):
             stdout_result = stdout.result(chosen_encoding, delivery=delivery, final=capture_complete)
             stderr_result = stderr.result(chosen_encoding, delivery=delivery, final=capture_complete)

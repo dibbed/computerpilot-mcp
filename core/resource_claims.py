@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import threading
 import time
 import uuid
 from collections.abc import Iterator, Sequence
@@ -271,6 +272,7 @@ def managed_resource_claims(
     db_path: Path | None = None,
     store: WorkflowStore | None = None,
     quarantine_on_error: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> Iterator[str]:
     """Coordinate one managed action or safely reuse an active parent capability."""
 
@@ -314,6 +316,9 @@ def managed_resource_claims(
     admission_started = time.perf_counter()
     try:
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                claim_store.release_resource_request(request_id, owner_token=owner_token)
+                raise ToolError("resource_admission_cancelled", "Resource admission was cancelled before dispatch.")
             result = claim_store.reserve_resource_claims(
                 request_id=request_id,
                 owner_token=owner_token,
