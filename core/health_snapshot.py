@@ -149,6 +149,9 @@ async def collect_server_health(
             summary["native_resource_recovery"] = dict(
                 getattr(workflows, "last_native_recovery", {}) or {},
             )
+            summary["native_runtime_reconciliation"] = dict(
+                getattr(workflows, "runtime_native_recovery", {}) or {},
+            )
             return (
                 resources,
                 summary,

@@ -202,6 +202,8 @@ class WorkflowStore:
         self._shared_connection: sqlite3.Connection | None = None
         self._closed = False
         self.last_native_recovery: dict[str, int] = {"released": 0, "quarantined": 0}
+        self.runtime_native_recovery: dict[str, int] = {"released": 0, "quarantined": 0, "examined": 0}
+        self._last_runtime_reconcile = 0.0
         path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self._reuse_connection = reuse_connection
@@ -1740,24 +1742,46 @@ class WorkflowStore:
                 (request_id,),
             ).fetchall()
             conflict_reason: str | None = None
-            for other in other_rows:
-                other_state = str(other["state"])
-                if other_state == "pending" and int(other["ticket"]) > current_ticket:
-                    continue
-                if other_state in {"active", "pending"} and other["policy_fingerprint"] != policy_fingerprint:
-                    conflict_reason = "resource_policy_incompatible"
+            reconciled = False
+            for _ in range(2):
+                conflict_reason = None
+                for other in other_rows:
+                    other_state = str(other["state"])
+                    if other_state == "pending" and int(other["ticket"]) > current_ticket:
+                        continue
+                    if other_state in {"active", "pending"} and other["policy_fingerprint"] != policy_fingerprint:
+                        conflict_reason = "resource_policy_incompatible"
+                        break
+                    other_claims = self._resource_claims_for_request(connection, str(other["request_id"]))
+                    if not claim_sets_conflict(canonical, other_claims):
+                        continue
+                    if other_state == "quarantined":
+                        conflict_reason = "resource_quarantined"
+                        break
+                    if other_state == "active":
+                        conflict_reason = "resource_conflict"
+                        break
+                    conflict_reason = "older_conflicting_request"
                     break
-                other_claims = self._resource_claims_for_request(connection, str(other["request_id"]))
-                if not claim_sets_conflict(canonical, other_claims):
-                    continue
-                if other_state == "quarantined":
-                    conflict_reason = "resource_quarantined"
+                if conflict_reason is None or reconciled:
                     break
-                if other_state == "active":
-                    conflict_reason = "resource_conflict"
+                reconciled = True
+                if time.monotonic() - self._last_runtime_reconcile < 1.0:
                     break
-                conflict_reason = "older_conflicting_request"
-                break
+                self._last_runtime_reconcile = time.monotonic()
+                if not self._reconcile_conflicting_native_claims(
+                    connection, canonical, now, request_id=request_id,
+                ):
+                    break
+                other_rows = connection.execute(
+                    """
+                    SELECT request_id, ticket, state, policy_fingerprint
+                    FROM workflow_resource_requests
+                    WHERE request_id <> ? AND state IN ('pending', 'active', 'quarantined')
+                    ORDER BY ticket
+                    """,
+                    (request_id,),
+                ).fetchall()
 
             if conflict_reason is not None:
                 connection.execute(
@@ -3263,6 +3287,76 @@ class WorkflowStore:
                 return True
             return True
         return False
+
+    def _reconcile_conflicting_native_claims(
+        self,
+        connection: sqlite3.Connection,
+        claims: Sequence[ResourceClaim],
+        now: str,
+        *,
+        request_id: str,
+        max_conflicts: int = 8,
+        scan_limit: int = 64,
+    ) -> int:
+        """Release only conclusively stale native claims that block admission.
+
+        Runtime reconciliation is lazy and bounded: it runs inside the admission
+        transaction for claims that conflict with the incoming request, belong to
+        an already-dead native owner, and are either never-dispatched pending,
+        active, or quarantined only for a live child that has since exited. Every
+        other quarantine reason (unresolved effects or capacity cleanup) stays
+        fenced. No PID-only decision and no side effect is replayed.
+        """
+
+        rows = connection.execute(
+            "SELECT request_id,owner_token,state,dispatch_pid,dispatch_process_created "
+            "FROM workflow_resource_requests "
+            "WHERE workflow_id IS NULL AND owner_token LIKE 'native-owner-%' "
+            "AND request_id <> ? "
+            "AND (state='pending' OR state='active' "
+            "OR (state='quarantined' AND reason='stale_native_owner_command_alive')) "
+            "ORDER BY ticket LIMIT ?",
+            (request_id, max(1, scan_limit)),
+        ).fetchall()
+        self.runtime_native_recovery["examined"] += len(rows)
+        reconciled = 0
+        conflicts = 0
+        for row in rows:
+            if conflicts >= max_conflicts:
+                break
+            request_id = str(row["request_id"])
+            owner_token = str(row["owner_token"])
+            if not claim_sets_conflict(claims, self._resource_claims_for_request(connection, request_id)):
+                continue
+            conflicts += 1
+            if native_resource_owner_alive(owner_token) is not False:
+                continue
+            if str(row["state"]) == "pending":
+                reason, target = "stale_native_owner_never_dispatched", "released"
+            else:
+                raw_pid, raw_created = row["dispatch_pid"], row["dispatch_process_created"]
+                if raw_pid is None or raw_created is None:
+                    reason, target = "stale_native_owner_dispatch_unknown", "quarantined"
+                elif self._process_identity_alive(int(raw_pid), float(raw_created)):
+                    reason, target = "stale_native_owner_command_alive", "quarantined"
+                elif connection.execute(
+                    "SELECT 1 FROM runtime_capacity_requests WHERE resource_request_id=? AND state!='released' LIMIT 1",
+                    (request_id,),
+                ).fetchone() is not None:
+                    reason, target = "child_capacity_cleanup_unresolved", "quarantined"
+                else:
+                    reason, target = "stale_native_owner_command_exited", "released"
+            updated = connection.execute(
+                "UPDATE workflow_resource_requests SET state=?, reason=?, updated_at=? "
+                "WHERE request_id=? AND owner_token=? "
+                "AND (state='pending' OR state='active' "
+                "OR (state='quarantined' AND reason='stale_native_owner_command_alive'))",
+                (target, reason, now, request_id, owner_token),
+            ).rowcount
+            if updated:
+                reconciled += updated
+                self.runtime_native_recovery[target] += 1
+        return reconciled
 
     def recover_interrupted(self) -> int:
         now = _now()
