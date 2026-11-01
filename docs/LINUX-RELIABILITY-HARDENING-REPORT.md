@@ -172,7 +172,7 @@ memory/FD numbers; the earlier audit measured 8→27 FDs (stable) and 122→127.
 | `python main.py --check` | pass — 138 tools, unique |
 | `python -m scripts.health_check --json` | pass |
 | `python -m scripts.platform_validation --json` | pass (`ok: true`) |
-| `python -m pytest -o addopts= -q --basetemp=.pytest-tmp` | 2 493 passed, 24 skipped; one racy recovery expectation updated afterwards and verified in isolation |
+| `python -m pytest -o addopts= -q --basetemp=.pytest-tmp` | **2 494 passed, 24 skipped, 0 failed** (499.86 s) |
 | New regression files | 14 passed |
 
 ## 11. Skipped and untested capabilities
@@ -199,6 +199,23 @@ memory/FD numbers; the earlier audit measured 8→27 FDs (stable) and 122→127.
 6. Windows/macOS parity is inferred; the new Windows Job Object path for cancellation was not
    executed here.
 
-## 13. Commits
+## 13. Commits and branch state
 
-Focused Conventional Commits on the working branch (see `git log`); no push, tag, or release.
+Branch: `fix/linux-reliability-hardening`, created at the hardening HEAD (7 commits ahead of
+`main` at `b88a2e1`, 0 behind). `main` is not modified, and no tag, release, or PR is created.
+
+History preserved on the branch (oldest first):
+
+| Commit | Subject |
+| --- | --- |
+| `9e27d1f` | test(terminal): skip the PowerShell admission probe when PowerShell is absent |
+| `e983fcc` | fix(terminal): reap owned processes when a command request is cancelled |
+| `b48bda8` | docs: record the deep Linux integration and reliability audit |
+| `b0a6716` | test(recovery): accept fenced or released ownership after a killed validation process |
+| `36d3c28` | fix(recovery): reconcile stale native command claims against durable child identity |
+| `635844c` | feat(terminal): add explicit cancellation and bounded read-only concurrency |
+| `d5be09f` | docs: record Linux reliability, cancellation and concurrency hardening evidence |
+| this commit | docs: finalize verification evidence and caller-declared read review |
+
+Push target: `origin/fix/linux-reliability-hardening` only. No fast-forward into `main`, no force
+push, no history rewrite.
