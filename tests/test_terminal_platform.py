@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 import time
 from collections.abc import Iterator
@@ -102,6 +103,9 @@ def test_command_timeout_bounds_resource_admission(
     from core.resource_claims import coordination_claim, managed_resource_claims
     from core.workflow_store import WorkflowStore
     from tools.terminal import registry
+
+    if tool == "run_powershell" and shutil.which("pwsh") is None and shutil.which("powershell") is None:
+        pytest.skip("PowerShell is not installed on this host.")
 
     monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path))
     store = WorkflowStore(config.SETTINGS.workflow_db, recover=False)
