@@ -24,6 +24,12 @@ from core.operation_control import OPERATIONS, run_cancellable_operation
 from core.resource_claims import coordination_claim, managed_resource_claims, path_claim
 from core.tooling import OPEN_WORLD_WRITE, compact_errors
 
+_ACCESS_DESCRIPTION = (
+    "Compatibility hint only. Terminal commands always take exclusive coordination and a cwd write "
+    "claim because arbitrary commands cannot be proven read-only; the result reports effective_access. "
+    "Native typed read tools retain their read concurrency."
+)
+
 
 def _cwd(value: str | None) -> Path:
     return resolve_path(value) if value else PROJECT_ROOT
@@ -102,7 +108,7 @@ def register(mcp: MCPServer) -> None:
             description="Client-chosen id for cancel_operation; enables HTTP cancellation.",
         )] = None,
         access: Annotated[Literal["exclusive", "read"], Field(
-            description="read only when the command writes nothing; read commands may overlap.",
+            description=_ACCESS_DESCRIPTION,
         )] = "exclusive",
     ) -> dict[str, Any]:
         """Run an executable with a timeout and optional per-stream output limits. Prefer read_file/search_files/git_* for native work."""
@@ -147,7 +153,7 @@ def register(mcp: MCPServer) -> None:
         env: Annotated[dict[str, str] | None, Field(max_length=100)] = None,
         delivery: Literal["inline", "file", "auto"] = output_default,
         operation_id: Annotated[str | None, Field(min_length=8, max_length=128)] = None,
-        access: Literal["exclusive", "read"] = "exclusive",
+        access: Annotated[Literal["exclusive", "read"], Field(description=_ACCESS_DESCRIPTION)] = "exclusive",
     ) -> dict[str, Any]:
         """Run PowerShell non-interactively with optional output limits and a hard timeout.
         For cmdlets/pipelines; prefer run_process or native file/search/Git tools.
@@ -198,7 +204,7 @@ def register(mcp: MCPServer) -> None:
             env: Annotated[dict[str, str] | None, Field(max_length=100)] = None,
             delivery: Literal["inline", "file", "auto"] = output_default,
             operation_id: Annotated[str | None, Field(min_length=8, max_length=128)] = None,
-            access: Literal["exclusive", "read"] = "exclusive",
+            access: Annotated[Literal["exclusive", "read"], Field(description=_ACCESS_DESCRIPTION)] = "exclusive",
         ) -> dict[str, Any]:
             """Run one Windows CMD command line with optional output limits and a hard timeout."""
 
@@ -245,7 +251,7 @@ def register(mcp: MCPServer) -> None:
             env: Annotated[dict[str, str] | None, Field(max_length=100)] = None,
             delivery: Literal["inline", "file", "auto"] = output_default,
             operation_id: Annotated[str | None, Field(min_length=8, max_length=128)] = None,
-            access: Literal["exclusive", "read"] = "exclusive",
+            access: Annotated[Literal["exclusive", "read"], Field(description=_ACCESS_DESCRIPTION)] = "exclusive",
         ) -> dict[str, Any]:
             """Run one POSIX sh command line with explicit shell expansion and a hard timeout."""
 

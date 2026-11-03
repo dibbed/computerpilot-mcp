@@ -21,6 +21,23 @@ def _tool_names() -> set[str]:
     return {tool.name for tool in asyncio.run(create_server().list_tools())}
 
 
+def test_terminal_access_schema_matches_conservative_runtime() -> None:
+    """The advertised hint must not promise the removed read-overlap behavior."""
+
+    async def scenario() -> None:
+        tools = {tool.name: tool for tool in await create_server().list_tools()}
+        terminal = {"run_process", "run_powershell", "run_cmd" if os.name == "nt" else "run_shell"}
+        for name in terminal:
+            schema = tools[name].model_dump(mode="json", by_alias=True)["inputSchema"]
+            description = schema["properties"]["access"]["description"]
+            assert "compatibility hint" in description.casefold()
+            assert "exclusive" in description.casefold()
+            assert "effective_access" in description
+            assert "may overlap" not in description.casefold()
+
+    asyncio.run(scenario())
+
+
 def test_platform_shell_registration_matches_host() -> None:
     names = _tool_names()
     if os.name == "nt":

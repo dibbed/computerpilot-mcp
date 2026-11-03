@@ -986,6 +986,7 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                 }
                 growth = 0
                 original_metadata = []
+                historical_access = "read only when the command writes nothing; read commands may overlap."
                 for item in metadata:
                     if item["name"] in descriptions:
                         original = descriptions[item["name"]]
@@ -995,6 +996,24 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                             assert item["description"].startswith(original)
                         growth += added
                         item = {**item, "description": original}
+                    if item["name"] in {"run_process", "run_powershell", "run_cmd", "run_shell"}:
+                        access = item.get("inputSchema", {}).get("properties", {}).get("access")
+                        if isinstance(access, dict) and isinstance(access.get("description"), str):
+                            # The truthful conservative contract is an intentional
+                            # metadata delta. Normalize only this parameter text so
+                            # the released non-output Windows hash remains a guard.
+                            added = len(access["description"].encode()) - len(historical_access.encode())
+                            assert added <= 320
+                            item = {
+                                **item,
+                                "inputSchema": {
+                                    **item["inputSchema"],
+                                    "properties": {
+                                        **item["inputSchema"]["properties"],
+                                        "access": {**access, "description": historical_access},
+                                    },
+                                },
+                            }
                     original_metadata.append(item)
                 assert growth < 1200
                 # The frozen Windows baseline predates cancel_operation; keep the
