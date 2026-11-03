@@ -79,6 +79,28 @@ def test_registry_rejects_duplicate_and_reports_terminal_state() -> None:
         registry.reserve("short", "run_shell")
 
 
+def test_cancel_identifiers_are_validated_process_local_and_idempotent() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    registry = OperationRegistry()
+    with pytest.raises(ToolError) as malformed:
+        registry.request_cancel("short")
+    assert malformed.value.code == "invalid_operation_id"
+    assert registry.request_cancel("registry-unknown-02")["reason"] == "operation_not_found"
+
+    handle = registry.reserve("registry-concurrent-01", "run_shell")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        replies = list(pool.map(lambda _: registry.request_cancel(handle.operation_id), range(8)))
+    assert all(reply["cancelled"] is True for reply in replies)
+    assert sum(reply['already_requested'] is False for reply in replies) == 1
+    assert handle.cancel_event.is_set()
+
+    registry.finish(handle, "cancelled")
+    assert registry.request_cancel(handle.operation_id)["reason"] == "operation_finished"
+    # A new runtime cannot resolve a capability minted by the previous one.
+    assert OperationRegistry().request_cancel(handle.operation_id)["reason"] == "operation_not_found"
+
+
 def test_run_cancellable_operation_signals_worker_and_settles_state() -> None:
     observed = threading.Event()
 
@@ -110,7 +132,7 @@ def test_explicit_cancel_reaps_owned_tree_and_releases_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token = f"cpm-opcancel-{uuid.uuid4().hex[:10]}"
-    script = f"{sys.executable} -c 'import time; time.sleep(120)' # {token}"
+    script = f"import time; time.sleep(120)  # {token}"
     operation_id = f"opcancel-{uuid.uuid4().hex[:12]}"
     monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path))
 
@@ -118,9 +140,10 @@ def test_explicit_cancel_reaps_owned_tree_and_releases_admission(
         async with Client(create_server()) as client:
             call = asyncio.create_task(
                 client.call_tool(
-                    "run_shell",
+                    "run_process",
                     {
-                        "command_text": script,
+                        "executable": sys.executable,
+                        "args": ["-c", script],
                         "cwd": str(tmp_path),
                         "timeout_sec": 300,
                         "operation_id": operation_id,
@@ -145,8 +168,13 @@ def test_explicit_cancel_reaps_owned_tree_and_releases_admission(
 
             follow = _tool_payload(
                 await client.call_tool(
-                    "run_shell",
-                    {"command_text": "echo released", "cwd": str(tmp_path), "timeout_sec": 60},
+                    "run_process",
+                    {
+                        "executable": sys.executable,
+                        "args": ["-c", "print('released')"],
+                        "cwd": str(tmp_path),
+                        "timeout_sec": 60,
+                    },
                 )
             )
             assert follow.get("ok") is True

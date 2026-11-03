@@ -5,8 +5,9 @@ handler task and the terminal tools reap their owned process tree. Streamable
 HTTP is served statelessly, so the server never observes a client disconnect and
 cannot cancel the request that way. For HTTP callers the supported contract is
 ``cancel_operation`` with the client-chosen ``operation_id`` supplied to the
-terminal tool: the identifier is a bearer capability scoped to this server
-lifetime, so an id is only reachable by the caller that chose it.
+terminal tool. The identifier is a process-local bearer capability, not
+authentication: anyone who can reach the same MCP server and learns the id can
+request cancellation. It is not persisted and is unknown after a restart.
 """
 
 from __future__ import annotations

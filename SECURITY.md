@@ -107,6 +107,18 @@ Persistent language servers and installed package-test runners execute reviewed 
 
 Native cooperative resource claims fence managed edits, jobs, workflows, analyzers and file batches. They do not lock out independent editors or unmanaged external programs. After timeout/crash, uncertain ownership remains quarantined until evidence-based resolution; do not delete SQLite rows or backups to make admission succeed. Before the 0.8-to-0.9 schema upgrade, drain owners and take consistent state backups; an older runtime must use its matching pre-upgrade backup.
 
+## Operation cancellation identity
+
+`cancel_operation(operation_id)` is an explicit, process-local cancellation contract for in-flight
+terminal commands. The identifier is a **bearer capability, not client authentication**. A client
+that can reach the same MCP server and learns an active id can request cancellation; the server does
+not derive a separate client identity from loopback HTTP or stateless streamable HTTP. Server-generated
+ids use 128 bits of randomness, client ids must be 8–128 characters, and ids are not persisted, so a
+restart reports `operation_not_found`. Do not put ids in shared logs or expose the MCP endpoint to
+untrusted clients. This is not an authorization boundary: any client with MCP access can already
+invoke the full tool surface. Durable jobs use the separate `cancel_job(job_id)` contract and are not
+cancelled by `cancel_operation`.
+
 ## Recovery behavior
 
 The runtime deliberately avoids blind replay of ambiguous mutations.

@@ -100,9 +100,10 @@ def test_http_explicit_cancel_reaps_process_and_releases_admission(http_endpoint
                 await session.initialize()
                 call = asyncio.create_task(
                     session.call_tool(
-                        "run_shell",
+                        "run_process",
                         {
-                            "command_text": f"{sys.executable} -c 'import time; time.sleep(120)' # {token}",
+                            "executable": sys.executable,
+                            "args": ["-c", f"import time; time.sleep(120)  # {token}"],
                             "timeout_sec": 300,
                             "operation_id": operation_id,
                         },
@@ -130,10 +131,53 @@ def test_http_explicit_cancel_reaps_process_and_releases_admission(http_endpoint
 
                 follow = _payload(
                     await session.call_tool(
-                        "run_shell", {"command_text": "echo released", "timeout_sec": 60},
+                        "run_process",
+                        {
+                            "executable": sys.executable,
+                            "args": ["-c", "print('released')"],
+                            "timeout_sec": 60,
+                        },
                     )
                 )
                 assert follow.get("ok") is True
+
+    asyncio.run(scenario())
+
+
+def test_http_cancel_rejects_malformed_and_reports_unknown_and_finished(http_endpoint: str) -> None:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    operation_id = f"httpterminal-{uuid.uuid4().hex[:12]}"
+
+    async def scenario() -> None:
+        async with streamable_http_client(http_endpoint) as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                malformed = await session.call_tool("cancel_operation", {"operation_id": "short"})
+                assert malformed.is_error is True, malformed
+                assert "validation" in str(malformed.content).casefold()
+                unknown = _payload(
+                    await session.call_tool("cancel_operation", {"operation_id": "http-unknown-0001"})
+                )
+                assert unknown["ok"] is False and unknown["reason"] == "operation_not_found"
+
+                completed = _payload(
+                    await session.call_tool(
+                        "run_process",
+                        {
+                            "executable": sys.executable,
+                            "args": ["-c", "print('terminal')"],
+                            "operation_id": operation_id,
+                        },
+                    )
+                )
+                assert completed.get("ok") is True
+                finished = _payload(
+                    await session.call_tool("cancel_operation", {"operation_id": operation_id})
+                )
+                assert finished["ok"] is True and finished["cancelled"] is False
+                assert finished["reason"] == "operation_finished"
 
     asyncio.run(scenario())
 
@@ -145,13 +189,16 @@ def test_http_disconnect_does_not_cancel_side_effecting_command(
     from mcp.client.streamable_http import streamable_http_client
 
     proof = tmp_path / "disconnect-proof"
-    command = f"sleep 2; echo survived > {proof}"
+    command = f"import time; from pathlib import Path; time.sleep(2); Path({str(proof)!r}).write_text('survived')"
 
     async def run_and_abandon() -> None:
         async with streamable_http_client(http_endpoint) as streams:
             async with ClientSession(streams[0], streams[1]) as session:
                 await session.initialize()
-                await session.call_tool("run_shell", {"command_text": command, "timeout_sec": 60})
+                await session.call_tool(
+                    "run_process",
+                    {"executable": sys.executable, "args": ["-c", command], "timeout_sec": 60},
+                )
 
     async def scenario() -> None:
         task = asyncio.create_task(run_and_abandon())
