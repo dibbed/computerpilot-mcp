@@ -139,7 +139,7 @@ print("No unresolved work")
     $startup = & $py main.py --check
     if ($LASTEXITCODE -ne 0) { throw 'Batch startup tool registration failed' }
     $registration = ($startup | Out-String).Trim() | ConvertFrom-Json
-    if ($registration.tool_count -ne 152 -or $registration.unique_tool_names -ne $true) {
+    if ($registration.tool_count -ne 153 -or $registration.unique_tool_names -ne $true) {
         throw 'Unexpected Batch tool catalog; refusing activation'
     }
     # Doctor must run with a clean, standalone resource capability environment.
@@ -148,7 +148,7 @@ print("No unresolved work")
     & $py -m scripts.doctor --mode tunnel --profile $tunnelProfile
     if ($LASTEXITCODE -ne 0) { throw 'Full Doctor failed before activation' }
     if ($CheckOnly) {
-        Record 'preflight_passed' 'Tool registration 152 and Full Doctor succeeded; live service untouched'
+        Record 'preflight_passed' 'Tool registration 153 and Full Doctor succeeded; live service untouched'
         return
     }
 
