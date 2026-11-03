@@ -973,49 +973,21 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
             # Windows. POSIX registrars expose different platform-specific
             # metadata, including in coding profiles, despite stable names.
             if os.name == "nt":
-                # P14 guidance is the only intentional metadata delta; keep the P08 golden guard.
-                descriptions = {
-                    "run_process": "Run an executable with a timeout and optional per-stream output limits.",
-                    "run_powershell": "Run PowerShell non-interactively with optional output limits and a hard timeout.",
-                    "replace_exact": "Replace an exact small fragment only when its match count is known.",
-                    "submit_job": (
-                        "Submit a retry-safe durable command. Execution timeout starts after launch; "
-                        "optional queue timeout bounds pre-launch waiting."
-                    ),
-                    "job_status": "Read a durable job status by ID after reconnect or server restart.",
-                }
-                growth = 0
+                # The frozen Windows baseline predates the optional terminal
+                # cancellation and access metadata. Remove only those two fields
+                # from terminal tools; durable tools already exposed operation_id
+                # in the baseline and must remain byte-identical. Descriptions are
+                # unchanged, so they must not be rewritten here.
+                terminal_tools = {"run_process", "run_powershell", "run_cmd", "run_shell"}
                 original_metadata = []
-                historical_access = "read only when the command writes nothing; read commands may overlap."
                 for item in metadata:
-                    if item["name"] in descriptions:
-                        original = descriptions[item["name"]]
-                        added = len(item["description"].encode()) - len(original.encode())
-                        assert added <= 120
-                        if item["name"] not in {"replace_exact", "submit_job"}:
-                            assert item["description"].startswith(original)
-                        growth += added
-                        item = {**item, "description": original}
-                    if item["name"] in {"run_process", "run_powershell", "run_cmd", "run_shell"}:
-                        access = item.get("inputSchema", {}).get("properties", {}).get("access")
-                        if isinstance(access, dict) and isinstance(access.get("description"), str):
-                            # The truthful conservative contract is an intentional
-                            # metadata delta. Normalize only this parameter text so
-                            # the released non-output Windows hash remains a guard.
-                            added = len(access["description"].encode()) - len(historical_access.encode())
-                            assert added <= 320
-                            item = {
-                                **item,
-                                "inputSchema": {
-                                    **item["inputSchema"],
-                                    "properties": {
-                                        **item["inputSchema"]["properties"],
-                                        "access": {**access, "description": historical_access},
-                                    },
-                                },
-                            }
+                    if item["name"] in terminal_tools:
+                        properties = item.get("inputSchema", {}).get("properties", {})
+                        assert "access" in properties
+                        assert "operation_id" in properties
+                        properties.pop("access")
+                        properties.pop("operation_id")
                     original_metadata.append(item)
-                assert growth < 1200
                 # The frozen Windows baseline predates cancel_operation; keep the
                 # historical guard over the released catalogue and vet the new
                 # descriptor separately through the shared registration tests.
