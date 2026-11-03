@@ -148,6 +148,11 @@ def main(argv: list[str] | None = None) -> int:
         report = run_validation(workflows=args.workflows)
     except RuntimeError as exc:
         print(f"FAIL platform validation: {exc}", file=sys.stderr)
+        # Hosted job logs are not public without authentication; surface the
+        # failing sub-step and its output tail as a public check annotation.
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            message = str(exc).replace("%", "%25").replace("\r", "").replace("\n", "%0A")[-900:]
+            print(f"::error title=Platform validation failure::{message}")
         return 1
     if args.json:
         print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
