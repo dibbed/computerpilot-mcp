@@ -3279,8 +3279,12 @@ class WorkflowStore:
         except (psutil.Error, OSError):
             pass
         if os.name != "nt":
+            kill_group = getattr(os, "killpg", None)
+            if kill_group is None:
+                # Without a group probe we cannot prove death; keep the fence.
+                return True
             try:
-                os.killpg(pid, 0)
+                kill_group(pid, 0)
             except ProcessLookupError:
                 return False
             except OSError:
