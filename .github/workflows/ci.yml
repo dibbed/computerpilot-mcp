@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, fix/cross-platform-runtime-hardening ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: read
