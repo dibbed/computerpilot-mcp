@@ -44,9 +44,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
-      - name: Windows catalogue digest probe
-        if: runner.os == 'Windows'
-        run: python scripts/_windows_digest_probe.py
 
       - name: Run cross-platform release gate
         run: python -m scripts.platform_validation --json
