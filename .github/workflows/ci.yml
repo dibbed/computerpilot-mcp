@@ -67,3 +67,17 @@ jobs:
 
       - name: Run test suite with Pytest
         run: python -m pytest
+
+      - name: Annotate pytest failures
+        if: failure()
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+
+          cache = Path(".pytest_cache/v/cache/lastfailed")
+          if not cache.is_file():
+              print("::error title=Pytest::No lastfailed cache; inspect the pytest log above.")
+          else:
+              for node_id in sorted(json.loads(cache.read_text(encoding="utf-8"))):
+                  print(f"::error title=Pytest failure::{node_id}")
