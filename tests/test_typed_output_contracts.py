@@ -974,13 +974,32 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
             # metadata, including in coding profiles, despite stable names.
             if os.name == "nt":
                 # The frozen Windows baseline predates the optional terminal
-                # cancellation metadata but did expose the historical access
-                # hint. Remove operation_id and restore that one historical
-                # description; the baseline access field itself must remain.
+                # cancellation metadata and the P14 guidance text, but did
+                # expose the historical access hint. Normalize only those
+                # intentional deltas; the baseline access field itself remains.
+                descriptions = {
+                    "run_process": "Run an executable with a timeout and optional per-stream output limits.",
+                    "run_powershell": "Run PowerShell non-interactively with optional output limits and a hard timeout.",
+                    "replace_exact": "Replace an exact small fragment only when its match count is known.",
+                    "submit_job": (
+                        "Submit a retry-safe durable command. Execution timeout starts after launch; "
+                        "optional queue timeout bounds pre-launch waiting."
+                    ),
+                    "job_status": "Read a durable job status by ID after reconnect or server restart.",
+                }
                 terminal_tools = {"run_process", "run_powershell", "run_cmd", "run_shell"}
                 historical_access = "read only when the command writes nothing; read commands may overlap."
+                growth = 0
                 original_metadata = []
                 for item in metadata:
+                    if item["name"] in descriptions:
+                        original = descriptions[item["name"]]
+                        added = len(item["description"].encode()) - len(original.encode())
+                        assert added <= 120
+                        if item["name"] not in {"replace_exact", "submit_job"}:
+                            assert item["description"].startswith(original)
+                        growth += added
+                        item["description"] = original
                     if item["name"] in terminal_tools:
                         properties = item.get("inputSchema", {}).get("properties", {})
                         assert "access" in properties
@@ -988,6 +1007,7 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                         properties.pop("operation_id")
                         properties["access"] = {**properties["access"], "description": historical_access}
                     original_metadata.append(item)
+                assert growth < 1200
                 # The frozen Windows baseline predates cancel_operation; keep the
                 # historical guard over the released catalogue and vet the new
                 # descriptor separately through the shared registration tests.
