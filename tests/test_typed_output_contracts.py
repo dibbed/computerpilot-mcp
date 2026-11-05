@@ -974,9 +974,9 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
             # metadata, including in coding profiles, despite stable names.
             if os.name == "nt":
                 # The frozen Windows baseline predates the optional terminal
-                # cancellation metadata and the P14 guidance text, but did
-                # expose the historical access hint. Normalize only those
-                # intentional deltas; the baseline access field itself remains.
+                # access and cancellation metadata and the P14 guidance text.
+                # Remove both new terminal fields and restore the historical
+                # descriptions, so the hash guards every other metadata delta.
                 descriptions = {
                     "run_process": "Run an executable with a timeout and optional per-stream output limits.",
                     "run_powershell": "Run PowerShell non-interactively with optional output limits and a hard timeout.",
@@ -988,7 +988,6 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                     "job_status": "Read a durable job status by ID after reconnect or server restart.",
                 }
                 terminal_tools = {"run_process", "run_powershell", "run_cmd", "run_shell"}
-                historical_access = "read only when the command writes nothing; read commands may overlap."
                 growth = 0
                 original_metadata = []
                 for item in metadata:
@@ -1004,8 +1003,8 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                         properties = item.get("inputSchema", {}).get("properties", {})
                         assert "access" in properties
                         assert "operation_id" in properties
+                        properties.pop("access")
                         properties.pop("operation_id")
-                        properties["access"] = {**properties["access"], "description": historical_access}
                     original_metadata.append(item)
                 assert growth < 1200
                 # The frozen Windows baseline predates cancel_operation; keep the
