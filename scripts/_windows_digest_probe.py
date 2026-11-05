@@ -5,10 +5,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
-from core import registry
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+from core import registry  # noqa: E402
 
 
 def encode(value: Any) -> bytes:
