@@ -66,7 +66,10 @@ def test_cancelled_mcp_call_reaps_owned_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token = f"cpm-cancel-{uuid.uuid4().hex[:10]}"
-    script = f"{sys.executable} -c 'import time; time.sleep(60)' # {token}"
+    # Keep the token inside the Python program. A POSIX shell may exec the
+    # final command, which would discard a shell-comment token before psutil
+    # can observe the owned process.
+    script = f"{sys.executable} -c 'import time; token=\"{token}\"; time.sleep(60)'"
     monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path))
 
     async def scenario() -> None:
