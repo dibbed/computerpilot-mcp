@@ -1015,8 +1015,10 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
             catalogue = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
             if os.name == "nt":
                 # The frozen baseline includes historical generic output schemas.
+                # The measured 291-byte increase is the post-baseline catalogue
+                # delta, including cancel_operation; keep this ceiling exact.
                 added_bytes = len(encode(catalogue)) - before_bytes
-                assert 0 < added_bytes <= 32284, (profile, added_bytes)
+                assert 0 < added_bytes <= 32575, (profile, added_bytes)
             else:
                 # No equivalent frozen POSIX historical baseline exists. Bound
                 # absolute schema overhead instead of comparing incompatible OS
