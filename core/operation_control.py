@@ -12,6 +12,8 @@ request cancellation. It is not persisted and is unknown after a restart.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 import secrets
 import threading
@@ -34,6 +36,23 @@ _TERMINAL_MAX_ENTRIES = 256
 
 def new_operation_id() -> str:
     return f"op-{secrets.token_hex(16)}"
+
+
+# Audit records must never contain the bearer operation id. A process-local
+# keyed digest supports correlation for the lifetime of the runtime without
+# making the id recoverable from a copied audit log.
+_AUDIT_CORRELATION_KEY = secrets.token_bytes(32)
+
+
+def cancellation_audit_target(operation_id: str) -> str:
+    """Return a non-authorizing, keyed correlation for a cancellation audit record."""
+
+    digest = hmac.new(
+        _AUDIT_CORRELATION_KEY,
+        operation_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"op-correlation:{digest[:32]}"
 
 
 def validate_operation_id(operation_id: str) -> str:

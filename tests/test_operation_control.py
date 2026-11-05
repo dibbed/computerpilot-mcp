@@ -101,6 +101,45 @@ def test_cancel_identifiers_are_validated_process_local_and_idempotent() -> None
     assert OperationRegistry().request_cancel(handle.operation_id)["reason"] == "operation_not_found"
 
 
+def test_cancel_audit_never_persists_bearer_operation_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core import audit
+
+    audit.close_audit_writer()
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path))
+    monkeypatch.setattr(audit, "SETTINGS", replace(audit.SETTINGS, state_dir=tmp_path))
+    operation_id = f"op-audit-secret-{uuid.uuid4().hex}"
+
+    async def scenario() -> None:
+        async with Client(create_server()) as client:
+            first = _tool_payload(
+                await client.call_tool("cancel_operation", {"operation_id": operation_id})
+            )
+            second = _tool_payload(
+                await client.call_tool("cancel_operation", {"operation_id": operation_id})
+            )
+            assert first["ok"] is False and first["reason"] == "operation_not_found"
+            assert second["ok"] is False and second["reason"] == "operation_not_found"
+
+    try:
+        asyncio.run(scenario())
+        audit.flush_audit()
+        path = tmp_path / "audit.jsonl"
+        text = path.read_text(encoding="utf-8")
+        assert operation_id not in text
+        records = [json.loads(line) for line in text.splitlines() if line.strip()]
+        cancellations = [record for record in records if record.get("operation") == "cancel_operation"]
+        assert len(cancellations) == 2
+        targets = {record["target"] for record in cancellations}
+        assert len(targets) == 1
+        target = targets.pop()
+        assert target.startswith("op-correlation:")
+        assert operation_id not in target
+    finally:
+        audit.close_audit_writer()
+
+
 def test_run_cancellable_operation_signals_worker_and_settles_state() -> None:
     observed = threading.Event()
 

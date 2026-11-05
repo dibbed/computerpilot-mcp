@@ -114,7 +114,8 @@ terminal commands. The identifier is a **bearer capability, not client authentic
 that can reach the same MCP server and learns an active id can request cancellation; the server does
 not derive a separate client identity from loopback HTTP or stateless streamable HTTP. Server-generated
 ids use 128 bits of randomness, client ids must be 8–128 characters, and ids are not persisted, so a
-restart reports `operation_not_found`. Do not put ids in shared logs or expose the MCP endpoint to
+restart reports `operation_not_found`. Cancellation audit records contain only a process-local keyed
+correlation, never the bearer id. Do not put ids in shared logs or expose the MCP endpoint to
 untrusted clients. This is not an authorization boundary: any client with MCP access can already
 invoke the full tool surface. Durable jobs use the separate `cancel_job(job_id)` contract and are not
 cancelled by `cancel_operation`.

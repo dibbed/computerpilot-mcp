@@ -20,7 +20,7 @@ from core.audit import audit_action
 from core.config import PROJECT_ROOT, resolve_path
 from core.errors import ToolError
 from core.executor import run_bounded
-from core.operation_control import OPERATIONS, run_cancellable_operation
+from core.operation_control import OPERATIONS, cancellation_audit_target, run_cancellable_operation
 from core.resource_claims import coordination_claim, managed_resource_claims, path_claim
 from core.tooling import OPEN_WORLD_WRITE, compact_errors
 
@@ -292,5 +292,5 @@ def register(mcp: MCPServer) -> None:
         operation_id: Annotated[str, Field(min_length=8, max_length=128)],
     ) -> dict[str, Any]:
         """Cancel one in-flight terminal command by its client-chosen operation_id; the HTTP-safe explicit contract."""
-        audit_action("cancel_operation", target=operation_id, durable=True)
+        audit_action("cancel_operation", target=cancellation_audit_target(operation_id), durable=True)
         return OPERATIONS.request_cancel(operation_id)
