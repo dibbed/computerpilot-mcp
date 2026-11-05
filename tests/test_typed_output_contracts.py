@@ -974,19 +974,19 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
             # metadata, including in coding profiles, despite stable names.
             if os.name == "nt":
                 # The frozen Windows baseline predates the optional terminal
-                # cancellation and access metadata. Remove only those two fields
-                # from terminal tools; durable tools already exposed operation_id
-                # in the baseline and must remain byte-identical. Descriptions are
-                # unchanged, so they must not be rewritten here.
+                # cancellation metadata but did expose the historical access
+                # hint. Remove operation_id and restore that one historical
+                # description; the baseline access field itself must remain.
                 terminal_tools = {"run_process", "run_powershell", "run_cmd", "run_shell"}
+                historical_access = "read only when the command writes nothing; read commands may overlap."
                 original_metadata = []
                 for item in metadata:
                     if item["name"] in terminal_tools:
                         properties = item.get("inputSchema", {}).get("properties", {})
                         assert "access" in properties
                         assert "operation_id" in properties
-                        properties.pop("access")
                         properties.pop("operation_id")
+                        properties["access"] = {**properties["access"], "description": historical_access}
                     original_metadata.append(item)
                 # The frozen Windows baseline predates cancel_operation; keep the
                 # historical guard over the released catalogue and vet the new
