@@ -66,18 +66,29 @@ jobs:
         run: python -m pytest -o addopts= -q tests/test_job_worker.py::test_successful_root_exit_settles_dead_descendant_capacity --tb=short --basetemp=.pytest-ownership
 
       - name: Run test suite with Pytest
-        run: python -m pytest
+        run: python -m pytest --junitxml=.pytest-results.xml
 
       - name: Annotate pytest failures
         if: failure()
         shell: python
         run: |
-          import json
+          import xml.etree.ElementTree as ET
           from pathlib import Path
 
-          cache = Path(".pytest_cache/v/cache/lastfailed")
-          if not cache.is_file():
-              print("::error title=Pytest::No lastfailed cache; inspect the pytest log above.")
-          else:
-              for node_id in sorted(json.loads(cache.read_text(encoding="utf-8"))):
-                  print(f"::error title=Pytest failure::{node_id}")
+          report = Path(".pytest-results.xml")
+          if not report.is_file():
+              print("::error title=Pytest::No JUnit report; inspect the pytest log above.")
+              raise SystemExit(0)
+
+          def escape(value: str) -> str:
+              return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          for case in ET.parse(report).getroot().iter("testcase"):
+              failure = case.find("failure")
+              if failure is None:
+                  failure = case.find("error")
+              if failure is None:
+                  continue
+              node_id = f"{case.get('classname', '')}::{case.get('name', '')}"
+              message = (failure.get("message") or "").strip().splitlines()[0] if failure.get("message") else ""
+              print(f"::error title=Pytest failure::{escape(node_id)}: {escape(message[:1000])}")
