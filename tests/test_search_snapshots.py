@@ -390,7 +390,9 @@ def test_runtime_maintenance_expires_snapshots_after_restart(
 
     async def start() -> None:
         async with heartbeat.lifespan(None):
-            await asyncio.sleep(0.01)
+            deadline = time.monotonic() + 5.0
+            while snapshot.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
 
     asyncio.run(start())
     assert not snapshot.exists()
