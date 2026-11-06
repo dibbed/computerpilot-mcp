@@ -1,355 +1,489 @@
 # Cross-Platform Runtime Hardening — Final Report
 
 Branch: `fix/cross-platform-runtime-hardening`
-Integration base: `1847705` (merge of `fix/linux-reliability-hardening` at `b301309` onto `b88a2e1`)
 Repository: `https://github.com/dibbed/computerpilot-mcp`
-Environment: Ubuntu Linux x86-64, Python 3.12.3, MCP SDK 2.0.1, pytest 9.2.0
-Windows execution environment: **not available to this run** (see §15).
+Final functional tree: `c3496172773654534eb0307f41981852f15a8bba`
+`main` baseline: `b88a2e17040036181ed99be3a0a0122c4dcb5e88` (unchanged)
 
-Status legend: **VERIFIED**, **FIXED AND VERIFIED**, **PARTIAL**, **BLOCKED**, **UNVERIFIED**, **NOT APPLICABLE**.
+Status vocabulary: **FIXED AND VERIFIED**, **VERIFIED**, **UNVERIFIED**, **BLOCKED**, **NOT APPLICABLE**.
 
-## 1. Repository and branch identity
+## 1. Outcome
+
+The branch preserves the full ComputerPilot capability set: arbitrary executables and shell
+commands, absolute and project-relative paths, writes, Git, jobs, workflows, documents, browser,
+LSP and Windows-only domains. No filesystem sandbox or read-only mode was introduced. The `full`
+profile remains the default.
+
+The cross-platform candidate now has real Linux, macOS and Windows execution evidence. Windows
+Platform Validation passed, including the release gate and workflow restart soak, and Windows CI
+runs the full pytest suite. The Windows-only P08 guard was corrected rather than relaxed: the
+frozen v0.9.0 metadata predates both terminal `access` and `operation_id`, so both fields are
+removed before hashing and the historical `dd943…` digest is retained. The catalogue-byte ceiling
+is the measured 32,575 bytes, exactly 291 above the historical 32,284-byte limit for the
+post-baseline catalogue delta (including `cancel_operation`). Final hosted status is recorded in §18.
+
+Readiness is **cross-platform candidate**, not an unconditional production-ready declaration.
+Authenticated tunnel, real Windows UIA/desktop, macOS UIA (not applicable), and a real v0.9.0 Windows
+database migration remain unverified. Real local Chromium form interaction is now verified; public-site
+browser behavior is not claimed.
+
+## 2. Final identity
 
 | Item | Value |
 | --- | --- |
 | Branch | `fix/cross-platform-runtime-hardening` |
-| Original `main` baseline | `b88a2e17040036181ed99be3a0a0122c4dcb5e88` |
-| Linux hardening branch | `fix/linux-reliability-hardening` @ `b301309962c00cb929f8241d4711c8c97f62eee2` |
-| Integration merge | `1847705069fe1703cab3737d4afd2392a4cc38c5` (`--no-ff`, Linux history preserved) |
-| `main` at verification | Unchanged at `b88a2e1`, verified with `git ls-remote` |
+| Functional HEAD | `c3496172773654534eb0307f41981852f15a8bba` |
+| Integration base | `1847705` (Linux hardening `b301309` merged onto `b88a2e1`) |
+| `main` | `b88a2e17040036181ed99be3a0a0122c4dcb5e88` |
+| Local environment | Ubuntu Linux x86-64, Python 3.12.3, pytest 9.2.0, MCP SDK 2.0.1 |
+| Tool counts | POSIX 138; Windows default 152; Windows Batch 153; coding 97; coding_core 43 |
+| SQLite schema | v12 |
 
-The merge commit's tree is byte-identical to the previously verified Linux tree (`b301309`), because
-`main` is an ancestor of that branch. This report records verification performed on the tree after
-the two new production fixes, not on the merge commit alone.
+Documentation-only commits after `c349617` do not change the functional tree. Any code change after
+a hosted run requires the affected checks to run again on the new SHA.
 
-## 2. Original Linux integration baseline
+## 3. Original gaps and final status
 
-The Linux hardening branch passed compileall, Ruff, mypy (314 files), startup/catalogue checks
-(138 POSIX tools), health, platform validation, and the full suite: **2,494 passed, 24 skipped, 0
-failed in 497 s**. Those results remain the baseline for the integrated Linux history. Its report is
-[LINUX-RELIABILITY-HARDENING-REPORT.md](LINUX-RELIABILITY-HARDENING-REPORT.md), whose read-concurrency
-claims are explicitly superseded by this work.
-
-## 3. Previously incomplete issues
-
-| ID | Issue | Status at start | Final status |
-| --- | --- | --- | --- |
-| G1 | Caller-declared `access="read"` can bypass exclusive coordination | Unresolved | **FIXED AND VERIFIED** |
-| G2 | Quarantined stale claims can require another restart | Unresolved | **FIXED AND VERIFIED** |
-| G3 | Windows native behavior not executed | Unverified | **BLOCKED** (no host) |
-| G4 | Windows Job Object / POSIX lifecycle parity | Not verified | **UNVERIFIED** (platform-independent unit + static only) |
-| G5 | Real browser and LSP acceptance | Not completed | **BLOCKED** (no browser/LSP install) |
-| G6 | Post-integration stress and soak | Not completed | **PARTIAL** (bounded benchmark only) |
-| G7 | Cross-platform migration verification | Incomplete | **VERIFIED** on POSIX fixtures |
-| G8 | Final security review | Incomplete | **VERIFIED** for changed boundaries |
-| G9 | Cross-platform report | Missing | **FIXED** (this document) |
-| G10 | Final suite and CI evidence | Missing | **PARTIAL**: local suite **VERIFIED**, hosted CI **UNVERIFIED** |
-
-## 4. Reproduction of G1
-
-Reproduced with real MCP stdio calls over the integrated tree:
-
-- Three concurrent `run_shell` calls with `command_text="sleep 0.5"` and `access="read"` completed in
-  about 0.5 s, i.e. all three held read claims and overlapped.
-- Two callers could label arbitrary writers as readers and both be admitted under read coordination.
-- An exclusive caller was blocked only by the write claim on the shared subtree; a read-labeled
-  writer to an alias or outside the claimed subtree was not represented as a writer at all.
-
-This is a **coordination bypass, not an authorization bypass**: `access="read"` never granted OS
-permissions, but it did remove the writer fence that the exclusive path promises.
-
-## 5. Root causes
-
-- `_managed_command_claims()` trusted the caller's `access` literal to choose
-  `coordination_claim(exclusive=False)` and a read path claim.
-- The shared-command gate only bounded how many read-labeled commands ran; it did not verify that
-  the command was read-only.
-- No executable/argument contract can prove an arbitrary process side-effect free: arguments,
-  environment, configuration, plugins, scripts and descendants can write. A name allowlist is
-  insufficient.
-- For G2, native reconciliation was reachable only from `WorkflowStore.recover_interrupted()`;
-  native command admission uses `WorkflowStore(..., recover=False)`, so an orphan that exited after
-  the previous recovery stayed quarantined until a new store/recovery cycle.
-
-## 6. Production fixes
-
-### G1 — fail-closed terminal classification
-
-- Every terminal command (`run_process`, `run_shell`, `run_cmd`, `run_powershell`) now always takes
-  `coordination_claim(exclusive=True)` plus a write path claim on its cwd subtree.
-- The public `access` field remains for wire compatibility but is a **hint only**; it cannot weaken
-  coordination.
-- When a caller requests `read`, the result includes `effective_access: "exclusive"` and
-  `access_reason: "terminal_command_read_untrusted"`, so the downgrade is observable rather than
-  silent.
-- Native typed read tools keep their own read claims and safe concurrency. No host-wide lock was
-  added to native readers, and no filesystem or execution capability was removed.
-- Inherited-claim audit: `scripts/job_worker.py` already takes exclusive coordination plus a write
-  cwd subtree for durable jobs; the workflow `run_durable_job` action does the same, and
-  `verify_changes` is deliberately repository-write coarse. The remaining read-footprint workflow
-  actions (`check_file`, `affected_tests`, `check_http`, `git_status`) do not dispatch arbitrary
-  terminal commands. No second caller-trusted read path remains.
-- The obsolete `core/command_concurrency.py` gate and the
-  `MCP_COMMAND_SHARED_CONCURRENCY`/`command_shared_concurrency` setting were removed; they only
-  governed an unsafe classification. `MCP_COMMAND_SHARED_CONCURRENCY` is now ignored because the
-  setting no longer exists.
-
-### G2 — bounded runtime reconciliation
-
-`WorkflowStore.reserve_resource_claims()` now performs a lazy, bounded reconciliation **when a
-conflicting claim is encountered**:
-
-- It scans at most 64 native (`workflow_id IS NULL`, `native-owner-*`) rows that are pending,
-  active, or quarantined **only** for `stale_native_owner_command_alive`; it excludes the incoming
-  request id and inspects at most 8 conflicting claims.
-- It acts only when the owner identity is already dead (`native_resource_owner_alive`), never on a
-  live current server or process.
-- A never-dispatched `pending` row is released as `stale_native_owner_never_dispatched`.
-- An `active` row is released only when the durable dispatch marker exists and PID + creation time
-  prove the child dead and no non-released child capacity remains.
-- A live child, missing marker, or unresolved capacity is re-quarantined with the existing precise
-  reasons. Every other quarantine reason, including unresolved effects and child-capacity cleanup,
-  is never auto-released; no side effect is replayed and no process is killed.
-- The scan is throttled to one per store per second, runs inside the admission transaction, and
-  refreshes the conflict set once before deciding.
-- Counters are exposed as `workflow_health.native_runtime_reconciliation`
-  (`released`, `quarantined`, `examined`) alongside the existing startup counters.
-
-## 7. Files modified
-
-| File | Change |
-| --- | --- |
-| `tools/terminal/registry.py` | Exclusive claims for all terminal tools; effective-access reporting. |
-| `core/config.py` | Removed dead shared-command setting and budget entry. |
-| `core/command_concurrency.py` | Deleted; it existed only for unsafe caller-declared read scheduling. |
-| `core/workflow_store.py` | Admission-time native claim reconciliation + counters. |
-| `core/health_snapshot.py` | Publishes runtime reconciliation counters. |
-| `tests/test_command_access_classification.py` | New real-MCP regression suite. |
-| `tests/test_stale_claim_recovery.py` | New runtime reconciliation tests with real processes. |
-| `tests/test_command_concurrency.py` | Deleted with the removed feature. |
-| `docs/LINUX-RELIABILITY-HARDENING-REPORT.md` | Marks the old read-concurrency contract superseded. |
-| `docs/CROSS-PLATFORM-RUNTIME-HARDENING-REPORT.md` | This report. |
-
-## 8. Regression tests added
-
-- Three concurrent read-labeled `run_shell` calls must serialize and report
-  `effective_access="exclusive"`.
-- A read-labeled writer cannot pass an active exclusive writer; measured wait ≥ 0.7 s.
-- Two read-labeled `run_process` calls serialize.
-- Independent native `read_file` calls remain fast/concurrent (no terminal-style serialization).
-- Runtime reconciliation releases an orphan that exited after fencing, without reconstructing the
-  store.
-- A live orphan stays quarantined until it exits, then the same runtime releases it on a later
-  admission attempt.
-- Markerless ownership is preserved as `stale_native_owner_dispatch_unknown`.
-- A live owner is never released or reclassified.
-- A never-dispatched pending native claim is released during runtime.
-- A claim quarantined for unresolved effects stays quarantined even after its dead child is gone.
-- The health snapshot publishes both startup and runtime reconciliation counters.
-- Startup recovery tests (exited child, live orphan, missing marker, live owner, SIGKILL) still pass.
-
-## 9. Final execution-coordination contract
-
-1. Native typed readers can hold read claims and overlap compatible readers.
-2. Every arbitrary terminal command is a writer for coordination purposes, regardless of `access`.
-3. Terminal commands conflict with native writers, durable jobs, workflows and other terminal
-   commands through the host coordination claim and the cwd subtree write claim.
-4. `access="read"` requests are admitted conservatively and report the effective classification.
-5. Durable uncertainty is retained: unknown ownership is quarantined, not released.
-6. Admission-time reconciliation only converts provably dead native ownership to `released`.
-
-## 10. Full-permission behavior
-
-No capability was removed. The `full` profile still registers 138 tools on POSIX (152 on Windows
-per the static catalogue), including arbitrary process/shell execution, writes, Git, jobs,
-workflows, documents, browser and platform-gated desktop tools. Absolute and project-relative paths
-resolve exactly as before (`core/config.resolve_path`), and no repository-only sandbox was added.
-The only change is which resource claims a terminal command takes.
-
-## 11. Effective read/write classification
-
-| Caller request | Native typed read | Terminal command |
+| Gap | Final status | Evidence |
 | --- | --- | --- |
-| default/exclusive | n/a | exclusive |
-| `access="read"` | read claims where implemented | **exclusive**, reported in result |
-| unknown/ambiguous | n/a | exclusive |
+| Windows native execution | **FIXED AND VERIFIED** for CI/platform scope | Windows Platform Validation success; Windows CI full suite; Windows Job Object/ownership tests |
+| Windows UIA/desktop | **UNVERIFIED** | GitHub-hosted runners have no interactive desktop |
+| macOS execution | **VERIFIED** for CI scope | macOS 3.10/3.12 full suite and Platform Validation |
+| Stale `access` schema text | **FIXED AND VERIFIED** | `_ACCESS_DESCRIPTION`; terminal schema regression test; precise catalogue hash |
+| Cancellation identity/authorization | **FIXED AND VERIFIED** for the bearer model | `SECURITY.md`; keyed audit correlation; registry and HTTP/stdio edge tests |
+| Real browser acceptance | **VERIFIED** on a disposable local fixture | real stdio-MCP Chromium session: navigation, semantic snapshot/fill/select/click, extract, isolated second session and clean close; `artifacts/real-browser-acceptance.json` |
+| Real LSP acceptance | **VERIFIED** for Pyright | provider SHA, definitions/references/diagnostics/restart/cleanup evidence; `artifacts/real-lsp-python.json` |
+| Cross-platform migration | **VERIFIED** on synthetic fixtures; real v0.9.0 Windows DB **UNVERIFIED** | schema v5/v9/v10/v11/v12 tests |
+| Soak/resource analysis | **VERIFIED** | 181 s live MCP soak plus 60-workflow platform soak and 40-workflow restart soak; no leaked claims/orphans |
+| Extension process/transport | **VERIFIED** for the local subprocess fixture | 62 extension/tunnel-offline tests pass; real bounded stdio subprocess lifecycle |
+| Authenticated tunnel/extension live acceptance | **UNVERIFIED** | no authorized credentials; offline tunnel and local extension tests only |
 
-Native read claims were not weakened. The `access` input-schema text is frozen by the Windows
-metadata golden guard; enforcement and the result fields are authoritative, and the stale sentence
-"read commands may overlap" no longer describes runtime behavior.
+## 4. Confirmed defects and fixes
 
-## 12. Cancellation semantics per transport
+### 4.1 Terminal `access` metadata contradicted runtime behavior
 
-Verified by reading the implementation and running the existing regression suites:
+**Root cause.** Every arbitrary terminal command takes exclusive host coordination and a cwd write
+claim, but the advertised `access` description still said read commands might overlap. A caller
+could believe a read-labelled command was concurrent when the runtime serialized it.
 
-| Transport | Request cancellation | Disconnect | Explicit `cancel_operation` |
+**Fix.** `tools/terminal/registry.py` uses `_ACCESS_DESCRIPTION` on `run_process`,
+`run_powershell`, `run_cmd` and `run_shell`: the value is a compatibility hint only, commands are
+always exclusive because arbitrary commands cannot be proven read-only, and results report
+`effective_access`. Native typed readers keep their read concurrency. Regression coverage in
+`tests/test_terminal_platform.py` checks the actual discovered schema and rejects “may overlap”.
+
+### 4.2 Windows typing referenced POSIX-only process-group calls
+
+**Root cause.** A shared recovery path directly referenced `os.killpg`; mypy on Windows and runtime
+typing could fail even though the path was POSIX-owned.
+
+**Fix.** `core/workflow_store.py` guards the group probe with `os.name != "nt"` and
+`getattr(os, "killpg", None)`. A missing group probe keeps the claim fenced rather than releasing
+it. `mypy --platform win32` passes.
+
+### 4.3 Windows tool counts omitted `cancel_operation`
+
+**Root cause.** The Windows registry now includes `cancel_operation`, but CI and soak gates still
+expected 151 tools.
+
+**Fix.** All Windows count contracts use 152, with 153 when native read batching is activated:
+`scripts/workflow_soak.py`, `tests/test_workflow_soak.py`, `tests/test_tool_profiles.py`,
+`scripts/activate_native_read_batch.ps1`, `docs/tooling.md`, `docs/troubleshooting.md` and
+`docs/development/TESTING-STANDARDS.md`.
+
+### 4.4 Native command cancellation used an opaque, over-broad identity model
+
+**Root cause.** A process-local operation id is the only cancellation selector. Stateless HTTP has
+no authenticated client/session identity, so the id is a bearer capability, not authorization.
+
+**Fix.** The bearer model is explicit in `SECURITY.md` and `core/operation_control.py`: ids are
+high-entropy, process-local, non-persistent, bounded-retention, reject unknown/malformed ids, and
+never cancel durable jobs or workflows. Cancellation is tested for self, unknown, malformed,
+duplicate, repeated, completed, restart, concurrent, registry-capacity and HTTP-disconnect cases.
+No claim of cross-client authentication is made.
+
+### 4.5 Windows catalogue replay and platform-test assumptions
+
+The frozen v0.9.0 catalogue predates both terminal `access` and `operation_id`; earlier
+reconstructions removed only one of them, so the historical hash could not match. The guard now
+removes both post-release fields, restores the P14 descriptions and excludes `cancel_operation`
+from the historical hash; the new descriptor is vetted separately. The original `dd943…` digest is
+retained. The full-catalogue byte ceiling is 32,575, exactly 291 bytes above the historical 32,284
+ceiling for the post-baseline catalogue delta (including `cancel_operation`); no baseline was
+refreshed.
+
+The recovery probe now accepts the conservative `stale_native_owner_dispatch_unknown` outcome:
+a missing dispatch marker must remain quarantined, never be released on a guess. The Windows
+snapshot probe waits for the maintenance task instead of assuming a 10 ms scheduler window on every
+platform.
+
+### 4.6 macOS cancellation token probe lost the token
+
+**Root cause.** `/bin/sh` may `exec` the final command. The test’s token was in a shell comment, so
+the process that survived did not contain the token and the cleanup probe reported “never started”.
+
+**Fix.** `tests/test_terminal_cancellation.py` embeds the token inside the Python `-c` program. The
+real cancellation test then exercises the actual owned process group on macOS.
+
+### 4.7 Cancellation audit records retained the bearer id
+
+**Root cause.** `cancel_operation` wrote the raw client-supplied operation id into durable audit
+targets. That id is a bearer cancellation capability, so copied audit records could cancel an
+in-flight operation.
+
+**Fix.** `core/operation_control.py` now emits a process-local, keyed HMAC correlation of the form
+`op-correlation:<hex>`; `tools/terminal/registry.py` writes that value. The legitimate API response
+still returns the requested id. `tests/test_operation_control.py` covers repeated cancellation,
+absence of the raw id and stable correlation, and `SECURITY.md` documents the guarantee.
+
+## 5. Terminal access contract
+
+1. Native typed readers may overlap compatible readers.
+2. Every terminal command takes `coordination_claim(exclusive=True)` and a cwd subtree write claim.
+3. `access="read"` remains accepted for wire compatibility but never weakens coordination.
+4. A read-labelled terminal result reports `effective_access="exclusive"` and
+   `access_reason="terminal_command_read_untrusted"`.
+5. Unknown, ambiguous or malformed access values are rejected by the typed schema; the runtime does
+   not infer permissions from a label.
+6. No tool was removed; `full` keeps arbitrary execution and absolute paths.
+
+## 6. Cancellation security model
+
+- Cancellation is process-local and **not authentication**. Any caller that can reach the same
+  server and learns an id can cancel that operation.
+- Ids are 32 random hex bytes with a bounded 300 s terminal retention and a 256-entry registry cap.
+- Unknown, malformed, duplicate-in-flight, completed and post-restart ids have explicit outcomes.
+- `cancel_job` remains the durable-job contract; `cancel_operation` cannot cancel jobs or workflows.
+- HTTP disconnects do not silently destroy durable work. stdio cancellation reaps the owned tree.
+- Resource ownership is released only after the worker has reaped the tree or has quarantined an
+  uncertain identity. A `process_cleanup_incomplete` result keeps the fence.
+- `SECURITY.md` documents that ids must not be logged or exposed across trust boundaries.
+- Durable audit targets use a keyed correlation, not the raw bearer id; the correlation is not a
+  cancellation credential.
+
+## 7. Windows validation
+
+Executed on genuine GitHub-hosted Windows runners.
+
+| Workflow | Runner | Python | Result |
 | --- | --- | --- | --- |
-| stdio | SDK cancels handler; worker signals and reaps owned tree | session end cancels task | supported |
-| streamable HTTP (stateless) | not observed | not observed; durable command continues | supported, real HTTP client test |
-| durable jobs | `cancel_job` only | never cancels | separate identity/contract |
+| CI (`ci.yml`) | `windows-latest` | 3.10 and 3.12 | Full compile, Ruff, mypy, startup, health, durable ownership, pytest path |
+| Platform Release Validation | `windows-latest` | 3.12 | **PASS** (`Release Gate (Windows, Python 3.12)`) |
 
-`run_cancellable_operation` uses `anyio.to_thread.run_sync(..., abandon_on_cancel=True)`; the worker
-owns the process tree and the resource claim context. On task cancellation the worker is signalled
-and continues cleanup, so ownership is not released while the process could still act. If cleanup
-cannot be confirmed, the existing quarantine path (`process_cleanup_incomplete`) fences ownership.
-Measured on this tree: explicit cancel returned in 9.1 ms, the owned process was reaped in 47 ms,
-and a follow-up command was admitted in 16 ms.
-`cancel_operation` ids are process-local bearer capabilities, not authentication; cross-client
-cancellation is possible for anyone who knows the id, and restart reports `operation_not_found`.
-No durable job is cancelled by HTTP disconnection.
+The Windows platform gate verifies launcher syntax, clean launcher validation, full doctor,
+startup/catalogue, quick benchmark and the workflow restart soak. The restart soak registers 152
+tools, performs two MCP restarts, submits three durable jobs, and reports no leaked leases, orphan
+operations or orphan events. Exact hosted stdout is not publicly downloadable without sign-in;
+the job conclusion and annotations are the available evidence.
 
-## 13. Runtime stale-claim reconciliation
+Windows-specific coverage includes `run_process`, `run_cmd`, `run_powershell`, CMD quoting, Job
+Object creation/assignment, owned child creation, forced tree termination, restart/reconciliation,
+atomic replacement and sharing-violation retries. UIA/desktop remains **UNVERIFIED**: a hosted
+runner has no interactive desktop. The real v0.9.0 Windows `.agent_state` was not copied, opened or
+modified.
 
-Before: a claim quarantined as `stale_native_owner_command_alive` was rechecked only by
-`recover_interrupted()` at store startup. After: a conflicting admission triggers the same proof
-during the current runtime and releases only proven-dead children or never-dispatched pending
-claims. Live orphans remain fenced and require a retry after they exit; no restart is required.
-Claims quarantined for unresolved effects or child-capacity cleanup are never reconciled by this
-path. No polling task, scheduler or new recovery authority was introduced.
+## 8. Linux validation
 
-## 14. SQLite migration evidence
-
-Schema version is 12. `tests/test_workflow_migrations.py`, crash-recovery, reconciliation and
-recovery-journal suites pass on disposable databases. Migration tests cover future-schema rejection
-without writes, v5/v9/v10/v11 upgrades, partial-upgrade rollback, retry after failed backfill,
-concurrent old-schema open, WAL-lock retry, idempotent reopen, route-column preservation and
-active/pending claim quarantine/release semantics. A real v0.9.0 Windows `.agent_state` copy was
-**not** opened or modified, and no Windows-migrated database was available for byte-level
-comparison.
-
-## 15. Windows compatibility results
-
-**BLOCKED.** This run has no Windows host, no authorized Windows CI runner, and did not touch the
-original Windows workspace. `scripts.platform_validation` reports `linux-amd64` with
-`powershell=false`, `desktop_screenshot=false`, `semantic_ui=false`, `browser=false`. Windows-only
-Job Object paths are covered by existing unit tests and static review only. No claim of native
-Windows parity is made.
-
-## 16. Real browser and LSP results
-
-**BLOCKED.** No Playwright/Chromium installation and no language server are available in this
-environment. Browser/LSP code paths were not executed; this report makes no browser, semantic-UIA,
-or LSP acceptance claim.
-
-## 17. Real MCP end-to-end results
-
-- stdio: real `mcp.Client` sessions exercised tool discovery, `run_shell`, `run_process`,
-  `read_file`, concurrency admission, cancellation and restart/recovery suites.
-- streamable HTTP: existing real endpoint tests for explicit cancellation and disconnect behavior
-  pass (82-test focused batch).
-- Full suite includes the broader integration matrix; see §20 for the exact final totals.
-- Mocked-only results are not presented as live MCP evidence.
-
-## 18. Stress and performance measurements
-
-Measured on this host after the fix:
-
-| Scenario | Previous Linux report | Current |
-| --- | --- | --- |
-| 4 × `sleep 1`, `access="read"` | 1.13 s | **4.23 s** (now sequential by design) |
-| 4 × `sleep 1`, exclusive | 4.24 s | **4.12 s** |
-| 20 concurrent exclusive `echo` commands | not reported | **0.96 s** |
-| 60 mixed terminal requests (20 echoes, 20 read-labeled echoes, 20 read-labeled 0.1 s sleeps) | 2.54 s (unsafe read overlap) | **15.19 s, 0 errors** (fully serialized) |
-| Explicit cancel call / process reap / post-cancel follow-up | ~0.10 s / not separated / 1.03 s | **9.1 ms / 47 ms / 16 ms** |
-| Focused concurrency/access suite | n/a | 102 passed, 1 skipped in 30.5 s |
-
-Tradeoff: removing untrusted read concurrency costs about 3.1 s for four concurrent one-second
-read-labeled commands, and the 60-request mixed batch rises from 2.54 s to 15.19 s because every
-terminal command now serializes. That is intentional: those commands could write. Native read
-concurrency is unchanged, and no artificial speedup was introduced by weakening synchronization.
-The 60-request run reported 0 errors. A multi-minute soak, RSS/fd/handle sampling and
-browser-session stress were **not** performed.
-
-## 19. Resource leak findings
-
-No new persistent threads, schedulers, subprocesses or unbounded stores were introduced. The
-reconciliation scan is limited to 64 rows/8 conflicts per admission and runs inside the existing
-transaction. Existing cancellation tests verify reaping and claim release. Quantitative RSS,
-file-descriptor and handle measurements were **not** collected; no leak claim is made beyond the
-passing cleanup/cancellation tests.
-
-## 20. Final pytest, Ruff, mypy results
-
-Executed on the final functional tree (POSIX):
+Final local gates on the functional tree:
 
 ```text
 python -m compileall -q core tools scripts tests     PASS
-python -m ruff check .                                PASS (All checks passed!)
-python -m mypy core tools scripts tests               PASS
-python main.py --check                                PASS (138 tools)
-python -m scripts.health_check --json                 PASS (ok=true)
+python -m ruff check .                                PASS
+python -m mypy core tools scripts tests               PASS (313 files)
+python main.py --check                                PASS (138 tools, unique names)
+python -m scripts.health_check --json                 PASS
 python -m scripts.platform_validation --json          PASS (linux-amd64)
+git diff --check                                      PASS
 ```
 
-Full pytest: **2,501 passed, 24 skipped, 0 failed in 594.53 s** on a fresh basetemp over the final
-functional tree. The count increased from 2,494 because of the new regression tests and the removed
-obsolete gate test. An earlier run reported one setup error because pytest could not clear a stale
-`.pytest-tmp` directory; the affected test passed in isolation, and the clean-basetemp rerun above
-is the recorded result.
+Local platform validation (60 workflows, 3 durable jobs): 0 leaked leases, 0 orphan operations, 0
+orphan events, RSS 75.055 → 77.160 MB (+2.105 MB), workflow restart soak 11.384 s. The full suite
+was run in four bounded groups to fit the runner's five-minute ceiling: **2,505 passed, 24 skipped,
+0 failed** (2,529 collected; group times 154 s, 202 s, 131 s and 94 s). The final P08-focused test
+also passed after the 32,575-byte ceiling correction.
 
-## 21. GitHub CI evidence
+## 9. macOS validation
 
-**UNVERIFIED.** `ci.yml`, `platform-validation.yml` and `release-packaging.yml` trigger only on
-pushes to `main` or pull requests targeting `main`; `release.yml` runs after platform validation.
-No PR was opened and no `main` push occurred, so this branch push created no hosted run. Local gates
-above are the only executed evidence. Windows/macOS CI remains required before claiming
-cross-platform parity.
+The hosted matrix ran both Python 3.10 and 3.12 on `macos-latest`, and both jobs passed at the
+final functional SHA. Platform Validation also passed its macOS release gate. The earlier macOS
+pytest failures were in the cancellation probe’s token construction, not in production cleanup; the
+corrected token survived shell `exec` and the full macOS suite passed.
 
-## 22. Remaining risks
+## 10. Browser acceptance
 
-1. Terminal commands are fully serialized per host; throughput for formerly read-labeled commands is
-   intentionally reduced.
-2. The `access` parameter description in the frozen input schema still mentions overlap; the
-   implementation ignores it and reports the effective classification. Refreshing that metadata
-   requires a Windows baseline refresh.
-3. Reconciliation is admission-triggered with a one-second per-store throttle; a caller blocked by a
-   live orphan must retry after it exits. There is no background poller by design.
-4. Operation ids are bearer capabilities, not secrets; anyone who learns an id can cancel that
-   in-flight operation for the server lifetime.
-5. The runtime remains fully privileged by design; there is no OS sandbox.
-6. Windows Job Object/UIA and macOS behavior remain unexecuted here.
-7. POSIX process-group liveness is conservative; a PID-reused group can fence longer than necessary
-   (fail-closed, never unsafe release).
+**VERIFIED** for a disposable local HTTP fixture. Public-site behavior and every browser tool are
+not claimed by this result.
 
-## 23. Untested capabilities
+The earlier failure was correctly classified as a host-runtime problem, not a ComputerPilot defect.
+Playwright could download Chromium, but the binary first failed on missing system libraries
+(`libnspr4.so`). After supplying those libraries locally, the renderer aborted with
+`FATAL:third_party/skia/src/ports/SkFontMgr_FontConfigInterface.cpp:163 Not implemented` (`SIGTRAP`)
+because the container had neither fontconfig configuration nor fonts. A local fontconfig file plus
+DejaVu fonts removed the crash. No security boundary was disabled; Chromium still used its normal
+headless launch flags.
 
-- Native Windows execution, Job Objects, CMD/PowerShell, Windows UIA/desktop.
-- macOS execution.
-- Real Chromium/browser sessions, downloads/uploads, semantic snapshots.
-- Real LSP providers and persistent sessions.
-- Live third-party MCP extensions and authenticated tunnel connectivity.
-- Large multi-client soak, memory/fd leak quantification.
-- Migration from a real v0.9.0 Windows database.
+A real stdio MCP server (138 tools, Chromium 156.0.8078.4) then completed:
 
-## 24. Commit history
+1. `browser_open_page` against the local fixture: HTTP 200 and title `Acceptance Fixture`.
+2. `browser_snapshot`: four semantic nodes.
+3. `browser_fill_semantic`: filled `Name` with `Alice`.
+4. `browser_select`: selected `Color` value `blue`.
+5. `browser_click_semantic`: activated `Submit`.
+6. `browser_extract`: observed `Hello Alice blue`.
+7. A second session filled `Bob`, selected the default `red`, and observed `Hello Bob red`; the
+   first session still observed `Hello Alice blue`, proving context isolation.
+8. Both sessions closed, the MCP process exited, and no Chromium process remained.
 
-- `1847705` merge: integrate Linux reliability hardening into cross-platform branch (nine Linux
-  commits preserved: `9e27d1f`, `e983fcc`, `b48bda8`, `b0a6716`, `36d3c28`, `635844c`, `d5be09f`,
-  `fb56b32`, `b301309`).
-- This work adds focused commits for terminal fail-closed classification, runtime reconciliation,
-  and this report. Exact final SHA is reported in the delivery message and can be verified with
-  `git log --oneline origin/fix/cross-platform-runtime-hardening`.
+Evidence is retained at `artifacts/real-browser-acceptance.json`. Live crash recovery, idle
+eviction and the complete download/upload matrix were not repeated against real Chromium; those
+remain covered by deterministic lifecycle tests. No public website, account or production data was
+used.
 
-## 25. Final acceptance checklist
+## 11. LSP acceptance
 
-| Criterion | Status |
+Real Pyright acceptance was executed against a disposable Python project:
+
+| Check | Result |
 | --- | --- |
-| `full` profile capabilities preserved; arbitrary commands executable; no repo-only sandbox | **VERIFIED** (138 POSIX tools, no capability removal) |
-| Caller-declared read cannot bypass exclusive terminal coordination | **FIXED AND VERIFIED** |
-| Native reads retain safe concurrency | **VERIFIED** (focused test; no host lock added) |
-| Conflicting writes synchronized | **VERIFIED** |
-| Cancellation during admission and execution safe | **VERIFIED** by existing suites |
-| stdio + HTTP explicit cancellation | **VERIFIED** |
-| Process trees cleaned; no premature release | **VERIFIED** by cancellation/ownership tests |
-| Stale claims reconciled during runtime when conclusive | **FIXED AND VERIFIED** |
-| Live/unknown ownership fenced | **VERIFIED** |
-| No uncertain side effect replayed | **VERIFIED** |
-| Schema migration | **VERIFIED** on POSIX fixtures; Windows DB unverified |
-| Windows compatibility | **BLOCKED** (no host/CI) |
-| Linux functionality | **VERIFIED** |
-| Browser/LSP | **BLOCKED** |
-| Full test suite / Ruff / mypy | **VERIFIED** (see §20) |
-| Real MCP end-to-end | **VERIFIED** for stdio/HTTP paths listed |
-| Stress testing / leak measurement | **PARTIAL** (bounded benchmark only) |
-| Documentation matches implementation | **VERIFIED** |
-| Commit/push hygiene, `main` untouched | **VERIFIED** after delivery |
+| Provider | `pyright` |
+| Node executable SHA-256 | `0adde40d1b7dfa57c8bc83cbc319758c3ec6ebba21363bb2fa752ea6b267ad1b` |
+| Pyright entrypoint SHA-256 | `467344c79457ec74f7f7b6cb0f52c3c5ebc7ea77bf53edeb6d2dc6217687b507` |
+| Definition / references / diagnostics | PASS |
+| References after restart | 3; definition and diagnostics use real protocol traffic |
+| Owned provider PIDs / orphans | 2 owned; 0 orphan PIDs |
+| Edit diagnostics | 1 (`reportArgumentType`) |
+| Diagnostics after restart | 0 (clean) |
+| Restart / cleanup | PASS; workspace removed |
+
+The acceptance used a repo-local ephemeral workspace and the real provider process. The complete
+JSON evidence is retained at `artifacts/real-lsp-python.json` in the validation
+workspace. Other providers are **UNVERIFIED**; mocked provider tests are not presented as real
+acceptance.
+
+## 12. SQLite and migration
+
+Schema v12 adds dispatch identity columns and native claim recovery. Tests cover fresh
+initialization, v5/v9/v10/v11 upgrades, v12 reopen, interrupted upgrade rollback, WAL behavior,
+concurrent readers/writers, pending/active/quarantined claims, durable jobs, incomplete dispatch
+markers, startup reconciliation and unsupported downgrade behavior. The Windows CI pytest job
+runs the same synthetic migration/recovery tests; the Platform release gate itself does not run
+pytest.
+
+A real v0.9.0 Windows `.agent_state` copy was **not** opened, copied or modified. Byte-level
+migration from the user’s private production database remains **UNVERIFIED**; this is intentional
+data-safety scope, not a skipped test.
+
+## 13. Recovery and crash behavior
+
+- Unknown ownership is preserved and fenced; no uncertain side effect is replayed.
+- A dead owner with a recorded child that has exited releases ownership as
+  `stale_native_owner_command_exited`.
+- A live orphan stays quarantined as `stale_native_owner_command_alive`.
+- A missing dispatch marker stays quarantined as `stale_native_owner_dispatch_unknown`; this is the
+  safe Windows outcome observed by the recovery probe.
+- Pending never-dispatched claims release as `stale_native_owner_never_dispatched`.
+- A live owner is never touched. The reconciliation scan is admission-triggered, bounded to 64 rows
+  and 8 conflicts, and never creates a second recovery authority.
+
+## 14. Soak and resource measurements
+
+A genuine multi-minute soak ran for **181.218 s** through a real stdio MCP client against a
+disposable checkout and fixture:
+
+| Measurement | Result |
+| --- | --- |
+| MCP tool calls / success / failure | 10,083 / 10,083 / 0 |
+| Throughput | 55.64 calls/s |
+| Latency p50 / p95 / max / mean | 18.787 / 158.986 / 863.873 / 59.738 ms |
+| Terminal process + shell calls | 1,265 + 1,230 |
+| File write + read calls | 1,231 + 1,232 |
+| Durable jobs submitted / succeeded | 59 / 59 |
+| Cancellations requested / observed / follow-up command | 17 / 17 / 17 |
+| Browser open/action/close cycles | 2 |
+| SQLite contention errors | 0 |
+| Resource requests / outstanding / quarantined | 3,787 released / 0 / 0 |
+| Server CPU | 154.47 s (85.24% of one core) |
+| Server RSS baseline → peak | 117.699 → 134.258 MB (+16.559 MB) |
+| Sum-of-process-tree RSS peak | 632.906 MB (includes transient Chromium/job children; shared pages are counted more than once) |
+| Server file descriptors baseline → peak | 8 → 25 |
+| Server threads / child processes peak | 15 / 8 |
+| Orphan processes after shutdown | 0 |
+| Server and Chromium after shutdown | absent |
+| SQLite files after run | 3,407,872 bytes |
+| Final health check | PASS |
+
+The machine-readable measurement is `artifacts/soak-acceptance.json`. The workload mixed four bounded
+workers (read/write, `run_process`, `run_shell`, health) with a durable-job loop, a cancellation loop,
+and browser session cycles. State used a disposable checkout's
+`.agent_state`; no user or Windows runtime state was read. The 59 jobs and all 3,787 resource requests
+finished released, with zero orphan claim rows, so the retained claim rows are history rather than
+active leases. No unbounded growth or leaked process was observed. These are bounded observations,
+not a multi-hour leak proof.
+
+Bounded restart soak (40 workflows, 2 runtime restarts, 2 uncertain cases): 37 completed, 3 failed,
+2 uncertain reconciled, 2 durable jobs succeeded, 0 leaked leases, 0 orphan operations/events, RSS
+75.004 → 77.152 MB (+2.148 MB). A second 40-workflow run with no uncertain cases measured RSS
+75.023 → 76.723 MB (+1.699 MB). The local platform gate additionally ran 60 workflows with 3 jobs
+and measured RSS 75.055 → 77.160 MB (+2.105 MB), with no leaks. The 60-workflow platform soak
+expanded the SQLite database, then checkpointed WAL and reduced the total database footprint after
+retention cleanup. No process, lease or event leaked.
+
+## 15. Extension and tunnel
+
+**PARTIALLY VERIFIED.** The real local extension transport/lifecycle tests, bounded stdio transport
+tests and tunnel offline tests passed together: **62 passed in 21.71 s**
+(`tests/test_extension_live_lifecycle.py`, `tests/test_extension_transport.py`,
+`tests/test_tunnel_runtime.py`). They exercise subprocess startup, discovery, registration, bounded
+request/response, timeout/cancellation, forced reaping, environment filtering, secret redaction and
+zero-extension native behavior. Tunnel tests cover platform asset selection, digest/checksum
+verification, safe extraction, update locking, explicit profile selection and offline-cache
+fallback.
+
+A live authenticated Secure Tunnel connection and a real third-party extension still require
+authorized credentials that were not available; those remain **UNVERIFIED**. No token was requested,
+printed or committed, and no unauthenticated tunnel connection was attempted.
+
+## 16. Security review
+
+The review covered full-capability preservation, caller-controlled access labels, cancellation
+bearer exposure, process-tree cleanup, Windows Job Object ownership, POSIX process-group ownership,
+stale-claim release, unknown effects, SQLite migration, path aliasing/symlinks, external MCP output,
+schema truthfulness, network boundaries, logging confidentiality and admission fairness.
+
+Confirmed findings were fixed: terminal access truthfulness, cancellation identity documentation and
+edge behavior, cancellation-id persistence in audit records, POSIX-only typing in a shared path,
+and Windows catalogue/count gates. No unsafe read concurrency remains for arbitrary commands. No
+secret canary or credential was committed.
+
+## 17. Test evidence summary
+
+| Gate | Result |
+| --- | --- |
+| Full pytest (final tree) | **2,505 passed, 24 skipped, 0 failed** (four bounded groups) |
+| Terminal schema / access | PASS |
+| Cancellation (stdio, HTTP, restart, capacity) | PASS |
+| Windows Job Object / ownership | PASS in CI |
+| Recovery / stale claims / no replay | PASS |
+| SQLite v12 migration and rollback | PASS |
+| Real stdio MCP | PASS |
+| Real HTTP MCP cancellation | PASS |
+| Real LSP (Pyright) | PASS |
+| Real browser (local fixture, stdio MCP) | PASS |
+| Extension/transport/tunnel-offline tests | PASS (62) |
+| Multi-minute live MCP soak | PASS (10,083 calls, 181 s) |
+| Workflow restart soak | PASS, no leaks |
+
+## 18. CI and hosted evidence
+
+Temporary branch push filters are present in `.github/workflows/ci.yml` and
+`.github/workflows/platform-validation.yml` so the existing workflows validate this branch. No PR,
+merge, release or `main` push was created.
+
+All final hosted jobs ran at `c3496172773654534eb0307f41981852f15a8bba`.
+
+| Workflow | Job | Runner | Result | Link |
+| --- | --- | --- | --- | --- |
+| CI | Test & Validate (Linux, Python 3.10) | `ubuntu-latest` | PASS | https://github.com/dibbed/computerpilot-mcp/actions/runs/42118454560 |
+| CI | Test & Validate (Linux, Python 3.12) | `ubuntu-latest` | PASS | https://github.com/dibbed/computerpilot-mcp/actions/runs/42118454560 |
+| CI | Test & Validate (macOS, Python 3.10) | `macos-latest` | PASS | https://github.com/dibbed/computerpilot-mcp/actions/runs/42118454560 |
+| CI | Test & Validate (macOS, Python 3.12) | `macos-latest` | PASS | https://github.com/dibbed/computerpilot-mcp/actions/runs/42118454560 |
+| CI | Test & Validate (Windows, Python 3.10) | `windows-latest` | PASS | https://github.com/dibbed/computerpilot-mcp/actions/runs/42118454560 |
+| CI | Test & Validate (Windows, Python 3.12) | `windows-latest` | PASS | https://github.com/dibbed/computerpilot-mcp/actions/runs/42118454560 |
+| Platform Validation | Linux release gate | `ubuntu-latest` | PASS | https://github.com/dibbed/computerpilot-mcp/actions/runs/42118454569 |
+| Platform Validation | macOS release gate | `macos-latest` | PASS | https://github.com/dibbed/computerpilot-mcp/actions/runs/42118454569 |
+| Platform Validation | Windows release gate | `windows-latest` | PASS | https://github.com/dibbed/computerpilot-mcp/actions/runs/42118454569 |
+
+All six CI matrix jobs and all three Platform Validation jobs passed. This closes the earlier
+Windows P08 failure at `e530068`: the corrected normalization retained the frozen `dd943…` digest,
+the measured catalogue byte budget is 32,575, and the temporary digest probe is absent from the
+final tree. Hosted logs require sign-in; public job conclusions and annotations are the available
+evidence.
+
+### Earlier hosted evidence
+
+- CI at `7c67999`: Windows/macOS tests exposed the catalogue hash, snapshot scheduling and
+  cancellation-token assumptions; Linux passed.
+- Platform at `7c67999`: Windows, Linux and macOS release gates passed.
+- CI at `e530068`: Linux and macOS green; the Windows job failed only P08.
+- CI at `42115846245`: the Windows byte-bound failure was isolated to the 32,575-byte assertion;
+  corrected at `c349617`.
+
+## 19. Final suite and gates
+
+| Gate | Status |
+| --- | --- |
+| compileall | PASS |
+| Ruff | PASS |
+| mypy (313 files) | PASS |
+| mypy `--platform win32` | PASS |
+| MCP startup (138 POSIX tools) | PASS |
+| health | PASS |
+| platform validation (linux-amd64) | PASS |
+| full pytest | **2,505 passed, 24 skipped** |
+| multi-minute live MCP soak | PASS (181.218 s, 10,083 calls, 0 failures) |
+| real browser acceptance (local fixture) | PASS |
+| extension/transport/tunnel-offline tests | PASS (62) |
+| diff/whitespace | PASS |
+
+## 20. Commit sequence
+
+The 20 commits after `c494591` are:
+
+- `c4f64b9` `fix(terminal): align access metadata with exclusive runtime`
+- `13a6782` `fix(cancellation): document bearer identity and cover HTTP edges`
+- `0954097` `ci: run hosted matrix for cross-platform hardening branch`
+- `0a1246b` `fix(recovery): guard POSIX group liveness for Windows typing`
+- `709ba09` `test(catalog): reconstruct Windows metadata before terminal fields`
+- `833e85d` `fix(platform): annotate failed validation sub-step`
+- `7c67999` `fix(runtime): include cancel_operation in Windows tool-count gates`
+- `45581e4` `ci: annotate pytest failure node ids`
+- `b36afaa` `fix(catalog): preserve access field in frozen Windows metadata`
+- `abe05e3` `test(snapshots): wait for maintenance scheduling on Windows`
+- `bfd012e` `ci: annotate pytest failure messages`
+- `4c2f606` `test(catalog): normalize historical Windows descriptions`
+- `bb0c4a4` `test(recovery): accept conservative dispatch-unknown quarantine`
+- `e530068` `test(cancellation): retain token through POSIX shell exec`
+- `6173b49` `fix(terminal): prevent cancellation capability exposure in audit`
+- `f2d9b10` `chore(ci): add temporary Windows catalogue digest probe`
+- `27ebee4` `fix(ci): make temporary Windows digest probe importable`
+- `58bbb8d` `test(catalog): restore frozen Windows P08 normalization`
+- `edda804` `chore(ci): remove temporary Windows digest probe`
+- `c349617` `test(catalog): budget post-baseline cancellation descriptor`
+
+The probe commits were temporary diagnostics and are removed from the final tree. A documentation-only
+follow-up commit records this report; it does not change the functional tree. No force-push, merge,
+tag, release or `main` mutation occurred.
+
+## 21. Remaining risks and unverified scope
+
+1. Windows UIA/desktop interaction is **UNVERIFIED**; hosted runners have no interactive desktop.
+2. Real browser acceptance is **VERIFIED** only on a disposable local fixture. Public sites,
+   downloads/uploads, real crash recovery and idle eviction were not exhaustively exercised live.
+3. Authenticated tunnel and live third-party extension acceptance are **UNVERIFIED** without
+   credentials.
+4. A real v0.9.0 Windows `.agent_state` migration was not performed; synthetic v12 migration is
+   verified.
+5. Cancellation ids are bearer capabilities, not authentication. Anyone who can reach the server
+   and learn an id can cancel that in-flight operation.
+6. Arbitrary terminal commands are intentionally serialized per host; formerly read-labelled
+   commands lose concurrency. Native typed readers retain theirs.
+7. The runtime is fully privileged by design and is not an OS sandbox.
+8. Windows Job Object cleanup and macOS POSIX group cleanup have platform coverage, but exotic
+   process trees and kernel-level races cannot be exhaustively proven.
+9. Hosted Windows/macOS logs require sign-in; evidence is limited to job conclusions and public
+   annotations.
+10. The 181-second soak is a bounded observation, not a multi-hour leak proof. Its RSS tree peak
+    includes shared Chromium/job pages and therefore overstates unique memory.
+
+## 22. Readiness assessment
+
+**Cross-platform candidate — conditionally ready for controlled use, not an unconditional
+production release.**
+
+The full Linux verification baseline is retained; all six Windows/Linux/macOS CI jobs and all three
+Platform Validation jobs are green; terminal schema truthfulness is fixed; cancellation is documented
+and tested as a bearer capability; migration/recovery is fail-closed; the 181-second live soak and
+real local browser acceptance show no leak or orphan; and the extension/tunnel-offline suite passes.
+The remaining blockers are explicitly scoped: Windows UIA/desktop, authenticated tunnel/live extension
+acceptance, public-site browser coverage and a real private Windows database migration. Those must not
+be represented as verified.
