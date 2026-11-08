@@ -188,3 +188,57 @@ This is a bounded soak, not multi-hour reliability evidence. A longer run with e
 **READY WITH DOCUMENTED LIMITATIONS.**
 
 The three confirmed Windows defects found here are fixed with regression coverage, the full 152-tool capability profile is intact, native terminal/job-object/cancellation/UIA/browser behavior is substantially verified, and no open defect was confirmed in production code. Remaining gaps (LSP session completion, upload/download metadata, full-suite completion, live tunnel/extension, soak) are documented above rather than hidden.
+
+## 16. Independent isolated recheck — 2026-11-08
+
+This section records a later run and supersedes the preceding sections only where it states new results. The earlier section describes its own checkout and source state; do not attribute its measurements to this run.
+
+- **VERIFIED:** Windows 10 Enterprise 10.0.19045, x64, Intel Core i3-12100F (4 cores / 8 logical processors), approximately 15.8 GiB RAM; active console session and accessible input desktop.
+- **VERIFIED:** CPython 3.12.8; PowerShell 7.6.9 (Windows PowerShell 5.1.19041.6456 was used for the UIA fixture); Git 2.48.1.windows.1; GitHub CLI 2.74.2; Node.js 22.18.0; MCP 2.0.1; Playwright 1.64.1; UIAutomation 2.0.29; pytest 9.2.0; Ruff 0.17.4.
+- **VERIFIED:** Fresh checkout `C:\Users\Meliodas\Downloads\computerpilot-mcp-windows-validation`, branch `fix/cross-platform-runtime-hardening`, starting source SHA `bfc318084d503056b8c30de20b6e9e61adb411d0`; tests below ran against that source plus test-only commit `917d46020da00832969728ed1da58480379c5551`. The production source is unchanged by this recheck.
+- **PARTIALLY VERIFIED:** PyPI timed out. A separate earlier validation environment built against the same CPython was copied into this checkout's isolated virtual environment; matching browser binaries were copied into this checkout. `pip check` passed. No global packages were installed.
+- **VERIFIED:** The protected original ComputerPilot workspace was not used for this run; its configuration and private database were not opened, copied, or migrated. No comparison of all original-workspace files was performed.
+
+### Current capability and native checks
+
+- **VERIFIED:** `main.py --check` reported 152 unique full-profile tools. The real stdio catalog contained 152 unique names and object input schemas; the repository catalog tests checked additional schema and registration contracts. Full filesystem, terminal, Git, browser, workflows, jobs, LSP and Windows desktop capability registration remains enabled. This observed count is configuration-specific.
+- **VERIFIED:** The local health check returned `ok: true` and exercised MCP startup, registration, filesystem and terminal operations. Real stdio requests executed `run_process`, `run_cmd` and `run_powershell` from a disposable path containing spaces.
+- **VERIFIED:** Grouped Windows tests included 27 Job Object tests, including owned process-tree cleanup and durable worker crash, plus three real HTTP cancellation/disconnection tests. The earlier focused run after the PID-file fix passed 74 tests with two skips. Audit-redaction and resource coordination tests are included in the grouped suite; the earlier section contains separate real MCP terminal and synthetic bearer-ID observations.
+- **PARTIALLY VERIFIED:** Ten stale-claim recovery cases passed, including live fencing, runtime release after exit, unknown marker handling and quarantine preservation. One POSIX SIGKILL case was skipped on Windows. This does not establish every requested Windows PID-reuse or crash-race scenario.
+- **VERIFIED:** All 15 synthetic migration tests passed, including legacy and v11 upgrades, interrupted-upgrade rollback, WAL, concurrent opening, reopen and future-schema rejection. The Windows CI workflow invokes the full test suite, including this module; no private database was touched.
+- **VERIFIED:** A real, off-screen, test-owned WinForms window was found by PID and title. MCP UIA traversed and located its controls, set a value, invoked a button, and verified the value through a fixture-owned file. The foreground window was unchanged, and the fixture was terminated. The previous section records a separate test-only screenshot, keyboard and mouse run.
+- **PARTIALLY VERIFIED:** This recheck did not repeat foreground switching, keyboard, mouse or screenshot acceptance. It did not inspect or capture personal desktop content.
+- **VERIFIED:** A real isolated Chromium session, reached via MCP stdio and a loopback HTTP fixture, passed semantic snapshot, fill, select, click and text extraction. A second session retained independent page state; both sessions closed, and no process from the copied Chromium directory remained afterward.
+- **PARTIALLY VERIFIED:** Browser upload/download, cancellation and idle eviction were not repeated here. The smoke run exited successfully but its stderr contained an asyncio subprocess-destructor `RuntimeError: Event loop is closed`; its owning component and implications were not established. Do not treat the absence of a surviving Chromium process as proof of all transport cleanup.
+- **VERIFIED:** The real Pyright acceptance script, using system Node and the isolated Pyright JavaScript entry point, passed cross-file definitions, references, diagnostics, edit synchronization, restart and process cleanup twice; no orphan PIDs remained. The script exercises the language session manager, not MCP transport. Its `source_index` received a reply.
+- **UNVERIFIED:** The earlier failing Python/Node wrapper-launcher route, LSP cancellation over MCP, and the reason that route failed were not resolved by the successful direct-Node run.
+- **VERIFIED:** Grouped tests included 26 local extension fixture cases and nine real-provider lifecycle cases using repository-owned subprocess fixtures. These are not a live third-party service.
+- **PARTIALLY VERIFIED:** 29 tunnel-runtime and 26 supervisor tests passed; no tunnel binary was found on this session's `PATH`. A real authenticated or externally exposed tunnel was not started, and private tunnel configuration was not inspected.
+
+### Verification results and test fixes
+
+Compilation, full Ruff, full mypy (313 files), startup, health and Windows platform validation all passed after the test edits. Platform validation ran launcher validation, Full Doctor, the quick benchmark and a 60-workflow restart soak: three durable jobs succeeded, with zero reported leaked leases, orphan operations or orphan events.
+
+| Non-overlapping group | Files | Passed | Skipped | Failed |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 40 | 571 | 8 | 0 |
+| 2 | 40 | 758 | 4 | 0 |
+| 3 | 40 | 722 | 19 | 0 |
+| 4 | 40 | 446 | 4 | 0 |
+| Total | 160 | **2497** | **35** | **0** |
+
+Each group used a distinct disposable base directory and a 120-second per-test timeout. The 35 skips include POSIX-only cancellation/recovery probes and a Windows symlink-dependent test; they are not passes. CI at the starting SHA has a successful Windows Python 3.10/3.12 matrix and Windows platform release gate.
+
+- **FIXED AND VERIFIED:** A Windows Job Object test observed an existing but still-empty PID fixture file and raised `JSONDecodeError`. The fixture now publishes the completed file with an atomic rename. The original test and surrounding suite passed afterward; process ownership assertions were preserved.
+- **FIXED AND VERIFIED:** A resource-claim test replaced `sleep` on the shared Python `time` module, exposing unrelated background threads to its failing stub. The stub is now scoped to the resource-claim module; the affected claim, timing and Job Object tests passed together (83 passed, one skipped).
+- **UNVERIFIED:** Before these edits, one ungrouped full run timed out in `test_completed_timing_history_is_bounded_and_latest_records_survive` while `flush_timings()` waited for its queue; a timing writer was idle on queue input. The shared-clock patch is a plausible contributor, but the exact cause was not proven. The grouped pass does not prove that a single-process full-suite run now completes.
+
+### Bounded resource run
+
+A separate 182.28-second stdio run performed 232 disposable read, write, CMD and health operations: zero reported failures; mean latency 22.23 ms, p95 63.0 ms; sampled CPU 2.73% of one logical core. Sampled aggregate owned-process working set was 133,197,824 bytes initially, 132,706,304 bytes at the end and 133,275,648 bytes peak. Sampled handles rose from 458 to 507; threads went from 21 to 11, with peak 21; peak sampled process count was three. Active and quarantined claims were zero at the first and last samples. Shutdown took 0.188 seconds, with zero observed owned survivors. CPU sampling may miss short-lived processes. This limited run does not prove long-term resource or handle stability and did not exercise every integration.
+
+### GitHub and readiness
+
+Historical baseline runs `42118454560` and `42118454569` succeeded at `c3496172773654534eb0307f41981852f15a8bba`. At the start of this recheck, CI run `42433807442` and platform run `42433807367` succeeded at `bfc318084d503056b8c30de20b6e9e61adb411d0`; they are not evidence for a later commit. Before this report commit, CI for its final SHA had not yet run and must be checked separately. `main` was observed at `b88a2e17040036181ed99be3a0a0122c4dcb5e88`.
+
+**READY WITH DOCUMENTED LIMITATIONS** for review, not release: the grouped Windows suite and the listed native checks passed, but the ungrouped timeout, earlier LSP wrapper failure, subprocess-destructor warning, transfer metadata gaps, untested external tunnel and long-duration handle behavior remain open. No production defect was conclusively established by this recheck. No merge, release, or production database migration was performed.
