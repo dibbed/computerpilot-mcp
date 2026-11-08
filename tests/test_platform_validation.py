@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -70,7 +71,9 @@ def test_platform_validation_runs_launcher_doctor_benchmark_and_soak(monkeypatch
 def test_windows_launcher_command_uses_absolute_batch_path(monkeypatch: pytest.MonkeyPatch) -> None:
     from pathlib import Path
 
-    monkeypatch.setattr(platform_validation.os, "name", "nt", raising=False)
+    # Patch only this module's reference: changing the global os.name makes
+    # pytest instantiate WindowsPath on POSIX hosts and abort the session.
+    monkeypatch.setattr(platform_validation, "os", SimpleNamespace(name="nt"))
     command = platform_validation._launcher_command()
 
     assert command[:4] == ["cmd.exe", "/d", "/s", "/c"]
