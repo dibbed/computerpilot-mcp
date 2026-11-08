@@ -231,7 +231,8 @@ def test_worker_crash_closes_job_and_reaps_durable_command_tree(
     code = (
         "import json,os,subprocess,sys,time;from pathlib import Path;"
         "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
-        f"Path({str(tree_file)!r}).write_text(json.dumps([os.getpid(),p.pid]));time.sleep(60)"
+        f"f=Path({str(tree_file)!r});t=f.with_suffix('.tmp');"
+        "t.write_text(json.dumps([os.getpid(),p.pid]));t.replace(f);time.sleep(60)"
     )
     submitted = store.submit(
         [sys.executable, "-c", code],
