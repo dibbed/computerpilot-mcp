@@ -37,7 +37,9 @@ def test_launcher_restarts_then_honors_interrupt(tmp_path: Path, first_exit: int
     )
     started = time.monotonic()
     result = subprocess.run(
-        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "START_MCP.bat"],
+        # Hardened Windows shells set NoDefaultCurrentDirectoryInExePath, so
+        # cmd.exe will not resolve a bare batch name from the working directory.
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(project / "START_MCP.bat")],
         cwd=project,
         capture_output=True,
         text=True,

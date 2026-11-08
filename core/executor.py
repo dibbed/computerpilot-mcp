@@ -22,7 +22,12 @@ import psutil
 from core.artifacts import Delivery, deliver_stream
 from core.errors import ToolError
 from core.process_ownership import OwnedProcess, spawn_owned_process
-from core.resource_claims import RESOURCE_CAPABILITY_ENV, current_resource_capability, resource_requires_native_ownership
+from core.resource_claims import (
+    RESOURCE_CAPABILITY_ENV,
+    current_resource_capability,
+    record_native_dispatch_identity,
+    resource_requires_native_ownership,
+)
 from core.timings import timing_span
 
 OutputMode = Literal["head", "tail", "both"]
@@ -245,13 +250,20 @@ def run_bounded(
     encoding: str | None = None,
     delivery: Delivery = "inline",
     require_native: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """Execute without shell expansion and optionally limit each output stream."""
+    """Execute without shell expansion and optionally limit each output stream.
+
+    ``cancel_event`` lets an owner (for example a cancelled MCP request) stop the
+    owned process tree without waiting for the command timeout to expire.
+    """
 
     if not command or not command[0]:
         raise ToolError("invalid_command", "An executable is required.")
     if not cwd.is_dir():
         raise ToolError("invalid_cwd", f"Working directory does not exist: {cwd}")
+    if cancel_event is not None and cancel_event.is_set():
+        raise ToolError("command_cancelled", "The command was cancelled before dispatch.")
     chosen_encoding = encoding or locale.getpreferredencoding(False) or "utf-8"
     stdout = OutputCapture(stdout_limit, output_mode)
     stderr = OutputCapture(stderr_limit, output_mode)
@@ -269,6 +281,7 @@ def run_bounded(
                 creationflags=_creation_flags(),
                 require_native=resource_requires_native_ownership() or require_native,
             )
+        record_native_dispatch_identity(process.pid)
         stdout_thread = threading.Thread(target=_read_pipe, args=(process.stdout, stdout), daemon=True)
         stderr_thread = threading.Thread(target=_read_pipe, args=(process.stderr, stderr), daemon=True)
         stdout_thread.start()
@@ -280,13 +293,23 @@ def run_bounded(
             except BrokenPipeError:
                 pass
         timed_out = False
+        cancelled = False
         with timing_span("process_execution"):
-            try:
-                exit_code = process.wait(timeout=timeout_sec)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                process.terminate_tree(force=True)
-                exit_code = process.wait(timeout=5.0)
+            deadline = time.monotonic() + timeout_sec
+            while True:
+                try:
+                    exit_code = process.wait(timeout=min(0.1, max(deadline - time.monotonic(), 0.001)))
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
+                    elif time.monotonic() >= deadline:
+                        timed_out = True
+                    else:
+                        continue
+                    process.terminate_tree(force=True)
+                    exit_code = process.wait(timeout=5.0)
+                    break
         # Releasing platform ownership reaps descendants that outlived the root
         # and releases inherited pipe handles before drain.
         process.close_ownership()
@@ -294,6 +317,8 @@ def run_bounded(
             stdout_thread.join(timeout=2.0)
             stderr_thread.join(timeout=2.0)
         capture_complete = not (stdout_thread.is_alive() or stderr_thread.is_alive() or stdout.read_error or stderr.read_error)
+        if cancelled:
+            raise ToolError("command_cancelled", "The command was cancelled before completion.")
         with timing_span("output_delivery"):
             stdout_result = stdout.result(chosen_encoding, delivery=delivery, final=capture_complete)
             stderr_result = stderr.result(chosen_encoding, delivery=delivery, final=capture_complete)

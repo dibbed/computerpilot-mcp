@@ -331,6 +331,31 @@ def test_exec_cost_real_sdk_paths_are_equivalent_and_isolated(monkeypatch: pytes
     assert report["cases"]["short/job"]["output_sha256"] == report["cases"]["short/direct"]["output_sha256"]
 
 
+def test_exec_cost_timeout_scales_with_warmups_and_cases(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    observed: dict[str, Any] = {}
+
+    def timed_out(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {"exit_code": 1, "timed_out": True, "stdout": {"text": ""}, "stderr": {"text": ""}}
+
+    monkeypatch.setattr(perf_benchmark, "run_bounded", timed_out)
+    report = perf_benchmark._exec_cost_once(1, True)
+    retained = Path(report["retained_fixture"])
+    import shutil
+
+    try:
+        assert report["status"] == "error"
+        assert report["comparable"] is False
+        assert report["error"] == "isolated_benchmark_timeout"
+        assert report["timed_out"] is True
+        assert report["exit_code"] == 1
+        # 5 warmups + 1 repeat over 12 cases must not reuse the old 150 s ceiling.
+        assert observed["timeout_sec"] == report["timeout_sec"] >= 300
+    finally:
+        assert retained.parent.resolve() == Path(perf_benchmark.tempfile.gettempdir()).resolve()
+        shutil.rmtree(retained)
+
+
 @pytest.mark.parametrize("repeats", [0, 101])
 def test_exec_cost_bounds_work_before_launch(repeats: int) -> None:
     with pytest.raises(ValueError, match="paired repeats"):
@@ -717,7 +742,8 @@ def test_launcher_benchmark_executes_real_bootstrap(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert _launcher_validation_once() == {"exit_code": 0}
     if os.name == "nt":
-        assert captured[:5] == ["cmd.exe", "/d", "/s", "/c", "START_MCP.bat"]
+        assert captured[:4] == ["cmd.exe", "/d", "/s", "/c"]
+        assert Path(captured[4]) == Path(__file__).resolve().parents[1] / "START_MCP.bat"
     else:
         assert captured == [str(Path(__file__).resolve().parents[1] / "start_mcp.sh")]
 

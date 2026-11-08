@@ -757,7 +757,11 @@ def test_managed_claims_report_quarantine_without_waiting_or_releasing_fence(
     claim = path_claim(tmp_path / "target", "write")
     store.reserve_resource_claims(request_id="blocked", owner_token="owner", category="test", claims=(claim,))
     store.quarantine_resource_request("blocked", owner_token="owner", reason="cleanup_unresolved")
-    monkeypatch.setattr(resource_claims.time, "sleep", lambda _: pytest.fail("waited on unresolved quarantine"))
+    monkeypatch.setattr(resource_claims, "time", SimpleNamespace(
+        monotonic=time.monotonic,
+        perf_counter=time.perf_counter,
+        sleep=lambda _: pytest.fail("waited on unresolved quarantine"),
+    ))
 
     with pytest.raises(ToolError) as raised:
         with managed_resource_claims((claim,), category="test", store=store):

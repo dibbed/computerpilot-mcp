@@ -4,7 +4,7 @@ import asyncio
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 from core.health_snapshot import _lsp_snapshot, collect_server_health
 
@@ -32,6 +32,9 @@ def test_health_metrics_collection_does_not_block_event_loop() -> None:
             return {}
 
     class Workflows:
+        last_native_recovery: ClassVar[dict[str, int]] = {"released": 0, "quarantined": 1}
+        runtime_native_recovery: ClassVar[dict[str, int]] = {"released": 2, "quarantined": 0, "examined": 3}
+
         def health_summary(self) -> dict[str, int]:
             return {
                 "unresolved_operation_count": 0, "workflow_db_bytes": 0,
@@ -53,7 +56,7 @@ def test_health_metrics_collection_does_not_block_event_loop() -> None:
         time.sleep(0.35)
         return {"budgets": {}, "resource_pressure": "normal"}
 
-    async def scenario() -> None:
+    async def scenario() -> dict[str, Any]:
         task = asyncio.create_task(collect_server_health(
             Server(), browser_manager=Browser(), resource_collector=slow_disk_and_sqlite_metrics,
             recovery=Recovery(), workflow_store_factory=lambda _: Workflows(),
@@ -64,9 +67,14 @@ def test_health_metrics_collection_does_not_block_event_loop() -> None:
             assert entered.is_set()
             assert time.perf_counter() - started < 0.2
         finally:
-            await task
+            payload = await task
+        return payload
 
-    asyncio.run(scenario())
+    payload = asyncio.run(scenario())
+    assert payload["workflow_health"]["native_resource_recovery"] == {"released": 0, "quarantined": 1}
+    assert payload["workflow_health"]["native_runtime_reconciliation"] == {
+        "released": 2, "quarantined": 0, "examined": 3,
+    }
 
 
 def test_concurrent_health_requests_serialize_shared_store_reads() -> None:
@@ -127,6 +135,9 @@ def test_health_exposes_bounded_execution_router_snapshot_without_extra_io() -> 
             return {}
 
     class Workflows:
+        last_native_recovery: ClassVar[dict[str, int]] = {"released": 0, "quarantined": 1}
+        runtime_native_recovery: ClassVar[dict[str, int]] = {"released": 2, "quarantined": 0, "examined": 3}
+
         def health_summary(self) -> dict[str, int]:
             return {
                 "unresolved_operation_count": 0, "workflow_db_bytes": 0,

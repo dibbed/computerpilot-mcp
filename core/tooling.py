@@ -54,6 +54,7 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "run_powershell",
         "run_cmd",
         "run_shell",
+        "cancel_operation",
         "kill_process",
         "run_background",
         "run_pytest",

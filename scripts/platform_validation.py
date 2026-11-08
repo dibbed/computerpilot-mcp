@@ -53,7 +53,10 @@ def _run_command(
 
 def _launcher_command() -> list[str]:
     if os.name == "nt":
-        return ["cmd.exe", "/d", "/s", "/c", "START_MCP.bat"]
+        # cmd.exe only searches the current directory when
+        # NoDefaultCurrentDirectoryInExePath is unset; pass the absolute
+        # launcher path so the gate works in hardened Windows shells too.
+        return ["cmd.exe", "/d", "/s", "/c", str(ROOT / "START_MCP.bat")]
     return [str(ROOT / "start_mcp.sh")]
 
 
@@ -148,6 +151,11 @@ def main(argv: list[str] | None = None) -> int:
         report = run_validation(workflows=args.workflows)
     except RuntimeError as exc:
         print(f"FAIL platform validation: {exc}", file=sys.stderr)
+        # Hosted job logs are not public without authentication; surface the
+        # failing sub-step and its output tail as a public check annotation.
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            message = str(exc).replace("%", "%25").replace("\r", "").replace("\n", "%0A")[-900:]
+            print(f"::error title=Platform validation failure::{message}")
         return 1
     if args.json:
         print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))

@@ -3,11 +3,12 @@
 Every language-server process is spawned under the strongest process-tree
 ownership available on this host (Windows Job Object or POSIX process group)
 with an explicit minimal environment: only fixed OS variables required for
-process startup are copied, ``PATH`` is narrowed to the pinned executable
-directories of the reviewed command tuple, and no other parent variable
-(``PYTHONPATH``, ``PYTHONHOME``, ``NODE_OPTIONS``, ``NODE_PATH``, shell loader
-variables, credentials) is inherited. Environment filtering is not an OS
-sandbox: the server still runs with the user's own account privileges.
+process startup are copied, ``PATH`` contains the pinned executable
+directories plus a discovered Node runtime directory when a launcher requires
+it, and no other parent variable (``PYTHONPATH``, ``PYTHONHOME``,
+``NODE_OPTIONS``, ``NODE_PATH``, shell loader variables, credentials) is
+inherited. Environment filtering is not an OS sandbox: the server still runs
+with the user's own account privileges.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -32,7 +34,19 @@ from core.windows_job import NativeOwnershipRequiredError
 from core.workflow_store import redact_inputs
 from tools.language.providers import LspProvider, command_for, validate_provider
 
-_OS_ENV_VARS = ("SystemRoot", "WINDIR", "TEMP", "TMP") if os.name == "nt" else ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
+# Windows providers are frequently Python or Node launchers that resolve the user
+# profile and their cache directories during import (for example ``Path.home()``).
+# Forward only fixed, non-credential startup variables; code-injection and
+# credential variables (PYTHONPATH, NODE_OPTIONS, tokens) are still never inherited.
+_OS_ENV_VARS = (
+    (
+        "SystemRoot", "SYSTEMDRIVE", "WINDIR", "TEMP", "TMP",
+        "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+        "COMSPEC", "PATHEXT", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    )
+    if os.name == "nt"
+    else ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
+)
 _MAX_HEADER_BYTES = 64 * 1024
 
 
@@ -400,7 +414,25 @@ class LspTransport:
         return self._close_result
 
 
-def build_environment(executable_paths: Sequence[Path]) -> dict[str, str]:
+def _launcher_runtime_paths(executable: Path) -> tuple[Path, ...]:
+    """Return bounded runtime directories required by known launcher executables.
+
+    The Python ``pyright`` console launcher resolves its Node runtime through
+    ``PATH``; without that directory it falls back to a network-dependent
+    ``nodeenv`` install and never starts the language server. Only the
+    discovered Node directory is added, never the rest of the parent ``PATH``.
+    """
+
+    if executable.name.casefold().startswith("pyright-langserver"):
+        node = shutil.which("node")
+        if node:
+            return (Path(node).parent,)
+    return ()
+
+
+def build_environment(
+    executable_paths: Sequence[Path], runtime_paths: Sequence[Path] = (),
+) -> dict[str, str]:
     """Build the minimal launch environment; nothing else is inherited."""
 
     environment: dict[str, str] = {}
@@ -416,12 +448,21 @@ def build_environment(executable_paths: Sequence[Path]) -> dict[str, str]:
         if key not in seen:
             seen.add(key)
             directories.append(parent)
+    for runtime_path in runtime_paths:
+        directory = str(Path(runtime_path))
+        key = directory.casefold() if os.name == "nt" else directory
+        if key not in seen:
+            seen.add(key)
+            directories.append(directory)
     environment["PATH"] = os.pathsep.join(directories)
     return environment
 
 
-def _spawn(command: Sequence[str], root: str | Path, executable_paths: Sequence[Path]) -> OwnedProcess:
-    environment = build_environment(executable_paths)
+def _spawn(
+    command: Sequence[str], root: str | Path, executable_paths: Sequence[Path],
+    runtime_paths: Sequence[Path] = (),
+) -> OwnedProcess:
+    environment = build_environment(executable_paths, runtime_paths)
     try:
         return spawn_owned_process(
             command,
@@ -453,7 +494,9 @@ def open_transport(provider: LspProvider, root: str | Path) -> OwnedProcess:
     if not provider.languages:
         raise ToolError("lsp_provider_unavailable", "The LSP provider has no eligible language.")
     validate_provider(root, provider.languages[0], providers=(provider,))
-    return _spawn(command_for(provider), root, [provider.executable])
+    return _spawn(
+        command_for(provider), root, [provider.executable], _launcher_runtime_paths(provider.executable),
+    )
 
 
 def _open_command_transport(command: Sequence[str], root: str | Path) -> OwnedProcess:
@@ -469,7 +512,7 @@ def _open_command_transport(command: Sequence[str], root: str | Path) -> OwnedPr
     executable = Path(command[0])
     if not executable.is_absolute():
         raise ToolError("lsp_server_not_found", "Language server executable not found.")
-    return _spawn(command, root, [executable])
+    return _spawn(command, root, [executable], _launcher_runtime_paths(executable))
 
 
 def close_transport(process: OwnedProcess, *, timeout_sec: float) -> bool:

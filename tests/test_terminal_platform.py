@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 import time
 from collections.abc import Iterator
@@ -18,6 +19,23 @@ from core.registry import create_server
 
 def _tool_names() -> set[str]:
     return {tool.name for tool in asyncio.run(create_server().list_tools())}
+
+
+def test_terminal_access_schema_matches_conservative_runtime() -> None:
+    """The advertised hint must not promise the removed read-overlap behavior."""
+
+    async def scenario() -> None:
+        tools = {tool.name: tool for tool in await create_server().list_tools()}
+        terminal = {"run_process", "run_powershell", "run_cmd" if os.name == "nt" else "run_shell"}
+        for name in terminal:
+            schema = tools[name].model_dump(mode="json", by_alias=True)["inputSchema"]
+            description = schema["properties"]["access"]["description"]
+            assert "compatibility hint" in description.casefold()
+            assert "exclusive" in description.casefold()
+            assert "effective_access" in description
+            assert "may overlap" not in description.casefold()
+
+    asyncio.run(scenario())
 
 
 def test_platform_shell_registration_matches_host() -> None:
@@ -102,6 +120,9 @@ def test_command_timeout_bounds_resource_admission(
     from core.resource_claims import coordination_claim, managed_resource_claims
     from core.workflow_store import WorkflowStore
     from tools.terminal import registry
+
+    if tool == "run_powershell" and shutil.which("pwsh") is None and shutil.which("powershell") is None:
+        pytest.skip("PowerShell is not installed on this host.")
 
     monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path))
     store = WorkflowStore(config.SETTINGS.workflow_db, recover=False)
