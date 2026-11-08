@@ -2937,6 +2937,86 @@ def test_windows_provider_environment_preserves_home_without_code_injection(
     assert not any("canary-module" in value for value in environment.values())
 
 
+def test_pyright_launcher_adds_only_the_discovered_node_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    launcher = scripts / ("pyright-langserver.exe" if os.name == "nt" else "pyright-langserver")
+    launcher.write_text("", encoding="utf-8")
+    node_parent = tmp_path / "node"
+    node_parent.mkdir()
+    node = node_parent / ("node.exe" if os.name == "nt" else "node")
+    node.write_text("", encoding="utf-8")
+    monkeypatch.setattr(transport.shutil, "which", lambda name: str(node) if name == "node" else None)
+
+    runtime_paths = transport._launcher_runtime_paths(launcher)
+    assert runtime_paths == (node_parent,)
+    environment = transport.build_environment([launcher], runtime_paths)
+    assert environment["PATH"].split(os.pathsep) == [str(scripts), str(node_parent)]
+    assert transport._launcher_runtime_paths(tmp_path / "other-language-server") == ()
+
+
+def test_pyright_provider_launch_uses_the_discovered_node_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = tmp_path / "pyright-langserver.exe"
+    launcher.write_text("", encoding="utf-8")
+    node_parent = tmp_path / "node"
+    node_parent.mkdir()
+    node = node_parent / "node.exe"
+    node.write_text("", encoding="utf-8")
+    provider = LspProvider(
+        "pyright",
+        ("python",),
+        launcher,
+        hashlib.sha256(launcher.read_bytes()).hexdigest(),
+        None,
+        None,
+        "fixture",
+        (tmp_path,),
+    )
+    monkeypatch.setattr(transport.shutil, "which", lambda name: str(node) if name == "node" else None)
+    captured: dict[str, Any] = {}
+
+    def capture_spawn(
+        command: tuple[str, ...], root: Path, executable_paths: list[Path], runtime_paths: tuple[Path, ...] = (),
+    ) -> Any:
+        captured.update(command=command, root=root, executable_paths=executable_paths, runtime_paths=runtime_paths)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(transport, "_spawn", capture_spawn)
+
+    transport.open_transport(provider, tmp_path)
+
+    assert captured["runtime_paths"] == (node_parent,)
+
+
+def test_pyright_one_shot_launch_uses_the_discovered_node_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = tmp_path / "pyright-langserver.exe"
+    launcher.write_text("", encoding="utf-8")
+    node_parent = tmp_path / "node"
+    node_parent.mkdir()
+    node = node_parent / "node.exe"
+    node.write_text("", encoding="utf-8")
+    monkeypatch.setattr(transport.shutil, "which", lambda name: str(node) if name == "node" else None)
+    captured: dict[str, Any] = {}
+
+    def capture_spawn(
+        command: tuple[str, ...], root: Path, executable_paths: list[Path], runtime_paths: tuple[Path, ...] = (),
+    ) -> Any:
+        captured.update(command=command, root=root, executable_paths=executable_paths, runtime_paths=runtime_paths)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(transport, "_spawn", capture_spawn)
+
+    transport._open_command_transport([str(launcher), "--stdio"], tmp_path)
+
+    assert captured["runtime_paths"] == (node_parent,)
+
+
 def test_lsp_error_and_stderr_canaries_do_not_escape(tmp_path: Path) -> None:
     error_canary = "canary-error-4f7d1b"
     stderr_canary = "canary-stderr-8e2a5c"
