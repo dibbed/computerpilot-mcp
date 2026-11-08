@@ -65,6 +65,9 @@ class BrowserManager:
         self._pool_lock = asyncio.Lock()
         self._capacity_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._lifecycle_users = 0
+        self._shutdown_incomplete = False
         self._session_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
         self._pending_sessions = 0
@@ -85,18 +88,75 @@ class BrowserManager:
         self._cleanup_interval_sec = max(0.01, min(30.0, self._session_idle_sec / 2, self._pool_idle_sec / 2))
         self._clock = clock
 
+    async def start_lifespan(self) -> None:
+        async with self._lifecycle_lock:
+            if self._shutdown_incomplete:
+                await self._shutdown_resources()
+                self._shutdown_incomplete = False
+            self._lifecycle_users += 1
+
+    async def stop_lifespan(self) -> None:
+        async with self._lifecycle_lock:
+            if self._lifecycle_users < 1:
+                raise RuntimeError("Browser runtime lifecycle is not active.")
+            self._lifecycle_users -= 1
+            if self._lifecycle_users == 0:
+                self._shutdown_incomplete = True
+                await self._shutdown_resources()
+                self._shutdown_incomplete = False
+
+    async def _shutdown_resources(self) -> None:
+        task = self._cleanup_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            if self._cleanup_task is task:
+                self._cleanup_task = None
+        async with self._cleanup_lock:
+            failed = False
+            for session_id in set(self._sessions) | set(self._session_locks):
+                async with self.session(session_id, touch=False, allow_shutdown=True):
+                    session = self._sessions.get(session_id)
+                    if session is not None:
+                        try:
+                            await self._close_session_context(session)
+                        except Exception:
+                            failed = True
+            for pool in list(self._pools.values()):
+                try:
+                    await pool.browser.close()
+                except Exception:
+                    failed = True
+            async with self._runtime_lock:
+                if self._playwright is not None:
+                    try:
+                        await self._playwright.stop()
+                    except Exception:
+                        raise RuntimeError("Browser resource shutdown was incomplete.") from None
+                    self._playwright = None
+            if failed:
+                raise RuntimeError("Browser resource shutdown was incomplete.")
+            self._sessions.clear()
+            self._pools.clear()
+
     def _touch_session(self, session_id: str) -> None:
         session = self._sessions.get(session_id)
         if session is not None:
             session.last_used = self._clock()
 
     @asynccontextmanager
-    async def session(self, session_id: str, *, touch: bool = True) -> AsyncIterator[None]:
+    async def session(
+        self, session_id: str, *, touch: bool = True, allow_shutdown: bool = False,
+    ) -> AsyncIterator[None]:
+        if self._shutdown_incomplete and not allow_shutdown:
+            raise ToolError("browser_runtime_stopping", "Browser runtime cleanup is in progress.")
         # Map bookkeeping has no await and is atomic on the owning event loop.
         lock, users = self._session_locks.get(session_id, (asyncio.Lock(), 0))
         self._session_locks[session_id] = (lock, users + 1)
         try:
             async with lock:
+                if self._shutdown_incomplete and not allow_shutdown:
+                    raise ToolError("browser_runtime_stopping", "Browser runtime cleanup is in progress.")
                 if touch:
                     self._touch_session(session_id)
                 try:

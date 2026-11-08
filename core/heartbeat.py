@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -24,9 +25,11 @@ from core.recovery import OPERATION_RECOVERY
 from core.tool_activity import TOOL_ACTIVITY
 from core.workflow_retention import schedule_workflow_history_retention
 from core.workflow_store import workflow_store
+from tools.browser.manager import MANAGER as BROWSER_MANAGER
 from tools.filesystem.search_snapshots import SEARCH_SNAPSHOTS
 
 RUNTIME_HEALTH_PUBLISH_INTERVAL_SEC = 10.0
+BROWSER_LIFESPAN_TIMEOUT_SEC = 5.25
 
 
 @asynccontextmanager
@@ -116,6 +119,26 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
             if hasattr(server, "__dict__"):
                 server.extension_manager = extension_manager
 
+    try:
+        await asyncio.wait_for(BROWSER_MANAGER.start_lifespan(), timeout=BROWSER_LIFESPAN_TIMEOUT_SEC)
+    except BaseException:
+        startup_tasks = [item for item in (task, health_task, lifecycle_task, maintenance_task) if item is not None]
+        for item in startup_tasks:
+            item.cancel()
+        await asyncio.gather(*startup_tasks, return_exceptions=True)
+        if batch_reader is not None:
+            with suppress(Exception):
+                batch_reader.stop()
+                await asyncio.wait_for(asyncio.to_thread(batch_reader.close), timeout=5.25)
+        OPERATION_RECOVERY.configure(None, None)
+        RUNTIME_LIFECYCLE.configure(None, None)
+        TOOL_ACTIVITY.configure(None, None)
+        if hasattr(server, "__dict__"):
+            server.runtime_started = False
+            if config_owned_manager:
+                server.extension_manager = None
+        raise
+
     extension_task = (
         asyncio.create_task(extension_manager.start_all_async())
         if extension_manager is not None
@@ -137,6 +160,10 @@ async def lifespan(server: Any) -> AsyncIterator[dict[str, Any]]:
                 lsp_manager.close_all(timeout_sec=0)
 
         async def finish_lifespan() -> None:
+            try:
+                await asyncio.wait_for(BROWSER_MANAGER.stop_lifespan(), timeout=BROWSER_LIFESPAN_TIMEOUT_SEC)
+            except Exception:
+                logging.getLogger(__name__).warning("Browser resource shutdown did not complete.")
             if batch_reader is not None:
                 with suppress(Exception):
                     await asyncio.wait_for(asyncio.to_thread(batch_reader.close), timeout=5.25)

@@ -6,6 +6,9 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 
 ## [Unreleased]
 
+### Fixed
+- 2026-11-08: Stop owned browser sessions, pools and the Playwright driver when the last MCP server lifetime ends; fence new browser operations during cleanup and retry incomplete cleanup before reuse.
+
 ### Documentation
 - 2026-10-29: Record guarded v0.9.0 publication on `21b659939430edf93af4a8d71b38190766cf3971`, all ten PR/main gates, verified downloaded archives and current release authority. Preserve both immutable release tags; this evidence update does not change release assets or runtime behavior.
 

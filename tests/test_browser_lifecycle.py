@@ -4,7 +4,163 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from core.errors import ToolError
 from tools.browser.manager import BrowserManager
+
+
+def test_shared_runtime_shutdown_waits_for_last_server_and_closes_browser_resources() -> None:
+    async def run() -> None:
+        manager = BrowserManager()
+        context = SimpleNamespace(new_page=AsyncMock(return_value=_page()), close=AsyncMock())
+        browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+        playwright = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)), stop=AsyncMock())
+        manager._playwright = playwright
+
+        await manager.start_lifespan()
+        await manager.start_lifespan()
+        await manager.open("fixture", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        await manager.stop_lifespan()
+        assert manager.page("fixture") is not None
+        playwright.stop.assert_not_awaited()
+        await manager.stop_lifespan()
+
+        context.close.assert_awaited_once()
+        browser.close.assert_awaited_once()
+        playwright.stop.assert_awaited_once()
+        assert manager._sessions == {}
+        assert manager._pools == {}
+        assert manager._playwright is None
+        assert manager._cleanup_task is None
+
+    asyncio.run(run())
+
+
+def test_failed_shutdown_fences_operations_and_is_retried_before_restart() -> None:
+    async def run() -> None:
+        manager = BrowserManager()
+        runtime = SimpleNamespace(stop=AsyncMock(side_effect=[RuntimeError("private-browser-error"), None]))
+        manager._playwright = runtime
+        await manager.start_lifespan()
+        with pytest.raises(RuntimeError, match="incomplete") as error:
+            await manager.stop_lifespan()
+        assert "private-browser-error" not in str(error.value)
+        with pytest.raises(ToolError, match="cleanup"):
+            async with manager.session("other"):
+                pytest.fail("browser operation passed shutdown fence")
+        await manager.start_lifespan()
+        assert runtime.stop.await_count == 2
+        assert manager._playwright is None
+        await manager.stop_lifespan()
+
+    asyncio.run(run())
+
+
+def test_context_cleanup_failure_keeps_fence_even_when_driver_stops() -> None:
+    async def run() -> None:
+        manager = BrowserManager()
+        context = SimpleNamespace(new_page=AsyncMock(return_value=_page()), close=AsyncMock(side_effect=RuntimeError("failed")))
+        browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+        runtime = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)), stop=AsyncMock())
+        manager._playwright = runtime
+        await manager.start_lifespan()
+        await manager.open("fixture", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        with pytest.raises(RuntimeError, match="incomplete"):
+            await manager.stop_lifespan()
+        runtime.stop.assert_awaited_once()
+        with pytest.raises(ToolError, match="cleanup"):
+            async with manager.session("other"):
+                pytest.fail("browser operation passed shutdown fence")
+        context.close.side_effect = None
+        await manager.start_lifespan()
+        await manager.stop_lifespan()
+
+    asyncio.run(run())
+
+
+def test_shutdown_fences_new_operations_while_existing_session_drains() -> None:
+    async def run() -> None:
+        manager = BrowserManager()
+        await manager.start_lifespan()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def operation() -> None:
+            async with manager.session("fixture"):
+                entered.set()
+                await release.wait()
+
+        active = asyncio.create_task(operation())
+        await entered.wait()
+        # The operation may still be opening a session and not have published it yet.
+        stopping = asyncio.create_task(manager.stop_lifespan())
+        await asyncio.sleep(0)
+        with pytest.raises(ToolError, match="cleanup"):
+            async with manager.session("another"):
+                pytest.fail("new browser operation passed shutdown fence")
+        assert not stopping.done()
+        release.set()
+        await active
+        await stopping
+
+    asyncio.run(run())
+
+
+def test_cancelled_shutdown_is_retried_before_new_lifespan() -> None:
+    async def run() -> None:
+        manager = BrowserManager()
+        stopping, release = asyncio.Event(), asyncio.Event()
+
+        async def stop() -> None:
+            stopping.set()
+            await release.wait()
+
+        runtime = SimpleNamespace(stop=AsyncMock(side_effect=stop))
+        manager._playwright = runtime
+        await manager.start_lifespan()
+        task = asyncio.create_task(manager.stop_lifespan())
+        await stopping.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(ToolError, match="cleanup"):
+            async with manager.session("other"):
+                pytest.fail("browser operation passed shutdown fence")
+        release.set()
+        await manager.start_lifespan()
+        assert runtime.stop.await_count == 2
+        await manager.stop_lifespan()
+
+    asyncio.run(run())
+
+
+def test_shutdown_waits_for_external_idle_cleanup() -> None:
+    async def run() -> None:
+        manager = BrowserManager(session_idle_sec=0, pool_idle_sec=1000)
+        manager._cleanup_interval_sec = 1000
+        closing, release = asyncio.Event(), asyncio.Event()
+
+        async def close_context() -> None:
+            closing.set()
+            await release.wait()
+
+        context = SimpleNamespace(new_page=AsyncMock(return_value=_page()), close=AsyncMock(side_effect=close_context))
+        browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+        runtime = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)), stop=AsyncMock())
+        manager._playwright = runtime
+        await manager.start_lifespan()
+        await manager.open("fixture", "about:blank", browser_name="chromium", headless=True, timeout_ms=1000, wait_until="load")
+        cleanup = asyncio.create_task(manager.cleanup_idle())
+        await closing.wait()
+        shutdown = asyncio.create_task(manager.stop_lifespan())
+        await asyncio.sleep(0)
+        assert not shutdown.done()
+        release.set()
+        await cleanup
+        await shutdown
+        context.close.assert_awaited_once()
+        browser.close.assert_awaited_once()
+        runtime.stop.assert_awaited_once()
+
+    asyncio.run(run())
 
 
 def _page(*, goto: AsyncMock | None = None) -> SimpleNamespace:

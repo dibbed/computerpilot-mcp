@@ -369,12 +369,16 @@ def test_real_mutating_tool_stays_active_until_command_finishes(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("cancel_count,seal_error", [(0, False), (1, False), (2, False), (0, True)])
+@pytest.mark.parametrize("cancel_count,seal_error,browser_error", [
+    (0, False, False), (1, False, False), (2, False, False), (0, True, False), (0, False, True),
+])
 def test_lsp_shutdown_survives_extension_error_and_parent_cancellation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_count: int, seal_error: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    cancel_count: int, seal_error: bool, browser_error: bool,
 ) -> None:
     from dataclasses import replace
     from types import SimpleNamespace
+    from unittest.mock import AsyncMock
 
     from core import audit, config, heartbeat
 
@@ -388,6 +392,11 @@ def test_lsp_shutdown_survives_extension_error_and_parent_cancellation(
         monkeypatch.setattr(heartbeat, name, lambda **_kwargs: None)
     monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
     monkeypatch.setattr(heartbeat.SEARCH_SNAPSHOTS, "cleanup", lambda: None)
+    browser = SimpleNamespace(
+        start_lifespan=AsyncMock(),
+        stop_lifespan=AsyncMock(side_effect=RuntimeError("private-browser-error") if browser_error else None),
+    )
+    monkeypatch.setattr(heartbeat, "BROWSER_MANAGER", browser)
     closing, release, closed = threading.Event(), threading.Event(), threading.Event()
     calls: list[float] = []
     drained: list[bool] = []
@@ -432,11 +441,59 @@ def test_lsp_shutdown_survives_extension_error_and_parent_cancellation(
                 await task
             assert closed.is_set() and drained == [True]
             assert calls == [0, 5.0]
+            browser.start_lifespan.assert_awaited_once()
+            browser.stop_lifespan.assert_awaited_once()
+            if browser_error:
+                assert "Browser resource shutdown did not complete" in caplog.text
+                assert "private-browser-error" not in caplog.text
             assert server.runtime_started is False
         finally:
             release.set()
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_browser_startup_timeout_cleans_up_partially_started_lifespan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from core import audit, config, heartbeat
+
+    settings = replace(config.SETTINGS, state_dir=tmp_path / "state", memory_dir=tmp_path / "memory", extensions_enabled=False)
+    for module in (audit, config, heartbeat):
+        monkeypatch.setattr(module, "SETTINGS", settings)
+    for name in ("MCP_HEARTBEAT_FILE", "MCP_RUNTIME_HEALTH_FILE", "MCP_LIFECYCLE_CONTROL_FILE",
+                 "MCP_LIFECYCLE_STATUS_FILE", "MCP_TOOL_ACTIVITY_FILE", "MCP_RUNTIME_GENERATION_ID"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("schedule_artifact_retention", "schedule_job_history_retention", "schedule_workflow_history_retention"):
+        monkeypatch.setattr(heartbeat, name, lambda **_kwargs: None)
+    monkeypatch.setattr(heartbeat.BACKUP_RETENTION, "schedule", lambda: None)
+    monkeypatch.setattr(heartbeat.SEARCH_SNAPSHOTS, "cleanup", lambda: None)
+    monkeypatch.setattr(heartbeat, "BROWSER_LIFESPAN_TIMEOUT_SEC", 0.05)
+
+    async def never_ready() -> None:
+        await asyncio.Event().wait()
+
+    browser = SimpleNamespace(start_lifespan=AsyncMock(side_effect=never_ready), stop_lifespan=AsyncMock())
+    monkeypatch.setattr(heartbeat, "BROWSER_MANAGER", browser)
+    batch = SimpleNamespace(start=Mock(), stop=Mock(), close=Mock())
+    extension = SimpleNamespace(start_all_async=AsyncMock())
+    server = SimpleNamespace(native_read_batch_state=batch, extension_manager=extension)
+
+    async def scenario() -> None:
+        with pytest.raises(asyncio.TimeoutError):
+            async with heartbeat.lifespan(server):
+                pytest.fail("server started while browser cleanup was blocked")
+        assert server.runtime_started is False
+        batch.start.assert_called_once()
+        batch.stop.assert_called_once()
+        batch.close.assert_called_once()
+        extension.start_all_async.assert_not_awaited()
 
     asyncio.run(scenario())
