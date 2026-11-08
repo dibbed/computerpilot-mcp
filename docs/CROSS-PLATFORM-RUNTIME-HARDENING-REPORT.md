@@ -52,7 +52,7 @@ a hosted run requires the affected checks to run again on the new SHA.
 | Stale `access` schema text | **FIXED AND VERIFIED** | `_ACCESS_DESCRIPTION`; terminal schema regression test; precise catalogue hash |
 | Cancellation identity/authorization | **FIXED AND VERIFIED** for the bearer model | `SECURITY.md`; keyed audit correlation; registry and HTTP/stdio edge tests |
 | Real browser acceptance | **VERIFIED** on a disposable local fixture | real stdio-MCP Chromium session: navigation, semantic snapshot/fill/select/click, extract, isolated second session and clean close; `artifacts/real-browser-acceptance.json` |
-| Real LSP acceptance | **VERIFIED** for Pyright | provider SHA, definitions/references/diagnostics/restart/cleanup evidence; `artifacts/real-lsp-python.json` |
+| Real LSP acceptance | **VERIFIED** for Pyright, including the pip wrapper and direct Node paths | provider SHA, definitions/references/diagnostics/restart/cleanup evidence; `artifacts/real-lsp-python.json`; final pip-launcher recheck in section 23 |
 | Cross-platform migration | **VERIFIED** on synthetic fixtures; real v0.9.0 Windows DB **UNVERIFIED** | schema v5/v9/v10/v11/v12 tests |
 | Soak/resource analysis | **VERIFIED** | 181 s live MCP soak plus 60-workflow platform soak and 40-workflow restart soak; no leaked claims/orphans |
 | Extension process/transport | **VERIFIED** for the local subprocess fixture | 62 extension/tunnel-offline tests pass; real bounded stdio subprocess lifecycle |
@@ -260,6 +260,21 @@ JSON evidence is retained at `artifacts/real-lsp-python.json` in the validation
 workspace. Other providers are **UNVERIFIED**; mocked provider tests are not presented as real
 acceptance.
 
+### 11.1 Pip launcher resolution
+
+The earlier native-session investigation recorded a supported-path defect: the pip
+`pyright-langserver` console launcher resolves its Node runtime through `PATH`, while the LSP
+transport deliberately launches providers with a minimal environment containing only the pinned
+provider directory. Without a Node directory the launcher attempted a network-dependent
+`nodeenv` install and the session failed before document symbols.
+
+The fix adds a bounded launcher-runtime lookup: when the provider executable name starts with
+`pyright-langserver`, the transport resolves `node` with `shutil.which` and adds only that
+directory to the child `PATH`. `PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `NODE_PATH`, shell
+loader variables and credentials remain excluded. Three regression tests cover the lookup,
+environment construction, provider launch and the one-shot command path. A final real acceptance
+against the ordinary pip launcher passed; see section 23.
+
 ## 12. SQLite and migration
 
 Schema v12 adds dispatch identity columns and native claim recovery. Tests cover fresh
@@ -359,7 +374,10 @@ secret canary or credential was committed.
 
 | Gate | Result |
 | --- | --- |
-| Full pytest (final tree) | **2,505 passed, 24 skipped, 0 failed** (four bounded groups) |
+| Full pytest (hosted CI at `c33004e`, Linux/macOS) | **2,516 passed, 24 skipped, 0 failed** |
+| Full pytest (hosted CI at `c33004e`, Windows) | **2,526 passed, 14 skipped, 0 failed** |
+| Full pytest (local Linux, four bounded groups, earlier tree) | 2,505 passed, 24 skipped, 0 failed |
+| Full pytest (local Windows, grouped, earlier tree) | 2,505 passed, 35 skipped, 0 failed |
 | Terminal schema / access | PASS |
 | Cancellation (stdio, HTTP, restart, capacity) | PASS |
 | Windows Job Object / ownership | PASS in CI |
@@ -414,12 +432,13 @@ evidence.
 | --- | --- |
 | compileall | PASS |
 | Ruff | PASS |
-| mypy (313 files) | PASS |
+| mypy (313 files; native, `--platform win32`, `--platform linux`) | PASS |
 | mypy `--platform win32` | PASS |
 | MCP startup (138 POSIX tools) | PASS |
 | health | PASS |
 | platform validation (linux-amd64) | PASS |
-| full pytest | **2,505 passed, 24 skipped** |
+| full pytest (local Linux groups, earlier tree) | 2,505 passed, 24 skipped |
+| full pytest (hosted CI at `c33004e`) | Linux/macOS **2,516 passed, 24 skipped**; Windows **2,526 passed, 14 skipped** |
 | multi-minute live MCP soak | PASS (181.218 s, 10,083 calls, 0 failures) |
 | real browser acceptance (local fixture) | PASS |
 | extension/transport/tunnel-offline tests | PASS (62) |
@@ -470,8 +489,9 @@ tag, release or `main` mutation occurred.
 7. The runtime is fully privileged by design and is not an OS sandbox.
 8. Windows Job Object cleanup and macOS POSIX group cleanup have platform coverage, but exotic
    process trees and kernel-level races cannot be exhaustively proven.
-9. Hosted Windows/macOS logs require sign-in; evidence is limited to job conclusions and public
-   annotations.
+9. Hosted logs require authentication; public evidence is limited to job conclusions and annotations.
+   Authenticated CLI logs were used to read exact suite counts, and those counts can change as tests
+   are added.
 10. The 181-second soak is a bounded observation, not a multi-hour leak proof. Its RSS tree peak
     includes shared Chromium/job pages and therefore overstates unique memory.
 
@@ -487,3 +507,36 @@ real local browser acceptance show no leak or orphan; and the extension/tunnel-o
 The remaining blockers are explicitly scoped: Windows UIA/desktop, authenticated tunnel/live extension
 acceptance, public-site browser coverage and a real private Windows database migration. Those must not
 be represented as verified.
+
+## 23. Final integration — pip Pyright launcher and merge readiness
+
+A supported-path defect remained after the acceptance recorded in section 11: the pip
+`pyright-langserver` console launcher could not resolve `node` from the deliberately minimal
+provider `PATH`. It attempted a network-dependent `nodeenv` fallback and failed before
+`source_index`. The direct-Node provider path was unaffected, which is why earlier acceptance
+passed.
+
+The fix in `tools/language/transport.py` adds only the discovered Node directory to the child
+`PATH` for launcher executables beginning with `pyright-langserver`; all other parent variables
+remain excluded. Three regression tests cover the lookup, environment construction, provider
+launch and one-shot command path. A real acceptance run against the ordinary pip launcher exited
+0 with `source_index: REPLIED`, PASS for definitions, references, diagnostics, edit
+synchronization, restart and cleanup, eight owned provider processes, no orphan PIDs and the
+ephemeral workspace removed.
+
+Final Windows integration gates on the complete tree:
+
+| Gate | Result |
+| --- | --- |
+| `compileall` | PASS |
+| Ruff | PASS |
+| mypy (313 files; native, `--platform win32`, `--platform linux`) | PASS |
+| `main.py --check` | PASS, 152 unique tools |
+| Health | PASS, 5/5 checks |
+| Windows platform validation | PASS |
+| Full pytest (ungrouped, serial) | **2,508 passed, 35 skipped, 0 failed** (621.24 s) |
+| Real Pyright pip-launcher acceptance | PASS |
+| `git diff --check` | PASS |
+
+Hosted CI and Platform Validation for the final integration commit are a separate gate. This
+section does not publish a release, create or move tags, publish packages, bump versions or deploy.

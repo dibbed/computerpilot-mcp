@@ -23,6 +23,15 @@ This directory contains the public technical documentation and release evidence 
 - [Extension authoring](development/MCP-EXTENSION-AUTHORING.md) — verified v0.8 extensibility contracts, transport, lifecycle, and safety boundaries.
 - [Testing standards](development/TESTING-STANDARDS.md) — isolation, behavior checks, platform and release evidence.
 
+## Cross-platform hardening evidence
+
+- [Cross-platform runtime hardening report](CROSS-PLATFORM-RUNTIME-HARDENING-REPORT.md) — Linux acceptance, hosted matrix, browser/LSP/soak evidence, fixes and residual risks.
+- [Windows native acceptance report](WINDOWS-NATIVE-ACCEPTANCE-REPORT.md) — native Windows terminal, Job Object, UIA, browser, LSP and soak evidence.
+- [Linux deep integration audit](LINUX-DEEP-INTEGRATION-AUDIT.md) — real MCP integration, process ownership, recovery and migration scope.
+- [Linux reliability hardening report](LINUX-RELIABILITY-HARDENING-REPORT.md) — reliability and soak measurements.
+
+These reports describe the cross-platform hardening integration. They do not create a new release, tag or package; the latest published release remains v0.9.0.
+
 ## Release evidence
 
 Current release evidence:

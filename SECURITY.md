@@ -107,6 +107,10 @@ Persistent language servers and installed package-test runners execute reviewed 
 
 Native cooperative resource claims fence managed edits, jobs, workflows, analyzers and file batches. They do not lock out independent editors or unmanaged external programs. After timeout/crash, uncertain ownership remains quarantined until evidence-based resolution; do not delete SQLite rows or backups to make admission succeed. Before the 0.8-to-0.9 schema upgrade, drain owners and take consistent state backups; an older runtime must use its matching pre-upgrade backup.
 
+## Terminal command coordination
+
+Arbitrary terminal commands (`run_process`, `run_shell`, `run_cmd`, `run_powershell`) take exclusive host coordination and a working-directory write claim. The optional `access="read"` field is accepted for wire compatibility and reported as a hint only; it never lets arbitrary shell code run concurrently, because a command cannot be proven read-only from its input. Native typed readers retain their read concurrency. This is a correctness and resource-safety boundary, not an authorization boundary: any client with MCP access can still execute commands permitted by the server account.
+
 ## Operation cancellation identity
 
 `cancel_operation(operation_id)` is an explicit, process-local cancellation contract for in-flight

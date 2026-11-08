@@ -4,15 +4,31 @@ ComputerPilot MCP uses capability detection rather than registering every tool o
 
 ## Current matrix
 
-| Platform | Status | Native hosted CI | Package target | Native desktop/UIA |
-| --- | --- | --- | --- | --- |
-| Windows amd64 | Supported | Python 3.10 + 3.12 | Yes | Yes |
-| Linux amd64 | Preview | Python 3.10 + 3.12 | Yes | No |
-| macOS arm64 | Preview | Python 3.10 + 3.12 | Yes | No |
-| Linux arm64 | Preview package target | No dedicated claim for v0.9.0 | Yes | No |
-| macOS amd64 | Preview package target | No dedicated claim for v0.9.0 | Yes | No |
+| Platform | Release label | Validation status | Native hosted CI | Package target | Native desktop/UIA |
+| --- | --- | --- | --- | --- | --- |
+| Windows amd64 | Supported | CI + Platform Validation + native interactive acceptance | Python 3.10 + 3.12 | Yes | Yes |
+| Linux amd64 | Preview | CI + Platform Validation + native Linux acceptance | Python 3.10 + 3.12 | Yes | No |
+| macOS arm64 | Preview | CI + Platform Validation | Python 3.10 + 3.12 | Yes | No |
+| Linux arm64 | Preview package target | Packaging/updater mapping | No dedicated runner claim | Yes | No |
+| macOS amd64 | Preview package target | Packaging/updater mapping | No dedicated runner claim | Yes | No |
 
 The CI matrix runs on `windows-latest`, `ubuntu-latest`, and `macos-latest` for Python 3.10 and 3.12. Platform Release Validation runs the three hosted OS targets on Python 3.12.
+
+## Validation scope
+
+| Capability | Linux amd64 | Windows amd64 | macOS |
+| --- | --- | --- | --- |
+| Full automated suite (hosted CI at `c33004e`) | 2,516 passed, 24 skipped | 2,526 passed, 14 skipped | 2,516 passed, 24 skipped |
+| Real MCP stdio/HTTP | Verified | Verified | Hosted CI coverage |
+| Native terminal execution | Verified | Verified | Hosted CI coverage |
+| Process cancellation/recovery | Verified | Verified | Hosted CI coverage |
+| SQLite schema v12 migration tests | Verified (synthetic) | Verified (synthetic) | Hosted CI coverage |
+| Real Chromium (local fixture) | Verified | Verified | Not independently verified |
+| Real Pyright language server | Verified | Verified | Not independently verified |
+| UI Automation | Not applicable | Verified with isolated fixture | Not applicable |
+| Bounded MCP soak | Verified (181 s) | Verified (181 s) | Not independently verified |
+
+The macOS result validates portable CI behavior and the platform release gate. It is not a claim that every interactive, hardware-dependent or desktop workflow was exercised on a native Mac. A local Windows grouped acceptance run recorded 2,505 passed and 35 skipped, and a final local ungrouped run recorded 2,508 passed and 35 skipped; the extra local skips are mostly symlink-privilege cases that the hosted runner grants. The final integration adds three Pyright launcher regression tests, so its own hosted logs are the authority for updated totals. The 181-second soaks are bounded observations, not multi-hour leak proofs. See the [cross-platform report](CROSS-PLATFORM-RUNTIME-HARDENING-REPORT.md) and [Windows native acceptance report](WINDOWS-NATIVE-ACCEPTANCE-REPORT.md).
 
 ## Portable capabilities
 
@@ -61,9 +77,9 @@ Native Windows desktop/UIA tools are not emulated on POSIX hosts. Browser automa
 
 A package being generated for an architecture is not the same as that architecture receiving dedicated hosted-runner execution.
 
-For v0.9.0:
+For the current source line:
 
 - Linux arm64 and macOS amd64 are deterministic package/updater targets.
 - The project does not claim dedicated native hosted-runner validation for those two architecture combinations.
 
-See the versioned release validation document for release-specific evidence.
+See the versioned release validation document for published-release-specific evidence.

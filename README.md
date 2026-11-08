@@ -2,7 +2,7 @@
 
 **Supervised computer use and developer automation over the Model Context Protocol.**
 
-Version **0.9.0** adds durable background verification, opt-in parallel DAG workflows, persistent multilingual LSP/context, package-runner verification and bounded native file batching. See [everything since 0.8.0](docs/V0.9.0-RELEASE-NOTES.md) and [release validation](docs/V0.9.0-VALIDATION.md). Optional capabilities keep their documented defaults and require operator configuration.
+Current source includes the **cross-platform runtime-hardening integration** validated on Linux and Windows and covered by hosted Linux, macOS, and Windows CI. The latest published release remains **0.9.0** ([release notes](docs/V0.9.0-RELEASE-NOTES.md), [validation](docs/V0.9.0-VALIDATION.md)); the hardening work described here is unreleased and no new version or tag is implied. Optional capabilities keep their documented defaults and require operator configuration.
 
 [![Release](https://img.shields.io/github/v/release/dibbed/computerpilot-mcp?label=release)](https://github.com/dibbed/computerpilot-mcp/releases/latest)
 [![CI](https://github.com/dibbed/computerpilot-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dibbed/computerpilot-mcp/actions/workflows/ci.yml)
@@ -16,6 +16,38 @@ It is designed for developers who want an agent to do real work on a machine wit
 
 > **Security:** this project intentionally has broad local capabilities. Treat access to the MCP endpoint as equivalent to granting a development agent access to the OS account running it. See [SECURITY.md](SECURITY.md).
 
+## Cross-Platform Validation
+
+ComputerPilot MCP has been tested with its **full automated suite and representative real MCP integrations on both Linux and Windows**. macOS passes the same hosted CI matrix and the Platform Release Validation gate; native interactive macOS desktop acceptance is not claimed.
+
+| Capability / validation | Linux amd64 | Windows amd64 | macOS |
+| --- | --- | --- | --- |
+| Automated CI (Python 3.10 and 3.12) | Verified | Verified | Verified |
+| Platform Release Validation | Verified | Verified | Verified |
+| Native terminal execution | Verified (`run_shell`, `run_process`) | Verified (CMD, PowerShell, `run_process`) | Hosted CI coverage |
+| Process cancellation and recovery | Verified | Verified | Hosted CI coverage |
+| SQLite schema/migration tests | Verified | Verified | Hosted CI coverage |
+| Real Chromium acceptance (local fixture) | Verified | Verified | Not independently verified |
+| Real Pyright language-server acceptance | Verified | Verified | Not independently verified |
+| Windows UI Automation | Not applicable | Verified with isolated fixture | Not applicable |
+| Sustained bounded MCP soak | Verified (181 s) | Verified (181 s) | Not independently verified |
+| Full automated regression suite (hosted CI at `c33004e`) | 2,516 passed, 24 skipped | 2,526 passed, 14 skipped | 2,516 passed, 24 skipped |
+
+At `c33004e`, hosted CI reported the counts above. A local Windows grouped acceptance run recorded **2,505 passed, 35 skipped, 0 failed** across 160 test files, and a final ungrouped local run after the Pyright launcher fix recorded **2,508 passed, 35 skipped, 0 failed**; the difference from hosted counts is mostly symlink-privilege skips on the local host. The final integration adds three Pyright launcher regression tests, so its own hosted logs are the authority for updated totals. Counts also vary by platform and selection. The Linux and macOS suites exercised real MCP stdio/HTTP sessions, POSIX process ownership and cancellation, stale-claim reconciliation, durable jobs/workflows, schema v12 migration coverage, Chromium, Pyright and a multi-minute live MCP soak. Windows native acceptance additionally covered Job Objects, CMD/PowerShell, process-tree cleanup, UI Automation, browser uploads/downloads and an isolated 181-second resource soak.
+
+Linux provides the portable ComputerPilot tool catalog and full authorized operating-system capabilities (files, terminal, Git, testing, documents, browser, jobs, recovery and workflows). Windows-only UI Automation tools are not registered on Linux or macOS. Hosted macOS results validate portable functionality; they do not establish that every interactive or hardware-dependent workflow was tested on a native Mac.
+
+Evidence:
+
+- [Cross-platform runtime hardening report](docs/CROSS-PLATFORM-RUNTIME-HARDENING-REPORT.md)
+- [Windows native acceptance report](docs/WINDOWS-NATIVE-ACCEPTANCE-REPORT.md)
+- [Linux deep integration audit](docs/LINUX-DEEP-INTEGRATION-AUDIT.md)
+- [Linux reliability hardening report](docs/LINUX-RELIABILITY-HARDENING-REPORT.md)
+- [CI run 42442780885](https://github.com/dibbed/computerpilot-mcp/actions/runs/42442780885) and [Platform Validation run 42442780796](https://github.com/dibbed/computerpilot-mcp/actions/runs/42442780796) at `c33004e`
+- [CI workflow](.github/workflows/ci.yml) and [Platform Validation workflow](.github/workflows/platform-validation.yml)
+
+Those runs validated `c33004e`; later commits require their own hosted results. Detailed measurements and known gaps stay in the reports rather than being presented as universal guarantees.
+
 ## Why ComputerPilot MCP
 
 - **One supervised runtime for coding and computer use.** Files, code search, LSP, Git, diagnostics, processes, browser automation, jobs, workflows, recovery, and system inspection share one MCP surface.
@@ -25,9 +57,24 @@ It is designed for developers who want an agent to do real work on a machine wit
 - **Verified remote tunnel bootstrap.** Tunnel mode downloads the official OpenAI Secure MCP Tunnel runtime into local state and verifies release metadata, checksums, and binary version before publication.
 - **Release evidence is reproducible.** CI, platform validation, deterministic packaging, checksums, Doctor checks, benchmarks, and release validation live in the repository.
 
+## Security Model
+
+ComputerPilot is a **full-capability** local automation runtime, not an OS sandbox. Access to the MCP endpoint is equivalent to granting the connected agent the local permissions of the account that runs the server.
+
+- Run the server only under an account whose filesystem, process and desktop access match what you intend to delegate.
+- The local HTTP endpoint and control panel bind to loopback by default; do not expose them directly to untrusted networks. Use the managed Secure Tunnel path for remote access and protect its credentials.
+- Arbitrary terminal commands are conservatively coordinated as **exclusive**. `access="read"` remains a wire-compatibility hint; it does not make arbitrary shell code safe to run concurrently. Native typed readers retain read concurrency.
+- Cancellation operation IDs are process-local **bearer capabilities**, not client authentication. They are not persisted, and durable audit records store only a keyed correlation rather than the raw ID.
+- Uncertain external side effects are not replayed blindly. Durable jobs use their own cancellation contract and are not cancelled by `cancel_operation`.
+- External extensions and language providers run with the server account's permissions. Minimal environments, hashes, process ownership and filters reduce risk but do not create an OS sandbox.
+
+See [SECURITY.md](SECURITY.md) for reporting, the local authority model and operational guidance.
+
 ## Quick Start
 
 The fastest way to try the project without tunnel credentials is loopback-only local HTTP mode.
+
+Requirements: Python 3.10 or newer, Git, and `sh` on Linux/macOS. Browser automation and LSP intelligence have separate optional dependencies.
 
 ### Windows
 
@@ -46,12 +93,18 @@ cd computerpilot-mcp
 MCP_START_MODE=local-http ./start_mcp.sh
 ```
 
+If executable mode was lost while copying files on POSIX:
+
+```sh
+chmod +x start_mcp.sh
+```
+
 The launchers create or reuse `.venv`, validate Python and dependencies, run cached/full startup checks, and start the supervisor.
 
 - MCP endpoint: `http://127.0.0.1:8765/mcp`
 - Local control panel: `http://127.0.0.1:8766/`
 
-For Secure Tunnel mode, browser setup, release archives, and platform-specific notes, see [Installation](docs/installation.md).
+For Secure Tunnel mode, browser setup, language-server configuration, release archives, and platform-specific notes, see [Installation](docs/installation.md).
 
 ## What You Can Do
 
@@ -60,11 +113,11 @@ For Secure Tunnel mode, browser setup, release archives, and platform-specific n
 | Files & editing | bounded reads, search, atomic writes, exact/anchored edits, AST symbol-body edits, transactional unified patches, rollback-capable refactors |
 | Code intelligence | project summaries, Python AST metadata, dependency graphs, consolidated code context, LSP definition/references/symbols/hover/call hierarchy/diagnostics |
 | Git & verification | status/diff/show/blame/merge-base, guarded branch/stage/commit/restore, affected-test selection, pytest, Ruff, mypy, change-aware verification |
-| Terminal & processes | native process execution, background processes, durable jobs, Windows CMD, PowerShell where available, POSIX shell on Linux/macOS |
+| Terminal & processes | native process execution, background processes, durable jobs, Windows CMD, PowerShell where available, POSIX shell on Linux/macOS; arbitrary commands take exclusive coordination, while typed native readers retain read concurrency |
 | Documents | native XLSX/XLSM inspection and guarded edits, DOCX inspection/search/conservative mutation, bounded PDF metadata/text extraction, deterministic text/Markdown PDF creation |
-| Browser | Playwright sessions, bounded semantic snapshots/queries, generation-scoped refs, semantic click/fill/select/waits, tabs, extraction, controlled upload/download, screenshots, isolated contexts, shared compatible browser processes |
+| Browser | Playwright sessions, bounded semantic snapshots/queries, generation-scoped refs, semantic click/fill/select/waits, tabs, extraction, controlled upload/download, screenshots, isolated contexts, shared compatible browser processes, bounded shutdown and idle cleanup |
 | Windows desktop | native screenshots, mouse/keyboard input, semantic UI Automation with bounded locators |
-| Recovery & workflows | mutation journal, evidence-based reconciliation, durable workflow plans, optimistic versions, leases, restart recovery, bounded retries |
+| Recovery & workflows | mutation journal, evidence-based reconciliation, durable workflow plans, optimistic versions, leases, restart recovery, bounded retries, stale-claim reconciliation |
 | Adaptive execution routing | deterministic route candidates/recommendations across native, semantic, and explicitly allowed raw-desktop paths; hard safety constraints and explainable policy metadata |
 | Operations | CPU/memory/disk/process/service/software inspection, health/resource budgets, local control panel, supervised restart/stop |
 | Project memory | bounded versioned records with provenance and optimistic revisions |
@@ -100,8 +153,10 @@ Key runtime invariants:
 - filesystem mutations use scoped locks and guarded edit primitives;
 - durable jobs keep persistent state and disk-backed output;
 - uncertain side effects are not automatically replayed;
-- Windows process ownership uses Job Objects, while POSIX uses sessions/process groups;
-- browser sessions use isolated contexts with bounded pool/session lifetimes;
+- arbitrary terminal commands are coordinated exclusively because arbitrary code cannot be proven read-only; `access="read"` is a compatibility hint, not a concurrency grant;
+- Windows process ownership uses Job Objects, while POSIX uses sessions/process groups, with bounded cancellation and stale-claim reconciliation;
+- browser sessions use isolated contexts with bounded pool/session lifetimes; the shared browser manager is drained and Playwright is stopped when the last server lifetime ends;
+- language servers run under native process ownership with a minimal environment; the Node runtime directory is added only for known launcher dependencies such as the pip `pyright-langserver` wrapper;
 - document mutations use scoped same-file locks, optional SHA-256 preconditions, staged validation, backups, atomic publication, and durable file-hash recovery checkpoints;
 - generated runtime state lives under `.agent_state/` and is excluded from Git.
 
@@ -111,15 +166,15 @@ The opt-in `native_read_batch` tool reduces multiple independent file-window req
 
 ## Platform Support
 
-| Platform | Release status | Native CI | Native desktop / UIA | Notes |
+| Platform | Release label | Validation status | Native desktop / UIA | Notes |
 | --- | --- | --- | --- | --- |
-| Windows amd64 | Supported | Python 3.10 + 3.12 | Yes | Full portable core plus Windows desktop capabilities |
-| Linux amd64 | Preview | Python 3.10 + 3.12 | No | Portable filesystem/documents/terminal/browser/Git/testing/jobs/recovery/workflows |
-| macOS arm64 | Preview | Python 3.10 + 3.12 | No | Portable core; browser is the UI automation path |
-| Linux arm64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed in v0.9.0 |
-| macOS amd64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed in v0.9.0 |
+| Windows amd64 | Supported | CI + Platform Validation + native interactive acceptance | Yes | Full portable core plus Windows desktop capabilities; 152-tool full profile observed |
+| Linux amd64 | Preview | CI + Platform Validation + native Linux acceptance | No | Portable filesystem/documents/terminal/browser/Git/testing/jobs/recovery/workflows; 138-tool POSIX full profile observed |
+| macOS arm64 | Preview | CI + Platform Validation | No | Portable core; browser is the UI automation path; native interactive acceptance not claimed |
+| Linux arm64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed |
+| macOS amd64 | Preview package target | Packaging/updater mapping | No | No dedicated hosted-runner execution claimed |
 
-The release workflow builds five target archives from the same tracked source. Platform claims and limitations are documented in [Platform support](docs/platform-support.md).
+The release workflow builds five target archives from the same tracked source. Linux and macOS remain labeled **Preview** because the project does not claim exhaustive coverage of every distribution, desktop environment, interactive workflow, or architecture. The portable tool catalog and full authorized OS capabilities are supported on Linux; Windows-only UI Automation is not emulated there. Platform claims and limitations are documented in [Platform support](docs/platform-support.md).
 
 ## Practical Agent Workflows
 
@@ -262,7 +317,9 @@ python -m playwright install chromium
 python -m scripts.doctor --mode local-http --browser
 ```
 
-Playwright sessions use isolated contexts. Compatible sessions can share a browser process, and idle sessions/pools are bounded by runtime budgets.
+Playwright sessions use isolated contexts. Compatible sessions can share a browser process, and idle sessions/pools are bounded by runtime budgets. When the last MCP server lifetime ends, the shared browser manager fences new work, drains sessions and pools, and stops the Playwright driver; incomplete cleanup stays fenced and is retried before reuse.
+
+Real Chromium acceptance on Linux and Windows covered semantic snapshots, fill/select/click, extraction, context isolation, uploads, downloads and shutdown with no remaining browser process. Public-site behavior, browser crash recovery and live idle-eviction timing are not universal guarantees.
 
 The semantic browser layer prefers accessible meaning over raw selectors or coordinates:
 
@@ -277,6 +334,22 @@ browser_wait_for
 ```
 
 Snapshot node refs are generation-scoped. Navigation, semantic mutations, or tab changes invalidate old refs, so stale targets fail closed instead of silently acting on a changed page. `browser_extract` returns bounded text, links, tables, form fields, or a selected subtree. Uploads require an explicit local file, and downloads are saved under controlled runtime storage with filename sanitization and a configured byte limit.
+
+## Language Intelligence (LSP)
+
+The seven read-only LSP tools default to a trusted discovered `pyright-langserver --stdio`. ComputerPilot does not install a language server automatically and never accepts an arbitrary language-server command from an MCP caller.
+
+Install Pyright with the operator's normal tooling, for example:
+
+```sh
+python -m pip install pyright
+# or, for a bundled Node runtime:
+python -m pip install "pyright[nodejs]"
+```
+
+The pip Pyright launcher resolves Node through `PATH`. ComputerPilot's provider environment is deliberately minimal, but it adds the discovered Node directory for the Pyright launcher so the supported pip route works without inheriting the rest of the parent environment. If neither a system Node runtime nor the optional bundled `nodejs` wheel is available, install one of them; see [Troubleshooting](docs/troubleshooting.md#lsp-tools-cannot-start).
+
+Real Pyright acceptance covered cross-file definitions, references, pull diagnostics, on-disk edit synchronization, restart and owned process cleanup on Linux and Windows. Opt-in persistent sessions use reviewed provider configuration (`MCP_LSP_PERSISTENT_ENABLED`, `MCP_LSP_PROVIDERS_CONFIG`); listing, health and catalog construction never launch a provider. Other providers and real-provider macOS execution remain unverified; see [provider configuration](docs/configuration.md#persistent-language-providers) and [tooling](docs/tooling.md#profiles).
 
 ## Native Document Intelligence
 
@@ -320,28 +393,34 @@ The repository's normal CI matrix runs on Windows, Linux, and macOS with Python 
 - mypy;
 - MCP startup check;
 - MCP health smoke;
-- full pytest.
+- the full pytest suite.
 
-Release preparation also has:
+**Platform Release Validation** runs on Windows, Linux, and macOS with Python 3.12. It executes the launcher and Full Doctor gates, startup/catalog checks, the benchmark, and a multi-workflow restart soak. **Release Packaging Smoke** builds all five archives and validates `SHA256SUMS.txt`.
 
-- **Platform Release Validation** on Windows, Linux, and macOS with Python 3.12;
-- **Release Packaging Smoke** that builds all five archives and validates `SHA256SUMS.txt`;
-- exact-SHA publication gates for release commits.
+Cross-platform hardening evidence:
 
-Release-specific evidence is stored under `docs/V*-VALIDATION.md`. The current release evidence is [v0.9.0 validation](docs/V0.9.0-VALIDATION.md); earlier releases remain in the same directory and [docs/README.md](docs/README.md) lists them.
+- Linux: hosted CI (**2,516 passed, 24 skipped** at `c33004e`), real MCP stdio/HTTP integration, POSIX cancellation and process-tree recovery, runtime claim reconciliation, real Chromium and Pyright acceptance, and a 181-second live MCP soak with 10,083 calls and no failures.
+- Windows 10 Enterprise x64: full profile at 152 tools, hosted CI (**2,526 passed, 14 skipped** at `c33004e`), local grouped acceptance (**2,505 passed, 35 skipped**) and a final local ungrouped run (**2,508 passed, 35 skipped**), real CMD/PowerShell/process execution, Job Object ownership and cancellation, isolated UI Automation fixture, Chromium uploads/downloads, Pyright, synthetic schema v12 migration, and a 181-second native soak.
+- macOS: hosted CI (**2,516 passed, 24 skipped** at `c33004e`) plus Platform Validation passed. This is CI coverage; it is not a native interactive desktop acceptance claim.
+
+The last externally verified baseline is [CI run 42442780885](https://github.com/dibbed/computerpilot-mcp/actions/runs/42442780885) (six jobs) and [Platform Validation run 42442780796](https://github.com/dibbed/computerpilot-mcp/actions/runs/42442780796) (three jobs) at `c33004e`. Later commits, including the final documentation and Pyright launcher regression coverage, must pass the same workflows on their own SHA. Detailed results, timings and residual gaps are in the [cross-platform report](docs/CROSS-PLATFORM-RUNTIME-HARDENING-REPORT.md) and [Windows acceptance report](docs/WINDOWS-NATIVE-ACCEPTANCE-REPORT.md); release-specific evidence remains under `docs/V*-VALIDATION.md`.
 
 Run the common checks locally:
 
 ```sh
-python -m pytest
+python -m compileall -q core tools scripts tests
 python -m ruff check .
 python -m mypy core tools scripts tests
+python main.py --check
 python -m scripts.health_check --json
+python -m pytest
 ```
 
-See [Contributing](CONTRIBUTING.md) for the full development workflow.
+See [Contributing](CONTRIBUTING.md) and [Testing standards](docs/development/TESTING-STANDARDS.md) for the full development workflow.
 
 ## Release Artifacts
+
+The latest **published** release is 0.9.0. The cross-platform hardening described in this README is current source and has not been published as a new version; packaging or tagging it requires a separate release decision.
 
 Published releases contain deterministic source/runtime-controller archives for:
 
@@ -354,7 +433,7 @@ Published releases contain deterministic source/runtime-controller archives for:
 
 Each archive includes `RELEASE-MANIFEST.json`. Packaging is built from tracked Git blobs and fails if forbidden runtime, secret, virtualenv, test-cache, or generated-output paths are tracked.
 
-Browse the [latest release](https://github.com/dibbed/computerpilot-mcp/releases/latest).
+Browse the [latest release](https://github.com/dibbed/computerpilot-mcp/releases/latest) or the [release process](docs/release-process.md).
 
 ## Documentation
 
@@ -363,7 +442,9 @@ Browse the [latest release](https://github.com/dibbed/computerpilot-mcp/releases
 | [Documentation index](docs/README.md) | public documentation map |
 | [Installation](docs/installation.md) | source/release setup, local HTTP, tunnel, browser |
 | [Architecture](docs/architecture.md) | runtime components and reliability model |
-| [Platform support](docs/platform-support.md) | OS/architecture capability matrix |
+| [Platform support](docs/platform-support.md) | OS/architecture capability matrix and validation scope |
+| [Cross-platform hardening report](docs/CROSS-PLATFORM-RUNTIME-HARDENING-REPORT.md) | Linux/macOS/Windows evidence, fixes and residual risks |
+| [Windows native acceptance report](docs/WINDOWS-NATIVE-ACCEPTANCE-REPORT.md) | native Windows terminal, UIA, browser, LSP and soak evidence |
 | [Tooling and workflows](docs/tooling.md) | tool domains, profiles, practical workflows |
 | [Configuration](docs/configuration.md) | environment variables and resource budgets |
 | [Troubleshooting](docs/troubleshooting.md) | startup, browser, tunnel, catalog, recovery |
@@ -379,14 +460,22 @@ Historical release notes and validation records remain under `docs/`. Internal l
 
 ## Known Limits
 
-- Native desktop screenshot/input and semantic UI Automation are Windows-only.
-- Linux and macOS support is still labeled preview.
-- Linux arm64 and macOS amd64 are package targets without a dedicated native hosted-runner claim in v0.9.0.
-- Browser automation requires Playwright and installed browser runtimes.
+- Native desktop screenshot/input and semantic UI Automation are Windows-only. Linux and macOS use the portable tools and browser automation instead.
+- Linux and macOS remain labeled **Preview**. The project does not claim exhaustive coverage of every distribution, desktop environment, interactive workflow or architecture.
+- macOS passed hosted CI and Platform Validation, but native interactive desktop acceptance on a physical Mac is not claimed.
+- Linux arm64 and macOS amd64 are package targets without a dedicated native hosted-runner claim.
+- Browser automation requires Playwright and installed browser runtimes. Real Chromium acceptance used disposable local fixtures; public-site behavior, crash recovery and live idle-eviction timing are not universal guarantees.
 - Excel document tools support `.xlsx` and `.xlsm`; macro mutation is accepted only when VBA bytes can be verified unchanged.
 - DOCX mutation is intentionally conservative: `.docm`, tracked changes, comments, headers/footers, arbitrary XML edits, and ambiguous mixed-format replacements are not supported.
 - PDF creation uses built-in PDF fonts and a limited Markdown subset; complex-script shaping and arbitrary editing of existing PDFs are not supported.
-- LSP tools default to trusted `pyright-langserver --stdio` on `PATH`; opt-in persistent providers use reviewed local configuration. The MCP does not install providers implicitly; real-provider acceptance is Windows-specific.
+- The default one-shot LSP path uses a discovered `pyright-langserver --stdio`. The pip launcher needs Node discoverable at server startup or the optional `pyright[nodejs]` wheel. Real Pyright acceptance is verified on Linux and Windows; macOS and other providers remain unverified. The MCP does not install providers implicitly.
+- Persistent LSP sessions are opt-in through reviewed local configuration. Listing, health and catalog construction never launch a provider.
+- A live authenticated Secure Tunnel session and a real third-party extension were not exercised in the recorded acceptance because no authorized credentials were available; offline tunnel verification and local extension fixtures passed.
+- The 181-second Linux and Windows soaks are bounded observations, not multi-hour leak proofs.
+- A real private production database was not opened or migrated during acceptance. Synthetic schema v5/v9/v10/v11-to-v12 migration, rollback, WAL and future-schema rejection are covered by tests.
+- Cancellation IDs are bearer capabilities, not authentication. Do not log or share active IDs, and do not expose the MCP endpoint to untrusted clients.
+- Arbitrary terminal commands are serialized per host by design; callers that need read concurrency should use the native typed readers.
+- Uncertain external side effects remain uncertain until reconciled; they are not made transactional by the recovery journal.
 - The local HTTP endpoint and control panel are intended for loopback use, not direct exposure to untrusted networks.
 - Built-in workflows deliberately avoid blind push/tag/deploy behavior.
 

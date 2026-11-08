@@ -100,8 +100,8 @@ Browser security was not weakened and no user browser profile or cookies were us
 
 - Raw provider handshake: a direct stdio `initialize` to the pip `pyright-langserver` succeeds only with a full parent environment on this host — VERIFIED.
 - Root cause of the native-session failure: the provider environment narrowed by ComputerPilot omitted the Windows user-profile variables. The pyright launcher crashed at import with `RuntimeError: Could not determine home directory`. Fixed and covered by a regression test — FIXED AND VERIFIED.
-- End-to-end `scripts/real_lsp_acceptance.py` still reports `source_index: FAIL:lsp_session_failed`, both with the global pip launcher and with an isolated `pyright[nodejs]` install. The provider process starts (RSS ~86 MB) but the session never reaches document symbols. The remaining failure is not the home-directory crash and was not root-caused within this acceptance window — PARTIALLY VERIFIED / UNVERIFIED.
-- Cleanup after the failed session: `cleanup: PASS`, no orphan PIDs — VERIFIED.
+- End-to-end `scripts/real_lsp_acceptance.py` initially reported `source_index: FAIL:lsp_session_failed` with the global pip launcher. The launcher could not resolve `node` through the deliberately minimal provider `PATH` and fell back to the network-dependent `nodeenv` path. This was root-caused and fixed in `tools/language/transport.py`; the final pip-launcher acceptance passes. See section 18 — FIXED AND VERIFIED.
+- Cleanup after the earlier failed session: `cleanup: PASS`, no orphan PIDs — VERIFIED.
 
 ## 8. Extensions and Secure Tunnel
 
@@ -211,7 +211,7 @@ This section records a later run and supersedes the preceding sections only wher
 - **VERIFIED:** A real isolated Chromium session, reached via MCP stdio and a loopback HTTP fixture, passed semantic snapshot, fill, select, click and text extraction. A second session retained independent page state; both sessions closed, and no process from the copied Chromium directory remained afterward. A further run verified the exact uploaded file contents on the page and checked the downloaded file's path, contents and reported byte count.
 - **PARTIALLY VERIFIED:** Browser cancellation and idle eviction were not repeated here. Both smoke runs exited successfully but their stderr contained an asyncio subprocess-destructor `RuntimeError: Event loop is closed`; its owning component and implications were not established. Do not treat the absence of a surviving Chromium process as proof of all transport cleanup.
 - **VERIFIED:** The real Pyright acceptance script, using system Node and the isolated Pyright JavaScript entry point, passed cross-file definitions, references, diagnostics, edit synchronization, restart and process cleanup twice; no orphan PIDs remained. The script exercises the language session manager, not MCP transport. Its `source_index` received a reply.
-- **UNVERIFIED:** The earlier failing Python/Node wrapper-launcher route, LSP cancellation over MCP, and the reason that route failed were not resolved by the successful direct-Node run.
+- **UNVERIFIED at this checkpoint (resolved in section 18):** The earlier failing Python/Node wrapper-launcher route, LSP cancellation over MCP, and the reason that route failed were not resolved by the successful direct-Node run.
 - **VERIFIED:** Grouped tests included 26 local extension fixture cases and nine real-provider lifecycle cases using repository-owned subprocess fixtures. These are not a live third-party service.
 - **PARTIALLY VERIFIED:** 29 tunnel-runtime and 26 supervisor tests passed; no tunnel binary was found on this session's `PATH`. A real authenticated or externally exposed tunnel was not started, and private tunnel configuration was not inspected.
 
@@ -231,7 +231,7 @@ Each group used a distinct disposable base directory and a 120-second per-test t
 
 - **FIXED AND VERIFIED:** A Windows Job Object test observed an existing but still-empty PID fixture file and raised `JSONDecodeError`. The fixture now publishes the completed file with an atomic rename. The original test and surrounding suite passed afterward; process ownership assertions were preserved.
 - **FIXED AND VERIFIED:** A resource-claim test replaced `sleep` on the shared Python `time` module, exposing unrelated background threads to its failing stub. The stub is now scoped to the resource-claim module; the affected claim, timing and Job Object tests passed together (83 passed, one skipped).
-- **UNVERIFIED:** Before these edits, one ungrouped full run timed out in `test_completed_timing_history_is_bounded_and_latest_records_survive` while `flush_timings()` waited for its queue; a timing writer was idle on queue input. The shared-clock patch is a plausible contributor, but the exact cause was not proven. The grouped pass does not prove that a single-process full-suite run now completes.
+- **UNVERIFIED at this checkpoint (addressed by the ungrouped run in section 18):** Before these edits, one ungrouped full run timed out in `test_completed_timing_history_is_bounded_and_latest_records_survive` while `flush_timings()` waited for its queue; a timing writer was idle on queue input. The shared-clock patch is a plausible contributor, but the exact cause was not proven. The grouped pass does not prove that a single-process full-suite run now completes.
 
 ### Bounded resource run
 
@@ -241,7 +241,7 @@ A separate 182.28-second stdio run performed 232 disposable read, write, CMD and
 
 Historical baseline runs `42118454560` and `42118454569` succeeded at `c3496172773654534eb0307f41981852f15a8bba`. At the start of this recheck, CI run `42433807442` and platform run `42433807367` succeeded at `bfc318084d503056b8c30de20b6e9e61adb411d0`. After the test fixes, [CI run 42438687907](https://github.com/dibbed/computerpilot-mcp/actions/runs/42438687907) and [platform validation 42438687906](https://github.com/dibbed/computerpilot-mcp/actions/runs/42438687906) succeeded at `c711ee3b40baee2dbb8253c3f26d8625e65c6505`, including both Windows CI jobs and the Windows platform gate. A later report-only update records those results and the additional transfer check; its own CI must be checked at its exact SHA. `main` was observed at `b88a2e17040036181ed99be3a0a0122c4dcb5e88`.
 
-**READY WITH DOCUMENTED LIMITATIONS** for review, not release: the grouped Windows suite and the listed native checks passed, but the ungrouped timeout, earlier LSP wrapper failure, subprocess-destructor warning, untested external tunnel and long-duration handle behavior remain open. No production defect was conclusively established by this recheck. No merge, release, or production database migration was performed.
+**READY WITH DOCUMENTED LIMITATIONS** for review, not release: the grouped Windows suite and the listed native checks passed, but the ungrouped timeout, earlier LSP wrapper failure, subprocess-destructor warning, untested external tunnel and long-duration handle behavior remain open at this checkpoint. No production defect was conclusively established by this recheck. No merge, release, or production database migration was performed. Section 18 resolves the wrapper-launcher route and records an ungrouped full-suite run.
 
 ## 17. Browser shutdown fix and final native recheck
 
@@ -251,9 +251,47 @@ This later section supersedes section 16's browser-shutdown warning and its stat
 - The fix drains the manager when its last shared server lifetime ends: it fences new browser operations, waits for existing session and idle-cleanup activity, closes sessions and pools, and stops Playwright. Failed or cancelled cleanup remains fenced and is retried before reuse; startup and shutdown retries have bounded deadlines, startup failure cancels already-created tasks, and warnings and errors do not include provider exception text. The shared runtime is retained while another server lifetime is active.
 - **VERIFIED:** Real stdio MCP runs against the local fixture passed with sessions explicitly closed and with two sessions deliberately left open. Both final-source runs completed with zero server stderr bytes and no remaining process from the isolated Chromium directory. Snapshot, fill, select, click, extraction, upload contents, download contents and byte metadata were checked.
 - **VERIFIED:** The browser/lifecycle/profile/MCP/extension focused suite passed **135 tests**. Regressions cover shared lifetimes, admission fencing, active and unpublished sessions, external idle cleanup, failed and cancelled cleanup, redacted errors, bounded startup and partially started lifespan cleanup. The tests use local fakes where appropriate; the real Chromium checks above are separate.
-- **VERIFIED:** Four non-overlapping Windows groups, all collected after the last production edit, covered 160 test files: **2505 passed, 35 skipped, 0 failed**. The groups had 577/8, 760/4, 722/19 and 446/4 passed/skipped respectively. The earlier ungrouped timeout in section 16 remains historical evidence; an ungrouped run after this fix was not performed.
+- **VERIFIED:** Four non-overlapping Windows groups, all collected after the last production edit, covered 160 test files: **2505 passed, 35 skipped, 0 failed**. The groups had 577/8, 760/4, 722/19 and 446/4 passed/skipped respectively. The earlier ungrouped timeout in section 16 remains historical evidence; section 18 records a later ungrouped run on the integration tree.
 - **VERIFIED:** `compileall`, full Ruff, full mypy (313 files), `main.py --check`, health and Windows platform validation passed on this source. Startup reported 152 unique tools. Platform validation included the launcher, Full Doctor, quick benchmark and 60-workflow restart soak.
 - **VERIFIED:** A 181.16-second stdio soak performed 252 file, CMD, health and repeated browser-session operations with zero reported failures. Mean latency was 25.94 ms and p95 63.0 ms. Sampled aggregate owned-process CPU was 3.52% of one core; working set was 367,988,736 bytes initially, 348,483,584 bytes finally and 368,848,896 bytes peak. Handles were 2,002 initially, 2,008 finally and 2,032 peak; threads were 126 initially, 100 finally and 126 peak; peak sampled process count was seven. Active and quarantined claims were zero at both endpoints. Shutdown took 0.422 seconds and no sampled owned processes survived. CPU sampling can miss short-lived children; this is not multi-hour evidence.
 - **VERIFIED:** Before the browser fix, all six CI matrix jobs in [run 42439462934](https://github.com/dibbed/computerpilot-mcp/actions/runs/42439462934) and all three platform jobs in [run 42439462881](https://github.com/dibbed/computerpilot-mcp/actions/runs/42439462881) passed at `ae4f3bea1ac7b968781734b4039ec81a7520dcf7`. They do not validate the later browser fix. Its pushed commit and this report's exact SHA require their own hosted results.
 
-**READY WITH DOCUMENTED LIMITATIONS** for review, subject to the new commit's hosted checks. The direct-Node Pyright path was verified; the earlier wrapper-launcher failure remains unresolved. Browser cancellation and idle eviction were not repeated with a real browser in the final recheck; a live external tunnel, multi-hour stability, and browser-manager use across multiple event loops remain unverified. The private production database was not accessed or migrated. No merge or release was performed.
+**READY WITH DOCUMENTED LIMITATIONS** for review, subject to the new commit's hosted checks. The direct-Node and pip-wrapper Pyright paths are both verified (section 18). Browser cancellation and idle eviction were not repeated with a real browser in the final recheck; a live external tunnel, multi-hour stability, and browser-manager use across multiple event loops remain unverified. The private production database was not accessed or migrated. No merge or release was performed by the evidence in this section.
+
+## 18. Pyright pip-wrapper resolution and final integration
+
+This section records the final integration work performed after section 17. It covers source under the cross-platform hardening branch after the browser fix, including the LSP launcher fix and documentation refresh. The starting source was `c33004e49cd3a5a47650b11c2640f9670c67abda`; the fix and tests below are the changes after that baseline.
+
+### 18.1 Confirmed defect and fix
+
+- **ROOT CAUSE:** The supported pip `pyright-langserver` console launcher resolves its Node runtime through `PATH`. ComputerPilot deliberately launches language servers with a minimal environment containing only pinned provider directories, so the launcher could not see a system Node installation. It then attempted a network-dependent `nodeenv` fallback and failed with `RuntimeError: nodeenv failed`; `source_index` never completed. The failure was a supported-path defect, not merely an environment problem.
+- **FIX:** `tools/language/transport.py` now resolves a bounded launcher runtime. `_launcher_runtime_paths()` detects executable names beginning with `pyright-langserver`, locates `node` with `shutil.which`, and returns only that directory. `build_environment()` appends those runtime directories to the pinned `PATH`, and both provider launch paths pass them to `_spawn`. No other parent variable (`PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `NODE_PATH`, shell loader variables or credentials) is inherited.
+- **REGRESSION COVERAGE:** Three tests in `tests/test_lsp_sessions.py` verify the launcher lookup, the exact environment construction, the provider launch path and the one-shot command path. The focused LSP file passed after the change.
+
+### 18.2 Real acceptance
+
+The ordinary pip launcher was exercised directly:
+
+```powershell
+.venv\Scripts\python.exe scripts\real_lsp_acceptance.py python --executable C:\Users\Meliodas\AppData\Local\Programs\Python\Python312\Scripts\pyright-langserver.exe
+```
+
+The run exited 0 with `source_index: REPLIED` and PASS for definitions, cross-file definitions, references, pull diagnostics, on-disk edit synchronization, diagnostics after edit and restore, restart, diagnostics after restart and cleanup. Eight provider processes were observed as owned, `orphan_pids` was empty, and the ephemeral workspace was removed. The launcher SHA-256 was `a77919b40ae218dbb734a2a4f002468b938e8c16e2c058a3662ec9a993d33abb`.
+
+### 18.3 Final gates
+
+| Gate | Result |
+| --- | --- |
+| `compileall` | PASS |
+| Ruff (full repository) | PASS |
+| mypy (313 files; native, `--platform win32`, `--platform linux`) | PASS |
+| `main.py --check` | PASS, 152 unique tools |
+| Health smoke | PASS, 5/5 checks |
+| Windows platform validation | PASS (launcher, Full Doctor, quick benchmark, 60-workflow soak) |
+| Full pytest (ungrouped, serial) | **2,508 passed, 35 skipped, 0 failed** (621.24 s) |
+| `git diff --check` | PASS |
+| Real Pyright pip-launcher acceptance | PASS |
+
+### 18.4 Scope
+
+These results validate Windows amd64 source integration and the shared portable code path. Hosted Linux and macOS results for the final commit are a separate gate and are not inferred from this local evidence. No merge, tag, release, package publication or version change is part of section 18.

@@ -129,9 +129,13 @@ python -m scripts.doctor --mode local-http --browser
 
 ## LSP tools cannot start
 
-Confirm `pyright-langserver` is already available on `PATH`.
+Confirm `pyright-langserver` is already available on `PATH` and that the runtime it needs is available:
 
-The MCP intentionally does not install an LSP server or execute arbitrary caller-supplied language-server commands.
+- A pip-installed `pyright-langserver` launcher resolves Node through `PATH`. Install Node, or use `python -m pip install "pyright[nodejs]"` for a bundled runtime.
+- A direct Node provider configuration uses the pinned `node` executable plus the Pyright language-server entrypoint.
+- Persistent providers require a reviewed local configuration file; start with the default one-shot mode while diagnosing.
+
+Check that the language-server executable has not changed if a persistent provider is pinned by SHA-256. The MCP intentionally does not install an LSP server or execute arbitrary caller-supplied language-server commands. On success, a real Pyright session should return document symbols and diagnostics; cleanup must leave no owned provider process behind.
 
 ## A new tool does not appear in the client
 

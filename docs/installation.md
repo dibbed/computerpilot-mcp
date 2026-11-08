@@ -130,9 +130,15 @@ pyright-langserver --stdio
 
 on `PATH`.
 
+Install Pyright with the operator's normal tooling. The pip launcher resolves Node through `PATH`; ComputerPilot adds the discovered Node directory to the language-server environment without inheriting the rest of the parent environment. If Node is not installed system-wide, use the optional bundled runtime:
+
+```sh
+python -m pip install "pyright[nodejs]"
+```
+
 ComputerPilot MCP does not install a language server implicitly and does not accept an arbitrary language-server executable from an MCP caller.
 
-Persistent Python/TypeScript/PHP sessions in 0.9.0 are opt-in through reviewed local configuration, `MCP_LSP_PERSISTENT_ENABLED` and `MCP_LSP_PROVIDERS_CONFIG`. Catalog/health reads do not start them. See [configuration](configuration.md#persistent-language-providers) and [real-provider limits](development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md).
+Real Pyright acceptance (cross-file definitions, references, diagnostics, edit synchronization, restart and owned cleanup) passed on Linux and Windows. macOS real-provider execution and other providers remain unverified. Persistent Python/TypeScript/PHP sessions are opt-in through reviewed local configuration, `MCP_LSP_PERSISTENT_ENABLED` and `MCP_LSP_PROVIDERS_CONFIG`. Catalog/health reads do not start them. See [configuration](configuration.md#persistent-language-providers) and [real-provider limits](development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md).
 
 ## Validate the installation
 
