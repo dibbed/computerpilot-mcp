@@ -1,0 +1,190 @@
+# Windows-Native Acceptance Report
+
+Branch: `fix/cross-platform-runtime-hardening`
+Starting source SHA: `d2d396fcc0ff985e63e01de7e8f488da1d0690de`
+Host: physical Windows 10 workstation with an unlocked interactive desktop
+Evidence date: 2026-11-08
+
+Labels used below: **VERIFIED**, **FIXED AND VERIFIED**, **PARTIALLY VERIFIED**, **UNVERIFIED**, **BLOCKED**, **FAILED**.
+
+## 1. Windows environment
+
+| Item | Value | Status |
+| --- | --- | --- |
+| OS | Windows 10 Enterprise, build 19045 | VERIFIED |
+| Architecture | AMD64 (8 logical CPUs, 15.8 GB RAM) | VERIFIED |
+| Session | Interactive Console session with an accessible desktop | VERIFIED |
+| Python | CPython 3.12.8 in an isolated `.venv` (3.11 also installed) | VERIFIED |
+| PowerShell | 5.1.19041.6456 | VERIFIED |
+| Git | 2.56.0.windows.2 | VERIFIED |
+| GitHub CLI | 2.74.2, existing keyring authentication, no re-login | VERIFIED |
+| Node.js | v22.18.0 | VERIFIED |
+| Pyright | 1.1.403 (global pip launcher and an isolated `pyright[nodejs]` install) | VERIFIED |
+| UI Automation | Operational; 8 top-level windows enumerated | VERIFIED |
+| Existing ComputerPilot process | None running before acceptance | VERIFIED |
+
+The protected original workspace was not used for development, was not re-branched, and its `.agent_state`, `.secrets`, `uv.lock`, logs and user data were not modified.
+
+## 2. Isolated checkout
+
+- Checkout: `G:\sample` (dedicated clone; separate from the protected workspace).
+- Branch: `fix/cross-platform-runtime-hardening`; remote `https://github.com/dibbed/computerpilot-mcp.git`.
+- Starting HEAD matched the remote branch at `d2d396fcc0ff985e63e01de7e8f488da1d0690de`.
+- Dependencies installed only in the isolated `.venv` (`requirements-dev.txt`, `requirements-browser.txt`, Playwright Chromium headless shell).
+
+## 3. MCP startup and Windows full profile
+
+- `python main.py --check` -> `{"ok":true,"server":"ali_windows_agent_mcp","version":"0.9.0","tool_count":152,"unique_tool_names":true}` — VERIFIED.
+- `python -m scripts.health_check --json` -> `ok:true`, 152 tools, `mcp_startup`, `tool_registration`, `filesystem`, `terminal` all true, workflow health clean — VERIFIED.
+- Full-capability design preserved: no read-only conversion, no repository-root restriction, absolute paths, mutation, terminal, UIA, browser, workflow and durable-job tools remain registered.
+- The tool count is 152 in this configuration; it is reported as an observed value, not a hard requirement. Batch-enabled configurations can add tools.
+
+## 4. Native terminal, process ownership and cancellation
+
+Real MCP stdio requests against the running server produced 25 PASS results and one harness-expectation mismatch (not a product failure):
+
+| Area | Evidence | Status |
+| --- | --- | --- |
+| `run_process` unicode + working directory | Unicode payload and spaces-in-path cwd returned correctly | VERIFIED |
+| Exit codes | Non-zero exit propagated | VERIFIED |
+| stdout/stderr capture | Separate streams preserved | VERIFIED |
+| Output truncation | `stdout_limit` enforced with truncation metadata | VERIFIED |
+| Environment handling | Explicit per-call environment value reached child process | VERIFIED |
+| Spawn failure | Structured `ok:false` failure, no crash | VERIFIED |
+| Timeout | Timed out, `timed_out:true`, process reaped | VERIFIED |
+| Windows Job Object tree | Parent/child/grandchild tree killed; no survivors | VERIFIED |
+| `run_cmd` | Quoting, exit code, unicode | VERIFIED |
+| `run_powershell` | Exit code, unicode stdout, stderr | VERIFIED |
+| `access="read"` on terminal command | Effective access remained exclusive | VERIFIED |
+| Concurrent writers | Serialized by exclusive coordination | VERIFIED |
+| Native read-only readers | Concurrent readers completed | VERIFIED |
+| Cancellation in flight | `cancelled:true`, tree reaped | VERIFIED |
+| Cancellation after completion | `operation_finished`, no side effect | VERIFIED |
+| Unknown operation id | Structured error | VERIFIED |
+| Malformed operation id | Structured `invalid_operation_id` envelope (harness expected a raised error; server behavior is correct) | VERIFIED |
+| Background process kill | Target PID tree terminated, `alive_pids: []` | VERIFIED |
+| Audit redaction | 8 correlation records, raw bearer id absent | VERIFIED |
+
+Ownership backend reported `windows_job` for owned processes. Exclusive-claim metadata reported `effective_access="exclusive"` with reason `terminal_command_read_untrusted`.
+
+## 5. Desktop and UI Automation
+
+A disposable WinForms fixture plus a temporary Notepad document were used; no user applications or personal documents were touched.
+
+- Desktop availability and window enumeration: VERIFIED.
+- Window targeting and foreground switch to the fixture window: VERIFIED.
+- UIA element tree retrieval, button lookup by automation id, `ui_invoke` button activation: VERIFIED.
+- `ui_set_value` into the fixture text field and read-back: VERIFIED.
+- Keyboard input into Notepad (`typed-by-computerpilot ✓` plus a second line): VERIFIED.
+- Mouse click on the fixture button: VERIFIED.
+- Screenshot of a test-only region (460x20 PNG): VERIFIED (kept outside Git).
+- Closed-window error: `uia_window_not_found` — VERIFIED.
+- Fixture processes terminated and confirmed not alive: VERIFIED.
+- UIA recovery journal: the file exists but contained 0 bytes after the mutations; whether that is expected for this server configuration was not established — PARTIALLY VERIFIED.
+
+Two harness expectations were refined during review: the window tree legitimately contains title-bar buttons alongside `FixtureButton`, and the recovery journal assertion needs a documented expected-content contract.
+
+## 6. Browser
+
+Real Chromium (Playwright headless shell) against a local HTTP fixture:
+
+- Open page, semantic snapshot, fill, select, click, content extraction, session isolation, tabs, screenshot, close: VERIFIED.
+- Multiple isolated sessions and close/release: VERIFIED.
+- No Chromium processes remained after session close: VERIFIED.
+- Upload: the page received the uploaded content (`uploaded-bytes=188`); the tool result did not expose a `bytes` field, so the harness assertion failed — PARTIALLY VERIFIED.
+- Download: the page served the download, but the tool reported path `.` with no byte count; the saved artifact location/size was not confirmed — PARTIALLY VERIFIED.
+
+Browser security was not weakened and no user browser profile or cookies were used.
+
+## 7. Language server (LSP)
+
+- Raw provider handshake: a direct stdio `initialize` to the pip `pyright-langserver` succeeds only with a full parent environment on this host — VERIFIED.
+- Root cause of the native-session failure: the provider environment narrowed by ComputerPilot omitted the Windows user-profile variables. The pyright launcher crashed at import with `RuntimeError: Could not determine home directory`. Fixed and covered by a regression test — FIXED AND VERIFIED.
+- End-to-end `scripts/real_lsp_acceptance.py` still reports `source_index: FAIL:lsp_session_failed`, both with the global pip launcher and with an isolated `pyright[nodejs]` install. The provider process starts (RSS ~86 MB) but the session never reaches document symbols. The remaining failure is not the home-directory crash and was not root-caused within this acceptance window — PARTIALLY VERIFIED / UNVERIFIED.
+- Cleanup after the failed session: `cleanup: PASS`, no orphan PIDs — VERIFIED.
+
+## 8. Extensions and Secure Tunnel
+
+- Repository extension lifecycle/transport tests pass in isolation on this host (see section 10).
+- A live third-party extension and an authenticated Secure Tunnel session were not exercised: no authorized fixtures or credentials were available, and starting an externally exposed tunnel was not authorized — UNVERIFIED / BLOCKED.
+- Tunnel binary discovery and offline failure handling are covered by repository tests, not by a live tunnel.
+
+## 9. SQLite schema v12
+
+- Migration and workflow-store tests were run from the repository suite on Windows (focused results in section 10).
+- Fresh creation, upgrade, WAL mode, concurrent connections and future-schema rejection are exercised by those tests.
+- The private production database in the protected workspace was intentionally not opened, copied or migrated.
+
+## 10. Verification gates
+
+Static gates, after the source changes:
+
+- `python -m compileall -q core tools scripts tests` -> exit 0 — VERIFIED.
+- `python -m ruff check .` -> `All checks passed!` after the local `.validation` harnesses were moved outside the tree — VERIFIED.
+- `python -m mypy core tools scripts tests` -> `Success: no issues found in 313 source files` — VERIFIED.
+- Focused tests: LSP environment filtering, the new Windows home-directory test, the benchmark timeout test and platform-validation launcher test pass — VERIFIED.
+
+Full-suite execution:
+
+| Group | Files | Result |
+| --- | --- | --- |
+| 1 | 40 | 571 passed, 8 skipped (147 s) |
+| 2 | 40 | 756 passed, 4 skipped, 2 failed (see below) |
+| 3 | 40 | 722 passed, 19 skipped (203 s) |
+| 4 | 40 | 446 passed, 4 skipped (96 s) |
+| Combined | 160 | **2495 passed, 35 skipped, 2 failed** in the grouped run |
+
+The four groups are deterministic, non-overlapping file ranges. The only failures were two `tests/test_launcher.py` cases that invoked `cmd.exe /c START_MCP.bat` by bare relative name; this host sets `NoDefaultCurrentDirectoryInExePath=1`, so cmd.exe refused to resolve the batch file. After switching the test invocation to the absolute path (no assertion weakened), `tests/test_launcher.py` passes 4/4. Effective post-fix total: **2497 passed, 35 skipped, 0 failed**.
+
+Known issue observed during full-suite execution: an early ungrouped run stalled at 82%, and a grouped run stalled at 87% inside `tests/test_extension_fixture.py::test_fixture_root_exit_retains_owned_child_and_grandchild_cleanup` with the fake MCP server tree still alive. That test and its transport sibling pass in isolation (2 passed, 9.11 s), and the four groups completed under a 300 s per-test timeout without reproducing the stall. The interaction remains an intermittent cross-suite risk rather than a reproduced defect.
+
+## 11. Stress and resource monitoring
+
+The platform-validation workflow soak ran 60 workflows with 2 restarts and 3 durable jobs on Windows:
+
+- Workflows completed: 60; durable jobs submitted 3, succeeded 3, active 0.
+- Leaked leases 0; orphan operations 0; orphan events 0.
+- SQLite WAL delta 0; workflow database remained consistent through restart and retention cleanup.
+- RSS before 69.9 MB, after 72.0 MB (growth 2.1 MB).
+- The terminal/cancellation matrix left server RSS at ~115 MB with all owned processes reaped.
+
+This is a bounded soak, not multi-hour reliability evidence. A longer run with explicit handle/thread sampling remains UNVERIFIED.
+
+## 12. Defects fixed
+
+1. **Windows provider environment omitted the user profile.**
+   - Root cause: `build_environment` forwarded only `SystemRoot`, `WINDIR`, `TEMP` and `TMP`; Python/Node launchers resolve `Path.home()` and caches during import.
+   - Fix: forward fixed, non-credential Windows startup variables (`USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `APPDATA`, `LOCALAPPDATA`, `COMSPEC`, `PATHEXT`, drive/processor variables) while still excluding `PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `NODE_PATH` and credentials.
+   - Files: `tools/language/transport.py`, `tests/test_lsp_sessions.py`.
+   - Regression tests: updated environment-filter test and a new Windows-only home-directory/no-injection test.
+
+2. **Isolated exec-cost benchmark had a fixed 150 s budget and an opaque failure.**
+   - Root cause: the worker runs `(5 + repeats) x cases` rounds; the old ceiling ignored warmups and case count, so slower Windows hosts timed out and reported only `isolated_benchmark_failed`.
+   - Fix: per-case budget scaled by warmups and case count (capped at 3600 s) and a diagnostic error envelope (`isolated_benchmark_timeout`, `timed_out`, `exit_code`, `timeout_sec`).
+   - Files: `scripts/perf_benchmark.py`, `tests/test_perf_benchmark.py`.
+
+3. **Platform validation and the startup benchmark could not launch `START_MCP.bat` in a hardened Windows shell.**
+   - Root cause: `cmd.exe /c START_MCP.bat` relied on current-directory executable search, which is disabled when `NoDefaultCurrentDirectoryInExePath` is set. Both `scripts/platform_validation.py` and `scripts/perf_benchmark.py` used the relative form.
+   - Fix: pass the absolute batch path in both gates.
+   - Files: `scripts/platform_validation.py`, `scripts/perf_benchmark.py`, `tests/test_platform_validation.py`, `tests/test_perf_benchmark.py`, `tests/test_launcher.py`.
+   - Verification: `startup_launcher_validation` is now `ok`, the full platform validation gate passes, and `tests/test_launcher.py` passes 4/4 on this host.
+
+## 13. GitHub CI
+
+- Baseline runs `42118454560` and `42118454569` succeeded at `c349617` — VERIFIED historical evidence.
+- Branch HEAD `d2d396f` failed Windows Python 3.12 in `tests/test_perf_benchmark.py::test_exec_cost_real_sdk_paths_are_equivalent_and_isolated` (`1 failed, 2514 passed, 14 skipped`). That failure is addressed by fix 2.
+- New runs for the commits produced by this acceptance are reported in the final summary; a passing historical run is not treated as validation of new code.
+
+## 14. Remaining risks
+
+- An intermittent extension-fixture stall was seen twice but not reproduced after the per-test-timeout runs; it needs a traceback from a stalled process before it can be fixed.
+- End-to-end LSP `source_index` still fails with `lsp_session_failed`; the home-directory crash is fixed, but the session-level failure remains open.
+- Browser upload/download result metadata is incomplete or inconsistent on Windows.
+- No live Secure Tunnel or third-party extension acceptance.
+- No multi-minute soak with handle/thread/claim sampling.
+
+## 15. Readiness assessment
+
+**READY WITH DOCUMENTED LIMITATIONS.**
+
+The three confirmed Windows defects found here are fixed with regression coverage, the full 152-tool capability profile is intact, native terminal/job-object/cancellation/UIA/browser behavior is substantially verified, and no open defect was confirmed in production code. Remaining gaps (LSP session completion, upload/download metadata, full-suite completion, live tunnel/extension, soak) are documented above rather than hidden.
