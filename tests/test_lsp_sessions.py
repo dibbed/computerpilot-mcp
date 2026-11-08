@@ -2901,7 +2901,7 @@ def test_lsp_environment_excludes_secret_and_loader_vars(tmp_path: Path, monkeyp
     assert "NODE_PATH" not in env
     assert "canary-path" not in env.get("PATH", "")
     assert env["PATH"].split(os.pathsep) == [str(Path(sys.executable).parent)]
-    os_vars = ("SystemRoot", "WINDIR", "TEMP", "TMP") if os.name == "nt" else ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
+    os_vars = transport._OS_ENV_VARS
     for name in os_vars:
         parent_value = os.environ.get(name)
         if parent_value is not None:
@@ -2913,6 +2913,28 @@ def test_lsp_environment_excludes_secret_and_loader_vars(tmp_path: Path, monkeyp
     # Darwin may synthesize this key after launch; it is never forwarded in the explicit environment.
     runtime_added = {"__CF_USER_TEXT_ENCODING"} if sys.platform == "darwin" else set()
     assert set(env) <= allowed | runtime_added
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows provider environment parity")
+def test_windows_provider_environment_preserves_home_without_code_injection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    profile = r"C:\Users\canary-profile"
+    monkeypatch.setenv("USERPROFILE", profile)
+    monkeypatch.setenv("HOMEDRIVE", "C:")
+    monkeypatch.setenv("HOMEPATH", r"\Users\canary-profile")
+    monkeypatch.setenv("PYTHONPATH", "canary-pythonpath")
+    monkeypatch.setenv("NODE_OPTIONS", "--require=canary-module")
+
+    environment = transport.build_environment([Path(sys.executable)])
+
+    assert environment["USERPROFILE"] == profile
+    assert environment["HOMEDRIVE"] == "C:"
+    assert environment["HOMEPATH"] == r"\Users\canary-profile"
+    for forbidden in ("PYTHONPATH", "PYTHONHOME", "NODE_OPTIONS", "NODE_PATH"):
+        assert forbidden not in environment
+    assert "canary-pythonpath" not in environment.values()
+    assert not any("canary-module" in value for value in environment.values())
 
 
 def test_lsp_error_and_stderr_canaries_do_not_escape(tmp_path: Path) -> None:

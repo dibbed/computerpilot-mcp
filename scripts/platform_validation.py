@@ -53,7 +53,10 @@ def _run_command(
 
 def _launcher_command() -> list[str]:
     if os.name == "nt":
-        return ["cmd.exe", "/d", "/s", "/c", "START_MCP.bat"]
+        # cmd.exe only searches the current directory when
+        # NoDefaultCurrentDirectoryInExePath is unset; pass the absolute
+        # launcher path so the gate works in hardened Windows shells too.
+        return ["cmd.exe", "/d", "/s", "/c", str(ROOT / "START_MCP.bat")]
     return [str(ROOT / "start_mcp.sh")]
 
 

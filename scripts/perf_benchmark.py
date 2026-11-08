@@ -624,7 +624,9 @@ def _launcher_validation_once() -> dict[str, Any]:
     environment["MCP_START_VALIDATE_ONLY"] = "1"
     environment["PYTHON_BIN"] = sys.executable
     command = (
-        ["cmd.exe", "/d", "/s", "/c", "START_MCP.bat"]
+        # Absolute path: cmd.exe may not search the current directory when
+        # NoDefaultCurrentDirectoryInExePath is set on hardened Windows hosts.
+        ["cmd.exe", "/d", "/s", "/c", str(PROJECT_ROOT / "START_MCP.bat")]
         if os.name == "nt"
         else [str(PROJECT_ROOT / "start_mcp.sh")]
     )
@@ -3004,11 +3006,16 @@ def _exec_cost_once(
         ]
         env = {key: "" for key in os.environ if key.upper().startswith(("MCP_", "PYTHON"))}
         env.update({"MCP_TOOL_PROFILE": "full", "MCP_LSP_PERSISTENT_ENABLED": "0", "MCP_WORKFLOW_DAG_ENABLED": "0"})
+        # The worker runs (5 warmup + repeats) rounds over every workload case.
+        # Allow a fixed per-case budget so slower or loaded Windows hosts do not
+        # convert real work into a spurious timeout; a genuine hang still fails.
+        case_count = 12 if include_jobs else 10
+        timeout_sec = min(3_600, 120 + (5 + repeats) * case_count * 3)
         with suppress_timings() if suite == "native_batch_production" else nullcontext():
             result = run_bounded(
                 command,
                 cwd=source,
-                timeout_sec=min(3_600, 120 + repeats * 30),
+                timeout_sec=timeout_sec,
                 stdout_limit=2_000_000,
                 stderr_limit=2_000,
                 env=env,
@@ -3017,7 +3024,11 @@ def _exec_cost_once(
         if result["exit_code"] != 0:
             return {
                 "name": suite, "status": "error", "comparable": False,
-                "error": "isolated_benchmark_failed", "retained_fixture": str(temporary),
+                "error": "isolated_benchmark_timeout" if result.get("timed_out") else "isolated_benchmark_failed",
+                "timed_out": bool(result.get("timed_out")),
+                "exit_code": result["exit_code"],
+                "timeout_sec": timeout_sec,
+                "retained_fixture": str(temporary),
             }
         details = json.loads(result["stdout"]["text"])
         cleanup_verified = details.get("workers_cleaned") is True and all(

@@ -32,7 +32,19 @@ from core.windows_job import NativeOwnershipRequiredError
 from core.workflow_store import redact_inputs
 from tools.language.providers import LspProvider, command_for, validate_provider
 
-_OS_ENV_VARS = ("SystemRoot", "WINDIR", "TEMP", "TMP") if os.name == "nt" else ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
+# Windows providers are frequently Python or Node launchers that resolve the user
+# profile and their cache directories during import (for example ``Path.home()``).
+# Forward only fixed, non-credential startup variables; code-injection and
+# credential variables (PYTHONPATH, NODE_OPTIONS, tokens) are still never inherited.
+_OS_ENV_VARS = (
+    (
+        "SystemRoot", "SYSTEMDRIVE", "WINDIR", "TEMP", "TMP",
+        "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+        "COMSPEC", "PATHEXT", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    )
+    if os.name == "nt"
+    else ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
+)
 _MAX_HEADER_BYTES = 64 * 1024
 
 

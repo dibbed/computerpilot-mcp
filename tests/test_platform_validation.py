@@ -65,3 +65,16 @@ def test_platform_validation_runs_launcher_doctor_benchmark_and_soak(monkeypatch
     assert soak[soak.index("--workflows") + 1] == "20"
     assert soak[soak.index("--restarts") + 1] == "2"
     assert soak[soak.index("--durable-jobs") + 1] == "3"
+
+
+def test_windows_launcher_command_uses_absolute_batch_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import Path
+
+    monkeypatch.setattr(platform_validation.os, "name", "nt", raising=False)
+    command = platform_validation._launcher_command()
+
+    assert command[:4] == ["cmd.exe", "/d", "/s", "/c"]
+    launcher = Path(command[4])
+    assert launcher.is_absolute()
+    assert launcher.name == "START_MCP.bat"
+    assert launcher.parent == platform_validation.ROOT
