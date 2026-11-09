@@ -1166,7 +1166,7 @@ class LspSessionManager:
         self._cancel_context_tasks()
         self._drain_sessions(sessions, min(timeout_sec, 5.0))
 
-    def close_workspace(self, root: Path, *, timeout_sec: float = 2.0) -> None:
+    def close_workspace(self, root: Path, *, timeout_sec: float = 5.0) -> None:
         if not math.isfinite(timeout_sec) or timeout_sec < 0:
             raise ValueError("Close timeout must be finite and non-negative.")
         canonical = canonical_path(root)
@@ -1176,7 +1176,10 @@ class LspSessionManager:
             sessions = [item for key, item in self._sessions.items() if key.workspace_root == canonical]
         self._cancel_context_tasks(canonical)
         try:
-            self._drain_sessions(sessions, min(timeout_sec, 2.0))
+            # Owned-process teardown is bounded at five seconds (Job Object
+            # quiescence plus identity-checked reaping). A two-second join
+            # quarantined sessions whose cleanup was still completing normally.
+            self._drain_sessions(sessions, min(timeout_sec, 5.0))
         finally:
             with self._lock:
                 self._closing_roots.discard(canonical)

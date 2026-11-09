@@ -201,3 +201,53 @@ def test_job_termination_survives_process_inspection_failure(
 
     assert terminated == [1]
     assert result["backend"] == "windows_job"
+
+
+def test_ppid_scan_is_skipped_while_the_whole_lineage_is_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanned: list[list[str]] = []
+
+    class LiveProcess(SimpleNamespace):
+        def children(self, recursive: bool = False) -> list[SimpleNamespace]:
+            return [SimpleNamespace(pid=124, create_time=lambda: 11.0)]
+
+    def process(pid: int) -> LiveProcess:
+        return LiveProcess(pid=pid, create_time=lambda: 10.0)
+
+    def process_iter(attrs: list[str]) -> list[SimpleNamespace]:
+        scanned.append(attrs)
+        return []
+
+    monkeypatch.setattr(windows_job.psutil, "Process", process)
+    monkeypatch.setattr(windows_job.psutil, "process_iter", process_iter)
+    monkeypatch.setattr(windows_job, "process_identity_exited", lambda pid, created: False)
+    owned = windows_job.OwnedProcess(cast(Any, SimpleNamespace(pid=123)), None, "windows_job")
+    owned._root_created = 10.0
+    owned._known_identities = {123: 10.0}
+
+    identities = owned._capture_tree_identities(include_ppid_scan=True)
+
+    assert scanned == []
+    assert (123, 10.0) in identities and (124, 11.0) in identities
+
+
+def test_ppid_scan_runs_once_a_known_parent_has_exited(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanned: list[list[str]] = []
+
+    def process(pid: int) -> SimpleNamespace:
+        return SimpleNamespace(pid=pid, create_time=lambda: 10.0, children=lambda recursive=False: [])
+
+    def process_iter(attrs: list[str]) -> list[SimpleNamespace]:
+        scanned.append(attrs)
+        return [SimpleNamespace(info={"pid": 125, "ppid": 123, "create_time": 12.0})]
+
+    monkeypatch.setattr(windows_job.psutil, "Process", process)
+    monkeypatch.setattr(windows_job.psutil, "process_iter", process_iter)
+    monkeypatch.setattr(windows_job, "process_identity_exited", lambda pid, created: True)
+    owned = windows_job.OwnedProcess(cast(Any, SimpleNamespace(pid=123)), None, "windows_job")
+    owned._root_created = 10.0
+    owned._known_identities = {123: 10.0}
+
+    identities = owned._capture_tree_identities(include_ppid_scan=True)
+
+    assert scanned == [["pid", "ppid", "create_time"]]
+    assert (125, 12.0) in identities

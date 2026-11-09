@@ -377,6 +377,18 @@ class OwnedProcess:
                 # Remember whatever is already visible; later wait/poll calls extend it.
                 self._capture_tree_identities()
 
+    def _lineage_has_exited_parent(self, root_live: bool) -> bool:
+        """Only scan the process table once the root is no longer provably alive.
+
+        A live root exposes its whole tree through ``children``, and captures during
+        ``wait``/``poll`` already retain every descendant seen before an intermediate
+        launcher exits. Enumerating every process is expensive on Windows when
+        psutil's table is cold (2 s or more in practice), which pushed LSP workspace
+        teardown past its drain budget and quarantined sessions whose cleanup was
+        still completing normally.
+        """
+        return not root_live
+
     def _capture_tree_identities(self, *, include_ppid_scan: bool = False) -> list[tuple[int, float]]:
         """Capture current descendants by PID/create-time before any termination.
 
@@ -389,11 +401,15 @@ class OwnedProcess:
         """
         identities: dict[int, float] = dict(self._known_identities)
         root_reused = False
+        root_live = False
         if self._root_created is not None:
             identities[self.pid] = self._root_created
             try:
                 current_root = psutil.Process(self.pid)
-                root_reused = abs(current_root.create_time() - self._root_created) >= 0.01
+                if abs(current_root.create_time() - self._root_created) >= 0.01:
+                    root_reused = True
+                else:
+                    root_live = process_identity_exited(self.pid, self._root_created) is not True
             except psutil.NoSuchProcess:
                 pass
             except (psutil.Error, OSError):
@@ -407,7 +423,12 @@ class OwnedProcess:
                         identities[identity[0]] = identity[1]
             except (psutil.Error, OSError):
                 pass
-        if include_ppid_scan and self._root_created is not None and not root_reused:
+        if (
+            include_ppid_scan
+            and self._root_created is not None
+            and not root_reused
+            and self._lineage_has_exited_parent(root_live)
+        ):
             # Windows retains the parent PID on orphaned children. Candidates must
             # postdate this root, and a known parent must itself still match its
             # captured identity so a reused descendant PID cannot pull in a stranger.
