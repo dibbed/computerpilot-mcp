@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import psutil
 import pytest
@@ -219,6 +221,145 @@ def test_job_object_assignment_failure_falls_back_without_running_suspended_cand
     assert result["ok"] is True
     assert result["process_ownership"] == "psutil_fallback"
     assert marker.read_text() == "1"
+
+
+def test_terminate_tree_reaps_identity_matched_descendants_outside_job(tmp_path: Path) -> None:
+    """A broker can launch the real command outside Job Object authority."""
+
+    marker = tmp_path / "outside-job.json"
+    child_script = tmp_path / "outside_child.py"
+    child_script.write_text(
+        "import json,os,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+        "Path(sys.argv[1]).write_text(json.dumps([os.getpid(),p.pid]))\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    root_script = tmp_path / "outside_root.py"
+    root_script.write_text(
+        "import subprocess,sys,time\n"
+        "subprocess.Popen([sys.executable,sys.argv[1],sys.argv[2]])\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(root_script), str(child_script), str(marker)], cwd=tmp_path,
+    )
+    states = {"closed": False}
+
+    def terminate(code: int) -> bool:
+        try:
+            psutil.Process(process.pid).kill()
+        except psutil.NoSuchProcess:
+            pass
+        return True
+
+    job = SimpleNamespace(
+        closed=False, terminate=terminate, active_process_count=lambda: 0,
+        close=lambda: states.__setitem__("closed", True),
+    )
+    owned = windows_job.OwnedProcess(process, job, "windows_job")  # type: ignore[arg-type]
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.02)
+        assert marker.exists()
+        child_pid, grandchild_pid = [int(value) for value in json.loads(marker.read_text())]
+        result = owned.terminate_tree()
+        assert result["job_terminated"] is True
+        assert result["alive_pids"] == []
+        _wait_dead(child_pid, grandchild_pid)
+    finally:
+        for pid in (process.pid, *([] if not marker.exists() else json.loads(marker.read_text()))):
+            if _alive(pid):
+                psutil.Process(pid).kill()
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
+def test_close_ownership_reaps_escaped_descendant_after_root_exit(tmp_path: Path) -> None:
+    marker = tmp_path / "escaped-after-exit.json"
+    child_code = (
+        "import json,os,subprocess,sys,time;from pathlib import Path;"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+        "Path(sys.argv[1]).write_text(json.dumps([os.getpid(),p.pid]));time.sleep(60)"
+    )
+    root_code = (
+        "import subprocess,sys,time;from pathlib import Path;"
+        f"subprocess.Popen([sys.executable,'-c',{child_code!r},{str(marker)!r}]);"
+        "time.sleep(1)"
+    )
+    process = subprocess.Popen([sys.executable, "-c", root_code], cwd=tmp_path)
+    job = SimpleNamespace(
+        closed=False, terminate=lambda code: True, active_process_count=lambda: 0,
+        close=lambda: None,
+    )
+    owned = windows_job.OwnedProcess(process, job, "windows_job")  # type: ignore[arg-type]
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.02)
+        assert marker.exists()
+        owned.wait(timeout=5)
+        child_pid, grandchild_pid = [int(value) for value in json.loads(marker.read_text())]
+        assert _alive(child_pid)
+        owned.close_ownership()
+        _wait_dead(child_pid, grandchild_pid)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        if marker.exists():
+            for pid in json.loads(marker.read_text()):
+                if _alive(pid):
+                    psutil.Process(pid).kill()
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell is unavailable")
+def test_app_alias_launcher_tree_is_reaped_on_terminate(tmp_path: Path) -> None:
+    marker = tmp_path / "pwsh-tree.json"
+    child_script = tmp_path / "pwsh_child.py"
+    child_script.write_text(
+        "import json,os,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)'])\n"
+        "Path(sys.argv[1]).write_text(json.dumps([os.getpid(),p.pid]))\n"
+        "time.sleep(120)\n",
+        encoding="utf-8",
+    )
+    owned = spawn_owned_process(
+        ["pwsh.exe", "-NoProfile", "-NonInteractive", "-Command",
+         f"& '{sys.executable}' '{child_script}' '{marker}'"],
+        cwd=tmp_path,
+        env={key: value for key, value in os.environ.items() if not key.startswith(("MCP_", "COMPUTERPILOT_"))},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=_creation_flags(),
+    )
+    pids: list[int] = []
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.02)
+        assert marker.exists()
+        pids = [int(value) for value in json.loads(marker.read_text())]
+        result = owned.terminate_tree()
+        assert result["alive_pids"] == []
+        _wait_dead(*pids)
+        owned.close_ownership()
+    finally:
+        for pid in pids:
+            if _alive(pid):
+                psutil.Process(pid).kill()
+        if _alive(owned.pid):
+            psutil.Process(owned.pid).kill()
+        try:
+            owned.wait(timeout=2)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
 
 def test_worker_crash_closes_job_and_reaps_durable_command_tree(

@@ -7,6 +7,7 @@ Project releases do not bundle upstream tunnel-client/Cloudflared executables; m
 ## [Unreleased]
 
 ### Fixed
+- 2026-11-09: Reap identity-matched Windows descendants that a broker launcher placed outside Job Object authority, verify Job Object termination and quiescence before reporting cleanup, keep cleanup independent of MCP runtime imports so a bootstrap interpreter that installed pywin32 after startup can still settle escaped processes, enumerate Windows parent/child pairs through a bounded Toolhelp snapshot so the first cleanup after spawn does not pay psutil's multi-second cold table walk, isolate tests from ambient live resource capabilities, and add explicit guarded settlement for opaque child capacity after quarantine.
 - 2026-11-08: Let the pip `pyright-langserver` launcher find the discovered Node runtime while keeping the rest of the parent environment filtered, restoring the default one-shot LSP path on Linux and Windows.
 - 2026-11-08: Stop owned browser sessions, pools and the Playwright driver when the last MCP server lifetime ends; fence new browser operations during cleanup and retry incomplete cleanup before reuse.
 

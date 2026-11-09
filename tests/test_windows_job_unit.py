@@ -131,6 +131,40 @@ def test_native_cleanup_requires_positive_job_quiescence_and_keeps_failure(
     assert events.count("close") == 1
 
 
+def test_reap_identities_does_not_import_the_runtime_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    killed: list[int] = []
+    process = SimpleNamespace(
+        pid=123, create_time=lambda: 10.0, children=lambda recursive: [], kill=lambda: killed.append(123),
+    )
+    monkeypatch.setattr(windows_job.psutil, "Process", lambda pid: process)
+    states = iter([True, False])
+    monkeypatch.setattr(
+        windows_job.OwnedProcess, "_identity_live", lambda self, pid, created: next(states),
+    )
+    # A bootstrap interpreter may install pywin32 after startup, so importing
+    # core.executor (and therefore mcp/pywintypes) during cleanup is unsafe.
+    monkeypatch.setitem(sys.modules, "core.executor", None)
+    owned = windows_job.OwnedProcess(cast(Any, SimpleNamespace(pid=123)), None, "windows_job")
+
+    terminated, alive = owned._reap_identities([(123, 10.0)])
+
+    assert killed == [123]
+    assert terminated == [123]
+    assert alive == []
+
+
+def test_identity_tree_termination_skips_a_reused_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    killed: list[int] = []
+    process = SimpleNamespace(
+        pid=123, create_time=lambda: 20.0, children=lambda recursive: [], kill=lambda: killed.append(123),
+    )
+    monkeypatch.setattr(windows_job.psutil, "Process", lambda pid: process)
+
+    windows_job._terminate_identity_tree(123, 10.0)
+
+    assert killed == []
+
+
 def test_job_cleanup_never_kills_a_process_observed_outside_native_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     killed: list[int] = []
     reused = SimpleNamespace(pid=123, children=lambda **kwargs: [], kill=lambda: killed.append(123))
@@ -167,3 +201,23 @@ def test_job_termination_survives_process_inspection_failure(
 
     assert terminated == [1]
     assert result["backend"] == "windows_job"
+
+
+def test_ppid_scan_uses_fast_snapshot_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(windows_job, "_snapshot_process_ppids", lambda: [(125, 123)])
+
+    def process(pid: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            pid=pid,
+            create_time=lambda: 10.0 if pid == 123 else 12.0,
+            children=lambda recursive=False: [],
+        )
+
+    monkeypatch.setattr(windows_job.psutil, "Process", process)
+    owned = windows_job.OwnedProcess(cast(Any, SimpleNamespace(pid=123)), None, "windows_job")
+    owned._root_created = 10.0
+    owned._known_identities = {123: 10.0}
+
+    identities = owned._capture_tree_identities(include_ppid_scan=True)
+
+    assert (125, 12.0) in identities

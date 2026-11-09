@@ -121,6 +121,8 @@ def _kernel32() -> Any:
             ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
             ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
             ("CreateToolhelp32Snapshot", [_DWORD, _DWORD], wintypes.HANDLE),
+            ("Process32FirstW", [wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
+            ("Process32NextW", [wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
             ("Thread32First", [wintypes.HANDLE, ctypes.POINTER(_THREADENTRY32)], wintypes.BOOL),
             ("Thread32Next", [wintypes.HANDLE, ctypes.POINTER(_THREADENTRY32)], wintypes.BOOL),
             ("OpenThread", [_DWORD, wintypes.BOOL, _DWORD], wintypes.HANDLE),
@@ -310,6 +312,97 @@ def _close_popen_pipes(process: subprocess.Popen[bytes]) -> None:
                 pass
 
 
+def _process_identity(process: psutil.Process) -> tuple[int, float] | None:
+    try:
+        created = float(process.create_time())
+    except (psutil.Error, OSError, TypeError, ValueError):
+        return None
+    if created <= 0:
+        return None
+    return int(process.pid), created
+
+
+_TH32CS_SNAPPROCESS = 0x00000002
+_MAX_PATH = 260
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", _DWORD),
+        ("cntUsage", _DWORD),
+        ("th32ProcessID", _DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", _DWORD),
+        ("cntThreads", _DWORD),
+        ("th32ParentProcessID", _DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", _DWORD),
+        ("szExeFile", ctypes.c_wchar * _MAX_PATH),
+    ]
+
+
+def _snapshot_process_ppids() -> list[tuple[int, int]] | None:
+    """Enumerate PID/parent-PID pairs without psutil's cold process-table walk.
+
+    psutil's first full enumeration measured 1.6-2.2 s on this host, which made
+    every fresh worker's first cleanup far slower than the job it had just run.
+    """
+    try:
+        kernel32 = _kernel32()
+        snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if snapshot in (None, 0, _INVALID_HANDLE_VALUE):
+            return None
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        pairs: list[tuple[int, int]] = []
+        try:
+            if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                return None
+            while True:
+                pairs.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return pairs
+    except (OSError, AttributeError, TypeError, ValueError, ctypes.ArgumentError):
+        return None
+
+
+def _terminate_identity_tree(pid: int, created: float) -> None:
+    """Kill one captured process and its current children without runtime imports.
+
+    ``core.executor`` imports the MCP runtime. A bootstrap interpreter can install
+    pywin32 after it starts, so the runtime import may fail until a later process
+    re-reads the new ``.pth`` entries. Cleanup must remain usable at that point.
+    """
+    try:
+        root = psutil.Process(pid)
+        if abs(root.create_time() - created) >= 0.01:
+            return
+        children = root.children(recursive=True)
+    except psutil.NoSuchProcess:
+        return
+    except (psutil.Error, OSError):
+        children = []
+    identities: list[tuple[int, float]] = []
+    for child in children:
+        identity = _process_identity(child)
+        if identity is not None:
+            identities.append(identity)
+    identities.append((pid, created))
+    for target_pid, target_created in identities:
+        try:
+            process = psutil.Process(target_pid)
+            if abs(process.create_time() - target_created) >= 0.01:
+                continue
+            process.kill()
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError):
+            continue
+
+
 class OwnedProcess:
     """Small Popen proxy retaining process-tree ownership until explicitly released."""
 
@@ -318,6 +411,136 @@ class OwnedProcess:
         self.job = job
         self.ownership_backend = backend
         self._cleanup_failed = False
+        self._root_created: float | None = None
+        self._known_identities: dict[int, float] = {}
+        self._last_visible_capture = time.monotonic()
+        if isinstance(process, subprocess.Popen):
+            try:
+                self._root_created = float(psutil.Process(process.pid).create_time())
+            except (psutil.Error, OSError, ValueError):
+                self._root_created = None
+            if self._root_created is not None:
+                self._known_identities[process.pid] = self._root_created
+                # A redirected launcher (for example a venv python.exe stub) can
+                # expose the real command as a descendant within a few milliseconds.
+                # Remember whatever is already visible; later wait/poll calls extend it.
+                self._capture_tree_identities()
+
+    def _capture_tree_identities(self, *, include_ppid_scan: bool = False) -> list[tuple[int, float]]:
+        """Capture current descendants by PID/create-time before any termination.
+
+        A launcher can start the real command through a broker that does not inherit
+        the Job Object. Those processes remain visible as psutil descendants but are
+        outside ``TerminateJobObject`` authority, so their identities are retained for
+        an identity-checked fallback kill. Captures accumulate: a descendant seen while
+        the root was alive remains identifiable after the root and intermediate
+        launchers exit and keep only a stale parent PID.
+        """
+        identities: dict[int, float] = dict(self._known_identities)
+        root_reused = False
+        if self._root_created is not None:
+            identities[self.pid] = self._root_created
+            try:
+                current_root = psutil.Process(self.pid)
+                root_reused = abs(current_root.create_time() - self._root_created) >= 0.01
+            except psutil.NoSuchProcess:
+                pass
+            except (psutil.Error, OSError):
+                root_reused = True
+        if not root_reused:
+            try:
+                parent = psutil.Process(self.pid)
+                for child in parent.children(recursive=True):
+                    identity = _process_identity(child)
+                    if identity is not None:
+                        identities[identity[0]] = identity[1]
+            except (psutil.Error, OSError):
+                pass
+        if include_ppid_scan and self._root_created is not None and not root_reused:
+            # Windows retains the parent PID on orphaned children. Candidates must
+            # postdate this root, and a known parent must itself still match its
+            # captured identity so a reused descendant PID cannot pull in a stranger.
+            parent_pids: set[int] = {self.pid}
+            for pid, created in list(identities.items()):
+                if pid == self.pid:
+                    continue
+                try:
+                    process = psutil.Process(pid)
+                    if abs(process.create_time() - created) < 0.01:
+                        parent_pids.add(pid)
+                except (psutil.Error, OSError):
+                    continue
+            pairs = _snapshot_process_ppids()
+            if pairs is None:
+                try:
+                    pairs = [
+                        (int(item.info["pid"]), int(item.info.get("ppid") or -1))
+                        for item in psutil.process_iter(["pid", "ppid"])
+                    ]
+                except (psutil.Error, OSError, TypeError, ValueError):
+                    pairs = []
+            for candidate_pid, candidate_ppid in pairs:
+                if candidate_ppid not in parent_pids:
+                    continue
+                try:
+                    created = float(psutil.Process(candidate_pid).create_time())
+                except (psutil.Error, OSError, TypeError, ValueError):
+                    continue
+                if created > 0 and created + 0.01 >= self._root_created:
+                    identities[candidate_pid] = created
+        self._known_identities.update(identities)
+        return sorted(identities.items())
+
+    def _identity_live(self, pid: int, created: float) -> bool:
+        """A visible PID can belong to an exited process whose handle is retained."""
+        try:
+            process = psutil.Process(pid)
+            if abs(process.create_time() - created) >= 0.01:
+                return False
+            if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+                return False
+        except psutil.NoSuchProcess:
+            return False
+        except (psutil.Error, OSError):
+            # Uninspectable identity must retain the fence.
+            return True
+        return process_identity_exited(pid, created) is not True
+
+    def _reap_identities(self, identities: list[tuple[int, float]]) -> tuple[list[int], list[int]]:
+        """Kill only processes whose PID and create-time still match the captured tree."""
+        terminated: set[int] = set()
+        alive: set[int] = set()
+
+        for pid, created in identities:
+            if not self._identity_live(pid, created):
+                terminated.add(pid)
+                continue
+            _terminate_identity_tree(pid, created)
+            deadline = time.monotonic() + 1.0
+            while self._identity_live(pid, created):
+                if time.monotonic() >= deadline:
+                    alive.add(pid)
+                    break
+                time.sleep(0.02)
+            else:
+                terminated.add(pid)
+        return sorted(terminated), sorted(alive)
+
+    def _job_quiescent(self, job: WindowsJob) -> bool:
+        counter = getattr(job, "active_process_count", None)
+        if not callable(counter):
+            return True
+        try:
+            return int(counter()) == 0
+        except (ToolError, OSError):
+            return False
+
+    def _remember_visible_tree(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_visible_capture < 0.25:
+            return
+        self._last_visible_capture = now
+        self._capture_tree_identities()
 
     @property
     def pid(self) -> int:
@@ -340,9 +563,11 @@ class OwnedProcess:
         return self.process.returncode
 
     def poll(self) -> int | None:
+        self._remember_visible_tree()
         return self.process.poll()
 
     def wait(self, timeout: float | None = None) -> int:
+        self._remember_visible_tree(force=True)
         return self.process.wait(timeout=timeout)
 
     def kill(self) -> None:
@@ -354,6 +579,8 @@ class OwnedProcess:
     def terminate_tree(self, *, force: bool = True) -> dict[str, Any]:
         job = self.job
         if job is not None and not job.closed:
+            identities = self._capture_tree_identities(include_ppid_scan=True)
+            targeted = sorted({pid for pid, _ in identities} | {self.pid})
             try:
                 parent = psutil.Process(self.pid)
                 processes = [*parent.children(recursive=True), parent]
@@ -361,18 +588,50 @@ class OwnedProcess:
                 # The Job Object owns the tree even when process-table inspection
                 # fails; diagnostics must not prevent termination.
                 processes = []
-            targeted = [process.pid for process in processes]
-            job.terminate(1)
-            gone, alive = psutil.wait_procs(processes, timeout=5)
-            # A process-table PID may have been reused; only the Job Object may signal this owned tree.
+            if not identities:
+                # A test double or an uninspectable root has no provable identity.
+                # Retain the Job Object-only contract and never signal a bare PID.
+                job_terminated = job.terminate(1)
+                gone, alive = psutil.wait_procs(processes, timeout=5)
+                try:
+                    self.process.wait(timeout=0.1)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                return {
+                    "targeted_pids": [process.pid for process in processes],
+                    "terminated_pids": sorted({process.pid for process in gone}),
+                    "alive_pids": sorted({process.pid for process in alive}),
+                    "job_terminated": job_terminated,
+                    "job_quiescent": self._job_quiescent(job),
+                    "backend": "windows_job",
+                }
+            job_terminated = job.terminate(1)
+            deadline = time.monotonic() + 5.0
+            quiescent = self._job_quiescent(job)
+            while not quiescent and time.monotonic() < deadline:
+                time.sleep(0.01)
+                quiescent = self._job_quiescent(job)
+            terminated, alive = self._reap_identities(identities)
+            if not quiescent:
+                live = set(alive)
+                for pid, created in identities:
+                    try:
+                        process = psutil.Process(pid)
+                        if abs(process.create_time() - created) < 0.01 and process.is_running():
+                            live.add(pid)
+                    except (psutil.Error, OSError):
+                        continue
+                alive = sorted(live)
             try:
                 self.process.wait(timeout=0.1)
             except (subprocess.TimeoutExpired, OSError):
                 pass
             return {
                 "targeted_pids": targeted,
-                "terminated_pids": sorted({process.pid for process in gone}),
-                "alive_pids": sorted({process.pid for process in alive}),
+                "terminated_pids": terminated,
+                "alive_pids": alive,
+                "job_terminated": job_terminated,
+                "job_quiescent": quiescent,
                 "backend": "windows_job",
             }
         from core.executor import terminate_process_tree
@@ -387,13 +646,23 @@ class OwnedProcess:
         if job is not None:
             try:
                 if not job.closed:
-                    if not job.terminate(1):
-                        raise ToolError("process_cleanup_incomplete", "Job Object termination was denied.")
+                    # Capture before termination: a broker-launched command can be
+                    # outside Job Object authority but still be visible as a child.
+                    identities = self._capture_tree_identities(include_ppid_scan=True)
+                    job_terminated = job.terminate(1)
                     deadline = time.monotonic() + 5.0
-                    while job.active_process_count():
-                        if time.monotonic() >= deadline:
-                            raise ToolError("process_cleanup_incomplete", "Job Object still owns active processes.")
+                    quiescent = self._job_quiescent(job)
+                    while not quiescent and time.monotonic() < deadline:
                         time.sleep(0.01)
+                        quiescent = self._job_quiescent(job)
+                    _terminated, alive = self._reap_identities(identities)
+                    if not quiescent or alive:
+                        raise ToolError(
+                            "process_cleanup_incomplete",
+                            "Job Object ownership cleanup still has active processes.",
+                        )
+                    if not job_terminated:
+                        raise ToolError("process_cleanup_incomplete", "Job Object termination was denied.")
                     self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
                     job.close()
                 self.job = None
