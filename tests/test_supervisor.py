@@ -61,6 +61,43 @@ def test_console_interrupt_requests_graceful_then_forced_shutdown(
         close_logger(supervisor)
 
 
+def test_first_console_stop_preserves_configured_drain_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = Supervisor(
+        [], readiness_url=None, state_dir=tmp_path,
+        drain_timeout=5, watchdog_drain_timeout=0.2,
+    )
+    deadlines: list[float] = []
+
+    class RunningProcess:
+        def poll(self) -> None:
+            return None
+
+    def write_control(_path: Path, _command: str, _request_id: str, deadline: float) -> None:
+        deadlines.append(deadline)
+
+    def force_after_first_poll(_path: Path) -> None:
+        supervisor.force_stop.set()
+        return None
+
+    monkeypatch.setattr(supervisor, "_write_lifecycle_control", write_control)
+    monkeypatch.setattr(supervisor, "_read_lifecycle_status", force_after_first_poll)
+    started = time.time()
+    try:
+        result = supervisor.drain_runtime(
+            RunningProcess(),  # type: ignore[arg-type]
+            reason="user_stop",
+            control_path=tmp_path / "control.json",
+            status_path=tmp_path / "status.json",
+        )
+        assert len(deadlines) == 1
+        assert 4.5 <= deadlines[0] - started <= 5.5
+        assert result["forced"] is True
+    finally:
+        close_logger(supervisor)
+
+
 def test_console_interrupt_is_safe_while_supervisor_lock_is_held(tmp_path: Path) -> None:
     supervisor = Supervisor([], readiness_url=None, state_dir=tmp_path)
     finished = threading.Event()
