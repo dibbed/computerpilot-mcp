@@ -2247,6 +2247,90 @@ class WorkflowStore:
         # Live ancestors and uninspectable owners retain their own permits and resource fence.
         return released
 
+    def release_unidentified_resource_capacity(
+        self,
+        request_id: str,
+        *,
+        owner_token: str,
+        admission_ids: Sequence[str],
+        evidence: str,
+    ) -> int:
+        """Settle explicitly named opaque child capacity after a quarantined parent.
+
+        Opaque owner tokens (for example a test or a crashed third-party analyzer)
+        have no PID identity, so the normal death-proof path can never release
+        them. An operator may settle only exact admission IDs already linked to a
+        quarantined resource request, with recorded evidence. PID-identifiable
+        rows are rejected so they must still pass identity-checked reclamation.
+        """
+
+        bounded_evidence = evidence.strip()
+        if not bounded_evidence:
+            raise ToolError(
+                "resource_resolution_evidence_required",
+                "Unidentified capacity settlement requires bounded operator evidence.",
+            )
+        unique_ids = list(dict.fromkeys(str(value) for value in admission_ids))
+        if not unique_ids or len(unique_ids) > 100:
+            raise ToolError(
+                "invalid_capacity_request",
+                "One or more explicit child admission IDs are required.",
+            )
+        if any(not 1 <= len(value) <= 200 for value in unique_ids):
+            raise ToolError("invalid_capacity_request", "Child admission IDs exceed their bounded lengths.")
+        now = _now()
+        reason = f"operator_settled_unidentified_capacity: {bounded_evidence}"[:2_000]
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            resource = connection.execute(
+                "SELECT state, owner_token FROM workflow_resource_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if resource is None:
+                raise ToolError("resource_request_not_found", "Resource request was not found.")
+            if str(resource["owner_token"]) != owner_token:
+                raise ToolError("resource_owner_mismatch", "Resource request owner token does not match.")
+            if str(resource["state"]) != "quarantined":
+                raise ToolError("resource_request_not_quarantined", "Resource request is not quarantined.")
+            rows = connection.execute(
+                f"""
+                SELECT admission_id, state, owner_token
+                FROM runtime_capacity_requests
+                WHERE resource_request_id = ? AND admission_id IN ({placeholders})
+                """,
+                (request_id, *unique_ids),
+            ).fetchall()
+            found = {str(row["admission_id"]): row for row in rows}
+            missing = [value for value in unique_ids if value not in found]
+            if missing:
+                raise ToolError(
+                    "capacity_request_not_found",
+                    "Every child admission ID must be linked to the quarantined resource request.",
+                )
+            for admission_id in unique_ids:
+                row = found[admission_id]
+                state = str(row["state"])
+                if state not in {"active", "pending", "quarantined"}:
+                    continue
+                parts = str(row["owner_token"]).split("-", 3)
+                if len(parts) == 4 and parts[0] == "pid" and parts[1].isdigit():
+                    raise ToolError(
+                        "capacity_identity_requires_death_proof",
+                        "PID-identifiable child capacity must be reclaimed only after identity-checked exit.",
+                    )
+            released = connection.execute(
+                f"""
+                UPDATE runtime_capacity_requests
+                SET state = 'released', reason = ?, updated_at = ?
+                WHERE resource_request_id = ? AND admission_id IN ({placeholders})
+                  AND state IN ('active', 'pending', 'quarantined')
+                """,
+                (reason, now, request_id, *unique_ids),
+            ).rowcount
+            connection.commit()
+        return released
+
     def fail_unadmitted_operation(
         self, operation_id: str, *, lease_token: str, error_code: str,
     ) -> None:
