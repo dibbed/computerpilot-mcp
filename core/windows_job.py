@@ -121,6 +121,8 @@ def _kernel32() -> Any:
             ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
             ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
             ("CreateToolhelp32Snapshot", [_DWORD, _DWORD], wintypes.HANDLE),
+            ("Process32FirstW", [wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
+            ("Process32NextW", [wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
             ("Thread32First", [wintypes.HANDLE, ctypes.POINTER(_THREADENTRY32)], wintypes.BOOL),
             ("Thread32Next", [wintypes.HANDLE, ctypes.POINTER(_THREADENTRY32)], wintypes.BOOL),
             ("OpenThread", [_DWORD, wintypes.BOOL, _DWORD], wintypes.HANDLE),
@@ -320,6 +322,53 @@ def _process_identity(process: psutil.Process) -> tuple[int, float] | None:
     return int(process.pid), created
 
 
+_TH32CS_SNAPPROCESS = 0x00000002
+_MAX_PATH = 260
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", _DWORD),
+        ("cntUsage", _DWORD),
+        ("th32ProcessID", _DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", _DWORD),
+        ("cntThreads", _DWORD),
+        ("th32ParentProcessID", _DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", _DWORD),
+        ("szExeFile", ctypes.c_wchar * _MAX_PATH),
+    ]
+
+
+def _snapshot_process_ppids() -> list[tuple[int, int]] | None:
+    """Enumerate PID/parent-PID pairs without psutil's cold process-table walk.
+
+    psutil's first full enumeration measured 1.6-2.2 s on this host, which made
+    every fresh worker's first cleanup far slower than the job it had just run.
+    """
+    try:
+        kernel32 = _kernel32()
+        snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if snapshot in (None, 0, _INVALID_HANDLE_VALUE):
+            return None
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        pairs: list[tuple[int, int]] = []
+        try:
+            if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                return None
+            while True:
+                pairs.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return pairs
+    except (OSError, AttributeError, TypeError, ValueError, ctypes.ArgumentError):
+        return None
+
+
 def _terminate_identity_tree(pid: int, created: float) -> None:
     """Kill one captured process and its current children without runtime imports.
 
@@ -377,18 +426,6 @@ class OwnedProcess:
                 # Remember whatever is already visible; later wait/poll calls extend it.
                 self._capture_tree_identities()
 
-    def _lineage_has_exited_parent(self, root_live: bool) -> bool:
-        """Only scan the process table once the root is no longer provably alive.
-
-        A live root exposes its whole tree through ``children``, and captures during
-        ``wait``/``poll`` already retain every descendant seen before an intermediate
-        launcher exits. Enumerating every process is expensive on Windows when
-        psutil's table is cold (2 s or more in practice), which pushed LSP workspace
-        teardown past its drain budget and quarantined sessions whose cleanup was
-        still completing normally.
-        """
-        return not root_live
-
     def _capture_tree_identities(self, *, include_ppid_scan: bool = False) -> list[tuple[int, float]]:
         """Capture current descendants by PID/create-time before any termination.
 
@@ -401,15 +438,11 @@ class OwnedProcess:
         """
         identities: dict[int, float] = dict(self._known_identities)
         root_reused = False
-        root_live = False
         if self._root_created is not None:
             identities[self.pid] = self._root_created
             try:
                 current_root = psutil.Process(self.pid)
-                if abs(current_root.create_time() - self._root_created) >= 0.01:
-                    root_reused = True
-                else:
-                    root_live = process_identity_exited(self.pid, self._root_created) is not True
+                root_reused = abs(current_root.create_time() - self._root_created) >= 0.01
             except psutil.NoSuchProcess:
                 pass
             except (psutil.Error, OSError):
@@ -423,12 +456,7 @@ class OwnedProcess:
                         identities[identity[0]] = identity[1]
             except (psutil.Error, OSError):
                 pass
-        if (
-            include_ppid_scan
-            and self._root_created is not None
-            and not root_reused
-            and self._lineage_has_exited_parent(root_live)
-        ):
+        if include_ppid_scan and self._root_created is not None and not root_reused:
             # Windows retains the parent PID on orphaned children. Candidates must
             # postdate this root, and a known parent must itself still match its
             # captured identity so a reused descendant PID cannot pull in a stranger.
@@ -442,19 +470,24 @@ class OwnedProcess:
                         parent_pids.add(pid)
                 except (psutil.Error, OSError):
                     continue
-            try:
-                for candidate in psutil.process_iter(["pid", "ppid", "create_time"]):
-                    try:
-                        info = candidate.info
-                        if int(info.get("ppid") or -1) not in parent_pids:
-                            continue
-                        created = float(info.get("create_time") or 0)
-                        if created > 0 and created + 0.01 >= self._root_created:
-                            identities[int(info["pid"])] = created
-                    except (psutil.Error, OSError, TypeError, ValueError):
-                        continue
-            except (psutil.Error, OSError):
-                pass
+            pairs = _snapshot_process_ppids()
+            if pairs is None:
+                try:
+                    pairs = [
+                        (int(item.info["pid"]), int(item.info.get("ppid") or -1))
+                        for item in psutil.process_iter(["pid", "ppid"])
+                    ]
+                except (psutil.Error, OSError, TypeError, ValueError):
+                    pairs = []
+            for candidate_pid, candidate_ppid in pairs:
+                if candidate_ppid not in parent_pids:
+                    continue
+                try:
+                    created = float(psutil.Process(candidate_pid).create_time())
+                except (psutil.Error, OSError, TypeError, ValueError):
+                    continue
+                if created > 0 and created + 0.01 >= self._root_created:
+                    identities[candidate_pid] = created
         self._known_identities.update(identities)
         return sorted(identities.items())
 
