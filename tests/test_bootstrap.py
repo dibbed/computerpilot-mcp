@@ -42,6 +42,7 @@ def test_cache_and_full_doctor_have_explicit_watchdogs(monkeypatch: pytest.Monke
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(bootstrap, "_run", run)
+    monkeypatch.setattr(bootstrap, "imports_healthy", lambda: True)
     assert bootstrap._doctor_check("local-http", "default")
     bootstrap._full_doctor("local-http", "default")
     assert budgets == [30, 900]
@@ -146,6 +147,119 @@ def test_control_plane_key_handles_utf16_and_quotes(
     bootstrap._load_control_plane_key()
     assert os.environ["CONTROL_PLANE_API_KEY"] == "secret-with-utf16-quotes"
     assert secret.read_bytes() == b"secret-with-utf16-quotes"
+
+
+def test_missing_key_interactive_creates_secret_and_reuses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(bootstrap, "sys", SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: True)))
+    prompts: list[str] = []
+
+    def hidden_prompt(prompt: str) -> str:
+        prompts.append(prompt)
+        return "  test-key-secret  "
+
+    monkeypatch.setattr(bootstrap.getpass, "getpass", hidden_prompt)
+    bootstrap._load_control_plane_key()
+    secret = tmp_path / ".secrets" / "control_plane_api_key.txt"
+    assert secret.read_text(encoding="utf-8") == "test-key-secret"
+    assert os.environ["CONTROL_PLANE_API_KEY"] == "test-key-secret"
+    assert "test-key-secret" not in capsys.readouterr().out
+
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY")
+    bootstrap._load_control_plane_key()
+    assert len(prompts) == 1
+    assert secret.read_text(encoding="utf-8") == "test-key-secret"
+
+
+def test_missing_key_noninteractive_fails_without_creating_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(bootstrap, "sys", SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: False)))
+    with pytest.raises(bootstrap.BootstrapError) as error:
+        bootstrap._load_control_plane_key()
+    assert error.value.code == 17
+    assert not (tmp_path / ".secrets").exists()
+
+
+def test_empty_secret_file_is_filled_after_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(bootstrap, "sys", SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: True)))
+    secret = tmp_path / ".secrets" / "control_plane_api_key.txt"
+    secret.parent.mkdir()
+    secret.write_text(" \n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap.getpass, "getpass", lambda _: "new-test-key")
+    bootstrap._load_control_plane_key()
+    assert secret.read_text(encoding="utf-8") == "new-test-key"
+
+
+def test_empty_secret_file_changed_during_prompt_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(bootstrap, "sys", SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: True)))
+    secret = tmp_path / ".secrets" / "control_plane_api_key.txt"
+    secret.parent.mkdir()
+    secret.write_text(" \n", encoding="utf-8")
+
+    def prompt(_: str) -> str:
+        secret.write_text("another-process-key", encoding="utf-8")
+        return "new-test-key"
+
+    monkeypatch.setattr(bootstrap.getpass, "getpass", prompt)
+    with pytest.raises(bootstrap.BootstrapError) as error:
+        bootstrap._load_control_plane_key()
+    assert error.value.code == 17
+    assert secret.read_text(encoding="utf-8") == "another-process-key"
+    assert "CONTROL_PLANE_API_KEY" not in os.environ
+
+
+def test_cancelled_key_prompt_never_creates_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(bootstrap, "sys", SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: True)))
+
+    def cancel(_: str) -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(bootstrap.getpass, "getpass", cancel)
+    with pytest.raises(bootstrap.BootstrapError) as error:
+        bootstrap._load_control_plane_key()
+    assert error.value.code == 17
+    assert not (tmp_path / ".secrets").exists()
+
+
+def test_existing_key_never_prompts_or_changes_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    secret = tmp_path / ".secrets" / "control_plane_api_key.txt"
+    secret.parent.mkdir()
+    secret.write_text("already-set", encoding="utf-8")
+    monkeypatch.setattr(bootstrap.getpass, "getpass", lambda _: pytest.fail("unexpected prompt"))
+    bootstrap._load_control_plane_key()
+    assert secret.read_bytes() == b"already-set"
 
 
 @pytest.mark.parametrize(

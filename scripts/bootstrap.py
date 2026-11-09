@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
+import importlib
 import importlib.util
 import os
 import subprocess
@@ -56,6 +58,7 @@ def requirements_fingerprint(path: Path) -> str:
 def _required_imports() -> tuple[str, ...]:
     common = (
         "mcp",
+        "anyio",
         "pydantic",
         "psutil",
         "charset_normalizer",
@@ -72,7 +75,13 @@ def _required_imports() -> tuple[str, ...]:
 
 
 def imports_healthy() -> bool:
-    return all(importlib.util.find_spec(name) is not None for name in _required_imports())
+    """Actually import required modules so broken C-extensions or transitive deps are caught."""
+    for name in _required_imports():
+        try:
+            importlib.import_module(name)
+        except Exception:
+            return False
+    return True
 
 
 def _run(command: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
@@ -99,27 +108,77 @@ def _mode() -> str:
     return mode
 
 
+def _prompt_control_plane_key(secret: Path) -> str:
+    """Ask only on interactive first-run setup; never echo or log the key."""
+    if not sys.stdin.isatty():
+        raise BootstrapError(
+            "CONTROL_PLANE_API_KEY is missing. Run START_MCP.bat interactively "
+            "or provide the key via the environment / .secrets/control_plane_api_key.txt.",
+            17,
+        )
+
+    print("\n[Setup] Secure Tunnel API key is missing.")
+    print(f"[Setup] Enter the key once; it will be saved to: {secret}")
+    try:
+        value = clean_control_plane_key(getpass.getpass("CONTROL_PLANE_API_KEY (hidden): "))
+    except (EOFError, KeyboardInterrupt):
+        raise BootstrapError("Secure Tunnel key setup cancelled.", 17) from None
+    if not value:
+        raise BootstrapError("Empty CONTROL_PLANE_API_KEY; nothing was saved.", 17)
+    return value
+
+
+def _save_control_plane_key(secret: Path, value: str, *, expected_empty_bytes: bytes | None) -> None:
+    """Create the secret privately, without overwriting an existing nonempty key."""
+    try:
+        secret.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if expected_empty_bytes is not None:
+            if secret.read_bytes() != expected_empty_bytes:
+                raise BootstrapError("The key file changed during setup; restart to read it.", 17)
+            secret.write_bytes(value.encode("utf-8"))
+        else:
+            fd = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(value.encode("utf-8"))
+    except FileExistsError:
+        raise BootstrapError("The key file appeared during setup; restart to read it.", 17) from None
+    except OSError:
+        raise BootstrapError("Could not save the key under .secrets; check folder permissions.", 17) from None
+
+
 def _load_control_plane_key() -> None:
     existing = clean_control_plane_key(os.getenv("CONTROL_PLANE_API_KEY", ""))
     if existing:
         os.environ["CONTROL_PLANE_API_KEY"] = existing
         return
+
     secret = ROOT / ".secrets" / "control_plane_api_key.txt"
-    try:
-        value = clean_control_plane_key(secret.read_bytes())
-    except (OSError, ValueError):
-        value = ""
-    if not value:
-        raise BootstrapError(
-            "CONTROL_PLANE_API_KEY is unavailable and .secrets/control_plane_api_key.txt was not found.",
-            17,
-        )
+    expected_empty_bytes: bytes | None = None
+    if secret.is_file():
+        try:
+            raw = secret.read_bytes()
+        except OSError:
+            raise BootstrapError("Cannot read the existing Control Plane key file.", 17) from None
+        try:
+            value = clean_control_plane_key(raw)
+        except ValueError:
+            value = ""
+        if value:
+            os.environ["CONTROL_PLANE_API_KEY"] = value
+            try:
+                if raw != value.encode("utf-8"):
+                    secret.write_bytes(value.encode("utf-8"))
+            except OSError:
+                pass
+            return
+        expected_empty_bytes = raw
+    elif secret.exists():
+        raise BootstrapError("The Control Plane key path exists but is not a file.", 17)
+
+    value = _prompt_control_plane_key(secret)
+    _save_control_plane_key(secret, value, expected_empty_bytes=expected_empty_bytes)
     os.environ["CONTROL_PLANE_API_KEY"] = value
-    try:
-        if secret.is_file() and secret.read_bytes() != value.encode("utf-8"):
-            secret.write_bytes(value.encode("utf-8"))
-    except OSError:
-        pass
+    print("[Setup] Secure Tunnel key saved. Future starts will reuse it.")
 
 
 def _resolve_tunnel() -> str:
@@ -158,21 +217,25 @@ def _ensure_dependencies() -> None:
     except OSError:
         installed = ""
 
-    if installed == expected and imports_healthy():
+    healthy = imports_healthy()
+    if installed == expected and healthy:
         print("[3/5] Dependencies are current.")
         return
 
     print("[3/5] Installing or refreshing dependencies...")
-    result = _run([
+    cmd = [
         sys.executable,
         "-m",
         "pip",
         "install",
         "--quiet",
         "--disable-pip-version-check",
-        "--requirement",
-        str(requirements),
-    ])
+    ]
+    if installed == expected and not healthy:
+        cmd.append("--force-reinstall")
+    cmd.extend(["--requirement", str(requirements)])
+
+    result = _run(cmd)
     if result.returncode:
         raise BootstrapError("Dependency installation failed.", 13)
     if not imports_healthy():

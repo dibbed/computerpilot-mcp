@@ -28,6 +28,8 @@ rem Save ERRORLEVEL first because CALL intentionally resets it.
 rem Intentional console shutdown must not enter the crash-restart loop.
 if "!MCP_EXIT_CODE!"=="-1073741510" exit /b !MCP_EXIT_CODE!
 if "!MCP_EXIT_CODE!"=="130" exit /b !MCP_EXIT_CODE!
+rem Missing/cancelled key setup should not trigger repeated restarts.
+if "!MCP_EXIT_CODE!"=="17" exit /b !MCP_EXIT_CODE!
 set /a MCP_FAILURES+=1
 set "MCP_RETRY_SECONDS=5"
 if !MCP_FAILURES! GEQ 2 set "MCP_RETRY_SECONDS=10"
