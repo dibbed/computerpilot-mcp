@@ -320,6 +320,40 @@ def _process_identity(process: psutil.Process) -> tuple[int, float] | None:
     return int(process.pid), created
 
 
+def _terminate_identity_tree(pid: int, created: float) -> None:
+    """Kill one captured process and its current children without runtime imports.
+
+    ``core.executor`` imports the MCP runtime. A bootstrap interpreter can install
+    pywin32 after it starts, so the runtime import may fail until a later process
+    re-reads the new ``.pth`` entries. Cleanup must remain usable at that point.
+    """
+    try:
+        root = psutil.Process(pid)
+        if abs(root.create_time() - created) >= 0.01:
+            return
+        children = root.children(recursive=True)
+    except psutil.NoSuchProcess:
+        return
+    except (psutil.Error, OSError):
+        children = []
+    identities: list[tuple[int, float]] = []
+    for child in children:
+        identity = _process_identity(child)
+        if identity is not None:
+            identities.append(identity)
+    identities.append((pid, created))
+    for target_pid, target_created in identities:
+        try:
+            process = psutil.Process(target_pid)
+            if abs(process.create_time() - target_created) >= 0.01:
+                continue
+            process.kill()
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError):
+            continue
+
+
 class OwnedProcess:
     """Small Popen proxy retaining process-tree ownership until explicitly released."""
 
@@ -422,18 +456,12 @@ class OwnedProcess:
         """Kill only processes whose PID and create-time still match the captured tree."""
         terminated: set[int] = set()
         alive: set[int] = set()
-        from core.executor import terminate_process_tree
 
         for pid, created in identities:
             if not self._identity_live(pid, created):
                 terminated.add(pid)
                 continue
-            try:
-                terminate_process_tree(pid, force=True, expected_created=created)
-            except ToolError:
-                pass
-            except (psutil.Error, OSError):
-                pass
+            _terminate_identity_tree(pid, created)
             deadline = time.monotonic() + 1.0
             while self._identity_live(pid, created):
                 if time.monotonic() >= deadline:
