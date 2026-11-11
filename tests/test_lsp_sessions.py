@@ -708,6 +708,34 @@ def test_core_creates_fresh_inert_lsp_managers(tmp_path: Path, monkeypatch: pyte
     assert not _log.exists()
 
 
+def test_pyright_initialize_includes_workspace_root_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.language import transport
+    from tools.language.sessions import LspSessionManager
+
+    provider, _log = manager_provider(tmp_path)
+    manager = LspSessionManager((provider,), generation="rootpath-regression")
+    initialize_messages: list[dict[str, Any]] = []
+    original_send = transport.LspTransport.send
+
+    def recording_send(self: Any, payload: dict[str, Any]) -> None:
+        if payload.get("method") == "initialize":
+            initialize_messages.append(payload["params"])
+        original_send(self, payload)
+
+    monkeypatch.setattr(transport.LspTransport, "send", recording_send)
+
+    async def scenario() -> None:
+        try:
+            await manager.arequest(tmp_path, "python", "workspace/symbol", {"query": "test"}, timeout_sec=12)
+        finally:
+            await asyncio.to_thread(manager.close_workspace, tmp_path)
+
+    asyncio.run(scenario())
+    assert len(initialize_messages) == 1
+    assert initialize_messages[0]["rootPath"].casefold() == str(tmp_path).casefold()
+    assert initialize_messages[0]["rootUri"].casefold() == tmp_path.as_uri().casefold()
+
+
 def test_mcp_language_requests_share_server_owned_manager(tmp_path: Path, lsp_runtime_settings: Any) -> None:
     from mcp import Client
     from mcp.server import MCPServer

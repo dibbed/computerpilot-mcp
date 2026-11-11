@@ -969,6 +969,10 @@ class LspSessionManager:
                     "textDocument": {"publishDiagnostics": {"versionSupport": True}, "definition": {"linkSupport": True}},
                 },
             }
+            if session.provider.provider_id == "pyright":
+                # Pyright's Windows LSP workspace resolution needs rootPath in
+                # addition to rootUri to resolve local imports and index symbols.
+                initialize_params["rootPath"] = str(workspace_root)
             tsserver = _trusted_typescript_tsserver(session.provider)
             if tsserver is not None:
                 initialize_params["initializationOptions"] = {
