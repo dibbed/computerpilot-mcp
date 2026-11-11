@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import threading
@@ -18,6 +19,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, TypeVar
+
+import psutil
 
 from core.errors import ToolError
 from core.file_lock import exclusive_file_lock
@@ -932,6 +935,35 @@ class OperationRecoveryJournal:
                 merged["external_outcome"] = "uncertain"
         return merged
 
+    @staticmethod
+    def _native_uia_owner_provably_exited(begin: dict[str, Any]) -> bool:
+        """Recover same-generation stdio crashes only when the owner is certainly gone.
+
+        A tunnel can restart an MCP stdio process while retaining the supervisor's
+        generation ID. Never settle an in-flight operation owned by another live
+        process (or by an unidentifiable owner) merely because it shares this ID.
+        """
+        pid = begin.get("pid")
+        if type(pid) is not int or pid <= 0 or pid == os.getpid():
+            return False
+        try:
+            process = psutil.Process(pid)
+            recorded_created = begin.get("pid_created")
+            if (
+                not isinstance(recorded_created, (int, float))
+                or isinstance(recorded_created, bool)
+                or not math.isfinite(recorded_created)
+                or recorded_created <= 0
+            ):
+                # Old journal entries without process identity can be recovered
+                # only when the PID is absent, never based on wall-clock guesses.
+                return False
+            return abs(process.create_time() - float(recorded_created)) >= 0.02
+        except psutil.NoSuchProcess:
+            return True
+        except (psutil.Error, OSError):
+            return False
+
     def _recover_previous_unlocked(self, records: list[dict[str, Any]]) -> None:
         runtime_id = self._runtime_id
         if runtime_id is None:
@@ -946,7 +978,10 @@ class OperationRecoveryJournal:
                 or item.get("acknowledged")
             ):
                 continue
-            if begin.get("runtime_id") == runtime_id:
+            if begin.get("runtime_id") == runtime_id and not (
+                begin.get("operation_type") in _NATIVE_UIA_OPERATIONS
+                and self._native_uia_owner_provably_exited(begin)
+            ):
                 continue
             checkpoint = item.get("checkpoint")
             workspace_raw_present = isinstance(checkpoint, dict) and "workspace_edit" in checkpoint
@@ -1401,6 +1436,13 @@ class OperationRecoveryJournal:
                 "pid": os.getpid(),
             }
             if native_uia_protocol:
+                # Persist the process identity before any native UIA dispatch.
+                # A recycled PID is otherwise indistinguishable from a live
+                # owner after stdio restarts reuse the supervisor generation.
+                try:
+                    record["pid_created"] = psutil.Process(os.getpid()).create_time()
+                except (psutil.Error, OSError):
+                    pass  # Missing identity fails closed when the PID is alive.
                 record["native_recovery"] = {
                     "version": _NATIVE_UIA_DISPATCH_PROTOCOL_VERSION,
                     "kind": "windows_uia",

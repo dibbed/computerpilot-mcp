@@ -564,6 +564,7 @@ def test_native_uia_begin_only_crash_is_not_dispatched_instead_of_uncertain(tmp_
     journal.configure(path, "before")
     handle = journal.begin("ui_set_value", native_uia_protocol=True)
     assert handle is not None
+    assert _records(path)[0]["pid_created"] == pytest.approx(recovery.psutil.Process().create_time())
 
     recovered = OperationRecoveryJournal()
     recovered.configure(path, "after")
@@ -603,6 +604,140 @@ crash_before_native_checkpoint()
     assert isinstance(native_recovery, dict)
     assert native_recovery["dispatch_rule"] == "may_dispatch_checkpoint_before_effect"
     assert records[-1]["reason"] == "runtime_ended_before_native_uia_dispatch"
+
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_state"),
+    [("begin", "failed"), ("prepared", "failed"), ("may_dispatch", "uncertain")],
+)
+@pytest.mark.parametrize("operation", ["ui_invoke", "ui_set_value", "ui_select"])
+def test_same_generation_stdio_restarts_recover_dead_native_uia_owner(
+    tmp_path: Path, stage: str, expected_state: str, operation: str,
+) -> None:
+    """An MCP stdio worker can die while the supervisor generation stays unchanged."""
+    journal_path = tmp_path / "operation-recovery.jsonl"
+    operation_id_path = tmp_path / "operation_id.txt"
+    script = """
+import os
+import sys
+from pathlib import Path
+
+from core.recovery import OperationRecoveryJournal
+from core.recovery_models import NativeUIATarget
+
+journal = OperationRecoveryJournal()
+journal.configure(Path(sys.argv[1]), "shared-stdio-generation")
+handle = journal.begin(sys.argv[4], native_uia_protocol=True)
+assert handle is not None
+if sys.argv[3] != "begin":
+    target = NativeUIATarget(window_handle=10, element_runtime_id=(42, 1))
+    journal.checkpoint_native_uia(handle, target, stage="prepared")
+    if sys.argv[3] == "may_dispatch":
+        journal.checkpoint_native_uia(handle, target, stage="may_dispatch")
+Path(sys.argv[2]).write_text(handle.operation_id, encoding="ascii")
+os._exit(17)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(journal_path), str(operation_id_path), stage, operation],
+        cwd=Path(__file__).resolve().parents[1],
+        timeout=15,
+    )
+    assert result.returncode == 17
+    operation_id = operation_id_path.read_text(encoding="ascii")
+    recovered = OperationRecoveryJournal()
+    recovered.configure(journal_path, "shared-stdio-generation")
+    resolved_operation = recovered.inspect(operation_id)
+    assert resolved_operation["state"] == expected_state
+    assert recovered.summary()["pending_count"] == 0
+    if stage == "may_dispatch":
+        assert recovered.summary()["uncertain_count"] == 1
+    else:
+        assert recovered.summary()["uncertain_count"] == 0
+        records = _records(journal_path)
+        assert records[-1]["reason"] == "runtime_ended_before_native_uia_dispatch"
+
+
+def test_same_generation_native_uia_process_identity_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    begin: dict[str, object] = {
+        "pid": 987654,
+        "pid_created": 1767225500.0,
+        "started_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    class Process:
+        def __init__(self, started: float) -> None:
+            self.started = started
+
+        def create_time(self) -> float:
+            return self.started
+
+    # A still-running owner began before the journal operation.
+    monkeypatch.setattr(recovery.psutil, "Process", lambda _pid: Process(1767225500.0))
+    assert not OperationRecoveryJournal._native_uia_owner_provably_exited(begin)
+
+    # The PID has been reused by a new process: the previous owner is gone.
+    monkeypatch.setattr(recovery.psutil, "Process", lambda _pid: Process(1767225700.0))
+    assert OperationRecoveryJournal._native_uia_owner_provably_exited(begin)
+    assert not OperationRecoveryJournal._native_uia_owner_provably_exited(
+        {"pid": 987654, "started_at": begin["started_at"]},
+    )
+
+    def inaccessible(_pid: int) -> Process:
+        raise recovery.psutil.AccessDenied(pid=987654)
+
+    monkeypatch.setattr(recovery.psutil, "Process", inaccessible)
+    assert not OperationRecoveryJournal._native_uia_owner_provably_exited(begin)
+    assert not OperationRecoveryJournal._native_uia_owner_provably_exited(
+        {"pid": "987654", "started_at": begin["started_at"]},
+    )
+
+
+def test_same_generation_recovery_never_settles_live_native_uia_owner(tmp_path: Path) -> None:
+    journal_path = tmp_path / "live-recovery.jsonl"
+    operation_id_path = tmp_path / "id.txt"
+    release_path = tmp_path / "release"
+    script = """
+import sys
+import time
+from pathlib import Path
+from core.recovery import OperationRecoveryJournal
+
+journal = OperationRecoveryJournal()
+journal.configure(Path(sys.argv[1]), "shared-stdio-generation")
+handle = journal.begin("ui_invoke", native_uia_protocol=True)
+assert handle is not None
+Path(sys.argv[2]).write_text(handle.operation_id, encoding="ascii")
+deadline = time.monotonic() + 12
+while not Path(sys.argv[3]).exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(journal_path), str(operation_id_path), str(release_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 8
+        while not operation_id_path.exists() and time.monotonic() < deadline:
+            assert process.poll() is None
+            time.sleep(0.02)
+        assert operation_id_path.exists()
+        operation_id = operation_id_path.read_text(encoding="ascii")
+        recovered = OperationRecoveryJournal()
+        recovered.configure(journal_path, "shared-stdio-generation")
+        assert recovered.inspect(operation_id)["state"] == "running"
+        assert recovered.summary()["pending_count"] == 1
+    finally:
+        release_path.write_text("done", encoding="ascii")
+        stdout, stderr = process.communicate(timeout=15)
+        assert process.returncode == 0, (stdout, stderr)
+    recovered.configure(journal_path, "shared-stdio-generation")
+    assert recovered.inspect(operation_id)["state"] == "failed"
+    assert recovered.summary()["pending_count"] == 0
 
 
 def test_legacy_native_uia_begin_without_dispatch_protocol_remains_uncertain(tmp_path: Path) -> None:
