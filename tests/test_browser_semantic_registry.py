@@ -78,6 +78,22 @@ def test_browser_query_returns_only_matching_nodes_and_uniqueness(monkeypatch: p
     asyncio.run(run())
 
 
+def test_file_picker_snapshot_reference_routes_through_accessible_label() -> None:
+    locator = object()
+    calls: list[tuple[str, bool]] = []
+
+    def by_label(label: str, *, exact: bool) -> object:
+        calls.append((label, exact))
+        return locator
+
+    page = SimpleNamespace(get_by_label=by_label)
+    node = {"ref": "n1", "role": None, "name": "Upload File", "label": "Upload File", "tag": "input"}
+    selected, evidence = registry._make_semantic_locator(page, node=node)
+    assert selected is locator
+    assert calls == [("Upload File", True)]
+    assert evidence["target_kind"] == "label"
+
+
 def test_semantic_click_uses_generation_ref_and_invalidates_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         locator = SimpleNamespace(count=AsyncMock(return_value=1), click=AsyncMock())

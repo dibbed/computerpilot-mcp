@@ -25,6 +25,8 @@ _SEMANTIC_SNAPSHOT_JS = r"""
       if (["button", "submit", "reset", "image"].includes(type)) return "button";
       if (type === "range") return "slider";
       if (type === "number") return "spinbutton";
+      // File pickers have no textbox role in the browser accessibility tree.
+      if (type === "file") return null;
       if (type !== "hidden") return "textbox";
     }
     if (/^h[1-6]$/.test(tag)) return "heading";
@@ -95,7 +97,10 @@ _SEMANTIC_SNAPSHOT_JS = r"""
       return {
         role,
         name,
-        label: associatedLabel(el) || null,
+        // A file input exposes an accessible label even when it comes from
+        // aria-label rather than a visible <label> tag. Refs need this locator.
+        label: associatedLabel(el) ||
+          (el instanceof HTMLInputElement && el.type.toLowerCase() === "file" ? name || null : null),
         text,
         test_id: el.getAttribute("data-testid"),
         tag: el.tagName.toLowerCase(),
