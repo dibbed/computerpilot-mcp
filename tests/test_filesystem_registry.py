@@ -1,4 +1,5 @@
 import sqlite3
+import stat
 import sys
 import time
 from collections.abc import Callable
@@ -39,6 +40,25 @@ class InvalidationCapture:
 
     def clear(self) -> None:
         self.calls.clear()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="DOS read-only attributes require Windows")
+def test_recursive_delete_removes_readonly_git_objects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(registry, "audit_action", lambda *a, **k: None)
+    server = ToolCapture()
+    registry.register(cast(Any, server))
+    root = tmp_path / "audit"
+    obj = root / ".git" / "objects" / "ab" / "object"
+    obj.parent.mkdir(parents=True)
+    obj.write_bytes(b"isolated read-only object")
+    obj.chmod(stat.S_IREAD)
+    try:
+        result = server.functions["delete_file"](str(root), recursive=True)
+        assert result["ok"] is True, result
+        assert not root.exists()
+    finally:
+        if obj.exists():
+            obj.chmod(stat.S_IWRITE | stat.S_IREAD)
 
 
 @pytest.mark.parametrize("tool", ["write_file", "create_file", "delete_file", "move_file", "copy_file", "replace_exact"])

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
@@ -28,6 +29,22 @@ from tools.filesystem.models import SearchFilesResult
 from tools.filesystem.patches import PatchLimits, apply_patch_transaction
 from tools.filesystem.search_snapshots import SEARCH_SNAPSHOTS, search_fingerprint
 from tools.project.index import PYTHON_METADATA_CACHE
+
+
+def _retry_readonly_on_windows(remove: Any, path: str, exc_info: tuple[Any, BaseException, Any]) -> None:
+    """Honor a requested recursive delete while keeping ACL errors fail-closed."""
+    error = exc_info[1]
+    entry = Path(path)
+    if os.name != "nt" or not isinstance(error, PermissionError) or entry.is_symlink():
+        raise error
+    mode = entry.stat().st_mode
+    if mode & stat.S_IWRITE:
+        raise error
+    # Windows shutil.rmtree cannot remove read-only .git object files.
+    # Only clear the DOS read-only flag on entries already in the target tree.
+    entry.chmod(mode | stat.S_IWRITE)
+    remove(path)
+
 
 EncodingArg = Annotated[str, Field(min_length=1, max_length=40)]
 MaxCharsArg = Annotated[int | None, Field(ge=1)]
@@ -236,7 +253,7 @@ def register(mcp: MCPServer, *, batch_enabled: bool = False) -> None:
                 if not recursive:
                     target.rmdir()
                 else:
-                    shutil.rmtree(target)
+                    shutil.rmtree(target, onerror=_retry_readonly_on_windows if os.name == "nt" else None)
             else:
                 target.unlink()
             PYTHON_METADATA_CACHE.invalidate(target, recursive=target_type == "directory")
