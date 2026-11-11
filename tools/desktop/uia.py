@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from functools import wraps
+from typing import Any, Protocol, TypeVar, cast
 
 import psutil
 
@@ -103,6 +105,36 @@ class NativeUIABackend:
             raise ToolError("uia_pattern_unsupported", "Element does not support the SelectionItem pattern.") from exc
 
 
+_UIA_RESULT = TypeVar("_UIA_RESULT")
+
+
+def _uia_thread(fn: Callable[..., _UIA_RESULT]) -> Callable[..., _UIA_RESULT]:
+    """Initialize UIA COM in the worker thread that actually uses the controls."""
+
+    @wraps(fn)
+    def wrapped(self: UIAutomationService, *args: Any, **kwargs: Any) -> _UIA_RESULT:
+        backend = self.backend
+        if not isinstance(backend, NativeUIABackend):
+            return fn(self, *args, **kwargs)
+        # UI Automation controls are apartment-bound. Sync MCP tools can run
+        # on different threads, so initialization at import time is insufficient.
+        backend._automation.InitializeUIAutomationInCurrentThread()
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            backend._automation.UninitializeUIAutomationInCurrentThread()
+
+    return cast(Callable[..., _UIA_RESULT], wrapped)
+
+
+def _transient_uia_error(exc: Exception) -> bool:
+    # A destroyed/inaccessible *unrelated* desktop element must not abort an
+    # otherwise valid bounded enumeration. Never discard ToolError or defects.
+    return not isinstance(exc, ToolError) and (
+        isinstance(exc, OSError) or type(exc).__name__ in {"COMError", "ElementNotAvailableError"}
+    )
+
+
 class UIAutomationService:
     def __init__(self, backend: UIABackend | None = None) -> None:
         self._backend = backend
@@ -138,11 +170,17 @@ class UIAutomationService:
     def _windows(self, locator: WindowLocator | None = None) -> list[tuple[Any, dict[str, Any]]]:
         matches: list[tuple[Any, dict[str, Any]]] = []
         for window in self.backend.windows():
-            values = self.backend.properties(window)
+            try:
+                values = self.backend.properties(window)
+            except Exception as exc:
+                if not _transient_uia_error(exc):
+                    raise
+                continue
             if locator is None or self._matches(values, locator):
                 matches.append((window, values))
         return matches
 
+    @_uia_thread
     def list_windows(self, locator: WindowLocator | None = None, *, offset: int = 0, limit: int = 100) -> dict[str, Any]:
         matches = self._windows(locator)
         page = matches[offset:offset + limit]
@@ -180,15 +218,27 @@ class UIAutomationService:
             visited += 1
             if visited > max_nodes:
                 raise ToolError("uia_traversal_limit", f"UI traversal exceeded {max_nodes} nodes.")
-            values = window_values if depth == 0 else self.backend.properties(element)
+            try:
+                values = window_values if depth == 0 else self.backend.properties(element)
+            except Exception as exc:
+                if not _transient_uia_error(exc):
+                    raise
+                continue
             if depth > 0 and self._matches(values, locator):
                 matches.append((element, {
                     **values, "_window_pid": window_values.get("pid"), "_window_handle": window_values.get("handle"),
                 }))
             if depth < max_depth:
-                queue.extend((child, depth + 1) for child in self.backend.children(element))
+                try:
+                    children = self.backend.children(element)
+                except Exception as exc:
+                    if depth == 0 or not _transient_uia_error(exc):
+                        raise
+                    continue
+                queue.extend((child, depth + 1) for child in children)
         return matches
 
+    @_uia_thread
     def find_elements(
         self,
         window: WindowLocator,
@@ -209,6 +259,7 @@ class UIAutomationService:
             "has_more": offset + len(page) < len(matches),
         }
 
+    @_uia_thread
     def get_element(self, window: WindowLocator, locator: ElementLocator) -> dict[str, Any]:
         element, values = self._resolve_element(window, locator)
         del element
@@ -222,18 +273,21 @@ class UIAutomationService:
             raise ToolError("uia_element_ambiguous", f"Element locator matched {len(matches)} elements; refine it.")
         return matches[0]
 
+    @_uia_thread
     def invoke(self, window: WindowLocator, locator: ElementLocator) -> dict[str, Any]:
         element, values = self._resolve_element(window, locator)
         with native_uia_mutation("ui_invoke", self._recovery_target(element, values)):
             self.backend.invoke(element)
         return {"ok": True, "element": self._snapshot(values), "action": "invoke"}
 
+    @_uia_thread
     def set_value(self, window: WindowLocator, locator: ElementLocator, value: str) -> dict[str, Any]:
         element, values = self._resolve_element(window, locator)
         with native_uia_mutation("ui_set_value", self._recovery_target(element, values)):
             self.backend.set_value(element, value)
         return {"ok": True, "element": self._snapshot(values), "action": "set_value", "value_chars": len(value)}
 
+    @_uia_thread
     def select(self, window: WindowLocator, locator: ElementLocator) -> dict[str, Any]:
         element, values = self._resolve_element(window, locator)
         with native_uia_mutation("ui_select", self._recovery_target(element, values)):
@@ -258,6 +312,7 @@ class UIAutomationService:
         except (TypeError, ValueError, OverflowError) as exc:
             raise ToolError("invalid_native_recovery_metadata", "UIA target identity is unavailable or invalid.") from exc
 
+    @_uia_thread
     def wait_for_element(
         self,
         window: WindowLocator,

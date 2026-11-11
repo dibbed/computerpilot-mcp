@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from mcp import Client
@@ -62,6 +62,48 @@ class FakeBackend:
         self.saved.append(("select", element.automation_id))
 
 
+def test_native_backend_initializes_com_in_each_tool_thread() -> None:
+    from tools.desktop.uia import NativeUIABackend
+
+    calls: list[str] = []
+
+    class Apartment:
+        def InitializeUIAutomationInCurrentThread(self) -> None:
+            calls.append("init")
+
+        def UninitializeUIAutomationInCurrentThread(self) -> None:
+            calls.append("uninit")
+
+    class NativeFixture(FakeBackend, NativeUIABackend):
+        def __init__(self) -> None:
+            FakeBackend.__init__(self)
+            self._automation = cast(Any, Apartment())
+
+    service = UIAutomationService(NativeFixture())
+    assert service.list_windows()["total_count"] == 1
+    assert service.find_elements(WindowLocator(title="Editor"), ElementLocator(name="Save"))["count"] == 1
+    assert calls == ["init", "uninit", "init", "uninit"]
+
+
+def test_stale_unrelated_com_elements_do_not_abort_bounded_uia_search() -> None:
+    class StaleBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.window.children.insert(0, Node("stale", "stale"))
+
+        def windows(self) -> list[Node]:
+            return [Node("stale-window"), self.window]
+
+        def properties(self, element: Node) -> dict[str, Any]:
+            if element.name in {"stale", "stale-window"}:
+                raise OSError("UI element was destroyed")
+            return super().properties(element)
+
+    service = UIAutomationService(StaleBackend())
+    result = service.find_elements(WindowLocator(title="Editor"), ElementLocator(name="Save"))
+    assert result["count"] == 1
+
+
 def test_semantic_lookup_and_mutations_redact_values() -> None:
     backend = FakeBackend()
     service = UIAutomationService(backend)
@@ -98,6 +140,33 @@ def test_mutation_re_resolves_and_duplicate_match_fails_closed() -> None:
 
     with pytest.raises(ToolError, match="matched 2"):
         service.invoke(window, ElementLocator(name="Save"))
+
+
+@pytest.mark.parametrize("action", ["invoke", "set_value", "select"])
+def test_ambiguous_uia_mutation_fails_closed_without_pending_journal(
+    action: str, native_journal: OperationRecoveryJournal,
+) -> None:
+    backend = FakeBackend()
+    if action == "set_value":
+        backend.window.children.append(Node("Name", "name-duplicate", "EditControl"))
+        locator = ElementLocator(name="Name", control_type="EditControl")
+    else:
+        backend.window.children.append(Node("Save", "save-duplicate"))
+        locator = ElementLocator(name="Save", control_type="ButtonControl")
+
+    wrapped = tooling.compact_errors(f"ui_{action}")(getattr(UIAutomationService(backend), action))
+    arguments: list[Any] = [WindowLocator(handle=10), locator]
+    if action == "set_value":
+        arguments.append("should-not-be-written")
+    result = wrapped(*arguments)
+
+    assert result["ok"] is False
+    assert result["error"] == "uia_element_ambiguous"
+    assert backend.saved == []
+    journal = native_journal.list_operations()
+    assert journal["total_count"] == 1
+    assert journal["items"][0]["state"] == "failed"
+    assert native_journal.summary()["pending_count"] == 0
 
 
 def test_bounded_traversal_and_timeout() -> None:

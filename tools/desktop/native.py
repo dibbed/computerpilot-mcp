@@ -148,6 +148,10 @@ def virtual_key(name: str) -> int:
     lowered = name.casefold()
     if lowered in SPECIAL_KEYS:
         return SPECIAL_KEYS[lowered]
+    # Shortcut letters and digits use fixed virtual-key codes. VkKeyScanW
+    # depends on the active layout and rejects Latin letters on Persian layouts.
+    if len(name) == 1 and ("a" <= lowered <= "z" or "0" <= lowered <= "9"):
+        return ord(lowered.upper())
     if len(name) == 1:
         value = _user32().VkKeyScanW(name)
         if value != -1:
@@ -158,12 +162,17 @@ def virtual_key(name: str) -> int:
 def send_hotkey(keys: list[str], hold_ms: int) -> None:
     require_windows()
     codes = [virtual_key(key) for key in keys]
-    for code in codes:
-        _send_key(code)
-    if hold_ms:
-        time.sleep(hold_ms / 1_000)
-    for code in reversed(codes):
-        _send_key(code, key_up=True)
+    pressed: list[int] = []
+    try:
+        for code in codes:
+            _send_key(code)
+            pressed.append(code)
+        if hold_ms:
+            time.sleep(hold_ms / 1_000)
+    finally:
+        # A failed SendInput or interrupted delay must not leave Ctrl/Alt held.
+        for code in reversed(pressed):
+            _send_key(code, key_up=True)
 
 
 def click_mouse(x: int, y: int, button: str, clicks: int, interval_ms: int) -> None:
