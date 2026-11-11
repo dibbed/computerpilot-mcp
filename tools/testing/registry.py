@@ -96,9 +96,16 @@ def register(
     ) -> dict[str, Any]:
         """Start a durable, cancellable watch that verifies settled source changes."""
         working = _cwd(repo).resolve()
+        # The watched repository is the job cwd, not necessarily the server's
+        # source tree. Bootstrap the trusted worker from PROJECT_ROOT explicitly.
+        worker = (
+            "import runpy, sys; "
+            f"sys.path.insert(0, {str(PROJECT_ROOT)!r}); "
+            "runpy.run_module('scripts.validation_watch', run_name='__main__')"
+        )
         args = [
-            "-m",
-            "scripts.validation_watch",
+            "-c",
+            worker,
             str(working),
             "--poll-sec",
             str(poll_sec),
