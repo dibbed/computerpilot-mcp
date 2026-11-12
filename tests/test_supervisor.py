@@ -478,9 +478,19 @@ def test_panel_status_controls_and_cross_origin_rejection(tmp_path: Path, monkey
         assert 'id="auditPrev"' in html
         assert 'id="auditNext"' in html
         assert 'id="auditModal"' in html
+        assert 'id="auditCopy"' in html
+        assert 'id="auditFields"' in html
+        assert 'id="auditOutcome"' in html
+        assert "metaCard('Correlation ID'" in html
+        assert "metaCard('Parent operation'" in html
+        assert "JSON.stringify(item,null,2)" in html
+        assert "content.textContent=" in html
+        assert "refreshAll().then(scrollToHashSection)" in html
         diagnostics_index = html.index('<div id="diagnostics" class="section-anchor">')
-        transport_index = html.index('<section class="panel">', diagnostics_index)
-        assert '<div class="grid two">' not in html[diagnostics_index:transport_index]
+        operations_index = html.index('<h2>Recent Operations</h2>', diagnostics_index)
+        history_index = html.index('<h2>Transport History</h2>', diagnostics_index)
+        assert diagnostics_index < operations_index < history_index
+        assert '<div class="grid two">' not in html[diagnostics_index:operations_index]
         assert "Runtime Health" in html
         assert "Tool Activity" in html
         assert "Execution Routing" in html

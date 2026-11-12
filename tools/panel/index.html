@@ -114,6 +114,14 @@ tbody tr:hover{background:rgba(121,191,242,.035)}
 .clickable:focus-visible{outline:2px solid var(--info);outline-offset:-2px}
 .audit-target{max-width:520px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .audit-operation{font-weight:750;color:var(--text-soft)}
+.audit-overview{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;color:var(--muted);font-size:11px}
+.audit-detail-list{display:grid;grid-template-columns:minmax(160px,.6fr) minmax(0,1.4fr);overflow:hidden;border:1px solid #1c3140;border-radius:9px}
+.audit-detail-list>div{padding:9px 11px;border-bottom:1px solid #1a2b37;font-size:11px;overflow-wrap:anywhere}
+.audit-detail-list>div:nth-last-child(-n+2){border-bottom:0}
+.audit-detail-key{background:var(--surface-3);color:var(--muted);font-weight:750}
+.audit-detail-value{font-family:var(--mono);white-space:pre-wrap}
+.audit-raw{margin-top:14px}
+.audit-dialog{width:min(920px,100%)}
 .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .muted{color:var(--muted)}
 .issue{color:var(--bad)}
@@ -208,6 +216,11 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
   button,input,select{min-height:44px}
   button.mini{min-height:38px}
   .dialog-close{width:44px;height:44px;min-height:44px}
+  .audit-detail-list{grid-template-columns:1fr}
+  .audit-detail-list>div:nth-last-child(2){border-bottom:1px solid #1a2b37}
+  .audit-detail-list>div:last-child{border-bottom:0}
+  .audit-detail-key{padding-bottom:5px}
+  .audit-detail-value{padding-top:5px}
 }
 @media(prefers-reduced-motion:reduce){
   html{scroll-behavior:auto}
@@ -497,6 +510,16 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 </div>
 
 <div id="diagnostics" class="section-anchor"><span>Diagnostics</span></div>
+<section class="panel" id="auditSection">
+<div class="panel-head"><div><h2>Recent Operations</h2><div class="panel-note">Metadata-only audit trail for local MCP mutations and process actions. Select a row to see full trace context, target and recorded fields.</div></div><div class="chips"><div id="auditChips" class="chips"></div><span id="auditPill" class="pill">—</span></div></div>
+<div class="filters" style="margin-bottom:10px">
+<select id="auditFilter" aria-label="Filter operations by outcome"><option value="ALL">All outcomes</option><option value="attempted">Attempted</option><option value="started">Started</option><option value="queued">Queued</option><option value="accepted">Accepted</option><option value="completed">Completed</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="timed_out">Timed out</option><option value="interrupted">Interrupted</option></select>
+<input id="auditSearch" aria-label="Search recent operations" placeholder="Search operation, target or PID">
+<button id="auditPrev" class="secondary mini">Previous</button><button id="auditNext" class="secondary mini">Next</button><span id="auditPage" class="muted"></span>
+</div>
+<div class="table-wrap"><table><thead><tr><th>Time</th><th>Operation</th><th>Outcome</th><th>PID</th><th>Target</th></tr></thead><tbody id="auditRows"></tbody></table></div>
+</section>
+
 <section class="panel">
 <div class="panel-head"><div><h2>Transport History</h2><div class="panel-note">Persisted classifications plus incident counts, watchdog recoveries and response-deadline drops.</div></div><span id="transportHistoryPill" class="pill">—</span></div>
 <div class="meta-grid" style="margin-bottom:10px">
@@ -508,16 +531,6 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 <div class="meta"><span>Latest Incident</span><strong id="transportLatestIncident">—</strong></div>
 </div>
 <div class="table-wrap"><table><thead><tr><th>Time</th><th>Diagnosis</th><th>Severity</th><th>Reason</th></tr></thead><tbody id="transportHistoryRows"></tbody></table></div>
-</section>
-
-<section class="panel">
-<div class="panel-head"><div><h2>Recent Operations</h2><div class="panel-note">Metadata-only audit trail for local MCP mutations and process actions. Click a row for the full target and safe operation metadata.</div></div><div class="chips"><div id="auditChips" class="chips"></div><span id="auditPill" class="pill">—</span></div></div>
-<div class="filters" style="margin-bottom:10px">
-<select id="auditFilter" aria-label="Filter operations by outcome"><option value="ALL">All outcomes</option><option value="attempted">Attempted</option><option value="started">Started</option><option value="queued">Queued</option><option value="accepted">Accepted</option><option value="completed">Completed</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="timed_out">Timed out</option><option value="interrupted">Interrupted</option></select>
-<input id="auditSearch" aria-label="Search recent operations" placeholder="Search operation, target or PID">
-<button id="auditPrev" class="secondary mini">Previous</button><button id="auditNext" class="secondary mini">Next</button><span id="auditPage" class="muted"></span>
-</div>
-<div class="table-wrap"><table><thead><tr><th>Time</th><th>Operation</th><th>Outcome</th><th>PID</th><th>Target</th></tr></thead><tbody id="auditRows"></tbody></table></div>
 </section>
 
 <section class="panel">
@@ -562,12 +575,14 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 
 <div id="auditModal" class="dialog-wrap" aria-hidden="true">
 <div class="backdrop" data-close-audit></div>
-<section id="auditDialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="auditModalTitle" tabindex="-1">
-<header class="dialog-head"><div><h2 id="auditModalTitle" class="dialog-title">Operation details</h2><div id="auditModalId" class="dialog-sub">—</div></div><button id="auditClose" class="dialog-close" aria-label="Close operation details">×</button></header>
+<section id="auditDialog" class="dialog audit-dialog" role="dialog" aria-modal="true" aria-labelledby="auditModalTitle" tabindex="-1">
+<header class="dialog-head"><div><h2 id="auditModalTitle" class="dialog-title">Operation details</h2><div id="auditModalId" class="dialog-sub">—</div></div><div class="actions"><button id="auditCopy" class="secondary mini">Copy details</button><button id="auditClose" class="dialog-close" aria-label="Close operation details">×</button></div></header>
 <div class="dialog-body">
+<div class="audit-overview"><span id="auditOutcome" class="pill">—</span><span>Recorded audit metadata only. Commands, file contents and secrets are not included.</span></div>
 <div id="auditMeta" class="meta-grid"></div>
-<div class="section-title">Target</div><pre id="auditTarget">—</pre>
-<div class="section-title">Safe metadata</div><pre id="auditDetails">—</pre>
+<div class="section-title">Full target</div><pre id="auditTarget">—</pre>
+<div class="section-title">Recorded fields</div><div id="auditFields" class="audit-detail-list"></div>
+<details class="log-details audit-raw"><summary>Raw recorded metadata (JSON)</summary><div class="log-details-body"><pre id="auditDetails">—</pre></div></details>
 </div>
 </section>
 </div>
@@ -1049,15 +1064,42 @@ function openAudit(item){
   activeAudit=item;
   document.body.classList.add('modal-open');$('auditModal').classList.add('open');$('auditModal').setAttribute('aria-hidden','false');
   $('auditModalId').textContent=safe(item.operation)+' · '+iso(item.time);
+  $('auditCopy').textContent='Copy details';
+  pill($('auditOutcome'),safe(item.outcome),auditTone(item.outcome));
+  const details=item.details&&typeof item.details==='object'&&!Array.isArray(item.details)?item.details:{};
+  const entries=Object.entries(details);
   $('auditMeta').replaceChildren(
-    metaCard('Outcome',safe(item.outcome)),
-    metaCard('PID',item.pid??'—'),
-    metaCard('Time',iso(item.time)),
-    metaCard('Metadata fields',fmtNum(Object.keys(item.details||{}).length))
+    metaCard('Operation',item.operation),
+    metaCard('Recorded (local time)',iso(item.time)),
+    metaCard('Recorded (UTC)',item.time||'—'),
+    metaCard('Process PID',item.pid??'—'),
+    metaCard('Correlation ID',item.correlation_id||'Not recorded'),
+    metaCard('Parent operation',item.parent_operation_id||'Not recorded'),
+    metaCard('Trace schema',item.trace_schema_version??'—'),
+    metaCard('Additional fields',fmtNum(entries.length))
   );
   $('auditTarget').textContent=item.target||'No target recorded.';
-  $('auditDetails').textContent=Object.keys(item.details||{}).length?JSON.stringify(item.details,null,2):'No additional metadata.';
+  const fields=$('auditFields');fields.replaceChildren();
+  if(!entries.length){
+    fields.className='empty';fields.textContent='No additional fields were recorded for this operation.';
+  }else{
+    fields.className='audit-detail-list';
+    for(const [key,value] of entries){
+      const label=document.createElement('div');label.className='audit-detail-key';label.textContent=key.replaceAll('_',' ');
+      const content=document.createElement('div');content.className='audit-detail-value';
+      content.textContent=value!==null&&typeof value==='object'?JSON.stringify(value,null,2):safe(value);
+      fields.append(label,content)
+    }
+  }
+  $('auditDetails').textContent=JSON.stringify(item,null,2);
   requestAnimationFrame(()=>$('auditDialog').focus())
+}
+async function copyAuditDetails(){
+  if(!activeAudit)return;
+  try{
+    await navigator.clipboard.writeText(JSON.stringify(activeAudit,null,2));
+    $('auditCopy').textContent='Copied';
+  }catch(e){$('auditCopy').textContent='Copy failed'}
 }
 function closeAudit(){
   activeAudit=null;$('auditModal').classList.remove('open');$('auditModal').setAttribute('aria-hidden','true');document.body.classList.remove('modal-open');
@@ -1174,8 +1216,17 @@ function schedulePoll(key,delay,fn){
   const tick=async()=>{if(!stopped&&document.visibilityState!=='hidden')await singleFlight(key,fn);setTimeout(tick,delay)};
   setTimeout(tick,delay)
 }
+function scrollToHashSection(){
+  const target=document.getElementById(location.hash.slice(1));
+  if(target&&target.classList.contains('section-anchor')){
+    target.scrollIntoView({block:'start',behavior:'instant'});
+  }
+}
 function setupSectionNavigation(){
   const links=[...document.querySelectorAll('.section-nav a')],targets=links.map(link=>document.querySelector(link.getAttribute('href'))).filter(Boolean);
+  // Repeat an anchor scroll even when clicking the already-selected hash.
+  // The initial async panel refresh can move the Diagnostics anchor downward.
+  links.forEach(link=>link.addEventListener('click',()=>requestAnimationFrame(scrollToHashSection)));
   if(!('IntersectionObserver' in window))return;
   const observer=new IntersectionObserver(entries=>{
     const visible=entries.filter(entry=>entry.isIntersecting).sort((a,b)=>a.boundingClientRect.top-b.boundingClientRect.top)[0];
@@ -1190,11 +1241,11 @@ $('jobsPrev').onclick=()=>{jobOffset=Math.max(0,jobOffset-jobLimit);singleFlight
 $('auditPrev').onclick=()=>{auditOffset=Math.max(0,auditOffset-auditLimit);lastAudit&&renderAudit(lastAudit)};$('auditNext').onclick=()=>{auditOffset+=auditLimit;lastAudit&&renderAudit(lastAudit)};$('auditFilter').onchange=()=>{auditOffset=0;lastAudit&&renderAudit(lastAudit)};$('auditSearch').oninput=()=>{auditOffset=0;lastAudit&&renderAudit(lastAudit)};
 $('eventFilter').onchange=()=>lastEvents&&renderEvents(lastEvents);$('eventSearch').oninput=()=>lastEvents&&renderEvents(lastEvents);
 $('jobClose').onclick=closeJob;$('jobModal').onclick=e=>{if(e.target instanceof Element&&e.target.hasAttribute('data-close-job'))closeJob()};$('jobCancel').onclick=cancelActiveJob;$('jobCopy').onclick=copyCommand;$('jobStdoutMore').onclick=()=>loadMoreJobOutput('stdout');$('jobStderrMore').onclick=()=>loadMoreJobOutput('stderr');$('jobDownloadStdout').onclick=()=>downloadJobStream('stdout');$('jobDownloadStderr').onclick=()=>downloadJobStream('stderr');
-$('auditClose').onclick=closeAudit;$('auditModal').onclick=e=>{if(e.target instanceof Element&&e.target.hasAttribute('data-close-audit'))closeAudit()};$('copyRawLogs').onclick=copyRawLogs;
+$('auditClose').onclick=closeAudit;$('auditCopy').onclick=copyAuditDetails;$('auditModal').onclick=e=>{if(e.target instanceof Element&&e.target.hasAttribute('data-close-audit'))closeAudit()};$('copyRawLogs').onclick=copyRawLogs;
 document.addEventListener('keydown',handleModalKeys);
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&!stopped)refreshAll()});
 setupSectionNavigation();
-refreshAll();
+refreshAll().then(scrollToHashSection);
 schedulePoll('summary',2500,refreshSummary);
 schedulePoll('events',5000,refreshEvents);
 schedulePoll('jobs',5000,refreshJobs);
