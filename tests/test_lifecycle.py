@@ -355,7 +355,10 @@ def test_real_mutating_tool_stays_active_until_command_finishes(
                 completed = await running
 
             assert completed.structured_content
-            assert completed.structured_content["ok"] is True
+            assert completed.structured_content["ok"] is True, {
+                key: completed.structured_content.get(key)
+                for key in ("error", "message", "exit_code", "timed_out", "capture_complete", "capture_error", "process_ownership")
+            }
             assert "done" in completed.structured_content["stdout"]["text"]
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
