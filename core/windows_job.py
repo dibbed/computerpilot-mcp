@@ -411,6 +411,7 @@ class OwnedProcess:
         self.job = job
         self.ownership_backend = backend
         self._cleanup_failed = False
+        self._close_lock = threading.Lock()
         self._root_created: float | None = None
         self._known_identities: dict[int, float] = {}
         self._last_visible_capture = time.monotonic()
@@ -507,24 +508,34 @@ class OwnedProcess:
         return process_identity_exited(pid, created) is not True
 
     def _reap_identities(self, identities: list[tuple[int, float]]) -> tuple[list[int], list[int]]:
-        """Kill only processes whose PID and create-time still match the captured tree."""
+        """Signal captured identities, then wait under one shared bounded deadline."""
         terminated: set[int] = set()
-        alive: set[int] = set()
+        pending: list[tuple[int, float]] = []
 
         for pid, created in identities:
             if not self._identity_live(pid, created):
                 terminated.add(pid)
                 continue
+            # Signal every identity-checked descendant before waiting: a large
+            # tree must not consume another full timeout for each child.
             _terminate_identity_tree(pid, created)
-            deadline = time.monotonic() + 1.0
-            while self._identity_live(pid, created):
-                if time.monotonic() >= deadline:
-                    alive.add(pid)
-                    break
-                time.sleep(0.02)
-            else:
-                terminated.add(pid)
-        return sorted(terminated), sorted(alive)
+            pending.append((pid, created))
+
+        # Redirected Windows launchers can leave independently owned children
+        # that take longer than one second to exit under load.
+        deadline = time.monotonic() + 3.0
+        while pending:
+            remaining: list[tuple[int, float]] = []
+            for pid, created in pending:
+                if self._identity_live(pid, created):
+                    remaining.append((pid, created))
+                else:
+                    terminated.add(pid)
+            if not remaining or time.monotonic() >= deadline:
+                return sorted(terminated), sorted(pid for pid, _ in remaining)
+            pending = remaining
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+        return sorted(terminated), []
 
     def _job_quiescent(self, job: WindowsJob) -> bool:
         counter = getattr(job, "active_process_count", None)
@@ -577,7 +588,28 @@ class OwnedProcess:
         self.process.terminate()
 
     def terminate_tree(self, *, force: bool = True) -> dict[str, Any]:
+        # Cancellation and background ownership release may arrive concurrently.
+        # Keep termination and closing under one lock for the same native owner.
+        with self._close_lock:
+            return self._terminate_tree_locked(force=force)
+
+    def _terminate_tree_locked(self, *, force: bool = True) -> dict[str, Any]:
+        if self._cleanup_failed:
+            raise ToolError("process_cleanup_incomplete", "Job Object ownership cleanup remains unresolved.")
         job = self.job
+        if self.ownership_backend == "windows_job":
+            if job is None:
+                # Native ownership already ended. A stale PID may now belong
+                # to someone else; never fall back to an unowned PID kill.
+                return {
+                    "targeted_pids": [],
+                    "terminated_pids": [],
+                    "alive_pids": [],
+                    "already_closed": True,
+                    "backend": "windows_job",
+                }
+            if job.closed:
+                raise ToolError("process_cleanup_incomplete", "Native Job Object was closed without ownership settlement.")
         if job is not None and not job.closed:
             identities = self._capture_tree_identities(include_ppid_scan=True)
             targeted = sorted({pid for pid, _ in identities} | {self.pid})
@@ -612,15 +644,25 @@ class OwnedProcess:
                 time.sleep(0.01)
                 quiescent = self._job_quiescent(job)
             terminated, alive = self._reap_identities(identities)
+            if alive:
+                # TerminateJobObject may finish before a broker-launched descendant
+                # outside its authority has fully exited. Recheck only the
+                # captured PID/create-time identities once, never a bare PID.
+                pending = set(alive)
+                retried, alive = self._reap_identities(
+                    [(pid, created) for pid, created in identities if pid in pending]
+                )
+                terminated = sorted(set(terminated).union(retried))
+                quiescent = self._job_quiescent(job)
             if not quiescent:
                 live = set(alive)
                 for pid, created in identities:
-                    try:
-                        process = psutil.Process(pid)
-                        if abs(process.create_time() - created) < 0.01 and process.is_running():
-                            live.add(pid)
-                    except (psutil.Error, OSError):
-                        continue
+                    # A signaled Windows process can still appear "running" in
+                    # psutil while its handle is retained. Check the captured
+                    # identity and OS exit signal instead; access denial stays
+                    # conservatively live.
+                    if self._identity_live(pid, created):
+                        live.add(pid)
                 alive = sorted(live)
             try:
                 self.process.wait(timeout=0.1)
@@ -634,12 +676,22 @@ class OwnedProcess:
                 "job_quiescent": quiescent,
                 "backend": "windows_job",
             }
+        if self._root_created is None:
+            # Psutil fallback has no Job Object authority. Without the original
+            # PID/create-time pair, a late cancellation could kill a stranger.
+            raise ToolError("process_identity_unavailable", "Cannot verify the original process before termination.")
         from core.executor import terminate_process_tree
-        result = terminate_process_tree(self.pid, force=force)
+        result = terminate_process_tree(self.pid, force=force, expected_created=self._root_created)
         result["backend"] = self.ownership_backend
         return result
 
     def close_ownership(self) -> None:
+        # Background reaping and result polling can close the same owner at once.
+        # Do not terminate or close a native Job Object from two threads.
+        with self._close_lock:
+            self._close_ownership_locked()
+
+    def _close_ownership_locked(self) -> None:
         if self._cleanup_failed:
             raise ToolError("process_cleanup_incomplete", "Job Object ownership cleanup remains unresolved.")
         job = self.job
