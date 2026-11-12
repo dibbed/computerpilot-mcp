@@ -31,7 +31,9 @@ def test_timeout_does_not_wait_for_descendant_inherited_pipes(root: Path, hang: 
         f"sys.path.insert(0,{str(doctor.ROOT)!r})\n"
         "from scripts import doctor\n"
         "try:\n"
-        f" doctor._run(Path({str(root)!r}),'MCP filesystem and terminal smoke',[sys.executable,'-c',{command!r}],timeout=1)\n"
+        # A Windows venv launcher can spend more than one second starting the
+        # nested Python process under load. Keep the bound well below the 30s child sleep.
+        f" doctor._run(Path({str(root)!r}),'MCP filesystem and terminal smoke',[sys.executable,'-c',{command!r}],timeout=5)\n"
         "except RuntimeError:\n"
         " outcome='timed out'\n"
         "else:\n"
@@ -50,7 +52,7 @@ def test_timeout_does_not_wait_for_descendant_inherited_pipes(root: Path, hang: 
     )
     try:
         try:
-            assert process.wait(timeout=6) == 0
+            assert process.wait(timeout=12) == 0
         except subprocess.TimeoutExpired:
             pytest.fail("Doctor timeout waited for inherited descendant pipes")
     finally:
