@@ -1715,8 +1715,10 @@ def _install_windows_console_handler(supervisor: Supervisor) -> Any:
     if os.name != "nt":
         return None
     try:
-        kernel32 = ctypes.windll.kernel32
-        handler_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+        # Win32-only ctypes members are absent from the POSIX type stubs.
+        win_ctypes = cast(Any, ctypes)
+        kernel32 = win_ctypes.windll.kernel32
+        handler_type = win_ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
 
         def _ctrl_handler(ctrl_type: int) -> int:
             # 0 = CTRL_C_EVENT, 1 = CTRL_BREAK_EVENT, 2 = CTRL_CLOSE_EVENT, 5 = LOGOFF, 6 = SHUTDOWN
@@ -1740,7 +1742,8 @@ def _remove_windows_console_handler(c_handler: Any) -> None:
     if os.name != "nt" or c_handler is None:
         return
     try:
-        ctypes.windll.kernel32.SetConsoleCtrlHandler(c_handler, 0)
+        win_ctypes = cast(Any, ctypes)
+        win_ctypes.windll.kernel32.SetConsoleCtrlHandler(c_handler, 0)
     except Exception:
         pass
 
