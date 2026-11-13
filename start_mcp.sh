@@ -33,7 +33,7 @@ while :; do
     "$VENV_PYTHON" -m scripts.bootstrap --start
     code=$?
     case "$code" in
-        130|143) exit "$code" ;;
+        13|130|143) exit "$code" ;;
     esac
 
     failures=$((failures + 1))

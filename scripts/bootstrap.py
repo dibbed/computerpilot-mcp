@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import getpass
 import hashlib
-import importlib
 import importlib.util
 import os
+import re
 import subprocess
 import sys
+import sysconfig
+import tempfile
 from pathlib import Path
 
+from core.file_lock import exclusive_file_lock
 from scripts.tunnel_runtime import TunnelRuntimeError, clean_control_plane_key, detect_profile, ensure_runtime
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,13 +78,15 @@ def _required_imports() -> tuple[str, ...]:
 
 
 def imports_healthy() -> bool:
-    """Actually import required modules so broken C-extensions or transitive deps are caught."""
-    for name in _required_imports():
-        try:
-            importlib.import_module(name)
-        except Exception:
-            return False
-    return True
+    """Probe in a fresh interpreter so installed modules are never held open during repairs."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", f"import {','.join(_required_imports())}"],
+            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def _run(command: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
@@ -208,7 +213,58 @@ def _requirements_path() -> Path:
     return ROOT / ("requirements-browser.txt" if browser else "requirements.txt")
 
 
-def _ensure_dependencies() -> None:
+def _repair_dependencies() -> bool:
+    venv = ROOT.resolve() / ".venv"
+    if Path(sys.prefix).resolve() != venv or not (venv / "pyvenv.cfg").is_file():
+        return False
+
+    paths = sysconfig.get_paths()
+    sites = sorted({Path(paths[key]).resolve() for key in ("purelib", "platlib")})
+    leftovers: list[Path] = []
+    wheels: dict[str, list[tuple[str, Path]]] = {}
+    for site in sites:
+        if not site.is_relative_to(venv):
+            raise BootstrapError("Virtual environment site-packages is outside the project .venv.", 13)
+        leftovers.extend(site.glob("~*"))
+        for metadata in sorted(site.glob("*.dist-info")):
+            match = re.fullmatch(r"([a-zA-Z0-9_]+)-([a-zA-Z0-9.!+_]+)\.dist-info", metadata.name)
+            if match:
+                name, version = match.groups()
+                wheels.setdefault(name.lower(), []).append((f"{name}=={version}", metadata))
+
+    damaged = []
+    for installed in wheels.values():
+        for requirement, metadata in installed:
+            if (metadata / "METADATA").is_file() and (metadata / "RECORD").is_file():
+                continue
+            if len(installed) != 1 or metadata.resolve() != metadata:
+                raise BootstrapError(f"Cannot safely repair ambiguous package metadata for {requirement}.", 13)
+            damaged.append((requirement, metadata))
+
+    if leftovers:
+        # Keep interrupted uninstall files available for manual recovery.
+        quarantine = Path(tempfile.mkdtemp(prefix="repair-quarantine-", dir=venv))
+        print(f"[3/5] Moving interrupted pip files to .venv/{quarantine.name}", flush=True)
+        for path in leftovers:
+            target = quarantine / path.relative_to(venv)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(target)
+
+    if damaged:
+        requirements = [requirement for requirement, _ in damaged]
+        print(f"[3/5] Repairing incomplete Python packages: {', '.join(requirements)}", flush=True)
+        result = _run([
+            sys.executable, "-m", "pip", "--require-virtualenv", "install", "--quiet",
+            "--disable-pip-version-check", "--ignore-installed", "--no-deps", "--only-binary=:all:", *requirements,
+        ])
+        if result.returncode or any(
+            not ((metadata / "METADATA").is_file() and (metadata / "RECORD").is_file()) for _, metadata in damaged
+        ):
+            raise BootstrapError("Could not reinstall incomplete Python packages.", 13)
+    return bool(damaged or leftovers)
+
+
+def _ensure_dependencies(*, refresh: bool = False) -> None:
     requirements = _requirements_path()
     marker = Path(sys.prefix) / ".requirements.sha256"
     expected = requirements_fingerprint(requirements)
@@ -218,7 +274,7 @@ def _ensure_dependencies() -> None:
         installed = ""
 
     healthy = imports_healthy()
-    if installed == expected and healthy:
+    if installed == expected and healthy and not refresh:
         print("[3/5] Dependencies are current.")
         return
 
@@ -260,14 +316,19 @@ def validate() -> tuple[str, str]:
         print("INFO Resolving Secure MCP Tunnel runtime...")
         profile = _resolve_tunnel()
 
-    if _doctor_check(mode, profile):
-        print("[3/5] Successful startup fingerprint unchanged.")
-        print("[4/5] Fast checks complete.")
-        return mode, profile
+    try:
+        with exclusive_file_lock(ROOT / ".agent_state/startup-validation.lock", timeout_sec=900, label="startup validation"):
+            repaired = _repair_dependencies()
+            if not repaired and _doctor_check(mode, profile):
+                print("[3/5] Successful startup fingerprint unchanged.")
+                print("[4/5] Fast checks complete.")
+                return mode, profile
 
-    _ensure_dependencies()
-    print("[4/5] Running full startup doctor...")
-    _full_doctor(mode, profile)
+            _ensure_dependencies(refresh=repaired)
+            print("[4/5] Running full startup doctor...")
+            _full_doctor(mode, profile)
+    except OSError as exc:
+        raise BootstrapError(f"Startup validation could not access local files ({type(exc).__name__}).", 13) from None
     return mode, profile
 
 

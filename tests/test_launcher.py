@@ -1,4 +1,4 @@
-"""Exercise the real batch retry loop with an isolated bootstrap substitute."""
+"""Exercise the native launcher's retry loop with an isolated bootstrap substitute."""
 
 import os
 import shutil
@@ -10,13 +10,14 @@ from pathlib import Path
 import pytest
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows batch launcher")
-@pytest.mark.parametrize("first_exit", [0, 7])
-def test_launcher_restarts_then_honors_interrupt(tmp_path: Path, first_exit: int) -> None:
+@pytest.mark.parametrize("first_exit", [0, 7, 13])
+def test_launcher_handles_retry_and_terminal_exits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_exit: int) -> None:
+    monkeypatch.delenv("MCP_START_VALIDATE_ONLY", raising=False)
     project = tmp_path / "project with spaces"
     scripts = project / "scripts"
     scripts.mkdir(parents=True)
-    shutil.copyfile(Path(__file__).resolve().parents[1] / "START_MCP.bat", project / "START_MCP.bat")
+    launcher = project / ("START_MCP.bat" if os.name == "nt" else "start_mcp.sh")
+    shutil.copyfile(Path(__file__).resolve().parents[1] / launcher.name, launcher)
     subprocess.run(
         [sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", str(project / ".venv")],
         check=True,
@@ -39,14 +40,20 @@ def test_launcher_restarts_then_honors_interrupt(tmp_path: Path, first_exit: int
     result = subprocess.run(
         # Hardened Windows shells set NoDefaultCurrentDirectoryInExePath, so
         # cmd.exe will not resolve a bare batch name from the working directory.
-        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(project / "START_MCP.bat")],
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(launcher)] if os.name == "nt" else ["sh", str(launcher)],
         cwd=project,
         capture_output=True,
         text=True,
         timeout=60,
     )
+    attempts = (scripts / "attempts.txt").read_text().splitlines()
+    if first_exit == 13:
+        assert result.returncode == 13, result.stdout + result.stderr
+        assert attempts == ["first"]
+        assert "Restarting" not in result.stdout
+        return
     assert result.returncode == 130, result.stdout + result.stderr
-    assert (scripts / "attempts.txt").read_text().splitlines() == ["first", "second"]
+    assert attempts == ["first", "second"]
     assert f"MCP exited with code {first_exit}" in result.stdout
     assert time.monotonic() - started >= 5
 

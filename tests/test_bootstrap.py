@@ -2,11 +2,59 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
+import zipfile
 from pathlib import Path
 
 import pytest
 
 from scripts import bootstrap
+
+
+def test_recovers_incomplete_wheel_in_managed_venv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    venv = tmp_path / ".venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, timeout=90)
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    site = Path(subprocess.check_output(
+        [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True, timeout=15,
+    ).strip())
+    metadata = site / "repair_demo-1.0.dist-info"
+    metadata.mkdir()
+    wheel_metadata = "Metadata-Version: 2.1\nName: repair-demo\nVersion: 1.0\n"
+    old_metadata = site / "~epair_demo-0.9.dist-info"
+    old_metadata.mkdir()
+    old_package = site / "~epair_demo"
+    old_package.mkdir()
+    wheel = tmp_path / "repair_demo-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("repair_demo.py", "READY = True\n")
+        archive.writestr(f"{metadata.name}/METADATA", wheel_metadata)
+        archive.writestr(f"{metadata.name}/WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+        archive.writestr(f"{metadata.name}/RECORD", "")
+    (tmp_path / "requirements.txt").write_text("repair-demo==1.0\n", encoding="utf-8")
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(tmp_path))
+    monkeypatch.setenv("MCP_START_MODE", "local-http")
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    (venv / ".requirements.sha256").write_text(
+        bootstrap.requirements_fingerprint(tmp_path / "requirements.txt"), encoding="ascii",
+    )
+
+    subprocess.run([str(python), "-c", (
+        "from pathlib import Path\n"
+        "from scripts import bootstrap\n"
+        f"bootstrap.ROOT = Path({str(tmp_path)!r})\n"
+        "bootstrap._required_imports = lambda: ('repair_demo',)\n"
+        "bootstrap._full_doctor = lambda mode, profile: None\n"
+        "assert bootstrap.validate() == ('local-http', 'default')\n"
+        "import repair_demo\n"
+        "assert repair_demo.READY\n"
+    )], cwd=Path(__file__).resolve().parents[1], check=True, timeout=90)
+    subprocess.run([str(python), "-m", "pip", "check"], check=True, timeout=15)
+    assert (metadata / "RECORD").is_file()
+    assert not old_metadata.exists() and not old_package.exists()
+    assert list(venv.glob(f"repair-quarantine-*/**/{old_metadata.name}"))
+    assert list(venv.glob(f"repair-quarantine-*/**/{old_package.name}"))
 
 
 def test_doctor_watchdog_retains_tree_ownership_on_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,7 +96,7 @@ def test_cache_and_full_doctor_have_explicit_watchdogs(monkeypatch: pytest.Monke
     assert budgets == [30, 900]
 
 
-def test_cache_probe_cleanup_failure_stops_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cache_probe_cleanup_failure_stops_startup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from core import process_ownership
     from core.errors import ToolError
 
@@ -60,9 +108,11 @@ def test_cache_probe_cleanup_failure_stops_startup(monkeypatch: pytest.MonkeyPat
             raise ToolError("process_cleanup_incomplete", "secret-canary")
 
     monkeypatch.setenv("MCP_START_MODE", "local-http")
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(bootstrap, "_repair_dependencies", lambda: False)
     monkeypatch.setattr(bootstrap, "imports_healthy", lambda: True)
     monkeypatch.setattr(process_ownership, "spawn_owned_process", lambda *args, **kwargs: Process())
-    monkeypatch.setattr(bootstrap, "_ensure_dependencies", lambda: pytest.fail("continued after uncertain cleanup"))
+    monkeypatch.setattr(bootstrap, "_ensure_dependencies", lambda **kwargs: pytest.fail("continued after uncertain cleanup"))
     with pytest.raises(bootstrap.BootstrapError) as error:
         bootstrap.validate()
     assert "secret-canary" not in str(error.value)
@@ -271,6 +321,7 @@ def test_existing_key_never_prompts_or_changes_file(
     ],
 )
 def test_validate_fast_and_full_paths(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cached: bool,
     doctor_exit: int,
@@ -278,10 +329,12 @@ def test_validate_fast_and_full_paths(
     expected_full_calls: int,
 ) -> None:
     monkeypatch.setenv("MCP_START_MODE", "local-http")
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(bootstrap, "_repair_dependencies", lambda: False)
     dependency_calls: list[bool] = []
     full_calls: list[tuple[str, str]] = []
     monkeypatch.setattr(bootstrap, "_doctor_check", lambda mode, profile: cached)
-    monkeypatch.setattr(bootstrap, "_ensure_dependencies", lambda: dependency_calls.append(True))
+    monkeypatch.setattr(bootstrap, "_ensure_dependencies", lambda **kwargs: dependency_calls.append(True))
 
     def full_doctor(mode: str, profile: str) -> None:
         full_calls.append((mode, profile))
