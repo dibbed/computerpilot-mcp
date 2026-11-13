@@ -153,6 +153,19 @@ def test_unsupported_version_has_zero_dispatch(tmp_path: Path, monkeypatch: pyte
     assert exc.value.code == "unsupported_runner_version"
 
 
+def test_unsupported_version_is_rejected_before_resource_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _node(tmp_path, monkeypatch, version="28.0.0")
+    monkeypatch.setattr(
+        runners, "run_native_operation",
+        lambda *args, **kwargs: pytest.fail("An unsupported version must not request resource admission"),
+    )
+    with pytest.raises(ToolError) as failure:
+        _run(spec)
+    assert failure.value.code == "unsupported_runner_version"
+
+
 def test_no_tests_is_not_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     spec = _node(tmp_path, monkeypatch)
     _report_fixture(monkeypatch, lambda path: path.write_text(json.dumps({

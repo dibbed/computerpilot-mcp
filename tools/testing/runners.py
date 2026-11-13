@@ -268,6 +268,16 @@ def _runner_error(code: str) -> ToolError:
     return ToolError(code, "The selected test execution inputs are invalid or unsupported.")
 
 
+def _validate_pinned_runner_version(spec: RunnerSpec) -> None:
+    """Reject unsupported pinned versions without taking a managed resource claim."""
+    major = _SUPPORTED_RUNNERS.get(spec.runner)
+    if major is None:
+        return
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", spec.version or "")
+    if match is None or int(match[1]) != major:
+        raise _runner_error("unsupported_runner_version")
+
+
 def _runner_targets(spec: RunnerSpec, targets: list[Path]) -> list[Path]:
     selected: list[Path] = []
     if len(targets) > 1000:
@@ -299,9 +309,7 @@ def build_runner_argv(spec: RunnerSpec, targets: list[Path], report: Path) -> li
     selected = _runner_targets(spec, targets)
     command = [str(spec.runtime.path)]
     if spec.runner in _SUPPORTED_RUNNERS:
-        match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", spec.version or "")
-        if match is None or int(match[1]) != _SUPPORTED_RUNNERS[spec.runner]:
-            raise _runner_error("unsupported_runner_version")
+        _validate_pinned_runner_version(spec)
         if (
             spec.entrypoint is None or not spec.entrypoint.is_absolute()
             or spec.entrypoint.suffix.casefold() in {".cmd", ".bat", ".ps1"}
@@ -474,6 +482,9 @@ def run_project_tests(
     ):
         raise _runner_error("invalid_test_runner_budget")
     deadline = min(deadline, started + 600)
+    # No path or OS access here: fail unsupported versions before resource admission.
+    # The bound runner identity and version are still rechecked before dispatch.
+    _validate_pinned_runner_version(spec)
     return run_native_operation("verify_changes", str(spec.package_root), lambda: _run_project_tests(
         spec, targets=targets, deadline=deadline, diagnostic_cap=diagnostic_cap, started=started,
     ))
