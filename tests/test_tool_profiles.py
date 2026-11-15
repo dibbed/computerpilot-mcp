@@ -224,7 +224,7 @@ def test_full_is_default_and_preserves_complete_catalog() -> None:
     assert resolve_profile(None).name == "full"
     names = _names("full")
     if os.name == "nt":
-        assert len(names) == 152
+        assert len(names) == 154
     else:
         assert "run_shell" in names
         assert "run_cmd" not in names
@@ -241,6 +241,8 @@ def test_full_is_default_and_preserves_complete_catalog() -> None:
         "reconcile_operation",
         "discover_tool_domains",
         "recommend_tools",
+        "submit_jobs",
+        "jobs_snapshot",
     } <= names
     assert {"workflow_execute", "workflow_operations", "workflow_reconcile", "workflow_acknowledge_operation"} <= names
 

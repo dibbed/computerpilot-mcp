@@ -88,6 +88,8 @@ REQUIRED_TOOLS = {
     "memory_read",
     "memory_update",
     "job_wait",
+    "submit_jobs",
+    "jobs_snapshot",
     "execution_candidates",
     "execution_recommend",
 }
@@ -172,7 +174,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
     if os.name == "nt":
-        assert len(names) == 152
+        assert len(names) == 154
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     assert "execution_run" not in names
