@@ -99,6 +99,7 @@ MUTATING_TOOL_OPERATIONS = frozenset(
         "hotkey",
         "memory_update",
         "submit_job",
+        "submit_jobs",
         "cancel_job",
         "reconcile_operation",
         "acknowledge_uncertain_operation",
