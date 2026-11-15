@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Literal
@@ -20,6 +20,7 @@ import psutil
 from core.artifacts import Delivery, deliver_file
 from core.config import SETTINGS
 from core.errors import ToolError
+from core.resource_claims import ResourceClaim, canonical_claims, claim_sets_conflict, coordination_claim, path_claim
 from core.resource_locks import RESOURCE_LOCKS
 from core.timings import current_trace_metadata, invocation_trace, validated_trace_metadata
 
@@ -57,6 +58,21 @@ def _job_wait_poll_interval(elapsed: float) -> float:
     if elapsed < 30.0:
         return 0.25
     return 0.5
+
+
+def job_resource_claims(spec: dict[str, Any]) -> tuple[ResourceClaim, ...]:
+    """Map a durable job's stored intent to the actual resource-admission claims."""
+    cwd = str(spec["cwd"])
+    declared = spec.get("parallel_resources")
+    if declared is None:
+        return canonical_claims((coordination_claim(exclusive=True), path_claim(cwd, "write", scope="subtree")))
+    if not isinstance(declared, list) or not declared:
+        raise ValueError("Declared jobs must carry nonempty persisted resource claims.")
+    return canonical_claims((
+        coordination_claim(),
+        path_claim(cwd, "read"),
+        *(path_claim(item["key"], item["mode"], scope=item["scope"]) for item in declared),
+    ))
 
 
 def same_process(pid: int | None, created: float | None) -> bool:
@@ -158,6 +174,7 @@ class JobStore:
         queue_timeout_sec: float | None = None,
         _resource_capability: str | None = None,
         _retention_retry: bool = False,
+        parallel_resources: tuple[ResourceClaim, ...] | None = None,
     ) -> dict[str, Any]:
         if not command or not command[0] or not cwd.is_dir():
             raise ValueError("An executable and existing working directory are required.")
@@ -177,6 +194,16 @@ class JobStore:
             "timeout_sec": timeout_sec,
             "encoding": encoding,
         }
+        if parallel_resources is not None:
+            if not 1 <= len(parallel_resources) <= 32 or any(
+                claim.kind != "fs" or not Path(claim.key).is_absolute()
+                for claim in parallel_resources
+            ):
+                raise ValueError("Parallel jobs require 1..32 absolute filesystem resource claims.")
+            declared = canonical_claims(tuple(
+                path_claim(claim.key, claim.mode, scope=claim.scope) for claim in parallel_resources
+            ))
+            spec_data["parallel_resources"] = [claim.public() for claim in declared]
         if queue_timeout_sec is not None:
             spec_data["queue_timeout_sec"] = queue_timeout_sec
         fingerprint_spec = json.dumps(spec_data, sort_keys=True)
@@ -218,6 +245,7 @@ class JobStore:
                     queue_timeout_sec=queue_timeout_sec,
                     _resource_capability=_resource_capability,
                     _retention_retry=True,
+                    parallel_resources=parallel_resources,
                 )
             if result["status"] == "queued":
                 from core.job_scheduler import ensure_job_scheduler
@@ -384,21 +412,58 @@ class JobStore:
             available = max(max_running - active_count - reserved_count, 0)
             reservations: list[tuple[str, str]] = []
             if available:
-                ids = [str(row[0]) for row in db.execute(
-                    "SELECT id FROM jobs WHERE status='queued' AND launch_token IS NULL AND cancel_requested=0 "
-                    "AND (queue_deadline IS NULL OR queue_deadline>?) ORDER BY created,id LIMIT ?",
-                    (now, available),
-                )]
-                for job_id in ids:
-                    token = uuid.uuid4().hex
-                    claimed = db.execute(
-                        "UPDATE jobs SET launch_token=?,launch_started=?,updated=?,version=version+1 "
-                        "WHERE id=? AND status='queued' AND launch_token IS NULL AND cancel_requested=0 "
-                        "AND (queue_deadline IS NULL OR queue_deadline>?)",
-                        (token, now, now, job_id, now),
-                    ).rowcount
-                    if claimed:
-                        reservations.append((job_id, token))
+                # Do not waste worker slots on jobs that are already known to
+                # conflict with launched/running jobs. This also allows a later
+                # independent job to pass an earlier resource-blocked one.
+                occupying = [
+                    job_resource_claims(json.loads(row[0]))
+                    for row in db.execute(
+                        "SELECT spec FROM jobs WHERE status IN ('running','orphaned') "
+                        "OR (status='queued' AND launch_token IS NOT NULL)"
+                    )
+                ]
+                # Traverse the queue in bounded pages, not just its first
+                # N entries: a large prefix of blocked jobs must not starve a
+                # later independent job indefinitely. Keyset paging avoids
+                # materializing the whole queue under the SQLite write lock.
+                if not any(
+                    claim.kind == "coordination" and claim.mode == "write"
+                    for held in occupying for claim in held
+                ):
+                    cursor: tuple[float, str] | None = None
+                    while len(reservations) < available:
+                        query = (
+                            "SELECT id,created,spec FROM jobs WHERE status='queued' "
+                            "AND launch_token IS NULL AND cancel_requested=0 "
+                            "AND (queue_deadline IS NULL OR queue_deadline>?)"
+                        )
+                        params: tuple[Any, ...] = (now,)
+                        if cursor is not None:
+                            query += " AND (created,id)>(?,?)"
+                            params = (now, *cursor)
+                        rows = list(db.execute(query + " ORDER BY created,id LIMIT 128", params))
+                        if not rows:
+                            break
+                        for row in rows:
+                            job_id = str(row["id"])
+                            cursor = (float(row["created"]), job_id)
+                            wanted = job_resource_claims(json.loads(row["spec"]))
+                            if any(claim_sets_conflict(wanted, held) for held in occupying):
+                                continue
+                            token = uuid.uuid4().hex
+                            claimed = db.execute(
+                                "UPDATE jobs SET launch_token=?,launch_started=?,updated=?,version=version+1 "
+                                "WHERE id=? AND status='queued' AND launch_token IS NULL AND cancel_requested=0 "
+                                "AND (queue_deadline IS NULL OR queue_deadline>?)",
+                                (token, now, now, job_id, now),
+                            ).rowcount
+                            if claimed:
+                                reservations.append((job_id, token))
+                                occupying.append(wanted)
+                            if len(reservations) >= available:
+                                break
+                        if len(rows) < 128:
+                            break
             queued_remaining = int(db.execute(
                 "SELECT count(*) FROM jobs WHERE status='queued'",
             ).fetchone()[0])
@@ -540,6 +605,33 @@ class JobStore:
                     (time.time(), job_id, worker_pid, worker_created),
                 )
             return admitted
+
+    def resource_waiting_ids(self, job_ids: Sequence[str]) -> set[str]:
+        """Best-effort, read-only view of queued jobs blocked by other durable jobs.
+
+        The authoritative status remains 'queued'. These advisory labels do not
+        create new persisted states or consume worker slots.
+        """
+        if not job_ids:
+            return set()
+        with closing(self.connect()) as db:
+            held = [
+                job_resource_claims(json.loads(row[0]))
+                for row in db.execute(
+                    "SELECT spec FROM jobs WHERE status IN ('running','orphaned') "
+                    "OR (status='queued' AND launch_token IS NOT NULL)"
+                )
+            ]
+            placeholders = ",".join("?" for _ in job_ids)
+            rows = db.execute(
+                f"SELECT id,spec FROM jobs WHERE status='queued' AND launch_token IS NULL "
+                f"AND cancel_requested=0 AND id IN ({placeholders})",
+                tuple(job_ids),
+            )
+            return {
+                str(row["id"]) for row in rows
+                if any(claim_sets_conflict(job_resource_claims(json.loads(row["spec"])), claim) for claim in held)
+            }
 
     def get(self, job_id: str) -> dict[str, Any]:
         return self._public(self._reconcile([self._status_raw(job_id)])[0])

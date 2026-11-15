@@ -17,20 +17,22 @@ import pytest
 from core import job_scheduler
 from core import jobs as jobs_module
 from core.jobs import JobStore
+from core.resource_claims import path_claim
 
 
 def _seed(store: JobStore, count: int) -> list[str]:
     now = time.time()
-    spec = json.dumps(
-        {"command": ["fake"], "cwd": str(store.path.parent), "timeout_sec": 60.0, "encoding": "utf-8"},
-        sort_keys=True,
-    )
     ids = [f"{index + 500:032x}" for index in range(count)]
+    def spec_for(job_id: str) -> str:
+        return json.dumps({
+            "command": ["fake"], "cwd": str(store.path.parent), "timeout_sec": 60.0, "encoding": "utf-8",
+            "parallel_resources": [path_claim(store.path.parent / f"resource-{job_id}", "write").public()],
+        }, sort_keys=True)
     with closing(store.connect()) as db, db:
         db.executemany(
             "INSERT INTO jobs (id,request_key,fingerprint,spec,status,created,updated,version) "
             "VALUES (?,?,?,?,?,?,?,1)",
-            [(job_id, f"scheduler-{job_id}", f"fp-{job_id}", spec, "queued", now, now) for job_id in ids],
+            [(job_id, f"scheduler-{job_id}", f"fp-{job_id}", spec_for(job_id), "queued", now, now) for job_id in ids],
         )
     return ids
 

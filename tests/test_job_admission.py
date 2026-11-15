@@ -12,6 +12,7 @@ import psutil
 import pytest
 
 from core.jobs import ACTIVE_JOB_STATUSES, JobStore, same_process
+from core.resource_claims import path_claim
 
 
 def _seed_queued(store: JobStore, count: int) -> list[str]:
@@ -192,6 +193,7 @@ def test_real_workers_respect_max_running_jobs(tmp_path: Path, monkeypatch: pyte
             tmp_path,
             10.0,
             f"real-admission-{index}",
+            parallel_resources=(path_claim(tmp_path / f"admission-resource-{index}", "write"),),
         )
         job_ids.append(str(result["job_id"]))
 

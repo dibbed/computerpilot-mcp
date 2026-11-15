@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from contextlib import ExitStack, closing
 from pathlib import Path
@@ -18,14 +19,12 @@ from core.audit import audit_action
 from core.config import SETTINGS
 from core.errors import ToolError
 from core.executor import _creation_flags
-from core.jobs import JobStore
+from core.jobs import JobStore, job_resource_claims
 from core.process_ownership import OwnedProcess, spawn_owned_process
 from core.resource_claims import (
     RESOURCE_CAPABILITY_ENV,
     _parse_resource_capability,
-    coordination_claim,
     managed_resource_claims,
-    path_claim,
     resource_capability,
     resource_requires_native_ownership,
     validate_resource_capability,
@@ -72,6 +71,19 @@ def _kick_successor(store: JobStore) -> None:
         ensure_job_scheduler(SchedulerStore(store.path, initialize=False))
     except Exception:
         pass
+
+
+class _DbCancellationEvent(threading.Event):
+    """Read a durable cancellation flag during resource-admission waits."""
+
+    def __init__(self, db: sqlite3.Connection, job_id: str) -> None:
+        super().__init__()
+        self._db = db
+        self._job_id = job_id
+
+    def is_set(self) -> bool:
+        row = self._db.execute("SELECT cancel_requested FROM jobs WHERE id=?", (self._job_id,)).fetchone()
+        return row is None or bool(row[0])
 
 
 def _row(db: sqlite3.Connection, job_id: str) -> dict[str, Any]:
@@ -137,14 +149,12 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 resource_stack.enter_context(resource_capability(inherited_capability))
             capability = resource_stack.enter_context(
                 managed_resource_claims(
-                    [
-                        coordination_claim(exclusive=True),
-                        path_claim(str(spec["cwd"]), "write", scope="subtree"),
-                    ],
+                    job_resource_claims(spec),
                     category="native.job",
                     timeout_sec=float(spec["timeout_sec"]),
                     db_path=path.parent / "workflows.sqlite3",
                     quarantine_on_error=True,
+                    cancel_event=_DbCancellationEvent(db, job_id),
                 )
             )
             resource_authority = validate_resource_capability(capability, ())
@@ -254,7 +264,12 @@ def run(path: Path, job_id: str, launch_token: str | None = None) -> None:
                 except Exception as cleanup_error:
                     error += f"; ownership cleanup failed ({type(cleanup_error).__name__})"
             try:
-                _update(db, job_id, status="failed", error=error)
+                cancelled_during_admission = isinstance(exc, ToolError) and exc.code == "resource_admission_cancelled"
+                _update(
+                    db, job_id,
+                    status="cancelled" if cancelled_during_admission else "failed",
+                    error=None if cancelled_during_admission else error,
+                )
             except sqlite3.Error:
                 # Recovery path only: a broken worker connection must still make
                 # the terminal state visible if the database itself is reachable.
