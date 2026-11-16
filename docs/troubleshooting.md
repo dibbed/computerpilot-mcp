@@ -34,7 +34,7 @@ A full Doctor after a meaningful change is expected.
 
 ## Native Read Batch activation on Windows
 
-The default Windows `full` catalog has 156 native tools. Set
+The default Windows `full` catalog has 157 native tools. Set
 `MCP_NATIVE_READ_BATCH_ENABLED=1` before runtime startup to add `native_read_batch`.
 This is an opt-in operational setting, not a requirement for a working MCP server.
 
@@ -46,7 +46,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\activate_native_
 ```
 
 `-CheckOnly` checks tracked Git state, the local active-work guard, a unique
-157-tool startup catalog, and full Tunnel Doctor without stopping the current service.
+158-tool startup catalog, and full Tunnel Doctor without stopping the current service.
 The `CheckOnly` invocation must run in an ordinary, independent PowerShell
 session, **not** as a detached child of an MCP-owned job.
 
@@ -70,7 +70,7 @@ restores previous settings bytes and attempts the original service launch if the
 new service fails readiness. A `healthy` status means only the local Supervisor
 and Tunnel are healthy. **It does not establish that ChatGPT refreshed its tool
 catalog or that Batch improves real-world latency.** Refresh/reconnect the
-ChatGPT plugin, then verify 157 native tools in `discover_tool_domains.tool_counts.native` and invoke
+ChatGPT plugin, then verify 158 native tools in `discover_tool_domains.tool_counts.native` and invoke
 `native_read_batch` from the refreshed catalog before accepting the feature.
 If the old catalog persists, stop and investigate rather than creating a second
 Supervisor. The existing `uv.lock`, `.secrets/`, and other runtime data must be

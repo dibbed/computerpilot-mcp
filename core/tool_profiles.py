@@ -46,7 +46,7 @@ READ_BATCH_TOOLS = frozenset({
 CODING_CORE_TOOLS = frozenset("""
 discover_tool_domains recommend_tools execution_candidates execution_recommend server_health
 read_file search_files list_directory get_file_info apply_patch replace_exact write_file create_file
-project_summary code_context
+project_summary code_context cross_language_references
 symbol_definition symbol_references document_symbols workspace_symbols symbol_hover
 call_hierarchy language_diagnostics rename_symbol apply_code_action
 affected_tests verify_changes start_verification
@@ -67,6 +67,7 @@ PREFERRED_USE: dict[str, str] = {
     "run_cmd": "Use for intentional Windows CMD expansion; prefer run_process otherwise.",
     "run_background": "Use for a long-running process that needs a managed session.",
     "submit_job": "Use for durable execution that must survive MCP runtime restarts.",
+    "cross_language_references": "Find static HTML/CSS/JS/TS class and id evidence; dynamic selectors remain incomplete.",
     "affected_tests": "Use to identify a conservative focused test set for changed code.",
     "verify_changes": "Use for change-aware syntax, Ruff, mypy, and pytest verification.",
     "start_verification": "Start long verification, continue independent work, then collect the fresh result with job_wait/job_output.",

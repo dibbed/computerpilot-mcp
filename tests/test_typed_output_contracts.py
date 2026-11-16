@@ -644,7 +644,7 @@ def test_ten_tool_output_schemas_preserve_catalog_identity(monkeypatch: pytest.M
             assert names <= tools.keys()
             if profile == "full":
                 # Windows-only tool domains are excluded by capability negotiation on POSIX.
-                assert len(tools) == (156 if os.name == "nt" else 141)
+                assert len(tools) == (157 if os.name == "nt" else 142)
             for name in names:
                 schema = tools[name].output_schema
                 assert schema is not None
@@ -918,7 +918,7 @@ def test_portable_catalogue_excludes_only_platform_gated_domains(
     monkeypatch.setattr(registry, "detect_capabilities", lambda: fake_posix)
 
     async def scenario() -> None:
-        for profile, count in (("full", 141), ("coding", 100), ("coding_core", 43)):
+        for profile, count in (("full", 142), ("coding", 101), ("coding_core", 44)):
             monkeypatch.setattr(registry, "SETTINGS", replace(registry.SETTINGS, tool_profile=profile))
             tools = await registry.create_server().list_tools()
             assert len(tools) == count
@@ -950,13 +950,13 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
     from core import registry
 
     baseline = {
-        "full": (156 if os.name == "nt" else 141, 161424, "dd943f86782309bdadfce181d99ff868ae7a1a496a2aeaadcb177ad3e47257e6"),
-        "coding": (100, 100462, "63d7cefc60e4f461de32b37fa45d3aeca267ada484e074114f9824d0d570e593"),
-        "coding_core": (43, 47156, "6bac11be7330500d44e2439fe434e216faf46e0ccd025b8c2cb7c7614b88275f"),
+        "full": (157 if os.name == "nt" else 142, 161424, "dd943f86782309bdadfce181d99ff868ae7a1a496a2aeaadcb177ad3e47257e6"),
+        "coding": (101, 100462, "63d7cefc60e4f461de32b37fa45d3aeca267ada484e074114f9824d0d570e593"),
+        "coding_core": (44, 47156, "6bac11be7330500d44e2439fe434e216faf46e0ccd025b8c2cb7c7614b88275f"),
     }
     names = {"code_context", "affected_tests", "search_files", "project_summary", "job_status",
              "workflow_status", "server_health", "verify_changes", "language_diagnostics", "execution_recommend"}
-    added_tools = {"command_status", "windows_scheduled_task", "submit_jobs", "jobs_snapshot"}
+    added_tools = {"command_status", "windows_scheduled_task", "submit_jobs", "jobs_snapshot", "cross_language_references"}
 
     def encode(value: Any) -> bytes:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -1015,6 +1015,16 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                         assert "operation_id" in properties
                         properties.pop("access")
                         properties.pop("operation_id")
+                    # The new HTML/CSS language IDs extend the input enum
+                    # without changing the frozen historical wire contract.
+                    language = item.get("inputSchema", {}).get("properties", {}).get("language_id")
+                    if isinstance(language, dict):
+                        for variant in language.get("anyOf", []):
+                            if isinstance(variant, dict) and isinstance(variant.get("enum"), list):
+                                variant["enum"] = [
+                                    name for name in variant["enum"]
+                                    if name not in {"html", "css", "scss", "less"}
+                                ]
                     original_metadata.append(item)
                 assert growth < 1200
                 # Keep the frozen metadata hash over the released catalogue.
@@ -1029,6 +1039,7 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                     "windows_scheduled_task": 1_024,
                     "submit_jobs": 3_072,
                     "jobs_snapshot": 2_048,
+                    "cross_language_references": 1_280,
                 }
                 assert all(len(encode([item])) <= descriptor_budgets[item["name"]] for item in extra_descriptors)
                 assert 0 < len(encode(catalogue)) - before_bytes <= 34_623 + sum(

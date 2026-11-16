@@ -22,7 +22,7 @@ from core.tool_profiles import PROFILE_DOMAINS, resolve_profile
 CODING_CORE_NAMES = frozenset("""
 discover_tool_domains recommend_tools execution_candidates execution_recommend server_health
 read_file search_files list_directory get_file_info apply_patch replace_exact write_file create_file
-project_summary code_context
+project_summary code_context cross_language_references
 symbol_definition symbol_references document_symbols workspace_symbols symbol_hover
 call_hierarchy language_diagnostics rename_symbol apply_code_action
 affected_tests verify_changes start_verification
@@ -33,7 +33,7 @@ job_status job_wait job_output cancel_job
 
 
 def test_coding_core_catalog_matches_exact_allowlist() -> None:
-    assert len(CODING_CORE_NAMES) == 43
+    assert len(CODING_CORE_NAMES) == 44
     assert _names("coding_core") == CODING_CORE_NAMES
     assert resolve_profile("coding_core").domains == resolve_profile("coding").domains
     assert resolve_profile("full").native_allowlist is None
@@ -224,7 +224,7 @@ def test_full_is_default_and_preserves_complete_catalog() -> None:
     assert resolve_profile(None).name == "full"
     names = _names("full")
     if os.name == "nt":
-        assert len(names) == 156
+        assert len(names) == 157
     else:
         assert "run_shell" in names
         assert "run_cmd" not in names

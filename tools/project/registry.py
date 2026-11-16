@@ -13,6 +13,7 @@ from core.response import page
 from core.response_models import validate_tool_output
 from core.tooling import OPEN_WORLD_READ, READ_ONLY, PathArg, compact_errors
 from tools.project import service
+from tools.project.cross_language import scan_references
 from tools.project.index import ClassMetadata, FunctionMetadata
 from tools.project.intelligence_models import CodeContextResult, CodePosition
 from tools.project.models import ProjectSummaryResult
@@ -75,6 +76,22 @@ def _scan_symbols(
 
 
 def register(mcp: MCPServer) -> None:
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("cross_language_references")
+    def cross_language_references(
+        path: PathArg,
+        symbol: Annotated[str, Field(min_length=1, max_length=128)],
+        kind: Literal["class", "id"] = "class",
+        max_files: Annotated[int, Field(ge=1, le=10_000)] = 2_000,
+        offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0,
+        max_results: Annotated[int, Field(ge=1, le=500)] = 100,
+    ) -> dict[str, Any]:
+        """Find bounded static class/id evidence across HTML, CSS, JS and TS without claiming runtime certainty."""
+        return scan_references(
+            resolve_path(path), symbol, kind=kind,
+            max_files=max_files, offset=offset, max_results=max_results,
+        )
+
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     @compact_errors("project_summary")
     def project_summary(
