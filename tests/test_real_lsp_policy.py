@@ -18,12 +18,12 @@ from tools.language.providers import LspProvider, SessionKey
 @pytest.mark.parametrize(
     ("provider_id", "handles", "accepted"),
     [
-        ("pyright", 511, True),
-        ("pyright", 600, False),
-        ("phpactor", 600, False),
+        ("pyright", sessions._MAX_HANDLES_PER_SESSION, True),
+        ("pyright", sessions._MAX_HANDLES_PER_SESSION + 1, False),
+        ("phpactor", sessions._MAX_HANDLES_PER_SESSION + 1, False),
         ("typescript", 600, True),
-        ("typescript", 1024, True),
-        ("typescript", 1025, False),
+        ("typescript", sessions._MAX_TYPESCRIPT_HANDLES_PER_SESSION, True),
+        ("typescript", sessions._MAX_TYPESCRIPT_HANDLES_PER_SESSION + 1, False),
     ],
 )
 def test_real_provider_handle_budget_is_strictly_scoped(
