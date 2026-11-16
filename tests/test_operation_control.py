@@ -42,13 +42,15 @@ def _tool_payload(result: Any) -> dict[str, Any]:
 
 def _token_processes(token: str) -> list[int]:
     rows: list[int] = []
-    for process in psutil.process_iter(attrs=["pid", "cmdline"]):
+    # Never ask process_iter to eagerly load cmdline: macOS may reject one
+    # unrelated process (or raise a psutil C-extension SystemError) mid-scan.
+    for process in psutil.process_iter():
         try:
-            cmdline = process.info["cmdline"] or []
-        except psutil.Error:
+            cmdline = process.cmdline() or []
+            if any(token in str(part) for part in cmdline):
+                rows.append(int(process.pid))
+        except (psutil.Error, OSError, SystemError):
             continue
-        if any(token in str(part) for part in cmdline):
-            rows.append(int(process.info["pid"]))
     return rows
 
 
@@ -59,6 +61,26 @@ def _wait_until_gone(token: str, timeout: float = 15.0) -> list[int]:
         time.sleep(0.1)
         remaining = _token_processes(token)
     return remaining
+
+
+def test_token_process_scan_skips_inaccessible_unrelated_processes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        def __init__(self, pid: int, parts: list[str] | None = None) -> None:
+            self.pid = pid
+            self.parts = parts
+
+        def cmdline(self) -> list[str]:
+            if self.parts is None:
+                raise SystemError("transient macOS process metadata failure")
+            return self.parts
+
+    monkeypatch.setattr(
+        psutil, "process_iter",
+        lambda: iter([FakeProcess(1), FakeProcess(2, ["other"]), FakeProcess(3, ["target-token"])]),
+    )
+    assert _token_processes("target-token") == [3]
 
 
 def test_registry_rejects_duplicate_and_reports_terminal_state() -> None:
