@@ -349,7 +349,13 @@ python -m pip install "pyright[nodejs]"
 
 The pip Pyright launcher resolves Node through `PATH`. ComputerPilot's provider environment is deliberately minimal, but it adds the discovered Node directory for the Pyright launcher so the supported pip route works without inheriting the rest of the parent environment. If neither a system Node runtime nor the optional bundled `nodejs` wheel is available, install one of them; see [Troubleshooting](docs/troubleshooting.md#lsp-tools-cannot-start).
 
-Real Pyright acceptance covered cross-file definitions, references, pull diagnostics, on-disk edit synchronization, restart and owned process cleanup on Linux and Windows. Opt-in persistent sessions use reviewed provider configuration (`MCP_LSP_PERSISTENT_ENABLED`, `MCP_LSP_PROVIDERS_CONFIG`); listing, health and catalog construction never launch a provider. Other providers and real-provider macOS execution remain unverified; see [provider configuration](docs/configuration.md#persistent-language-providers) and [tooling](docs/tooling.md#profiles).
+Real Pyright acceptance covered cross-file definitions, references, pull diagnostics, on-disk edit synchronization, restart and owned process cleanup on Linux and Windows. Opt-in persistent sessions use reviewed provider configuration (`MCP_LSP_PERSISTENT_ENABLED`, `MCP_LSP_PROVIDERS_CONFIG`); listing, health and catalog construction never launch a provider. Pinned HTML/CSS providers have passed real Windows Symbols and Diagnostics checks with opt-in runtime configuration; macOS execution remains unverified. See [provider configuration](docs/configuration.md#persistent-language-providers) and [tooling](docs/tooling.md#profiles).
+
+The read-only `cross_language_references` tool reports source-located static
+HTML/CSS/JS/TS selector evidence for an exact class or ID, flags dynamic
+references as incomplete, and ignores generated directories. This is not a
+proof that runtime DOM elements or framework bindings are identical; see
+[implementation notes](docs/development/CROSS-LANGUAGE-IMPLEMENTATION.md).
 
 ## Native Document Intelligence
 

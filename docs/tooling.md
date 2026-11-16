@@ -120,14 +120,18 @@ Language tools add LSP-based:
 - transactional rename;
 - code-action workspace edits.
 
-The default language layer uses a trusted discovered `pyright-langserver --stdio` executable and bounds one-shot protocol requests. The pip launcher resolves Node through `PATH`; the provider environment adds only the discovered Node directory and does not inherit the rest of the parent environment. Real Pyright acceptance passed on Linux and Windows; macOS real-provider execution remains unverified. Opt-in persistent sessions require reviewed local configuration through `MCP_LSP_PROVIDERS_CONFIG` and `MCP_LSP_PERSISTENT_ENABLED=true`. The configuration accepts at most four explicit provider identities: `pyright`, `typescript`, `phpactor`, and `intelephense`; executable and entrypoint SHA-256 pins and trusted workspace roots are checked before launch. Configuring two providers for the same language and root is ambiguous and fails before dispatch.
+The default language layer uses a trusted discovered `pyright-langserver --stdio` executable and bounds one-shot protocol requests. The pip launcher resolves Node through `PATH`; the provider environment adds only the discovered Node directory and does not inherit the rest of the parent environment. Real Pyright acceptance passed on Linux and Windows; macOS real-provider execution remains unverified. Opt-in persistent sessions require reviewed local configuration through `MCP_LSP_PROVIDERS_CONFIG` and `MCP_LSP_PERSISTENT_ENABLED=true`. The configuration accepts at most six explicit provider identities: `pyright`, `typescript`, `phpactor`, `intelephense`, `html`, and `css`; executable and entrypoint SHA-256 pins and trusted workspace roots are checked before launch. Configuring two providers for the same language and root is ambiguous and fails before dispatch.
 
 For large Python workspaces, Pyright's source inventory must exclude
 disposable generated directories independently of Git ignores. This
 repository's `pyrightconfig.json` covers every tracked first-party Python
 source root while excluding `output/`, `graphify-out/` and `.worktrees/`.
-The LSP's 512 MiB per-session limit is unchanged. HTML and CSS are not yet
-registered languages; see the five-language design review in
+The persistent LSP budget is now 768 MiB per session and 3 GiB total,
+with at most six concurrent sessions, 180-second idle retirement and
+per-document, handle and cache admission limits. HTML and CSS have
+opt-in, pinned Node providers (also routing SCSS/LESS through CSS).
+The HTML/CSS real-provider smoke verified Symbols and Push Diagnostics,
+not every advanced language service. See
 `development/LSP-FIVE-LANGUAGE-ARCHITECTURE.md`.
 
 For native Windows PHP, `intelephense` uses a pinned Node executable plus its pinned `lib/intelephense.js` entrypoint with `--stdio`; PHPActor remains available for supported operator-selected runtimes. [Intelephense](https://intelephense.net/docs) provides definition, references and push diagnostics without a premium licence. Sessions isolate its caches and licence lookup under their private runtime directory, and remove that directory after confirmed process cleanup. Premium operations, including rename and code actions, are outside this free-provider acceptance; no licence is loaded or activated. Provider configuration is never enabled automatically. See [real-provider acceptance](development/REAL-LSP-PROVIDER-ACCEPTANCE-2026-10-26.md) for tested versions, reproduction and limitations.

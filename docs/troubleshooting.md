@@ -137,9 +137,9 @@ Check the panel's **Local Startup Check** or the `local_startup_status` and `loc
 
 ### Pyright exits with `lsp_resource_exceeded` on a large workspace
 
-The persistent LSP manager enforces a 512 MiB per-session process-tree RSS
-limit. This is an intentional safety bound, not an instruction to increase
-memory limits. A workspace containing generated files can exceed it even when
+The persistent LSP manager now enforces a 768 MiB per-session process-tree
+RSS limit and a 3 GiB aggregate limit. These are intentional safety bounds,
+not invitations to disable resource admission. A workspace containing generated files can exceed it even when
 Git ignores those files: `.gitignore` is not a substitute for Pyright's
 own include/exclude configuration.
 

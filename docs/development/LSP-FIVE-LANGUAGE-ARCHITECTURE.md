@@ -1,6 +1,6 @@
 # Five-language LSP architecture review
 
-Status: design recommendations, not a claim that every feature is implemented.
+Status: baseline delivered for static cross-language references and opt-in HTML/CSS LSP; advanced semantics remain proposals.
 Observed on Windows 10, ComputerPilot 0.9.0, source commit `315effb`.
 Review scope: Python, JavaScript, TypeScript, HTML, CSS, and shared LSP reliability.
 
@@ -34,8 +34,8 @@ test checks source coverage and exclusion policy.
 | Python | Pinned Pyright | Real repo diagnostics and document symbols passed after inventory fix | Persistent sessions supported |
 | JavaScript | Pinned TypeScript language server | Disposable `.js` diagnostics, symbols and JSDoc `TS2345` error matched offline `tsc` | Native LSP supported |
 | TypeScript | Pinned TypeScript language server | Disposable `.ts` type error (2322) and symbols verified | Native LSP supported |
-| HTML | None; not in the language/provider/suffix allowlists | Not tested as an LSP | Not yet supported |
-| CSS | None; not in the language/provider/suffix allowlists | Not tested as an LSP | Not yet supported |
+| HTML | Opt-in pinned Node provider available | Real Windows Symbols and Push Diagnostics passed | Baseline read-only supported after runtime reload |
+| CSS | Opt-in pinned Node provider available; SCSS/LESS routing | Real Windows CSS Symbols and Push Diagnostics passed | Baseline read-only supported after runtime reload |
 
 JSX and TSX are already included in the TypeScript provider's language
 set. PHP has separate providers and should retain its current behavior.
@@ -43,7 +43,7 @@ set. PHP has separate providers and should retain its current behavior.
 Relevant current implementation boundaries:
 
 - `tools/language/providers.py`: `ProviderId` allowlist, provider SHA-256
-  pinning, trusted workspace roots and `MAX_PROVIDERS = 4`.
+  pinning, trusted workspace roots and `MAX_PROVIDERS = 6`.
 - `tools/language/registry.py`: typed `LanguageId`, exposed operations
   and dispatch rules.
 - `tools/language/lsp.py` and `requests.py`: extension-to-language
@@ -51,20 +51,20 @@ Relevant current implementation boundaries:
 - `tools/language/sessions.py`: `SessionKey` currently includes
   `language_id`, so JavaScript and TypeScript in one project start
   **distinct** sessions, even if the provider executable is identical.
-  Four active sessions is the current global limit.
+  Six active sessions is the current global limit, bounded by 3 GiB aggregate RSS.
 - `LspSessionManager.arequest`: uses `pyrightconfig.json` for Python,
   `composer.json` for PHP, and `tsconfig.json` for all other languages
   before attempting read-result fingerprint caching. This misses
   `jsconfig.json` for JavaScript-only projects.
-- `_own` in `sessions.py`: pull-to-push diagnostics fallback currently
-  covers TypeScript and Intelephense. New HTML/CSS providers need
-  capability-based handling of push-only diagnostics.
+- `_own` in `sessions.py`: TypeScript/Intelephense use the existing push fallback;
+  HTML/CSS explicitly consume authentic Push Diagnostics despite falsely
+  advertising pull support and returning -32601 for pull requests.
 - `LspTransport._notification`: replies to
   `workspace/configuration` with bounded `null` entries. Some HTML/CSS
   servers require correctly typed safe configuration defaults.
-- `_resolve_language` in `registry.py` retains a legacy Python default
-  for unknown suffixes. Explicit unsupported HTML/CSS requests should
-  fail clearly, not silently route to the Python server.
+- `_resolve_language` now infers HTML/CSS/SCSS/LESS from their suffixes;
+  unknown extensions still retain the legacy Python default and need
+  clearer unsupported-language rejection in a future change.
 - Native process ownership, restricted launch environment, provider
   identity verification, request/data size bounds, cancellation,
   file-version guards and guarded workspace edits are existing
@@ -74,9 +74,9 @@ Relevant current implementation boundaries:
 
 ### P0: Make source inventory and failure mode observable
 
-1. Keep the immediate Pyright configuration fix and its tracked-source
-   coverage test. The `output/` exclusion is important for real Windows
-   test workspaces; do not raise the 512 MiB limit just to mask indexing.
+1. Preserve the Pyright source-scoping fix and tracked-source regression.
+   The memory ceiling was separately increased to 768 MiB per session,
+   with 3 GiB aggregate RSS retained as a hard safety limit.
 2. Return a safe, bounded resource-denial category such as
    `rss_limit`, `handle_limit`, `cpu_budget`, `index_limit`,
    without exposing file paths, source text, server stderr or tokens.
@@ -136,27 +136,26 @@ Relevant current implementation boundaries:
   JSDoc-driven JS type errors, cross-file definition, TSX symbols,
   jsconfig/tsconfig project isolation and stale-result invalidation.
 
-### P2: Add HTML and CSS providers safely
+### P2: Extend baseline HTML and CSS providers safely
 
-- Use pinned and explicitly trusted HTML/CSS servers extracted
-  from VS Code, e.g. `vscode-html-language-server` and
-  `vscode-css-language-server`, with absolute Node executable +
-  pinned entrypoint files and `--stdio`. Do not auto-download
-  packages or execute shell launchers in the MCP runtime.
+- Delivered: opt-in pinned HTML/CSS servers from
+  `@t1ckbase/vscode-langservers-extracted@2.0.5`, installed outside
+  tracked source and launched by absolute pinned Node/entrypoint under
+  native ownership. Runtime startup never auto-downloads providers.
 - Extend `ProviderId`, `PROVIDER_LANGUAGES`, `LanguageId`,
   suffix inference, request dispatch and test inventories. Include
   `.html`, `.css`, and optionally `.scss` / `.less` in a
   consciously reviewed rollout. HTML inside `.vue`, `.svelte`
   or JSX requires framework-aware virtual documents; do not
   treat them as ordinary HTML files.
-- The present `MAX_PROVIDERS = 4` is insufficient for the
-  existing Pyright + TypeScript + Intelephense plus two new
-  standalone servers. Increase any limit only together with
-  global process/CPU/memory admission and bounded idle eviction.
-- For providers without LSP pull diagnostics, safely bridge
-  `textDocument/publishDiagnostics` after opening and synchronizing
-  the requested document. Require version/freshness evidence;
-  never fabricate an empty `kind: full` report.
+- Implemented: `MAX_PROVIDERS = 6`, maximum six active sessions,
+  768 MiB per-session RSS and 3 GiB aggregate RSS with owned process
+  cleanup and bounded idle retirement. These are limits, not guarantees
+  that all providers may simultaneously consume their full budget.
+- Implemented for HTML/CSS: consume version-bound push publications
+  after document synchronization, even when the provider advertises
+  `diagnosticProvider` but rejects pull requests. Never fabricate
+  an empty success when no publication arrives.
 - Test actual `workspace/configuration` negotiation and
   schema-checked provider defaults. The existing generic `null`
   response is not sufficient evidence of compatibility.
@@ -195,7 +194,8 @@ Relevant current implementation boundaries:
 - Do not promise all five language servers can run concurrently
   until the four-session cap and total RSS cap have a tested
   scheduling/reuse policy.
-- Offer a separate, evidence-labeled cross-language source graph:
+- Delivered: bounded class/ID static source evidence with roles and locations.
+  Next: offer a richer cross-language source graph with verified links:
   HTML `id` / `class` references to CSS selectors, CSS Modules
   imports in TSX, and JavaScript DOM selector literals. Start with
   conservative static matching and preserve source-range provenance.
