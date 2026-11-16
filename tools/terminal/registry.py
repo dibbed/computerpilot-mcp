@@ -111,7 +111,7 @@ def register(mcp: MCPServer) -> None:
             description=_ACCESS_DESCRIPTION,
         )] = "exclusive",
     ) -> dict[str, Any]:
-        """Run an executable with a timeout and optional per-stream output limits. Prefer read_file/search_files/git_* for native work."""
+        """Run an executable with a timeout and optional per-stream output limits. For long work use submit_job then job_wait."""
 
         def execute(cancel: threading.Event) -> dict[str, Any]:
             working = _cwd(cwd)
