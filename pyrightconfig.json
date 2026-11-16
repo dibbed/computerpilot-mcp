@@ -1,0 +1,17 @@
+{
+  "include": [
+    "core",
+    "tools",
+    "scripts",
+    "tests",
+    "main.py",
+    "local_pc_mcp.py"
+  ],
+  "exclude": [
+    "output",
+    "graphify-out",
+    ".worktrees",
+    "tests/.real_lsp_runs",
+    "tests/.real_lsp_tools"
+  ]
+}

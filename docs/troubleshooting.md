@@ -135,6 +135,30 @@ Check the panel's **Local Startup Check** or the `local_startup_status` and `loc
 
 ## LSP tools cannot start
 
+### Pyright exits with `lsp_resource_exceeded` on a large workspace
+
+The persistent LSP manager enforces a 512 MiB per-session process-tree RSS
+limit. This is an intentional safety bound, not an instruction to increase
+memory limits. A workspace containing generated files can exceed it even when
+Git ignores those files: `.gitignore` is not a substitute for Pyright's
+own include/exclude configuration.
+
+Create or review a `pyrightconfig.json` (or the `[tool.pyright]` section in
+`pyproject.toml`) to include the actual source directories and exclude
+generated outputs, temporary worktrees and other disposable artifacts.
+Pyright takes `pyrightconfig.json` precedence over `pyproject.toml`.
+Preserve importable first-party packages and any directories intentionally
+needed for analysis. Excluded files may still be analyzed when imported.
+This repository keeps its tracked Python sources under the source-focused
+`pyrightconfig.json` and explicitly excludes local `output/` and
+`.worktrees/` artifacts.
+
+Recheck `language_diagnostics` and `document_symbols` on the actual
+workspace root, then inspect `server_health.lsp` for a ready session,
+resource usage and failure counters. Avoid pointing LSP at an untrusted
+parent directory to work around the issue. This change scopes analysis; it
+does not authorize bypassing provider SHA-256 pins or process ownership.
+
 Confirm `pyright-langserver` is already available on `PATH` and that the runtime it needs is available:
 
 - A pip-installed `pyright-langserver` launcher resolves Node through `PATH`. Install Node, or use `python -m pip install "pyright[nodejs]"` for a bundled runtime.
