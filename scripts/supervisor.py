@@ -37,6 +37,7 @@ from core.executor import _creation_flags
 from core.jobs import JobStore
 from core.lifecycle import lifecycle_control_request
 from core.singleflight import SingleFlight
+from core.stall_diagnostics import classify_continuation_state
 from core.transport_health import classify_transport_health
 from core.workflow_store import workflow_store
 from scripts.panel_data import (
@@ -44,6 +45,7 @@ from scripts.panel_data import (
     config_snapshot,
     doctor_snapshot,
     extensions_snapshot,
+    latest_job_observation,
     memory_summary,
     process_details,
     redact_diagnostics,
@@ -521,6 +523,7 @@ class Supervisor:
             "response_delivery": summary.get("response_delivery"),
             "tool_activity": summary.get("tool_activity"),
             "diagnostic_ages": summary.get("diagnostic_ages"),
+            "continuation": summary.get("continuation"),
         }
         self.transport_logger.info(
             json.dumps(record, ensure_ascii=False, separators=(",", ":"))
@@ -535,15 +538,23 @@ class Supervisor:
         detailed = (
             self._fetch_tunnel_health() if self.health_details_url is not None else None
         )
+        now = time.time()
         summary = classify_transport_health(
             detailed,
             tool_activity=activity,
             ready=ready,
             tunnel_mode=self.health_details_url is not None,
-            now=time.time(),
+            now=now,
             poll_stall_grace_sec=SETTINGS.tunnel_poll_stall_grace_sec,
             upstream_idle_sec=SETTINGS.transport_upstream_idle_sec,
             mcp_tool_stall_sec=SETTINGS.mcp_tool_stall_sec,
+        )
+        summary["continuation"] = classify_continuation_state(
+            transport=summary,
+            tool_activity=activity,
+            job_summary=latest_job_observation(self.state_dir / "jobs.sqlite3"),
+            now=now,
+            idle_threshold_sec=SETTINGS.transport_upstream_idle_sec,
         )
         if summary["diagnosis"] == "POLL_STALLED" and summary["restart_recommended"]:
             self._transport_stall_observations += 1

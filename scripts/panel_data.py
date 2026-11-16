@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
+import sqlite3
+import stat
 import subprocess
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +54,40 @@ def tail_jsonl(path: Path, *, limit: int = 100, max_bytes: int = _JSON_TAIL_BYTE
             if len(items) >= bounded:
                 break
     return items
+
+
+def latest_job_observation(path: Path) -> dict[str, Any] | None:
+    """Read relevant durable job metadata; active jobs precede terminal history.
+
+    This is intentionally a single read-only query, not another JobStore or
+    scheduler.  It never exposes the job spec, request key, command, or output.
+    """
+
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return None
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.2)) as db:
+            db.execute("PRAGMA query_only=ON")
+            row = db.execute(
+                "SELECT status, updated, exit_code FROM jobs "
+                "ORDER BY CASE WHEN status IN ('running','orphaned') THEN 0 "
+                "WHEN status='queued' THEN 1 ELSE 2 END, updated DESC LIMIT 1"
+            ).fetchone()
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+    if row is None:
+        return None
+    status, updated, exit_code = row
+    if not isinstance(status, str) or status not in {
+        "queued", "running", "orphaned", "succeeded", "failed",
+        "cancelled", "timed_out", "interrupted",
+    }:
+        return None
+    if not isinstance(updated, (int, float)) or not math.isfinite(updated) or updated < 0:
+        return None
+    if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool)):
+        return None
+    return {"status": status, "updated": float(updated), "exit_code": exit_code}
 
 
 def build_identity(project_root: Path = PROJECT_ROOT) -> dict[str, Any]:
@@ -371,6 +409,26 @@ def doctor_snapshot(
     else:
         transport_status = "warning"
     add("Transport", transport_status, diagnosis.replace("_", " ").title())
+
+    continuation = transport.get("continuation")
+    if isinstance(continuation, dict):
+        state = str(continuation.get("state") or "UNKNOWN").upper()
+        explanations = {
+            "LOCAL_CALL_ACTIVE": ("ok", "An MCP tool is still active locally."),
+            "JOB_ACTIVE": ("ok", "A durable job is still active."),
+            "JOB_WAITING_RESOURCES": ("warning", "A queued job is waiting for managed resources."),
+            "JOB_FINISHED_NO_NEXT_POLL_OBSERVED": (
+                "warning", "Durable job terminal; next local MCP poll not observed; hosted cause unknown.",
+            ),
+            "UPSTREAM_IDLE_AFTER_ACCEPTED_RESPONSE": (
+                "warning", "Tunnel accepted a response, but no later upstream request was observed; hosted cause unknown.",
+            ),
+            "TRANSPORT_RESPONSE_UNCERTAIN": (
+                "warning", "Response delivery is uncertain; never assume a side effect can be safely replayed.",
+            ),
+        }
+        status, description = explanations.get(state, ("pending", "Insufficient local evidence for continuation."))
+        add("Continuation", status, description)
 
     unresolved = int(runtime_health.get("unresolved_workflow_operations") or 0)
     add(

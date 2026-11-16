@@ -178,3 +178,70 @@ def test_upstream_idle_never_counts_toward_transport_restart(
         assert supervisor.state_snapshot()["transport_restart_confirmed"] is False
     finally:
         _close(supervisor)
+
+
+def test_supervisor_observes_terminal_job_without_next_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    now = time.time()
+    with sqlite3.connect(tmp_path / "jobs.sqlite3") as db:
+        db.execute("CREATE TABLE jobs (status TEXT, updated REAL, exit_code INTEGER)")
+        db.execute("INSERT INTO jobs VALUES ('failed', ?, 1)", (now - 900,))
+    activity = tmp_path / "activity.json"
+    activity.write_text(json.dumps({
+        "generation_id": "test-generation", "active_calls": 0,
+        "last_received_at": now - 1200, "last_completed_at": now - 1199,
+    }), encoding="utf-8")
+    tunnel = _payload(poll_age=1, last_enqueue_age=1200)
+    components = tunnel["components"]
+    assert isinstance(components, dict)
+    response = components["response-delivery"]
+    assert isinstance(response, dict)
+    details = response["details"]
+    assert isinstance(details, dict)
+    details["last_accepted"] = now - 1198
+
+    supervisor = Supervisor([], readiness_url="http://127.0.0.1:8080/readyz", state_dir=tmp_path)
+    supervisor.current_tool_activity_path = activity
+    monkeypatch.setattr(supervisor, "_fetch_tunnel_health", lambda: tunnel)
+    try:
+        result = supervisor.transport_snapshot(True)
+        continuation = result["continuation"]
+        assert continuation["state"] == "JOB_FINISHED_NO_NEXT_POLL_OBSERVED"
+        assert continuation["job_exit_code"] == 1
+        assert result["restart_recommended"] is False
+        history = (tmp_path / "transport-health.jsonl").read_text(encoding="utf-8")
+        assert "JOB_FINISHED_NO_NEXT_POLL_OBSERVED" in history
+    finally:
+        _close(supervisor)
+
+
+def test_supervisor_marks_failed_terminal_delivery_uncertain_without_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = time.time()
+    activity = tmp_path / "activity.json"
+    activity.write_text(json.dumps({
+        "active_calls": 0, "last_received_at": now - 900, "last_completed_at": now - 899,
+    }), encoding="utf-8")
+    tunnel = _payload(poll_age=1, last_enqueue_age=900)
+    components = tunnel["components"]
+    assert isinstance(components, dict)
+    response = components["response-delivery"]
+    assert isinstance(response, dict)
+    response["status"] = "error"
+    response["state"] = "failed"
+    response["details"] = {"disposition": "failed", "http_status": 503, "in_progress": 0}
+    supervisor = Supervisor([], readiness_url="http://127.0.0.1:8080/readyz", state_dir=tmp_path)
+    supervisor.current_tool_activity_path = activity
+    monkeypatch.setattr(supervisor, "_fetch_tunnel_health", lambda: tunnel)
+    try:
+        result = supervisor.transport_snapshot(True)
+        assert result["diagnosis"] == "RESPONSE_DELIVERY_STALLED"
+        assert result["continuation"]["state"] == "TRANSPORT_RESPONSE_UNCERTAIN"
+        assert result["restart_recommended"] is False
+        assert result["restart_confirmed"] is False
+    finally:
+        _close(supervisor)
