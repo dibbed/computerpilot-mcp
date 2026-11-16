@@ -188,6 +188,11 @@ _SUFFIX_LANGUAGES: dict[str, str] = {
     ".ts": "typescript",
     ".tsx": "typescriptreact",
     ".php": "php",
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".scss": "scss",
+    ".less": "less",
 }
 _MAX_URI_CHARS = 32_767
 

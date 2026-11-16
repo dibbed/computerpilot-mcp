@@ -35,7 +35,7 @@ from tools.language.requests import (
 )
 from tools.language.sessions import LspSessionManager
 
-LanguageId = Literal["python", "typescript", "typescriptreact", "javascript", "javascriptreact", "php"]
+LanguageId = Literal["python", "typescript", "typescriptreact", "javascript", "javascriptreact", "php", "html", "css", "scss", "less"]
 
 
 def _command() -> list[str]:

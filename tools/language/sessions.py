@@ -33,16 +33,16 @@ from tools.language.providers import LspProvider, SessionKey, make_session_key, 
 from tools.language.requests import validate_request
 from tools.language.transport import LspTransport, close_transport, open_transport
 
-_IDLE_SEC = 120.0
+_IDLE_SEC = 180.0
 _SAMPLE_SEC = 0.5
 _MAX_WIRE_BYTES = 64 * 1024 * 1024
-_MAX_RSS_BYTES = 512 * 1024 * 1024
-_MAX_TOTAL_RSS_BYTES = 2 * 1024 * 1024 * 1024
-_MAX_HANDLES_PER_SESSION = 512
+_MAX_RSS_BYTES = 768 * 1024 * 1024
+_MAX_TOTAL_RSS_BYTES = 3 * 1024 * 1024 * 1024
+_MAX_HANDLES_PER_SESSION = 768
 # A real TypeScript server can start a four-process tree with ~600 Windows handles.
-_MAX_TYPESCRIPT_HANDLES_PER_SESSION = 1024
-_MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
-_MAX_DOCUMENT_TOTAL_BYTES = 16 * 1024 * 1024
+_MAX_TYPESCRIPT_HANDLES_PER_SESSION = 1536
+_MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
+_MAX_DOCUMENT_TOTAL_BYTES = 32 * 1024 * 1024
 _CONTEXT_MAX_RESULTS = 32
 _CONTEXT_MAX_BYTES = 16 * 1024 * 1024
 _CONTEXT_TTL_SEC = 30.0
@@ -50,9 +50,9 @@ _CACHED_READ_METHODS = frozenset({
     "textDocument/definition", "textDocument/references", "textDocument/hover",
     "textDocument/documentSymbol", "workspace/symbol",
 })
-_MAX_CACHE_BYTES = 128 * 1024 * 1024
-_MAX_CACHE_ENTRIES = 4096
-_MAX_CACHE_DIRECTORIES = 16
+_MAX_CACHE_BYTES = 192 * 1024 * 1024
+_MAX_CACHE_ENTRIES = 6144
+_MAX_CACHE_DIRECTORIES = 24
 _EVIDENCE_CAPABILITIES = (
     "workspaceSymbolProvider", "documentSymbolProvider", "definitionProvider",
     "referencesProvider", "callHierarchyProvider", "typeHierarchyProvider",
@@ -651,7 +651,7 @@ class LspSessionManager:
             if self._preparing_count + sum(item.queue.qsize() for item in self._sessions.values()) >= 32:
                 raise _error("lsp_capacity_exceeded")
             if session is None:
-                if len(self._sessions) >= 4:
+                if len(self._sessions) >= 6:
                     raise _error("lsp_capacity_exceeded")
                 self._admit_start(key, time.monotonic())
                 session = _Session(key, provider)
@@ -1044,8 +1044,11 @@ class LspSessionManager:
                 diagnostic_uri = (
                     raw_document.get("uri") if isinstance(raw_document, dict)
                     and message.get("method") == "textDocument/diagnostic"
-                    and session.provider.provider_id in {"typescript", "intelephense"}
-                    and not session.capabilities.get("diagnosticProvider") else None
+                    and session.provider.provider_id in {"typescript", "intelephense", "html", "css"}
+                    and (
+                        session.provider.provider_id in {"html", "css"}
+                        or not session.capabilities.get("diagnosticProvider")
+                    ) else None
                 )
                 if diagnostic_uri is None:
                     channel.send({"jsonrpc": "2.0", "id": ticket.request_id, **message})

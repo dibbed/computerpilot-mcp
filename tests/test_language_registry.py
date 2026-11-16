@@ -30,7 +30,7 @@ _READ_MODELS = {
     "call_hierarchy": "PositionRequest",
     "language_diagnostics": "DiagnosticRequest",
 }
-_LANGUAGES = ["python", "typescript", "typescriptreact", "javascript", "javascriptreact", "php"]
+_LANGUAGES = ["python", "typescript", "typescriptreact", "javascript", "javascriptreact", "php", "html", "css", "scss", "less"]
 
 
 def _server() -> MCPServer:

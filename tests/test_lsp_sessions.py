@@ -1713,11 +1713,12 @@ def test_disk_snapshot_read_retries_are_bounded(tmp_path: Path, monkeypatch: pyt
 
 @pytest.mark.parametrize("kind,code", [("encoding", "lsp_document_encoding"), ("size", "lsp_document_too_large")])
 def test_manager_invalid_document_is_never_opened(tmp_path: Path, kind: str, code: str) -> None:
+    from tools.language import sessions
     from tools.language.sessions import LspSessionManager
 
     provider, log = manager_provider(tmp_path)
     path = tmp_path / "source.py"
-    path.write_bytes(b"\xff" if kind == "encoding" else b"x" * (2 * 1024 * 1024 + 1))
+    path.write_bytes(b"\xff" if kind == "encoding" else b"x" * (sessions._MAX_DOCUMENT_BYTES + 1))
     manager = LspSessionManager((provider,), generation="test")
 
     async def scenario() -> None:
@@ -2108,7 +2109,7 @@ def test_manager_queue_and_session_admission_are_bounded(tmp_path: Path) -> None
     from tools.language.sessions import LspSessionManager
 
     provider, _log = manager_provider(tmp_path, "slow", delay=60)
-    roots = [tmp_path / str(index) for index in range(5)]
+    roots = [tmp_path / str(index) for index in range(7)]
     for root in roots:
         root.mkdir()
     manager = LspSessionManager((provider,), generation="test")
@@ -2116,13 +2117,16 @@ def test_manager_queue_and_session_admission_are_bounded(tmp_path: Path) -> None
     async def scenario() -> None:
         requests: list[asyncio.Task[object]] = []
         try:
-            for root in roots[:4]:
+            for root in roots[:6]:
                 requests.append(asyncio.create_task(
                     manager.arequest(root, "python", "workspace/symbol", {"query": "hold"}, timeout_sec=30),
                 ))
-            await manager_until(lambda: manager.snapshot()["in_flight"] == 4)
+            deadline = time.monotonic() + 15
+            while manager.snapshot()["in_flight"] < 6 and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert manager.snapshot()["in_flight"] == 6
             with pytest.raises(ToolError) as failure:
-                await manager.arequest(roots[4], "python", "workspace/symbol", {"query": "fifth"}, timeout_sec=5)
+                await manager.arequest(roots[6], "python", "workspace/symbol", {"query": "seventh"}, timeout_sec=5)
             assert failure.value.code == "lsp_capacity_exceeded"
             for root in roots[:4]:
                 for index in range(8):
@@ -2133,7 +2137,7 @@ def test_manager_queue_and_session_admission_are_bounded(tmp_path: Path) -> None
             with pytest.raises(ToolError) as failure:
                 await manager.arequest(roots[0], "python", "workspace/symbol", {"query": "overflow"}, timeout_sec=5)
             assert failure.value.code == "lsp_capacity_exceeded"
-            assert manager.snapshot()["spawn_count"] == 4
+            assert manager.snapshot()["spawn_count"] == 6
         finally:
             for request in requests:
                 request.cancel()
