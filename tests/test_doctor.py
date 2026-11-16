@@ -223,7 +223,12 @@ def test_codebase_memory_reports_missing_executable_separately(
     monkeypatch.setattr(doctor, "_run", lambda *args, **kwargs: None)
     monkeypatch.setattr(doctor, "search_backend_diagnostics", lambda: {})
     monkeypatch.setattr(doctor.importlib.util, "find_spec", lambda name: None)
-    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+    actual_which = doctor.shutil.which
+    # Only hide the optional extension: hiding 'sh' breaks POSIX platform preflight.
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: None if name == "codebase-memory-mcp" else actual_which(name),
+    )
     doctor.validate(root, "local-http", "", codebase_memory=True)
     output = capsys.readouterr().out
     assert "SKIP Codebase Memory MCP connection (codebase-memory-mcp unavailable on PATH)" in output
