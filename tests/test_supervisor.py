@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from html import unescape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -398,9 +399,7 @@ p = Path({str(counter)!r})
 n = int(p.read_text()) + 1 if p.exists() else 1
 p.write_text(str(n))
 h = Path(os.environ["MCP_HEARTBEAT_FILE"])
-h.write_text(str(os.getpid()))
 if n == 1:
-    os.utime(h, (0, 0))
     time.sleep(60)
 while True:
     h.write_text(str(os.getpid()))
@@ -420,11 +419,118 @@ while True:
             raise AssertionError(supervisor.snapshot())
         assert counter.read_text() == "2"
         assert any("watchdog_unhealthy" in message for message in snapshot["logs"])
+        assert "Runtime startup failed reason=watchdog_unhealthy restart_count=0" in snapshot["logs"]
+        assert snapshot["local_startup_status"] == "ready"
+        assert snapshot["local_startup_failure_reason"] is None
     finally:
         supervisor.stop.set()
         thread.join(timeout=10)
     assert not thread.is_alive()
     assert not supervisor.heartbeat.exists()
+
+
+def test_startup_launch_failure_is_visible_before_retry(tmp_path: Path) -> None:
+    supervisor = Supervisor(
+        [str(tmp_path / "missing-runtime.exe")], readiness_url=None, state_dir=tmp_path,
+    )
+    thread = threading.Thread(target=supervisor.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            state = supervisor.state_snapshot()
+            if state["state"] == "retrying":
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(supervisor.state_snapshot())
+        assert state["pid"] is None
+        assert state["mcp_healthy"] is False
+        assert state["local_startup_status"] == "failed"
+        assert state["local_startup_failure_reason"] == "runtime_launch_failed"
+        assert any("Runtime launch failed: FileNotFoundError" in line for line in state["logs"])
+    finally:
+        supervisor.stop.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+def test_local_http_readiness_rejects_a_stale_listener(tmp_path: Path) -> None:
+    class StaleGeneration(BaseHTTPRequestHandler):
+        def do_HEAD(self) -> None:
+            if self.path.endswith("/slow"):
+                for _ in range(40):
+                    try:
+                        self.wfile.write(b" ")
+                    except OSError:
+                        break
+                    time.sleep(0.05)
+                return
+            self.send_response(204)
+            self.send_header("X-ComputerPilot-Generation", "previous-generation")
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), StaleGeneration)
+    thread = threading.Thread(target=server.serve_forever)
+    supervisor = Supervisor(
+        [], readiness_url=None, local_http_port=server.server_port, state_dir=tmp_path,
+    )
+    supervisor.heartbeat.touch()
+    thread.start()
+    try:
+        assert not supervisor.healthy("new-generation", "/.computerpilot/ready/new-generation")
+        state = supervisor.state_snapshot()
+        assert state["mcp_healthy"] is True
+        assert state["local_http_ready"] is False
+        assert state["tunnel_healthy"] is None
+        started = time.monotonic()
+        assert not supervisor.healthy("new-generation", "/.computerpilot/ready/slow")
+        assert time.monotonic() - started < 1.5
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        close_logger(supervisor)
+
+
+def test_supervised_local_http_waits_for_current_listener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module, "audit_action", lambda *args, **kwargs: None)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    # Use the real entry point with isolated storage and a loopback-only test port.
+    code = (
+        "from dataclasses import replace;from pathlib import Path;import core.config;"
+        f"state=Path({str(tmp_path)!r});"
+        "core.config.SETTINGS=replace(core.config.SETTINGS,state_dir=state/'child',memory_dir=state/'memory');"
+        "from main import main;"
+        f"raise SystemExit(main(['--transport','streamable-http','--port',{str(port)!r}]))"
+    )
+    supervisor = Supervisor(
+        [sys.executable, "-c", code], readiness_url=None, local_http_port=port,
+        state_dir=tmp_path / "supervisor", grace=5, interval=0.04,
+    )
+    thread = threading.Thread(target=supervisor.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            state = supervisor.state_snapshot()
+            if state["state"] == "running":
+                break
+            time.sleep(0.04)
+        else:
+            raise AssertionError(supervisor.state_snapshot())
+        assert state["runtime_generation"] == 1
+        assert state["local_startup_status"] == "ready"
+        assert state["local_http_ready"] is True
+        assert state["tunnel_healthy"] is None
+    finally:
+        supervisor.stop.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
 
 
 def test_panel_suppresses_expected_client_disconnect_traceback(
@@ -933,7 +1039,16 @@ def test_consecutive_runtime_restarts_preserve_one_durable_job(tmp_path: Path) -
     assert not thread.is_alive()
 
 
-def test_user_restart_drains_active_mutation_before_cleanup(tmp_path: Path) -> None:
+def test_user_restart_drains_active_mutation_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    console_released = threading.Event()
+
+    def print_to_console(*_args: object, **_kwargs: object) -> None:
+        console_released.wait(15)
+
+    monkeypatch.setattr(module, "print", print_to_console, raising=False)
+    monkeypatch.setattr(module, "audit_action", lambda *args, **kwargs: None)
     attempts = tmp_path / "attempts.txt"
     target = tmp_path / "mutation.txt"
     script = tmp_path / "runtime_probe.py"
@@ -1018,8 +1133,18 @@ while True:
         assert drain["drained"] is True
         assert drain["active_mutations"] == 0
         assert drain["elapsed_ms"] >= 250
+        assert state["runtime_generation"] == 2
+        assert state["local_startup_status"] == "ready"
+        assert state["mcp_healthy"] is True
+        assert state["tunnel_healthy"] is None
+        logs = state["logs"]
+        draining = logs.index("Runtime drain requested reason=user_restart")
+        starting = logs.index("Runtime starting restart_count=1")
+        ready = logs.index(f"Runtime locally ready pid={state['pid']} restart_count=1")
+        assert draining < starting < ready
     finally:
         supervisor.stop.set()
+        console_released.set()
         thread.join(timeout=10)
         close_logger(supervisor)
     assert not thread.is_alive()

@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from collections.abc import Sequence
+
+from starlette.requests import Request
+from starlette.responses import Response
 
 from core.config import SETTINGS, ensure_runtime_dirs
 from core.registry import create_server
@@ -48,6 +52,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.transport == "stdio":
         mcp.run(transport="stdio")
     else:
+        readiness_path = os.environ.get("MCP_LOCAL_HTTP_READY_PATH")
+        generation = os.environ.get("MCP_RUNTIME_GENERATION_ID")
+        if args.host == "127.0.0.1" and readiness_path and generation:
+            @mcp.custom_route(readiness_path, methods=["HEAD"], include_in_schema=False)
+            async def local_readiness(_request: Request) -> Response:
+                return Response(status_code=204, headers={"X-ComputerPilot-Generation": generation})
+
         mcp.run(
             transport="streamable-http",
             host=args.host,

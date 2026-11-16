@@ -311,6 +311,7 @@ pre{max-height:360px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:a
 <div class="meta"><span>Last State Change</span><strong id="stateChanged">—</strong></div>
 <div class="meta"><span>Last Event</span><strong id="lastEvent">—</strong></div>
 <div class="meta"><span>Runtime PID</span><strong id="runtimePid" class="mono">—</strong></div>
+<div class="meta"><span>Local Startup Check</span><strong id="localStartup">—</strong></div>
 <div class="meta"><span>Restart Count</span><strong id="restartCount" class="mono">0</strong></div>
 <div class="meta"><span>Active Mutations</span><strong id="mutations" class="mono">0</strong></div>
 <div class="meta"><span>Probe Failures</span><strong id="failedProbes" class="mono">0</strong></div>
@@ -658,6 +659,8 @@ function renderSummary(data){
   $('connectionText').textContent='Panel connected';$('updated').textContent='Summary '+clock(data.server_time);
 
   $('supervisorStarted').textContent=epoch(data.supervisor_started_at);$('runtimeStarted').textContent=epoch(data.runtime_started_at||data.last_runtime_started_at);$('stateChanged').textContent=epoch(data.last_state_change_at);$('lastEvent').textContent=epoch(data.last_event_at);$('runtimePid').textContent=data.pid??'—';$('restartCount').textContent=fmtNum(data.restart_count);$('mutations').textContent=fmtNum(data.active_mutations);$('failedProbes').textContent=fmtNum(data.failed_probes);pill($('lifecyclePill'),data.runtime_lifecycle||'Lifecycle unknown',data.runtime_lifecycle==='RUNNING'?'ok':data.runtime_lifecycle?'warn':'');
+  const startupLabel={starting:data.local_http_ready===false?'Waiting for local HTTP':'Checking',ready:'Passed',failed:'Failed',interrupted:'Interrupted'}[data.local_startup_status]||'—';
+  $('localStartup').textContent=startupLabel+(data.local_startup_failure_reason?' · '+String(data.local_startup_failure_reason).replaceAll('_',' '):'');
   $('exitReason').textContent=data.last_exit_reason||'—';$('exitCode').textContent=data.last_exit_code??'—';$('retryAfter').textContent=data.next_retry_seconds===null||data.next_retry_seconds===undefined?'—':duration(data.next_retry_seconds);$('runtimeStopped').textContent=epoch(data.last_runtime_stopped_at);pill($('exitPill'),data.last_exit_code===null||data.last_exit_code===undefined?'No exit recorded':'Exit '+data.last_exit_code,data.last_exit_code===0?'ok':data.last_exit_code===null||data.last_exit_code===undefined?'':'bad');
   const drain=data.last_drain_result;$('drainSummary').textContent=drain?'Last drain: '+safe(drain.reason)+' · acknowledged='+(drain.acknowledged?'yes':'no')+' · drained='+(drain.drained?'yes':'no')+' · mutations='+safe(drain.active_mutations)+' · '+safe(drain.elapsed_ms)+' ms':'No previous drain has been recorded.';
 

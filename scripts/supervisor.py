@@ -13,6 +13,7 @@ import os
 import secrets
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -75,6 +76,8 @@ LIFECYCLE_STATUS_MAX_BYTES = 16_384
 LIFECYCLE_POLL_SEC = 0.025
 LIFECYCLE_START_GRACE_SEC = 0.25
 LIFECYCLE_STOP_ACK_SEC = 0.25
+LOCAL_HTTP_PROBE_TIMEOUT_SEC = 0.5
+LOCAL_HTTP_PROBE_MAX_HEADER_BYTES = 4096
 TRANSPORT_HEALTH_MAX_BYTES = 128 * 1024
 TOOL_ACTIVITY_MAX_BYTES = 16 * 1024
 TRANSPORT_HISTORY_MAX_BYTES = 4 * 1024 * 1024
@@ -127,6 +130,7 @@ class Supervisor:
         command: list[str],
         *,
         readiness_url: str | None,
+        local_http_port: int | None = None,
         state_dir: Path | None = None,
         grace: float = 90,
         interval: float = 5,
@@ -135,6 +139,7 @@ class Supervisor:
     ) -> None:
         self.command = command
         self.readiness_url = readiness_url
+        self.local_http_port = local_http_port
         self.health_details_url = (
             readiness_url.rsplit("/", 1)[0] + "/health?details=true"
             if readiness_url is not None
@@ -169,6 +174,9 @@ class Supervisor:
             "pid": None,
             "mcp_healthy": False,
             "tunnel_healthy": None,
+            "local_http_ready": None,
+            "local_startup_status": "starting",
+            "local_startup_failure_reason": None,
             "runtime_lifecycle": None,
             "active_mutations": 0,
             "last_drain_result": None,
@@ -234,6 +242,7 @@ class Supervisor:
             marker in lowered
             for marker in (
                 "launch failed",
+                "supervision failed",
                 "fallback kill failed",
                 "fatal",
                 "traceback",
@@ -244,6 +253,7 @@ class Supervisor:
             marker in lowered
             for marker in (
                 "unhealthy",
+                "startup failed",
                 "degraded",
                 "access denied",
                 "os error",
@@ -620,6 +630,8 @@ class Supervisor:
                 "active_mutations": None,
                 "elapsed_ms": 0.0,
             }
+        self.set_state(state="draining")
+        self.event(f"Runtime drain requested reason={reason}")
         # The first Ctrl+C uses the configured mutation-drain budget. Only a
         # second interrupt (force_stop) may cut this wait short.
         timeout = self.watchdog_drain_timeout if reason.startswith("watchdog_") else self.drain_timeout
@@ -750,7 +762,42 @@ class Supervisor:
             except Exception:
                 pass
 
-    def healthy(self) -> bool:
+    def _probe_local_http(self, generation: str, readiness_path: str) -> bool:
+        assert self.local_http_port is not None
+        request = f"HEAD {readiness_path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".encode("ascii")
+        deadline = time.monotonic() + LOCAL_HTTP_PROBE_TIMEOUT_SEC
+        reply = b""
+        # Apply one deadline to the entire probe, including a partial response.
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+                connection.settimeout(LOCAL_HTTP_PROBE_TIMEOUT_SEC)
+                connection.connect(("127.0.0.1", self.local_http_port))
+                connection.settimeout(max(0, deadline - time.monotonic()))
+                connection.sendall(request)
+                while len(reply) < LOCAL_HTTP_PROBE_MAX_HEADER_BYTES:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    connection.settimeout(remaining)
+                    chunk = connection.recv(LOCAL_HTTP_PROBE_MAX_HEADER_BYTES - len(reply))
+                    if not chunk:
+                        return False
+                    reply += chunk
+                    if b"\r\n\r\n" in reply:
+                        break
+        except OSError:
+            return False
+        headers, complete, _ = reply.partition(b"\r\n\r\n")
+        status, _, fields = headers.partition(b"\r\n")
+        if not complete or not status.startswith(b"HTTP/1.") or status.split()[1:2] != [b"204"]:
+            return False
+        markers = [
+            value.strip() for name, _, value in (line.partition(b":") for line in fields.split(b"\r\n"))
+            if name.lower() == b"x-computerpilot-generation"
+        ]
+        return markers == [generation.encode("ascii")]
+
+    def healthy(self, generation: str = "", local_readiness_path: str = "") -> bool:
         try:
             heartbeat_ok = time.time() - self.heartbeat.stat().st_mtime < 15
         except OSError:
@@ -763,10 +810,14 @@ class Supervisor:
             except (OSError, ValueError):
                 ready = False
         transport = self.transport_snapshot(ready)
-        self.set_state(mcp_healthy=heartbeat_ok, tunnel_healthy=ready)
+        local_ready = None
+        if self.local_http_port is not None:
+            local_ready = heartbeat_ok and self._probe_local_http(generation, local_readiness_path)
+        self.set_state(mcp_healthy=heartbeat_ok, tunnel_healthy=ready, local_http_ready=local_ready)
         return (
             heartbeat_ok
             and ready is not False
+            and local_ready is not False
             and not bool(transport.get("restart_confirmed"))
         )
 
@@ -870,32 +921,59 @@ class Supervisor:
         try:
             while not self.stop.is_set():
                 self.restart.clear()
-                self.heartbeat.unlink(missing_ok=True)
-                control_path, status_path = self._runtime_lifecycle_paths()
-                generation_id = control_path.stem.removeprefix("control-")
-                activity_path = control_path.with_name(f"activity-{generation_id}.json")
-                health_path = control_path.with_name(f"health-{generation_id}.json")
-                control_path.unlink(missing_ok=True)
-                status_path.unlink(missing_ok=True)
-                activity_path.unlink(missing_ok=True)
-                health_path.unlink(missing_ok=True)
-                self.current_tool_activity_path = activity_path
-                self.current_runtime_health_path = health_path
+                self.set_state(
+                    state="starting",
+                    pid=None,
+                    next_retry_seconds=None,
+                    mcp_healthy=False,
+                    tunnel_healthy=None,
+                    local_http_ready=None,
+                    local_startup_status="starting",
+                    local_startup_failure_reason=None,
+                    runtime_lifecycle=None,
+                    active_mutations=0,
+                    failed_probes=0,
+                    transport_diagnosis="LOCAL_MODE"
+                    if self.health_details_url is None
+                    else "UNKNOWN",
+                    transport_health=None,
+                    tool_activity=None,
+                    transport_stall_observations=0,
+                    transport_restart_confirmed=False,
+                )
+                self.event(f"Runtime starting restart_count={attempts}")
                 self._transport_stall_observations = 0
                 self._last_transport_history_at = 0.0
                 self._last_transport_diagnosis = None
-                env = os.environ.copy()
-                env["MCP_HEARTBEAT_FILE"] = str(self.heartbeat)
-                env["MCP_LIFECYCLE_CONTROL_FILE"] = str(control_path)
-                env["MCP_LIFECYCLE_STATUS_FILE"] = str(status_path)
-                env["MCP_RUNTIME_GENERATION_ID"] = generation_id
-                env["MCP_TOOL_ACTIVITY_FILE"] = str(activity_path)
-                env["MCP_RUNTIME_HEALTH_FILE"] = str(health_path)
                 started = time.monotonic()
                 process: subprocess.Popen[bytes] | None = None
+                runtime_paths: tuple[Path, ...] = ()
                 readers: list[threading.Thread] = []
                 reason = "runtime_exit"
+                ready = False
                 try:
+                    control_path, status_path = self._runtime_lifecycle_paths()
+                    generation_id = control_path.stem.removeprefix("control-")
+                    activity_path = control_path.with_name(f"activity-{generation_id}.json")
+                    health_path = control_path.with_name(f"health-{generation_id}.json")
+                    self.heartbeat = self.state_dir / f"heartbeat-{generation_id}"
+                    runtime_paths = (
+                        self.heartbeat, control_path, status_path, activity_path, health_path
+                    )
+                    self.current_tool_activity_path = activity_path
+                    self.current_runtime_health_path = health_path
+                    env = os.environ.copy()
+                    env["MCP_HEARTBEAT_FILE"] = str(self.heartbeat)
+                    env["MCP_LIFECYCLE_CONTROL_FILE"] = str(control_path)
+                    env["MCP_LIFECYCLE_STATUS_FILE"] = str(status_path)
+                    env["MCP_RUNTIME_GENERATION_ID"] = generation_id
+                    local_readiness_path = f"/.computerpilot/ready/{generation_id}"
+                    if self.local_http_port is not None:
+                        env["MCP_LOCAL_HTTP_READY_PATH"] = local_readiness_path
+                    else:
+                        env.pop("MCP_LOCAL_HTTP_READY_PATH", None)
+                    env["MCP_TOOL_ACTIVITY_FILE"] = str(activity_path)
+                    env["MCP_RUNTIME_HEALTH_FILE"] = str(health_path)
                     process = subprocess.Popen(
                         self.command,
                         cwd=PROJECT_ROOT,
@@ -910,23 +988,11 @@ class Supervisor:
 
                     runtime_started_at = time.time()
                     self.set_state(
-                        state="starting",
                         pid=process.pid,
                         restart_count=attempts,
-                        next_retry_seconds=None,
-                        runtime_lifecycle=None,
-                        active_mutations=0,
-                        failed_probes=0,
                         runtime_started_at=runtime_started_at,
                         last_runtime_started_at=runtime_started_at,
                         runtime_generation=attempts + 1,
-                        transport_diagnosis="LOCAL_MODE"
-                        if self.health_details_url is None
-                        else "UNKNOWN",
-                        transport_health=None,
-                        tool_activity=None,
-                        transport_stall_observations=0,
-                        transport_restart_confirmed=False,
                     )
                     self.event(
                         f"Runtime started pid={process.pid} restart_count={attempts}"
@@ -946,9 +1012,19 @@ class Supervisor:
                             and not self.restart.is_set()
                         ):
                             self.remember_children(process)
-                            if self.healthy():
+                            healthy = self.healthy(generation_id, local_readiness_path)
+                            if process.poll() is not None:
+                                break
+                            if healthy:
+                                if not ready:
+                                    self.event(
+                                        f"Runtime locally ready pid={process.pid} restart_count={attempts}"
+                                    )
+                                    ready = True
                                 missed = 0
-                                self.set_state(state="running", failed_probes=0)
+                                self.set_state(
+                                    state="running", failed_probes=0, local_startup_status="ready"
+                                )
                             elif time.monotonic() - started > self.grace:
                                 missed += 1
                                 self.set_state(state="unhealthy", failed_probes=missed)
@@ -1017,9 +1093,25 @@ class Supervisor:
                             durable=True,
                         )
                 except Exception as exc:
-                    self.event(f"Runtime launch failed: {type(exc).__name__}: {exc}")
-                    self.set_state(last_error=str(exc))
+                    stage = "launch" if process is None else "supervision"
+                    reason = f"runtime_{stage}_failed"
+                    self.event(f"Runtime {stage} failed: {type(exc).__name__}: {exc}")
+                    self.set_state(
+                        last_exit_reason=reason,
+                        last_exit_code=process.poll() if process is not None else None,
+                    )
                 finally:
+                    if not ready:
+                        if reason in {"user_restart", "user_stop"}:
+                            self.set_state(local_startup_status="interrupted")
+                        else:
+                            self.set_state(
+                                local_startup_status="failed", local_startup_failure_reason=reason
+                            )
+                            if reason == "runtime_exit" or reason.startswith("watchdog_"):
+                                self.event(
+                                    f"Runtime startup failed reason={reason} restart_count={attempts}"
+                                )
                     if process is not None:
                         self.cleanup(process)
                         self.set_state(
@@ -1032,12 +1124,13 @@ class Supervisor:
                         )
                     with self.lock:
                         self._active_process = None
-                    control_path.unlink(missing_ok=True)
-                    status_path.unlink(missing_ok=True)
-                    activity_path.unlink(missing_ok=True)
-                    health_path.unlink(missing_ok=True)
                     self.current_tool_activity_path = None
                     self.current_runtime_health_path = None
+                    for path in runtime_paths:
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError as exc:
+                            self.event(f"Could not remove runtime file {path.name}: {type(exc).__name__}")
                     for thread in readers:
                         thread.join(timeout=1.0)
                 if self.stop.is_set():
@@ -1049,11 +1142,14 @@ class Supervisor:
                 self.set_state(
                     state="retrying",
                     pid=None,
+                    mcp_healthy=False,
+                    tunnel_healthy=None,
+                    local_http_ready=None,
                     next_retry_seconds=delay,
                     restart_count=attempts,
                 )
+                # A paused Windows console must not block the next generation.
                 self.event(f"Retry in {delay}s (consecutive_failures={failures})")
-                print(f"MCP restart in {delay}s; reason={reason}", flush=True)
                 deadline = time.monotonic() + delay
                 self.restart.clear()
                 while (
@@ -1069,8 +1165,9 @@ class Supervisor:
             return 130
         finally:
             self.emergency_cleanup()
-            self.set_state(state="stopped", pid=None, mcp_healthy=False)
-            self.heartbeat.unlink(missing_ok=True)
+            self.set_state(
+                state="stopped", pid=None, mcp_healthy=False, tunnel_healthy=None, local_http_ready=None
+            )
             for logger in (self.logger, self.transport_logger):
                 for handler in list(logger.handlers):
                     handler.close()
@@ -1769,6 +1866,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", default=_default_profile())
     parser.add_argument("--panel-port", type=int, default=8766)
     args = parser.parse_args(argv)
+    local_http_port = None
     if args.mode == "tunnel":
         try:
             tunnel_runtime = current_runtime(PROJECT_ROOT)
@@ -1783,14 +1881,17 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
     else:
+        local_http_port = 8765
         command = [
             sys.executable,
             str(PROJECT_ROOT / "main.py"),
             "--transport",
             "streamable-http",
+            "--port",
+            str(local_http_port),
         ]
         readiness_url = None
-    supervisor = Supervisor(command, readiness_url=readiness_url)
+    supervisor = Supervisor(command, readiness_url=readiness_url, local_http_port=local_http_port)
     atexit.register(supervisor.emergency_cleanup)
     panel = make_panel(supervisor, args.panel_port)
     thread = threading.Thread(target=panel.serve_forever, daemon=True)

@@ -53,6 +53,8 @@ def tools(mode: str = "readonly", epoch: int = 0) -> list[types.Tool]:
         ),
     ]
     read = catalog[1]
+    if mode == "long_description":
+        read.description = "Return the requested value. " * 20
     if mode == "invalid_output":
         catalog[0].output_schema = {"type": "object", "properties": {"receipt": {"type": "string"}}, "required": ["receipt"]}
     if mode == "duplicate":
@@ -246,6 +248,7 @@ def main() -> None:
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--page-size", type=int, default=128)
     parser.add_argument("--mode", choices=[
+        "long_description",
         "readonly", "mutation_success", "provider_error", "invalid_output", "malformed", "oversize", "no_newline", "nesting", "split_utf8",
         "duplicate", "cursor_loop", "schema_remote_ref", "schema_regex", "recursive_schema",
         "catalog_change", "remove", "unknown", "dangerous_annotation", "notification_flood", "stderr_flood",
