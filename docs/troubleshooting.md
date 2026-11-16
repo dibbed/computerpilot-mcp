@@ -34,8 +34,8 @@ A full Doctor after a meaningful change is expected.
 
 ## Native Read Batch activation on Windows
 
-The default `full` catalog remains at 152 tools. `native_read_batch` becomes the
-153rd native tool only with `MCP_NATIVE_READ_BATCH_ENABLED=1` before runtime startup.
+The default Windows `full` catalog has 156 native tools. Set
+`MCP_NATIVE_READ_BATCH_ENABLED=1` before runtime startup to add `native_read_batch`.
 This is an opt-in operational setting, not a requirement for a working MCP server.
 
 On a **healthy, running** Tunnel Supervisor, use the reviewed script in this
@@ -46,7 +46,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\activate_native_
 ```
 
 `-CheckOnly` checks tracked Git state, the local active-work guard, a unique
-153-tool startup catalog, and full Tunnel Doctor without stopping the current service.
+157-tool startup catalog, and full Tunnel Doctor without stopping the current service.
 The `CheckOnly` invocation must run in an ordinary, independent PowerShell
 session, **not** as a detached child of an MCP-owned job.
 
@@ -70,7 +70,7 @@ restores previous settings bytes and attempts the original service launch if the
 new service fails readiness. A `healthy` status means only the local Supervisor
 and Tunnel are healthy. **It does not establish that ChatGPT refreshed its tool
 catalog or that Batch improves real-world latency.** Refresh/reconnect the
-ChatGPT plugin, then verify `server_health.tool_count == 153` and invoke
+ChatGPT plugin, then verify 157 native tools in `discover_tool_domains.tool_counts.native` and invoke
 `native_read_batch` from the refreshed catalog before accepting the feature.
 If the old catalog persists, stop and investigate rather than creating a second
 Supervisor. The existing `uv.lock`, `.secrets/`, and other runtime data must be
@@ -126,6 +126,12 @@ python -m pip install -r requirements-browser.txt
 python -m playwright install chromium
 python -m scripts.doctor --mode local-http --browser
 ```
+
+Doctor reports the Playwright package and the disposable Chromium launch separately. Add `--codebase-memory` to check an MCP connection and then Git watcher behavior independently. This probe requires Git and a supported Codebase Memory executable on PATH (0.12.1), and uses temporary state and a disposable repository.
+
+## Verify a Supervisor restart
+
+Check the panel's **Local Startup Check** or the `local_startup_status` and `local_startup_failure_reason` fields in `/api/status`. The startup result is for the current or most recent local process generation. In supervised local HTTP mode, `local_http_ready` also requires a response from the new generation on the loopback listener. The event log carries drain, launch, and readiness or failure milestones. After local startup passes, reconnect the actual client and call `server_health` to verify that the client transport delivers a result.
 
 ## LSP tools cannot start
 
@@ -204,6 +210,8 @@ Check:
 - `job_output` using the returned byte cursors.
 
 Long-running jobs are designed to be observed incrementally rather than requiring one giant output response.
+
+When Codebase Memory reports `parse_partial`, check the exact path and ranges with `check_index_coverage` and read those lines from the file directly. A ready index can still miss declarations in an affected range.
 
 ## The panel previously printed `WinError 10053`
 

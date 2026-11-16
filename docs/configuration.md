@@ -51,7 +51,7 @@ The managed cache is stored under `.agent_state/tunnel-runtime/`.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `MCP_MAX_RUNNING_JOBS` | maximum concurrently active durable jobs | `4` |
+| `MCP_MAX_RUNNING_JOBS` | maximum admitted durable job workers, including workers waiting for resource claims | `4` |
 | `MCP_WORKFLOW_DAG_ENABLED` | operator opt-in for DAG execution in MCP and worker | disabled |
 | `MCP_WORKFLOW_MAX_PARALLEL_STEPS` | maximum accepted effective per-workflow parallel cap | `16` |
 | `MCP_MAX_RUNNING_WORKFLOW_STEPS` | shared active DAG-step budget | `16` |
@@ -188,6 +188,8 @@ Disabled mode does not read provider config. Missing files mean zero extensions.
 Core ceilings are defined in `core/extensions/models.py:ExtensionLimits` and are frozen by Section 35 budgets and M14 benchmark measurements. Providers may only tighten timeouts. See [extension authoring](development/MCP-EXTENSION-AUTHORING.md) for authoring details and the [agent contract](../AGENTS.md) for the brief implementation handoff.
 
 References are env-only, with explicit safe variable names; file references are deferred. Nonsecret values permit only PYTHONUNBUFFERED, PYTHONIOENCODING, LANG, LC_ALL, LC_CTYPE, TZ, NO_COLOR and TERM. Inheritance additionally permits OS launch/temp variables plus explicit HOME/APPDATA/USERPROFILE. No wildcard/PATH/injection-variable inheritance is allowed. HOME-style access still requires operator review; it can enable credential-file discovery.
+
+For an extension that launches Git or another dependency by name, set `environment.path_entries` to the reviewed absolute local executable directories, in search order. Each list item is a single directory. These entries form the entire PATH for that provider only. Omit the list for the default environment without PATH.
 
 Known credential flags, interpolation/control characters and resolved credential literals in operator fields are rejected even for disabled definitions. Missing references do not invalidate disabled configuration; resolving a private environment requires all configured credentials and tool-required reference names, otherwise auth_missing is returned without values/names. The builder does not launch code or authorize it. Provisional private environment ceilings are 8 KiB/value and 32 KiB total; no full parent environment is copied or public values projected. Unknown arbitrary text cannot be universally classified as a secret: operator review and reference use remain required.
 

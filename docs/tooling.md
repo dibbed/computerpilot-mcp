@@ -24,7 +24,7 @@ Set:
 MCP_TOOL_PROFILE=<profile>
 ```
 
-`discover_tool_domains` reports the requested/active domains and platform capabilities. `recommend_tools` searches only the tools actually registered in the active profile and attaches shared execution metadata when known.
+`discover_tool_domains` reports the requested and active domains, platform capabilities, and native/external tool counts. To compare a cached catalog with the server, compare `tool_names_sha256` with SHA-256 of the sorted tool names from all `tools/list` pages joined by LF and encoded as UTF-8, without a trailing LF. A mismatch calls for a fresh listing on the same profile. Matching names can still have updated schemas or descriptions. Compare `extension_catalog_generation` within the same `runtime_generation` to detect a published extension change. `recommend_tools` searches only the tools actually visible in the active profile and attaches shared execution metadata when known.
 
 `coding_core` uses the coding domains with an exact 43-tool native catalog covering discovery, files, project/LSP context, verification, Git, recovery and job observation/cancellation. Set it before startup and restart; clients can cache the catalog for the whole session. Choose `coding` or `full` and restart when broader capabilities are needed. Hidden native tools are rejected before dispatch, and extensions need explicit `coding_core` profile eligibility. Profiles are capability filters, not security sandboxes; visible mutations keep their existing policy, lifecycle and recovery guards. Static SDK journeys pass, but the separately budgeted live-model UX comparison is unverified; this profile does not change the default.
 
@@ -231,6 +231,13 @@ Choose execution based on intent:
 - `run_cmd`: intentional Windows CMD expansion.
 - `run_shell`: intentional POSIX shell expansion on Linux/macOS.
 - PowerShell execution: available where PowerShell/pwsh exists.
+- `windows_scheduled_task`: read the state and last result of one existing local task using its exact absolute task path, for example `\Folder\TaskName`. This uses Task Scheduler's local API and does not acquire the exclusive terminal command claim.
+
+For a foreground command whose reply might be lost, supply a fresh, unpredictable `operation_id` before dispatch. `command_status` can recover its state, exit code, process timeout flag and admission error in the same runtime. Completed entries are retained for up to five minutes, subject to the registry limit. Keep the ID private because it also authorizes `cancel_operation`. Use durable jobs when you need to recover stdout/stderr or check the result after a runtime restart.
+
+Launch temporary services such as a test PostgreSQL instance directly in foreground mode with `run_background`, then use `process_output` to check readiness. The launched root must stay running for the service to remain owned. Foreground commands reap their process tree when the command ends. For a service that must outlive ComputerPilot, use the system service manager.
+
+Arbitrary commands take an exclusive managed claim even when called with `access="read"`. If admission times out, the command did not start. The error includes the blocker observed at the last admission check. `server_health.resource_admission` shows current counts and bounded samples of the oldest requests, using operation categories and request ages. Use typed native tools for scoped reads and durable jobs for commands that need time in the queue.
 
 ## Durable jobs
 
@@ -247,6 +254,8 @@ cancel_job when needed
 ```
 
 Durable jobs use persistent state, independent workers, bounded admission control, idempotency keys, status versions, and disk-backed output.
+
+Keep the idempotency key and submitted arguments until you know the outcome. After a lost response, retry the same submission with the same key to recover the original job ID, then use `job_wait` and its output cursors. Wait for the final state and exit code before acting on the result. Raising the worker limit does not increase how many arbitrary commands can execute concurrently under the exclusive claim.
 
 Do not place secrets in `idempotency_key` values.
 
@@ -379,15 +388,15 @@ Detailed panel endpoints are control-token guarded. The panel is intended for lo
 
 Ten native tools publish validated output schemas: `code_context`, `affected_tests`, `search_files`, `project_summary`, `job_status`, `workflow_status`, `server_health`, `verify_changes`, `language_diagnostics`, and `execution_recommend`. Their existing dictionaries remain the wire format; no extra SDK `result` wrapper is added. The other tools retain their current contracts.
 
-These generated native output schemas omit descriptive annotations and redundant string-literal types, and collapse simple nullable unions only when their constraints still apply correctly. Literal data, property names, local `$defs`/`$ref` identities, validation ranges and conditional non-null requirements are preserved. Compaction does not change native inputs, tool names, descriptions, annotations, other discovery metadata, runtime validation, payloads or absent-versus-null behavior. A shared tool advertises the same output schema in every profile; native counts remain `full=152`, `coding=97`, `coding_core=43` on Windows.
+These generated native output schemas omit descriptive annotations and redundant string-literal types, and collapse simple nullable unions only when their constraints still apply correctly. Literal data, property names, local `$defs`/`$ref` identities, validation ranges and conditional non-null requirements are preserved. Compaction does not change native inputs, tool names, descriptions, annotations, other discovery metadata, runtime validation, payloads or absent-versus-null behavior. A shared tool advertises the same output schema in every profile. The default native tool counts on Windows are `full=156`, `coding=100` and `coding_core=43`.
 
-The P08 catalog allowance is an increase of at most 32,284 UTF-8 JSON bytes per profile over the committed baseline (`full=161424`, `coding=100462`, `coding_core=47156` bytes), serialized with `ensure_ascii=False`, sorted keys and compact separators. This retains the full-profile 20% ceiling and applies its absolute allowance to smaller profiles because the shared output definitions have a fixed cost. External encoding checks similarly allow increases of at most 7,487 `cl100k_base` and 7,882 `o200k_base` tokens per profile against that baseline, using tiktoken 0.7.0 and hash-verified vocabularies. These are catalog encoding counts, not complete client prompts, billed usage or evidence of live-model quality or UX. The existing catalog benchmark separately reports `output_schema_json_bytes`, the sum of compact UTF-8 JSON sizes of present wire output schemas; it excludes catalog keys and other tool metadata and adds no tokenizer dependency.
+The Windows catalog test preserves the frozen P08 metadata fingerprint and bounds schema growth to 34,623 UTF-8 JSON bytes after excluding newly added descriptors (`full=161424`, `coding=100462`, `coding_core=47156` historical bytes). Descriptor budgets are 1,024 bytes each for `command_status` and `windows_scheduled_task`, 3,072 bytes for `submit_jobs`, and 2,048 bytes for `jobs_snapshot`, when the active profile exposes them. Serialization uses `ensure_ascii=False`, sorted keys and compact separators. The original P08 validation measured token growth with tiktoken 0.7.0 and hash-verified vocabularies. Those measurements cover encoded catalog data. The catalog benchmark also reports `output_schema_json_bytes`, the sum of compact UTF-8 JSON sizes of the output schemas.
 
 An unsuccessful verification is a valid report with stages and explicit unknown outcomes. A recommendation with no eligible route remains an advisory result and grants no permission. Workflow status retains its existing state/checkpoint shape, including uncertainty. Health supports full snapshots, bounded summaries, and the compact unavailable response. Language diagnostics retain full versus unchanged pull reports, UTF-16 ranges, and any explicit completeness flag; opaque diagnostic data is redacted before validation. Unsupported stored job/workflow states return `output_version_unsupported`; malformed output returns a fixed `output_contract_violation` without echoing its payload.
 
 `server_health` reports runtime/platform capability state plus resource/job/browser/workflow/recovery summaries and a bounded in-memory `execution_router` snapshot with policy, route distribution, fallback/no-route/rejection counts, native/semantic/raw usage, latency, and recent decisions.
 
-Use health metadata for diagnostics, not as a substitute for validating the external effect you care about.
+Extension rows distinguish lifecycle errors (`last_error_code`) from the last error in the bounded call window (`last_call_error_code`). Provider features such as repository watchers have their own status tools. Browser capability reports the Python package; check the browser runtime with Doctor's `--browser` probe. When catalog counts differ, compare the active profile and catalog generation, then refresh the client catalog if the client caches tools across connections.
 
 ## External MCP extensions (v0.8)
 
