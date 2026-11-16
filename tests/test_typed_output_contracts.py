@@ -644,7 +644,7 @@ def test_ten_tool_output_schemas_preserve_catalog_identity(monkeypatch: pytest.M
             assert names <= tools.keys()
             if profile == "full":
                 # Windows-only tool domains are excluded by capability negotiation on POSIX.
-                assert len(tools) == (154 if os.name == "nt" else 140)
+                assert len(tools) == (156 if os.name == "nt" else 141)
             for name in names:
                 schema = tools[name].output_schema
                 assert schema is not None
@@ -918,7 +918,7 @@ def test_portable_catalogue_excludes_only_platform_gated_domains(
     monkeypatch.setattr(registry, "detect_capabilities", lambda: fake_posix)
 
     async def scenario() -> None:
-        for profile, count in (("full", 140), ("coding", 99), ("coding_core", 43)):
+        for profile, count in (("full", 141), ("coding", 100), ("coding_core", 43)):
             monkeypatch.setattr(registry, "SETTINGS", replace(registry.SETTINGS, tool_profile=profile))
             tools = await registry.create_server().list_tools()
             assert len(tools) == count
@@ -950,13 +950,13 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
     from core import registry
 
     baseline = {
-        "full": (154 if os.name == "nt" else 140, 161424, "dd943f86782309bdadfce181d99ff868ae7a1a496a2aeaadcb177ad3e47257e6"),
-        "coding": (99, 100462, "63d7cefc60e4f461de32b37fa45d3aeca267ada484e074114f9824d0d570e593"),
+        "full": (156 if os.name == "nt" else 141, 161424, "dd943f86782309bdadfce181d99ff868ae7a1a496a2aeaadcb177ad3e47257e6"),
+        "coding": (100, 100462, "63d7cefc60e4f461de32b37fa45d3aeca267ada484e074114f9824d0d570e593"),
         "coding_core": (43, 47156, "6bac11be7330500d44e2439fe434e216faf46e0ccd025b8c2cb7c7614b88275f"),
     }
     names = {"code_context", "affected_tests", "search_files", "project_summary", "job_status",
              "workflow_status", "server_health", "verify_changes", "language_diagnostics", "execution_recommend"}
-    added_tools = {"submit_jobs", "jobs_snapshot"}
+    added_tools = {"command_status", "windows_scheduled_task", "submit_jobs", "jobs_snapshot"}
 
     def encode(value: Any) -> bytes:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -1001,6 +1001,8 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                         growth += added
                         item["description"] = original
                     if item["name"] == "submit_job":
+                        # Preserve the historical hash by stripping only the
+                        # new opt-in parallel-resource input contract.
                         fields = item["inputSchema"]["properties"]
                         assert {"execution_mode", "resources"} <= fields.keys()
                         fields.pop("execution_mode")
@@ -1015,21 +1017,25 @@ def test_p08_catalogue_budget_and_non_output_metadata_are_preserved() -> None:
                         properties.pop("operation_id")
                     original_metadata.append(item)
                 assert growth < 1200
-                # The frozen Windows baseline predates cancel_operation; keep the
-                # historical guard over the released catalogue and vet the new
-                # descriptor separately through the shared registration tests.
+                # Keep the frozen metadata hash over the released catalogue.
                 historical = [item for item in original_metadata if item["name"] not in added_tools | {"cancel_operation"}]
                 assert hashlib.sha256(encode(historical)).hexdigest() == metadata_sha
             catalogue = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
             if os.name == "nt":
-                # The frozen baseline includes historical generic output schemas.
-                # The measured 291-byte increase is the post-baseline catalogue
-                # delta, including cancel_operation; keep this ceiling exact.
+                # Size the new descriptor separately to preserve the existing budget.
                 extra_descriptors = [item for item in catalogue if item["name"] in added_tools]
-                budgets = {"submit_jobs": 3072, "jobs_snapshot": 2048}
-                assert all(len(encode([item])) <= budgets[item["name"]] for item in extra_descriptors)
+                descriptor_budgets = {
+                    "command_status": 1_024,
+                    "windows_scheduled_task": 1_024,
+                    "submit_jobs": 3_072,
+                    "jobs_snapshot": 2_048,
+                }
+                assert all(len(encode([item])) <= descriptor_budgets[item["name"]] for item in extra_descriptors)
+                assert 0 < len(encode(catalogue)) - before_bytes <= 34_623 + sum(
+                    descriptor_budgets[item["name"]] for item in extra_descriptors
+                )
                 added_bytes = len(encode([item for item in catalogue if item["name"] not in added_tools])) - before_bytes
-                assert 0 < added_bytes <= 34623, (profile, added_bytes)
+                assert 0 < added_bytes <= 34_623, (profile, added_bytes)
             else:
                 # No equivalent frozen POSIX historical baseline exists. Bound
                 # absolute schema overhead instead of comparing incompatible OS

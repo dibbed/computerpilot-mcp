@@ -224,12 +224,13 @@ def test_full_is_default_and_preserves_complete_catalog() -> None:
     assert resolve_profile(None).name == "full"
     names = _names("full")
     if os.name == "nt":
-        assert len(names) == 154
+        assert len(names) == 156
     else:
         assert "run_shell" in names
         assert "run_cmd" not in names
         assert "installed_programs" not in names
         assert "windows_services" not in names
+        assert "windows_scheduled_task" not in names
         assert "desktop_screenshot" not in names
     assert {
         "read_file",

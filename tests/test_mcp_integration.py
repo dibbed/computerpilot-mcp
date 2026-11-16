@@ -38,6 +38,7 @@ REQUIRED_TOOLS = {
     "process_info",
     "kill_process",
     "run_background",
+    "command_status",
     "system_info",
     "cpu_usage",
     "memory_usage",
@@ -99,6 +100,7 @@ if os.name == "nt":
         "run_cmd",
         "installed_programs",
         "windows_services",
+        "windows_scheduled_task",
         "desktop_screenshot",
         "active_window",
         "mouse_click",
@@ -174,7 +176,7 @@ def test_registration_is_unique_strict_and_compact() -> None:
     tools = asyncio.run(server.list_tools())
     names = [tool.name for tool in tools]
     if os.name == "nt":
-        assert len(names) == 154
+        assert len(names) == 156
     assert len(names) == len(set(names))
     assert REQUIRED_TOOLS <= set(names)
     assert "execution_run" not in names

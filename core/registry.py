@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -91,6 +93,7 @@ def create_server() -> MCPServer:
             "catalog-compatible ChatGPT vision; view_image is equivalent after tool refresh. "
             "Mutating operations are metadata-audited locally."
             " For long verification use start_verification when available, continue independent work, then collect job_wait/job_output. "
+            "For other long commands use submit_job with a stable idempotency key so you can resume after reconnecting. "
             "Acceptance is not test success; require a successful job and a current final result before dependent decisions."
         ),
         version=SETTINGS.version,
@@ -124,6 +127,8 @@ def create_server() -> MCPServer:
 
         native = await MCPServer.list_tools(server)
         external = server.external_tools()
+        manager = server.extension_manager
+        names = sorted(tool.name for tool in (*native, *external))
         return {
             "ok": True,
             "active_profile": profile.name,
@@ -135,6 +140,9 @@ def create_server() -> MCPServer:
             "capabilities": capabilities.as_dict(),
             "profiles": {name: list(domains) for name, domains in PROFILE_DOMAINS.items()},
             "tool_counts": {"native": len(native), "external": len(external), "total": len(native) + len(external)},
+            "tool_names_sha256": sha256("\n".join(names).encode("utf-8")).hexdigest(),
+            "runtime_generation": os.environ.get("MCP_RUNTIME_GENERATION_ID") or None,
+            "extension_catalog_generation": manager.registry.manager_generation if manager is not None else None,
         }
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
