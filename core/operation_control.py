@@ -32,6 +32,10 @@ OperationState = Literal["running", "cancelled", "completed", "failed"]
 _OPERATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 _TERMINAL_RETENTION_SEC = 300.0
 _TERMINAL_MAX_ENTRIES = 256
+_COMMAND_STATUS_ERRORS = frozenset({
+    "command_cancelled", "command_input_incomplete", "process_cleanup_incomplete",
+    "resource_admission_cancelled", "resource_admission_timeout", "resource_quarantined",
+})
 
 
 def new_operation_id() -> str:
@@ -72,6 +76,9 @@ class OperationHandle:
     state: OperationState = "running"
     finished_at: float | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    exit_code: int | None = None
+    timed_out: bool = False
+    error: str | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -122,7 +129,10 @@ class OperationRegistry:
             self._operations[resolved] = handle
             return handle
 
-    def finish(self, handle: OperationHandle, state: OperationState) -> None:
+    def finish(
+        self, handle: OperationHandle, state: OperationState, *,
+        exit_code: int | None = None, timed_out: bool = False, error: str | None = None,
+    ) -> None:
         with self._lock:
             current = self._operations.get(handle.operation_id)
             if current is not handle:
@@ -130,7 +140,24 @@ class OperationRegistry:
             if handle.state == "cancelled" and state != "cancelled":
                 state = "cancelled"
             handle.state = state
+            handle.exit_code = exit_code
+            handle.timed_out = timed_out
+            handle.error = error if error in _COMMAND_STATUS_ERRORS else None
             handle.finished_at = time.monotonic()
+
+    def status(self, operation_id: str) -> dict[str, Any]:
+        resolved = validate_operation_id(operation_id)
+        with self._lock:
+            self._purge_locked(time.monotonic())
+            handle = self._operations.get(resolved)
+            if handle is None:
+                raise ToolError("operation_not_found", "No retained command has this operation_id in the current runtime.")
+            return {
+                "ok": True, **handle.public(),
+                "state": "cancelling" if handle.state == "running" and handle.cancel_event.is_set() else handle.state,
+                "exit_code": handle.exit_code, "timed_out": handle.timed_out,
+                "error": handle.error,
+            }
 
     def request_cancel(self, operation_id: str) -> dict[str, Any]:
         resolved = validate_operation_id(operation_id)
@@ -188,25 +215,40 @@ async def run_cancellable_operation(
 
     handle = OPERATIONS.reserve(operation_id, tool)
     cancel = handle.cancel_event
-    outcome: OperationState = "failed"
+    start_lock = threading.Lock()
+    started = False
 
     def worker() -> dict[str, Any]:
-        return action(cancel)
+        nonlocal started
+        with start_lock:
+            if cancel.is_set():
+                OPERATIONS.finish(handle, "cancelled")
+                raise ToolError("command_cancelled", "The command was cancelled before dispatch.")
+            started = True
+        outcome: OperationState = "failed"
+        result: dict[str, Any] = {}
+        error = None
+        try:
+            result = action(cancel)
+            outcome = "failed" if result.get("ok") is False else "completed"
+            return result
+        except ToolError as exc:
+            error = exc.code
+            if error in {"command_cancelled", "resource_admission_cancelled"}:
+                outcome = "cancelled"
+            raise
+        finally:
+            OPERATIONS.finish(handle, outcome, exit_code=result.get("exit_code"), timed_out=result.get("timed_out", False), error=error)
 
     try:
         result = await anyio.to_thread.run_sync(worker, abandon_on_cancel=True)
-        outcome = "completed"
-        if isinstance(result, dict):
-            result.setdefault("operation_id", handle.operation_id)
+        result.setdefault("operation_id", handle.operation_id)
         return result
-    except ToolError as exc:
-        outcome = "cancelled" if exc.code == "command_cancelled" else "failed"
-        raise
     except anyio.get_cancelled_exc_class():
         # The owner (client cancellation or server shutdown) is gone: signal the
         # worker so it terminates the owned process tree promptly.
-        cancel.set()
-        outcome = "cancelled"
+        with start_lock:
+            cancel.set()
+            if not started:
+                OPERATIONS.finish(handle, "cancelled")
         raise
-    finally:
-        OPERATIONS.finish(handle, outcome)

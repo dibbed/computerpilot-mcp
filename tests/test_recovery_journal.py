@@ -433,6 +433,7 @@ def test_mutation_target_includes_workflow_and_operation_identity() -> None:
         del workflow_id, operation_id
 
     target = _mutation_target(
+        "workflow_acknowledge_operation",
         inspect.signature(operation),
         (),
         {"workflow_id": "workflow-123", "operation_id": "operation-456"},

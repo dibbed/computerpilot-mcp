@@ -36,6 +36,7 @@ TimeoutArg = Annotated[float, Field(gt=0, le=3_600)]
 F = TypeVar("F", bound=Callable[..., Any])
 
 _TARGET_FIELDS = ("path", "source", "destination", "cwd", "job_id", "workflow_id", "operation_id", "pid", "session_id", "project_name")
+_PRIVATE_COMMAND_ID_TOOLS = frozenset({"run_process", "run_powershell", "run_cmd", "run_shell", "cancel_operation"})
 
 MUTATING_TOOL_OPERATIONS = frozenset(
     {
@@ -116,7 +117,9 @@ MUTATING_TOOL_OPERATIONS = frozenset(
 )
 
 
-def _mutation_target(signature: inspect.Signature, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
+def _mutation_target(
+    operation: str, signature: inspect.Signature, args: tuple[Any, ...], kwargs: dict[str, Any],
+) -> str | None:
     """Extract only bounded non-secret mutation identity metadata for recovery."""
     try:
         bound = signature.bind_partial(*args, **kwargs)
@@ -124,6 +127,8 @@ def _mutation_target(signature: inspect.Signature, args: tuple[Any, ...], kwargs
         return None
     values: list[str] = []
     for name in _TARGET_FIELDS:
+        if name == "operation_id" and operation in _PRIVATE_COMMAND_ID_TOOLS:
+            continue
         if name not in bound.arguments:
             continue
         value = bound.arguments[name]
@@ -145,7 +150,7 @@ def compact_errors(operation: str) -> Callable[[F], F]:
                 try:
                     with TOOL_ACTIVITY.track(operation), tool_timing(operation):
                         if operation in MUTATING_TOOL_OPERATIONS:
-                            target = _mutation_target(signature, args, kwargs)
+                            target = _mutation_target(operation, signature, args, kwargs)
                             with RUNTIME_LIFECYCLE.mutation(operation):
                                 handle = OPERATION_RECOVERY.begin(
                                     operation,
@@ -184,7 +189,7 @@ def compact_errors(operation: str) -> Callable[[F], F]:
             try:
                 with TOOL_ACTIVITY.track(operation), tool_timing(operation):
                     if operation in MUTATING_TOOL_OPERATIONS:
-                        target = _mutation_target(signature, args, kwargs)
+                        target = _mutation_target(operation, signature, args, kwargs)
                         with RUNTIME_LIFECYCLE.mutation(operation):
                             handle = OPERATION_RECOVERY.begin(
                                 operation,

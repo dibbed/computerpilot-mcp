@@ -22,7 +22,7 @@ from core.errors import ToolError
 from core.executor import run_bounded
 from core.operation_control import OPERATIONS, cancellation_audit_target, run_cancellable_operation
 from core.resource_claims import coordination_claim, managed_resource_claims, path_claim
-from core.tooling import OPEN_WORLD_WRITE, compact_errors
+from core.tooling import OPEN_WORLD_WRITE, READ_ONLY, compact_errors
 
 _ACCESS_DESCRIPTION = (
     "Compatibility hint only. Terminal commands always take exclusive coordination and a cwd write "
@@ -60,7 +60,7 @@ def _managed_command_claims(
         if cancel_event is not None and cancel_event.is_set():
             raise ToolError("command_cancelled", "The command was cancelled before dispatch.")
         if remaining <= 0:
-            raise ToolError("resource_admission_timeout", "Command timeout expired before process dispatch.")
+            raise ToolError("resource_admission_timeout", "The command was not started before the admission deadline.")
         yield remaining
 
 
@@ -285,6 +285,14 @@ def register(mcp: MCPServer) -> None:
                 return result
 
             return await run_cancellable_operation(operation_id, "run_shell", execute)
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @compact_errors("command_status")
+    async def command_status(
+        operation_id: Annotated[str, Field(min_length=8, max_length=128)],
+    ) -> dict[str, Any]:
+        """Check a foreground command by its client-chosen operation_id in this runtime. For durable output, use job_status/job_output."""
+        return OPERATIONS.status(operation_id)
 
     @mcp.tool(annotations=OPEN_WORLD_WRITE, structured_output=True)
     @compact_errors("cancel_operation")

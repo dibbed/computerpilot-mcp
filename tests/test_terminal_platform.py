@@ -141,7 +141,8 @@ def test_command_timeout_bounds_resource_admission(
 
     async def scenario() -> None:
         async with Client(create_server()) as client:
-            arguments = {"cwd": str(tmp_path), "timeout_sec": 0.1}
+            operation_id = f"admission-test-{tool}"
+            arguments = {"cwd": str(tmp_path), "timeout_sec": 0.1, "operation_id": operation_id}
             if tool == "run_process":
                 arguments["executable"] = sys.executable
             else:
@@ -149,6 +150,13 @@ def test_command_timeout_bounds_resource_admission(
             result = await client.call_tool(tool, arguments)
             assert result.structured_content
             assert result.structured_content["error"] == "resource_admission_timeout"
+            assert "not started" in result.structured_content["message"]
+            assert "older conflicting request" in result.structured_content["hint"] or "already holds" in result.structured_content["hint"]
+            status = await client.call_tool("command_status", {"operation_id": operation_id})
+            assert status.structured_content
+            assert status.structured_content["state"] == "failed"
+            assert status.structured_content["error"] == "resource_admission_timeout"
+            assert status.structured_content["exit_code"] is None
 
     started = time.monotonic()
     asyncio.run(scenario())

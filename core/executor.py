@@ -286,12 +286,24 @@ def run_bounded(
         stderr_thread = threading.Thread(target=_read_pipe, args=(process.stderr, stderr), daemon=True)
         stdout_thread.start()
         stderr_thread.start()
-        if stdin_text is not None and process.stdin is not None:
-            try:
-                process.stdin.write(stdin_text.encode(chosen_encoding, errors="replace"))
-                process.stdin.close()
-            except BrokenPipeError:
-                pass
+        stdin_thread = None
+        stdin_failed = False
+        if stdin_text is not None and (pipe := process.stdin) is not None:
+            data = stdin_text.encode(chosen_encoding, errors="replace")
+
+            def write_stdin() -> None:
+                nonlocal stdin_failed
+                try:
+                    with pipe:
+                        pipe.write(data)
+                except BrokenPipeError:
+                    pass
+                except OSError:
+                    stdin_failed = True
+
+            # A child can leave the input pipe full. Keep enforcing the deadline while it writes.
+            stdin_thread = threading.Thread(target=write_stdin, daemon=True)
+            stdin_thread.start()
         timed_out = False
         cancelled = False
         with timing_span("process_execution"):
@@ -316,6 +328,10 @@ def run_bounded(
         with timing_span("process_drain"):
             stdout_thread.join(timeout=2.0)
             stderr_thread.join(timeout=2.0)
+            if stdin_thread is not None:
+                stdin_thread.join(timeout=2.0)
+                if stdin_thread.is_alive() or stdin_failed:
+                    raise ToolError("command_input_incomplete", "The command input pipe did not finish cleanly.")
         capture_complete = not (stdout_thread.is_alive() or stderr_thread.is_alive() or stdout.read_error or stderr.read_error)
         if cancelled:
             raise ToolError("command_cancelled", "The command was cancelled before completion.")

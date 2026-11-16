@@ -61,6 +61,28 @@ def test_run_bounded_cancel_event_reaps_owned_tree(tmp_path: Path) -> None:
     assert _wait_until_gone(token) == []
 
 
+def test_foreground_timeout_also_covers_child_that_does_not_read_stdin(tmp_path: Path) -> None:
+    result = run_bounded(
+        [sys.executable, "-c", "import time; time.sleep(2)"],
+        cwd=tmp_path,
+        timeout_sec=0.2,
+        stdin_text="x" * 100_000,
+    )
+    assert result["timed_out"] is True
+    assert result["ok"] is False
+
+
+def test_foreground_child_receives_all_stdin_and_eof(tmp_path: Path) -> None:
+    result = run_bounded(
+        [sys.executable, "-c", "import sys; print(len(sys.stdin.buffer.read()))"],
+        cwd=tmp_path,
+        timeout_sec=10,
+        stdin_text="x" * 100_000,
+    )
+    assert result["ok"] is True
+    assert result["stdout"]["text"].strip() == "100000"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group cancellation probe")
 def test_cancelled_mcp_call_reaps_owned_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

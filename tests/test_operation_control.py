@@ -13,6 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import anyio
 import psutil
 import pytest
 from mcp import Client
@@ -104,20 +105,31 @@ def test_cancel_identifiers_are_validated_process_local_and_idempotent() -> None
 def test_cancel_audit_never_persists_bearer_operation_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from core import audit
+    from core import audit, tooling
+    from core.recovery import OperationRecoveryJournal
 
     audit.close_audit_writer()
     monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path))
     monkeypatch.setattr(audit, "SETTINGS", replace(audit.SETTINGS, state_dir=tmp_path))
     operation_id = f"op-audit-secret-{uuid.uuid4().hex}"
+    journal_path = tmp_path / "operation-recovery.jsonl"
+    recovery = OperationRecoveryJournal()
 
     async def scenario() -> None:
         async with Client(create_server()) as client:
+            recovery.configure(journal_path, "terminal-bearer-test")
+            monkeypatch.setattr(tooling, "OPERATION_RECOVERY", recovery)
+            command = _tool_payload(await client.call_tool("run_process", {
+                "executable": sys.executable, "args": ["-c", "raise SystemExit(0)"],
+                "cwd": str(tmp_path), "operation_id": operation_id,
+            }))
+            assert command["ok"] is True
+            unknown_id = operation_id + "-unknown"
             first = _tool_payload(
-                await client.call_tool("cancel_operation", {"operation_id": operation_id})
+                await client.call_tool("cancel_operation", {"operation_id": unknown_id})
             )
             second = _tool_payload(
-                await client.call_tool("cancel_operation", {"operation_id": operation_id})
+                await client.call_tool("cancel_operation", {"operation_id": unknown_id})
             )
             assert first["ok"] is False and first["reason"] == "operation_not_found"
             assert second["ok"] is False and second["reason"] == "operation_not_found"
@@ -136,7 +148,11 @@ def test_cancel_audit_never_persists_bearer_operation_id(
         target = targets.pop()
         assert target.startswith("op-correlation:")
         assert operation_id not in target
+        journal = journal_path.read_text(encoding="utf-8")
+        assert "run_process" in journal and "cancel_operation" in journal
+        assert operation_id not in journal
     finally:
+        recovery.configure(None, None)
         audit.close_audit_writer()
 
 
@@ -167,6 +183,35 @@ def test_run_cancellable_operation_signals_worker_and_settles_state() -> None:
     assert OPERATIONS.request_cancel("registry-worker-0001")["state"] == "cancelled"
 
 
+def test_lost_request_keeps_command_cancelling_until_worker_settles() -> None:
+    operation_id = f"op-lost-{uuid.uuid4().hex}"
+    entered = threading.Event()
+    release = threading.Event()
+
+    def action(cancel: threading.Event) -> dict[str, Any]:
+        entered.set()
+        assert cancel.wait(5)
+        assert release.wait(5)
+        raise ToolError("command_cancelled", "cancelled")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(run_cancellable_operation(operation_id, "run_process", action))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert OPERATIONS.status(operation_id)["state"] == "cancelling"
+        finally:
+            release.set()
+        with anyio.fail_after(5):
+            while OPERATIONS.status(operation_id)["state"] == "cancelling":
+                await asyncio.sleep(0.02)
+        assert OPERATIONS.status(operation_id)["state"] == "cancelled"
+
+    asyncio.run(scenario())
+
+
 def test_explicit_cancel_reaps_owned_tree_and_releases_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -194,6 +239,11 @@ def test_explicit_cancel_reaps_owned_tree_and_releases_admission(
                 await asyncio.sleep(0.05)
             assert _token_processes(token), "owned command never started"
 
+            running = _tool_payload(
+                await client.call_tool("command_status", {"operation_id": operation_id})
+            )
+            assert running["state"] == "running"
+
             cancel = _tool_payload(
                 await client.call_tool("cancel_operation", {"operation_id": operation_id})
             )
@@ -204,6 +254,10 @@ def test_explicit_cancel_reaps_owned_tree_and_releases_admission(
             assert time.monotonic() - started < 10
             assert outcome.get("error") == "command_cancelled"
             assert _wait_until_gone(token) == []
+            settled = _tool_payload(
+                await client.call_tool("command_status", {"operation_id": operation_id})
+            )
+            assert settled["state"] == "cancelled"
 
             follow = _tool_payload(
                 await client.call_tool(
@@ -218,6 +272,24 @@ def test_explicit_cancel_reaps_owned_tree_and_releases_admission(
             )
             assert follow.get("ok") is True
             assert follow["stdout"].get("text", "").strip() == "released"
+
+    asyncio.run(scenario())
+
+
+def test_failed_command_exit_is_recoverable_by_client_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, state_dir=tmp_path))
+    operation_id = f"op-exit-{uuid.uuid4().hex}"
+
+    async def scenario() -> None:
+        async with Client(create_server()) as client:
+            result = _tool_payload(await client.call_tool("run_process", {
+                "executable": sys.executable, "args": ["-c", "print('private output'); raise SystemExit(7)"],
+                "cwd": str(tmp_path), "operation_id": operation_id,
+            }))
+            assert result["exit_code"] == 7 and result["ok"] is False
+            status = _tool_payload(await client.call_tool("command_status", {"operation_id": operation_id}))
+            assert status["state"] == "failed" and status["exit_code"] == 7
+            assert "private output" not in json.dumps(status)
 
     asyncio.run(scenario())
 
