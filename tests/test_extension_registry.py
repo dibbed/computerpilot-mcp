@@ -152,9 +152,9 @@ def test_failed_replacement_leaves_old_generation_intact_no_partial_publication(
     t2 = _make_tool("ext_a", "valid2", generation=1)
     registry.publish_extension_catalog("ext_a", 1, [t1, t2])
 
-    # Candidate generation 2 with 1 valid tool and 1 broken tool (oversized description)
+    # Candidate generation 2 with 1 valid tool and 1 broken tool (oversized schema)
     t_good = _make_tool("ext_a", "valid1", generation=2)
-    t_bad = _make_tool("ext_a", "broken", generation=2, description="x" * 200)
+    t_bad = _make_tool("ext_a", "broken", generation=2, schema={"type": "object", "description": "x" * LIMITS.schema_bytes})
 
     with pytest.raises(CatalogLimitExceededError):
         registry.publish_extension_catalog("ext_a", 2, [t_good, t_bad])
@@ -297,9 +297,9 @@ def test_catalog_limits_enforced() -> None:
     with pytest.raises(CatalogLimitExceededError, match="schema bytes"):
         registry.publish_extension_catalog("ext_a", 1, [big_tool])
 
-    # Description length limit
-    desc_tool = _make_tool("ext_a", "long_desc", generation=1, description="x" * (LIMITS.description_chars + 1))
-    with pytest.raises(CatalogLimitExceededError, match="description length"):
+    # Long descriptions still count against the aggregate byte limit.
+    desc_tool = _make_tool("ext_a", "long_desc", generation=1, description="x" * LIMITS.catalog_bytes)
+    with pytest.raises(CatalogLimitExceededError, match="catalog bytes"):
         registry.publish_extension_catalog("ext_a", 1, [desc_tool])
 
 

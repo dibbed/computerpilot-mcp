@@ -33,6 +33,21 @@ def test_memory_snapshot_matches_live_catalog_and_retirement_without_provider_rp
     session.send_request.assert_not_called()
 
 
+def test_health_preserves_recent_call_failure_separately_from_lifecycle_failure() -> None:
+    manager, lease, session = admitted_call({"type": "object"}, types.CallToolResult(content=[], is_error=True))
+
+    async def scenario() -> None:
+        result = await manager.execute_guarded_call(lease)
+        assert result["error"] == "provider_error"
+        row = manager.health_snapshot()["items"][0]
+        assert row["calls"]["failed"] == 1
+        assert row["last_error_code"] is None
+        assert row["last_call_error_code"] == "provider_error"
+
+    anyio.run(scenario)
+    session.send_request.assert_awaited_once()
+
+
 def test_disabled_is_neutral_and_standalone_mutation_is_not_eligible() -> None:
     from dataclasses import replace
 

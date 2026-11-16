@@ -76,6 +76,8 @@ Public tools are `external.<extension_id>.<remote_tool_name>`, looked up by the 
 
 Provider names, descriptions, schemas and hints are untrusted attributed data. Only operator-reviewed `ToolPolicy` selects domain, exact symbolic intents, allowed profiles, mutation class, risk/recoverability/scores and permission. Unknown classification is denied; `readOnlyHint`/idempotent hints or a successful connection do not authorize a tool.
 
+Descriptions count toward the catalog byte limit and do not have a separate admission length limit. Public previews are redacted before truncation to 180 characters. An operator can give an extension a child-only PATH using `environment.path_entries` instead of launching it through a wrapper.
+
 | Trust | Consumption |
 |---|---|
 | untrusted | No launch or calls, even if enabled. |

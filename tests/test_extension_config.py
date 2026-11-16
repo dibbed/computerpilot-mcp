@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -107,8 +109,29 @@ def test_minimal_private_environment_and_missing_reference(definition: dict[str,
     assert error.value.code == "auth_missing" and "FIXTURE_TOKEN" not in str(error.value)
 
 
+def test_extension_subprocess_gets_only_explicit_dependency_directories(
+    definition: dict[str, Any],
+) -> None:
+    from core.extensions.config import build_extension_environment, validate_extension_config_candidate
+
+    dependency_directory = str(Path(sys.executable).parent)
+    definition["environment"] = {"path_entries": [dependency_directory]}
+    model, _ = validate_extension_config_candidate({"schema_version": 1, "extensions": [definition]})
+    env = build_extension_environment(model.extensions[0], {**os.environ, "PATH": "parent-path-canary"})
+    result = subprocess.run(
+        [sys.executable, "-c", "import os, shutil, sys; assert shutil.which(sys.argv[1]); print(os.environ['PATH'])",
+         Path(sys.executable).name],
+        env=env, capture_output=True, text=True, check=True, timeout=10,
+    )
+    assert result.stdout.strip() == dependency_directory
+
+
 @pytest.mark.parametrize("environment,arguments", [
     ({"inherit": ["PATH"]}, []),
+    ({"values": {"PATH": "/usr/bin"}}, []),
+    ({"path_entries": ["relative-bin"]}, []),
+    ({"path_entries": ["C:/bin;C:/elsewhere"]}, []),
+    ({"path_entries": ["//server/share"]}, []),
     ({"inherit": ["PYTHONPATH"]}, []),
     ({"values": {"API_TOKEN": "value"}}, []),
     ({"references": {"LD_PRELOAD": {"kind": "env", "name": "TOKEN"}}}, []),
@@ -116,7 +139,8 @@ def test_minimal_private_environment_and_missing_reference(definition: dict[str,
     ({}, ["--api-key=value"]),
     ({}, ["${TOKEN}"]),
     ({}, ["$(cmd)"]),
-], ids=["path", "pythonpath", "secret-value", "preload", "wildcard", "secret-argv", "interpolation", "substitution"])
+], ids=["inherit-path", "literal-path", "relative-path", "multiple-paths", "network-path",
+        "pythonpath", "secret-value", "preload", "wildcard", "secret-argv", "interpolation", "substitution"])
 def test_disabled_unsafe_config_is_still_denied(
     tmp_path: Path, definition: dict[str, Any], environment: dict[str, Any], arguments: list[str],
 ) -> None:

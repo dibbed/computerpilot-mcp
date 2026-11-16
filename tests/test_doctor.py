@@ -1,9 +1,13 @@
 """Startup cache invalidation and failed validation must fail closed."""
 
+import asyncio
 import json
 import subprocess
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -190,13 +194,109 @@ def test_full_validation_includes_smoke_and_tunnel(root: Path, monkeypatch: pyte
         "search_backend_diagnostics",
         lambda: {"content_search_backend": "ripgrep", "ripgrep_path": "rg.exe", "ripgrep_version": "ripgrep 14.1.0"},
     )
-    monkeypatch.setattr(doctor.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(doctor.importlib.util, "find_spec", lambda name: object())
     doctor.validate(root, "tunnel", "demo", browser=True)
     assert any(command[-2:] == ["pip", "check"] for command in calls)
     assert any("scripts.health_check" in command for command in calls)
     assert any(command[-3:] == ["--profile", "demo", "--json"] for command in calls)
+    assert any(command[-1] == "import playwright.async_api" for command in calls)
     assert any("chromium.launch" in " ".join(command) for command in calls)
 
+
+def test_full_doctor_names_optional_checks_without_launching_them(
+    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(doctor, "_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(doctor, "search_backend_diagnostics", lambda: {})
+    monkeypatch.setattr(doctor.importlib.util, "find_spec", lambda name: None)
+    doctor.validate(root, "local-http", "")
+    output = capsys.readouterr().out
+    assert "SKIP Playwright package import (package unavailable)" in output
+    assert "SKIP Chromium launch (use --browser)" in output
+    assert "SKIP Codebase Memory MCP connection (use --codebase-memory)" in output
+    assert "SKIP Codebase Memory Git watcher (use --codebase-memory)" in output
+
+
+def test_codebase_memory_reports_missing_executable_separately(
+    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(doctor, "_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(doctor, "search_backend_diagnostics", lambda: {})
+    monkeypatch.setattr(doctor.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+    doctor.validate(root, "local-http", "", codebase_memory=True)
+    output = capsys.readouterr().out
+    assert "SKIP Codebase Memory MCP connection (codebase-memory-mcp unavailable on PATH)" in output
+    assert "SKIP Codebase Memory Git watcher (MCP connection unavailable)" in output
+
+
+@pytest.mark.parametrize("git_failure", [False, True])
+def test_codebase_memory_reports_git_failure_separately_from_connection(
+    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], git_failure: bool,
+) -> None:
+    commands: list[list[str]] = []
+
+    async def initialize() -> None:
+        commands.append(["mcp", "initialize"])
+
+    def run_git(command: list[str], *_: object) -> None:
+        commands.append(command)
+        if git_failure:
+            raise subprocess.CalledProcessError(2, ["git", "private-setup-output"])
+
+    async def call_tool(name: str, arguments: object) -> SimpleNamespace:
+        if name == "index_repository":
+            return SimpleNamespace(is_error=False, structured_content={"status": "indexed", "project": "fixture"})
+        assert name == "index_status"
+        return SimpleNamespace(is_error=False, structured_content={"status": "ready", "watch": {"watched": False}})
+
+    @asynccontextmanager
+    async def transport(*args: object, **kwargs: object) -> AsyncIterator[tuple[None, None]]:
+        yield None, None
+
+    @asynccontextmanager
+    async def client_session(*args: object) -> AsyncIterator[SimpleNamespace]:
+        yield SimpleNamespace(initialize=initialize, call_tool=call_tool)
+
+    monkeypatch.setattr(doctor, "_probe_process", run_git)
+    monkeypatch.setattr("core.extensions.transport.bounded_stdio_transport", transport)
+    monkeypatch.setattr("mcp.ClientSession", client_session)
+    phase = "fixture setup" if git_failure else "registration"
+    with pytest.raises(RuntimeError, match=f"Codebase Memory Git watcher {phase}") as error:
+        asyncio.run(doctor._probe_codebase_memory_session("cbm", root, {}, "git"))
+
+    output = capsys.readouterr().out
+    assert commands[0] == ["mcp", "initialize"]
+    assert "PASS Codebase Memory MCP connection" in output
+    assert "PASS Codebase Memory Git watcher" not in output
+    assert [command[-1] for command in commands if "commit" in command] == (
+        [] if git_failure else ["doctor_original_symbol"]
+    )
+    assert "private-setup-output" not in str(error.value)
+
+
+def test_codebase_memory_preserves_probe_failure_when_daemon_cleanup_fails(
+    root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_probe(*_: object) -> None:
+        raise RuntimeError("Codebase Memory Git watcher registration: RuntimeError")
+
+    def run_process(
+        command: list[str], *_: object, read_stdout: bool = False,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if read_stdout:
+            return subprocess.CompletedProcess(command, 0, stdout=b"codebase-memory-mcp 0.12.1\n")
+        assert command[-2:] == ["daemon", "stop"]
+        raise OSError("private-cleanup-output")
+
+    monkeypatch.setattr(doctor.Path, "home", lambda: root)
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: name)
+    monkeypatch.setattr(doctor, "_probe_codebase_memory_session", run_probe)
+    monkeypatch.setattr(doctor, "_probe_process", run_process)
+    with pytest.raises(RuntimeError, match="Codebase Memory Git watcher registration") as error:
+        doctor.codebase_memory_diagnostics()
+    assert "Codebase Memory isolated daemon cleanup: OSError" in str(error.value)
+    assert "private-cleanup-output" not in str(error.value)
 
 
 def test_search_backend_diagnostics_reports_python_fallback(monkeypatch: pytest.MonkeyPatch) -> None:

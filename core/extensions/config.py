@@ -123,8 +123,11 @@ def _validate_operator_definition(definition: ExtensionDefinition, parent: Mappi
     for name, reference in environment.references.items():
         if name.upper() in _INHERIT_KEYS or not _environment_name(reference.name):
             raise ValueError("unsafe environment reference")
+    for entry in environment.path_entries:
+        if not _absolute_local_path(entry, portable=True) or ";" in entry or ":" in ntpath.splitdrive(entry)[1]:
+            raise ValueError("dependency paths require individual absolute local directories")
     literals = (definition.command, definition.working_directory, definition.provider, definition.display_name,
-                *definition.arguments, *environment.values.values())
+                *definition.arguments, *environment.values.values(), *environment.path_entries)
     for value in literals:
         if any(ord(char) < 32 for char in value) or "$(" in value or "${" in value or "`" in value or re.search(r"%[^%]+%", value):
             raise ValueError("operator field contains control or interpolation")
@@ -147,6 +150,10 @@ def build_extension_environment(definition: ExtensionDefinition, parent: Mapping
         result = {name: values[name] for name in required if name in values}
         result.update({name: values[name] for name in definition.environment.inherit if name in values})
         result.update(definition.environment.values)
+        if definition.environment.path_entries:
+            if any(not Path(entry).is_absolute() or os.pathsep in entry for entry in definition.environment.path_entries):
+                raise ValueError("dependency path is not absolute on this platform")
+            result["PATH"] = os.pathsep.join(definition.environment.path_entries)
         for name, reference in definition.environment.references.items():
             secret = values.get(reference.name)
             if not secret:

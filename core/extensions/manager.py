@@ -290,7 +290,7 @@ class ExtensionOwner:
         self.call_semaphore = anyio.Semaphore(LIMITS.calls_per_extension)
         self._credential_values: tuple[str, ...] = ()
         self._runner_scope: anyio.CancelScope | None = None
-        self.call_observations: deque[tuple[str, float]] = deque(maxlen=64)
+        self.call_observations: deque[tuple[str, float, str | None]] = deque(maxlen=64)
 
     @property
     def state(self) -> ExtensionState:
@@ -786,6 +786,8 @@ class ExtensionLifecycleManager:
             redactor = owner.credential_redactor()
             error = owner.state_machine.last_error
             safe_error = error if error in _HEALTH_ERROR_CODES else "external_failure" if error else None
+            observations = tuple(owner.call_observations)
+            last_call_error = next((code for _, _, code in reversed(observations) if code), None)
             items.append({
                 "extension_id": redactor.text(owner.extension_id), "display_name": redactor.text(definition.display_name)[:180],
                 "provider": redactor.text(definition.provider)[:64], "enabled": enabled,
@@ -797,11 +799,14 @@ class ExtensionLifecycleManager:
                 "state_age_sec": max(0.0, observed - owner.state_machine.last_changed_monotonic),
                 "last_error_code": safe_error if redactor.text(safe_error or "") == (safe_error or "") else "external_failure",
                 "last_error_at": owner.state_machine.last_error_at,
+                "last_call_error_code": (
+                    last_call_error if redactor.text(last_call_error or "") == (last_call_error or "") else "external_failure"
+                ),
                 "restart_count": owner.state_machine.restart_count,
-                "calls": {key: sum(outcome == key for outcome, _ in owner.call_observations) for key in _CALL_OUTCOMES},
-                "call_window_size": len(owner.call_observations),
-                "call_duration_mean_sec": sum(duration for _, duration in owner.call_observations) / max(1, len(owner.call_observations)),
-                "call_duration_max_sec": max((duration for _, duration in owner.call_observations), default=0.0),
+                "calls": {key: sum(outcome == key for outcome, _, _ in observations) for key in _CALL_OUTCOMES},
+                "call_window_size": len(observations),
+                "call_duration_mean_sec": sum(duration for _, duration, _ in observations) / max(1, len(observations)),
+                "call_duration_max_sec": max((duration for _, duration, _ in observations), default=0.0),
             })
         result: dict[str, Any] = {
             "configured_count": len(self._owners), **{f"{key}_count": value for key, value in counts.items()},
@@ -1440,8 +1445,8 @@ class ExtensionLifecycleManager:
         finally:
             if initial_owner is not None and initial is not None:
                 duration = max(0.0, time.monotonic() - observed_start)
-                initial_owner.call_observations.append((observed_outcome, duration))
                 safe_error = observed_error if observed_error in _HEALTH_ERROR_CODES else "external_failure" if observed_error else None
+                initial_owner.call_observations.append((observed_outcome, duration, safe_error))
                 try:
                     redactor = initial_owner.credential_redactor()
                     audit_action("external_tool_call", target=redactor.text(initial.public_name),

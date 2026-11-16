@@ -135,6 +135,7 @@ class ExtensionEnvironment(StrictDefinition):
     inherit: tuple[ReferenceName, ...] = Field(default=(), max_length=32)
     values: Mapping[ReferenceName, BoundedArgument] = Field(default_factory=dict, max_length=32)
     references: Mapping[ReferenceName, EnvironmentReference] = Field(default_factory=dict, max_length=32)
+    path_entries: tuple[BoundedArgument, ...] = Field(default=(), max_length=16)
 
     @field_validator("values", "references")
     @classmethod

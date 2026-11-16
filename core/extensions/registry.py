@@ -487,10 +487,6 @@ class ExtensionRegistry:
                 )
 
             # Check individual limits
-            if len(desc.description) > LIMITS.description_chars:
-                raise CatalogLimitExceededError(
-                    f"description length {len(desc.description)} exceeds limit {LIMITS.description_chars}"
-                )
             if len(desc.input_schema_json) > LIMITS.schema_bytes:
                 raise CatalogLimitExceededError(
                     f"input schema bytes {len(desc.input_schema_json)} exceeds limit {LIMITS.schema_bytes}"

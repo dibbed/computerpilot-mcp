@@ -16,7 +16,8 @@ from mcp.shared.subscriptions import ToolsListChanged
 from test_extension_bridge import bridge
 
 from core.extensions.manager import ExtensionLifecycleManager, connect_and_discover_tools
-from core.extensions.models import ExtensionDefinition, ExtensionState
+from core.extensions.models import LIMITS, ExtensionDefinition, ExtensionState
+from core.extensions.output import public_tool_descriptor
 from core.extensions.registry import CatalogLimitExceededError
 from core.platform import normalize_system
 
@@ -37,6 +38,22 @@ def configured_manager(tmp_path: Path, mode: str, *, starting: bool = True) -> E
     if starting:
         owner.state_machine.transition(ExtensionState.STARTING)
     return manager
+
+
+def test_long_provider_description_does_not_abort_real_catalog_discovery(tmp_path: Path) -> None:
+    manager = configured_manager(tmp_path, "long_description")
+    owner = manager.get_owner("refresh-fixture")
+    assert owner is not None
+
+    async def scenario() -> None:
+        catalog = await connect_and_discover_tools(owner, manager.registry)
+        assert owner.state is ExtensionState.HEALTHY
+        assert {tool.remote_name for tool in catalog} == {"read_value", "increment_value"}
+        display = public_tool_descriptor(next(tool for tool in catalog if tool.remote_name == "read_value"))
+        assert display.description and len(display.description) <= LIMITS.description_chars
+        assert "Return the requested value." in display.description
+
+    anyio.run(scenario)
 
 
 @pytest.mark.parametrize("legacy", [False, True])

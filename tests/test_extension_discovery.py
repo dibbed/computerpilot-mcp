@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from hashlib import sha256
 from unittest.mock import MagicMock
 
 import anyio
@@ -68,6 +69,31 @@ def test_full_profile_grants_no_implicit_external_permission(monkeypatch: pytest
         assert not server.external_tools()
         result = await server.call_tool(descriptor.public_name, {})
         assert isinstance(result, types.CallToolResult) and result.is_error
+        session.send_request.assert_not_awaited()
+
+    anyio.run(scenario)
+
+
+def test_discovery_fingerprint_matches_client_visible_names_and_reflects_catalog_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, manager, session = prepared_server("full", monkeypatch)
+
+    async def snapshot() -> dict[str, object]:
+        names = sorted(item.name for item in await server.list_tools())
+        result = await server.call_tool("discover_tool_domains", {})
+        assert isinstance(result, types.CallToolResult) and result.structured_content
+        payload = result.structured_content
+        assert payload["tool_names_sha256"] == sha256("\n".join(names).encode("utf-8")).hexdigest()
+        return payload
+
+    async def scenario() -> None:
+        before = await snapshot()
+        assert await snapshot() == before
+        manager.registry.retire_extension_catalog("security-fixture")
+        after = await snapshot()
+        assert after["tool_names_sha256"] != before["tool_names_sha256"]
+        assert int(str(after["extension_catalog_generation"])) > int(str(before["extension_catalog_generation"]))
         session.send_request.assert_not_awaited()
 
     anyio.run(scenario)
