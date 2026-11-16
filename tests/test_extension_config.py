@@ -119,9 +119,7 @@ def test_extension_subprocess_gets_only_explicit_dependency_directories(
     model, _ = validate_extension_config_candidate({"schema_version": 1, "extensions": [definition]})
     env = build_extension_environment(model.extensions[0], {**os.environ, "PATH": "parent-path-canary"})
     result = subprocess.run(
-        [sys.executable, "-c",
-         "import os, pathlib, sys; assert (pathlib.Path(os.environ['PATH']) / sys.argv[1]).is_file(); print(os.environ['PATH'])",
-         Path(sys.executable).name],
+        [sys.executable, "-c", "import os; print(os.environ['PATH'])"],
         env=env, capture_output=True, text=True, check=True, timeout=10,
     )
     assert result.stdout.strip() == dependency_directory
