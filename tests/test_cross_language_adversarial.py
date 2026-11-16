@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
 from tools.project.cross_language import scan_references
 
 
-def scan(tmp_path: Path, name: str, content: str, *, kind: str = "class", symbol: str = "card") -> dict:
+def scan(tmp_path: Path, name: str, content: str, *, kind: Literal["class", "id"] = "class", symbol: str = "card") -> dict:
     (tmp_path / name).write_text(content, encoding="utf-8")
     return scan_references(tmp_path, symbol, kind=kind, max_files=100, max_results=50)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -74,6 +75,14 @@ def _declared_resources(
     )), resource.mode, scope=resource.scope) for resource in resources)
 
 
+def _queue_wait_seconds(state: dict[str, Any]) -> float:
+    """Human-readable queue age, not an execution or admission timeout."""
+    created = state.get("created")
+    if isinstance(created, bool) or not isinstance(created, (int, float)) or not math.isfinite(created):
+        return 0.0
+    return round(max(time.time() - float(created), 0.0), 3)
+
+
 def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = None) -> None:
     get_store = store_getter or lazy_job_store(lambda: JobStore())
     output_default = default_delivery()
@@ -91,7 +100,7 @@ def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = No
         execution_mode: Literal["exclusive", "declared"] = "exclusive",
         resources: Annotated[list[JobResourceSpec] | None, Field(max_length=32)] = None,
     ) -> dict[str, Any]:
-        """Durable job; default exclusive. Declared resources opt into parallel execution for trusted commands."""
+        """Durable job; default exclusive. Accepted is not success; check final job_status. Parallel jobs require declared resources."""
         working = resolve_path(cwd)
         declared = _declared_resources(str(working), execution_mode, resources)
         audit_action("submit_job", target=working, details={"executable": executable, "execution_mode": execution_mode})
@@ -188,7 +197,8 @@ def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = No
             else:
                 items.append({
                     "ok": True, **state,
-                    **({"queue_phase": "waiting_resources" if job.job_id in blocked_ids else "awaiting_worker"}
+                    **({"queue_phase": "waiting_resources" if job.job_id in blocked_ids else "awaiting_worker",
+                        "queue_wait_seconds": _queue_wait_seconds(state)}
                        if state["status"] == "queued" else {}),
                     "changed": int(state["version"]) > job.after_version,
                     **progress,
@@ -212,6 +222,8 @@ def register(mcp: MCPServer, *, store_getter: Callable[[], JobStore] | None = No
             result["queue_phase"] = (
                 "waiting_resources" if job_id in store.resource_waiting_ids([job_id]) else "awaiting_worker"
             )
+        if result.get("status") == "queued":
+            result["queue_wait_seconds"] = _queue_wait_seconds(result)
         if result.get("status") not in get_args(JobStatus):
             raise ToolError("output_version_unsupported", "The stored job status version is unsupported.")
         return cast(JobStatusResult, validate_tool_output(JobStatusResult, result, operation="job_status"))

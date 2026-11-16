@@ -271,6 +271,45 @@ Keep the idempotency key and submitted arguments until you know the outcome. Aft
 
 Do not place secrets in `idempotency_key` values.
 
+### Long-running verification and continuation observations
+
+A long **workflow** can last many minutes, but each direct MCP `tools/call`
+still has its own caller/Tunnel response deadline. A larger local
+`timeout_sec` or `job_wait` heartbeat does **not** extend that deadline.
+For a potentially expensive suite, prefer the durable workflow below instead of a long direct `run_pytest`, `verify_changes`, or `collect_diagnostics` call:
+
+```text
+start_verification (or submit_job with a stable idempotency_key)
+    -> job_status / short job_wait / jobs_snapshot
+    -> job_output (bounded byte cursors)
+    -> inspect terminal status, exit_code and verification result
+```
+
+`submit_job.ok=true` means **accepted**, not tests passed. A job may return
+`failed` with `exit_code=1`; preserve that result. If ChatGPT stops making
+MCP requests, the durable job can finish without any further model polling.
+When a new user turn arrives, first use `list_jobs`, `job_status`,
+`jobs_snapshot` and `job_output` to recover the **existing** job.
+Do not re-submit a possibly executed side effect with a new idempotency key.
+
+Queued jobs expose `queue_phase` (`awaiting_worker` or `waiting_resources`)
+and `queue_wait_seconds`. Arbitrary shell/CMD/PowerShell execution remains
+exclusive even with `access="read"`; a `resource_admission_timeout` means
+the command **was not dispatched**. Prefer `read_file`, `native_read_batch`
+and typed Git/status tools for safe observation alongside long jobs.
+
+The Supervisor's `transport_health.continuation` and rotated
+`transport-health.jsonl` report only a **local observation**:
+`LOCAL_CALL_ACTIVE`, `JOB_ACTIVE`, `JOB_WAITING_RESOURCES`,
+`JOB_FINISHED_NO_NEXT_POLL_OBSERVED`,
+`UPSTREAM_IDLE_AFTER_ACCEPTED_RESPONSE`, `TRANSPORT_RESPONSE_UNCERTAIN`,
+or `UNKNOWN`. Timestamps and the `correlation="temporal_only"` label
+make clear that the most recently updated local job is **not necessarily**
+the job associated with a particular hosted ChatGPT turn.
+An HTTP 200 accepted by Tunnel does **not** prove ChatGPT consumed the
+result. No local diagnostic can force ChatGPT to continue, and upstream
+idle alone never authorizes an automatic Tunnel restart or command replay.
+
 ## Recovery
 
 Standalone mutation recovery tools support:

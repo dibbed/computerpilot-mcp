@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,7 +27,7 @@ def test_html_css_document_suffixes(suffix: str, language: str, tmp_path: Path) 
 def test_reviewed_html_and_css_providers_validate_and_pin(tmp_path: Path) -> None:
     executable = tmp_path / "node.exe"
     executable.write_bytes(b"pretend pinned node")
-    config = {"schema_version": 1, "providers": []}
+    config: dict[str, Any] = {"schema_version": 1, "providers": []}
     for provider_id, languages in (
         ("html", ["html"]), ("css", ["css", "scss", "less"])
     ):

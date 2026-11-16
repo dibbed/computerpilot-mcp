@@ -225,6 +225,44 @@ Use:
 
 If the persisted evidence still cannot determine the result, use explicit acknowledgement and document the reason.
 
+## ChatGPT appears to stop after a tool or background job
+
+Check these states **without restarting or resubmitting**:
+
+| Observation | Meaning | Safe next inspection |
+| --- | --- | --- |
+| `continuation.state=LOCAL_CALL_ACTIVE` | An MCP tool call is still executing | Inspect the active tool / bounded deadline |
+| `JOB_ACTIVE` | A durable worker is running or orphaned | `job_status`, then short `job_wait` |
+| `JOB_WAITING_RESOURCES` or `queue_phase=waiting_resources` | Job is queued behind a conflicting claim | Check `queue_wait_seconds`, `server_health.resource_admission` |
+| `JOB_FINISHED_NO_NEXT_POLL_OBSERVED` | Local job reached terminal state, no later MCP request observed | Read that job's actual terminal status and output |
+| `UPSTREAM_IDLE_AFTER_ACCEPTED_RESPONSE` | Tunnel accepted last response; no newer request locally observed | Preserve evidence; hosted continuation is **unknown** |
+| `TRANSPORT_RESPONSE_UNCERTAIN` | Delivery failed/expired or was explicitly rejected | Reconcile side effects before any retry |
+| `UNKNOWN` | Incomplete/stale/ambiguous evidence | Check generation, timestamps, JobStore and Tunnel history separately |
+
+The control panel's **Continuation** check summarizes this read-only
+state. Tunnel `UPSTREAM_IDLE` with healthy polling and an empty queue
+does not mean the local MCP is hung. A successfully accepted Tunnel
+HTTP response is not proof that the ChatGPT model consumed the reply.
+If no later local MCP request is observed, the hosted continuation reason remains unknown.
+Never automatically restart a healthy Tunnel merely because ChatGPT
+has not issued another tool call.
+
+For example, if a test Job ended with `status=failed`, `exit_code=1`
+while ChatGPT was silent, a new conversation turn can request:
+
+> Read the latest relevant durable jobs with `list_jobs` and `job_status`;
+> retrieve their existing output, report the real exit code, and continue
+> from saved evidence. Do not rerun any possibly completed side effect.
+
+The current continuation classifier correlates the most recent local
+job by **time only**, not by hosted conversation identity. A failed test
+suite is not proof of a hung worker; a `resource_admission_timeout`
+means the blocked terminal command never started. Long direct test
+calls may exceed the caller's response budget; use `start_verification`
+or `submit_job` with short, bounded polling instead. Avoid including
+prompt text, secrets, raw command arguments, request bearer IDs or
+unredacted output in public bug reports.
+
 ## A durable job is silent
 
 Check:
