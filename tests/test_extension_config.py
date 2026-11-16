@@ -118,11 +118,26 @@ def test_extension_subprocess_gets_only_explicit_dependency_directories(
     definition["environment"] = {"path_entries": [dependency_directory]}
     model, _ = validate_extension_config_candidate({"schema_version": 1, "extensions": [definition]})
     env = build_extension_environment(model.extensions[0], {**os.environ, "PATH": "parent-path-canary"})
-    result = subprocess.run(
-        [sys.executable, "-c", "import os; print(os.environ['PATH'])"],
-        env=env, capture_output=True, text=True, check=True, timeout=10,
+    assert env["PATH"] == dependency_directory
+    # Use the host shell rather than assuming a Python distribution can start
+    # without its own interpreter environment variables (Windows 3.10 CI).
+    command = (
+        [env["COMSPEC"], "/d", "/c", "set PATH"]
+        if os.name == "nt"
+        else ["/bin/sh", "-c", 'printf "%s" "$PATH"']
     )
-    assert result.stdout.strip() == dependency_directory
+    result = subprocess.run(
+        command, env=env, capture_output=True, text=True, check=True, timeout=10,
+    )
+    if os.name == "nt":
+        actual = next(
+            (line.partition("=")[2] for line in result.stdout.splitlines()
+             if line.partition("=")[0].casefold() == "path"),
+            None,
+        )
+    else:
+        actual = result.stdout
+    assert actual == dependency_directory
 
 
 @pytest.mark.parametrize("environment,arguments", [
