@@ -353,17 +353,33 @@ def managed_resource_claims(
             if result["admitted"] is True:
                 admitted = True
                 break
-            if result.get("reason") == "resource_quarantined":
+            reason = result.get("reason")
+            remaining = deadline - time.monotonic()
+            hint = None
+            if reason == "resource_quarantined" or remaining <= 0:
+                hint = {
+                    "resource_conflict": "Another managed operation already holds a conflicting claim. Check server_health and job_status.",
+                    "older_conflicting_request": "An older conflicting request is ahead in the queue. Check server_health.",
+                    "resource_policy_incompatible": "Check that the server and its workers use the same resource policy.",
+                    "resource_quarantined": "Check server_health and reconcile the quarantined claim before retrying.",
+                }.get(reason or "")
+                blocker = result.get("blocker")
+                if blocker and hint:
+                    age_sec = blocker["age_sec"]
+                    age = f", request age {age_sec}s" if age_sec is not None else ""
+                    wait_sec = time.perf_counter() - admission_started
+                    hint = f"Waited {wait_sec:.2f}s. Blocker {blocker['category']} ({blocker['state']}{age}). {hint}"
+            if reason == "resource_quarantined":
                 raise ToolError(
                     "resource_quarantined",
                     "Conflicting resource ownership is quarantined. Reconcile it before retrying; this operation was not dispatched.",
+                    hint=hint,
                 )
-            remaining = deadline - time.monotonic()
             if remaining <= 0:
-                claim_store.release_resource_request(request_id, owner_token=owner_token)
                 raise ToolError(
                     "resource_admission_timeout",
-                    "Managed resource admission did not become available before the timeout.",
+                    "Timed out waiting for managed resources. This operation was not started.",
+                    hint=hint,
                 )
             time.sleep(min(0.05, remaining))
         record_timing("claim_wait", (time.perf_counter() - admission_started) * 1_000)

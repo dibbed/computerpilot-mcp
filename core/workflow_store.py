@@ -78,6 +78,20 @@ _STEP_OPERATION_STATES = {
     "completed": "succeeded",
     "cancelled": "cancelled",
 }
+_PUBLIC_RESOURCE_CATEGORIES = frozenset({
+    "native.command", "native.document", "native.filesystem", "native.filesystem.patch",
+    "native.git", "native.job", "native.read_batch", "native.safe_refactor",
+    "native.testing.diagnostics", "native.testing.project", "native.testing.verify",
+    "native.workspace_edit", "workflow.git", "workflow.verify_changes", "workflow_step",
+})
+_RESOURCE_WAIT_REASONS = {
+    "resource_conflict", "older_conflicting_request", "resource_policy_incompatible", "resource_quarantined",
+}
+_RESOURCE_QUARANTINE_REASONS = {
+    "child_capacity_cleanup_unresolved", "legacy_resource_policy_unknown",
+    "managed_effect_or_cleanup_unresolved", "stale_native_owner_command_alive",
+    "stale_native_owner_dispatch_unknown", "workflow_lease_lost_before_resource_reconciliation",
+}
 
 
 def redact_inputs(value: Any, key: str = "") -> Any:
@@ -120,6 +134,18 @@ def public_workflow_projection(value: Any) -> Any:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _resource_observation(row: sqlite3.Row, now: str) -> dict[str, Any]:
+    try:
+        age_sec = max(0, int((datetime.fromisoformat(now) - datetime.fromisoformat(row["created_at"])).total_seconds()))
+    except (TypeError, ValueError):
+        age_sec = None
+    return {
+        "category": row["category"] if row["category"] in _PUBLIC_RESOURCE_CATEGORIES else "other",
+        "state": row["state"],
+        "age_sec": age_sec,
+    }
 
 
 def _canonical(value: Any) -> str:
@@ -1734,7 +1760,7 @@ class WorkflowStore:
             current_ticket = int(row["ticket"])
             other_rows = connection.execute(
                 """
-                SELECT request_id, ticket, state, policy_fingerprint
+                SELECT request_id, ticket, state, policy_fingerprint, category, created_at
                 FROM workflow_resource_requests
                 WHERE request_id <> ? AND state IN ('pending', 'active', 'quarantined')
                 ORDER BY ticket
@@ -1742,19 +1768,23 @@ class WorkflowStore:
                 (request_id,),
             ).fetchall()
             conflict_reason: str | None = None
+            blocker: sqlite3.Row | None = None
             reconciled = False
             for _ in range(2):
                 conflict_reason = None
+                blocker = None
                 for other in other_rows:
                     other_state = str(other["state"])
                     if other_state == "pending" and int(other["ticket"]) > current_ticket:
                         continue
                     if other_state in {"active", "pending"} and other["policy_fingerprint"] != policy_fingerprint:
                         conflict_reason = "resource_policy_incompatible"
+                        blocker = other
                         break
                     other_claims = self._resource_claims_for_request(connection, str(other["request_id"]))
                     if not claim_sets_conflict(canonical, other_claims):
                         continue
+                    blocker = other
                     if other_state == "quarantined":
                         conflict_reason = "resource_quarantined"
                         break
@@ -1775,7 +1805,7 @@ class WorkflowStore:
                     break
                 other_rows = connection.execute(
                     """
-                    SELECT request_id, ticket, state, policy_fingerprint
+                    SELECT request_id, ticket, state, policy_fingerprint, category, created_at
                     FROM workflow_resource_requests
                     WHERE request_id <> ? AND state IN ('pending', 'active', 'quarantined')
                     ORDER BY ticket
@@ -1794,6 +1824,7 @@ class WorkflowStore:
                     "request_id": request_id,
                     "state": "pending",
                     "reason": conflict_reason,
+                    "blocker": _resource_observation(blocker, now) if blocker is not None else None,
                 }
 
             connection.execute(
@@ -3740,6 +3771,7 @@ class WorkflowStore:
 
     def health_summary(self, *, sample_limit: int = 5) -> dict[str, Any]:
         bounded = min(max(sample_limit, 1), 20)
+        now = _now()
         with closing(self._connect()) as connection:
             workflow_counts = {
                 str(row["state"]): int(row["count"])
@@ -3765,7 +3797,7 @@ class WorkflowStore:
             lease_count = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM workflow_leases WHERE expires_at > ?",
-                    (_now(),),
+                    (now,),
                 ).fetchone()[0]
             )
             resource_request_counts = {
@@ -3773,6 +3805,18 @@ class WorkflowStore:
                 for row in connection.execute(
                     "SELECT state, COUNT(*) AS count FROM workflow_resource_requests GROUP BY state ORDER BY state"
                 ).fetchall()
+            }
+            oldest_resource_requests = {
+                state: connection.execute(
+                    """
+                    SELECT category, state, reason, created_at
+                    FROM workflow_resource_requests
+                    WHERE state = ?
+                    ORDER BY ticket LIMIT ?
+                    """,
+                    (state, bounded),
+                ).fetchall()
+                for state in ("active", "pending")
             }
             quarantined_resources = connection.execute(
                 """
@@ -3838,7 +3882,25 @@ class WorkflowStore:
             "active_resource_request_count": resource_request_counts.get("active", 0),
             "pending_resource_request_count": resource_request_counts.get("pending", 0),
             "quarantined_resource_request_count": resource_request_counts.get("quarantined", 0),
-            "oldest_quarantined_resources": [dict(row) for row in quarantined_resources],
+            "oldest_active_resources": [
+                _resource_observation(row, now) for row in oldest_resource_requests["active"]
+            ],
+            "oldest_waiting_resources": [
+                {
+                    **_resource_observation(row, now),
+                    "reason": row["reason"] if row["reason"] in _RESOURCE_WAIT_REASONS else None,
+                }
+                for row in oldest_resource_requests["pending"]
+            ],
+            "oldest_quarantined_resources": [
+                {
+                    **_resource_observation(row, now),
+                    "reason": row["reason"] if row["reason"] in _RESOURCE_QUARANTINE_REASONS else "ownership_unresolved",
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in quarantined_resources
+            ],
             "runtime_capacity_counts": capacity_counts,
             "active_analyzer_capacity_weight": analyzer_active_weight,
             "sample_limit": bounded,

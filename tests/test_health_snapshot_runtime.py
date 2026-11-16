@@ -35,13 +35,18 @@ def test_health_metrics_collection_does_not_block_event_loop() -> None:
         last_native_recovery: ClassVar[dict[str, int]] = {"released": 0, "quarantined": 1}
         runtime_native_recovery: ClassVar[dict[str, int]] = {"released": 2, "quarantined": 0, "examined": 3}
 
-        def health_summary(self) -> dict[str, int]:
+        def health_summary(self) -> dict[str, Any]:
             return {
                 "unresolved_operation_count": 0, "workflow_db_bytes": 0,
                 "workflow_total": 0, "workflow_operation_total": 0,
                 "workflow_event_total": 0, "active_workflow_leases": 0,
                 "queued_workflows": 0, "running_workflows": 0,
                 "uncertain_workflows": 0, "unresolved_workflow_operations": 0,
+                "active_resource_request_count": 1, "pending_resource_request_count": 2,
+                "oldest_active_resources": [{"category": "native.command", "state": "active", "age_sec": 12}],
+                "oldest_waiting_resources": [
+                    {"category": "native.job", "state": "pending", "age_sec": 9, "reason": "resource_conflict"},
+                ],
             }
 
         def list(self, **kwargs: Any) -> dict[str, Any]:
@@ -71,6 +76,14 @@ def test_health_metrics_collection_does_not_block_event_loop() -> None:
         return payload
 
     payload = asyncio.run(scenario())
+    assert payload["resource_admission"] == {
+        "active": 1, "waiting": 2, "quarantined": 0,
+        "oldest_active": [{"category": "native.command", "state": "active", "age_sec": 12}],
+        "oldest_waiting": [
+            {"category": "native.job", "state": "pending", "age_sec": 9, "reason": "resource_conflict"},
+        ],
+        "oldest_quarantined": [],
+    }
     assert payload["workflow_health"]["native_resource_recovery"] == {"released": 0, "quarantined": 1}
     assert payload["workflow_health"]["native_runtime_reconciliation"] == {
         "released": 2, "quarantined": 0, "examined": 3,

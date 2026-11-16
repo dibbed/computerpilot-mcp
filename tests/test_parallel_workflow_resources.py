@@ -85,7 +85,7 @@ def test_sequential_workflow_verification_obeys_repository_claims(
     monkeypatch.setattr(workflow_actions, "SETTINGS", config.SETTINGS)
     store = WorkflowStore(db_path, recover=False)
     store.reserve_resource_claims(
-        request_id="reader", owner_token="reader", category="test",
+        request_id="reader", owner_token="reader", category="native.read_batch",
         claims=(path_claim(repo, "read", scope="subtree"),),
     )
     ran = []
@@ -100,6 +100,10 @@ def test_sequential_workflow_verification_obeys_repository_claims(
             {"cwd": str(repo), "ruff_fix": True}, timeout_sec=0.06,
         )
     assert error.value.code == "resource_admission_timeout"
+    assert error.value.hint is not None
+    assert "Waited " in error.value.hint
+    assert "Blocker native.read_batch (active, request age " in error.value.hint
+    assert str(repo) not in error.value.hint
     assert not ran
 
 
@@ -343,7 +347,10 @@ def test_older_writer_fences_late_readers_without_blocking_independent_work(tmp_
 
     assert reserve("reader", target, "read")["admitted"] is True
     assert reserve("writer", target, "write")["admitted"] is False
-    assert reserve("late-reader", target, "read")["reason"] == "older_conflicting_request"
+    late = reserve("late-reader", target, "read")
+    assert late["reason"] == "older_conflicting_request"
+    blocker = late["blocker"]
+    assert isinstance(blocker, dict) and blocker["state"] == "pending"
     assert reserve("independent", tmp_path / "other", "write")["admitted"] is True
     store.release_resource_request("reader", owner_token="reader")
     assert reserve("writer", target, "write")["admitted"] is True
@@ -1105,16 +1112,32 @@ def test_mixed_resource_claim_pressure_has_finite_progress(tmp_path: Path) -> No
     assert all(results)
 
 
-def test_health_summary_reports_resource_and_capacity_pressure(tmp_path: Path) -> None:
+def test_health_summary_reports_resource_and_capacity_pressure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = WorkflowStore(tmp_path / "workflows.sqlite3", recover=False)
     claim = ResourceClaim("fs", str((tmp_path / "health.txt").resolve(strict=False)), "write", "exact")
+    now = "2026-11-15T00:00:00.000+00:00"
+    monkeypatch.setattr("core.workflow_store._now", lambda: now)
+    block = ResourceClaim("coordination", "secret-coordination-key", "write")
+    assert store.reserve_resource_claims(
+        request_id="secret-holder-id", owner_token="secret-holder-owner",
+        claims=(block,), category="native.command",
+    )["admitted"]
+    now = "2026-11-15T00:00:05.000+00:00"
+    for name in ("first", "second"):
+        pending = store.reserve_resource_claims(
+            request_id=f"secret-{name}-id", owner_token=f"secret-{name}-owner",
+            claims=(block,), category=f"secret-{name}-category",
+        )
+        assert pending["blocker"] == {"category": "native.command", "state": "active", "age_sec": 5}
     assert store.reserve_resource_claims(
         request_id="health-resource",
         owner_token="health-owner",
         claims=(claim,),
         category="health",
     )["admitted"] is True
-    store.quarantine_resource_request("health-resource", owner_token="health-owner", reason="health-test")
+    store.quarantine_resource_request("health-resource", owner_token="health-owner", reason="secret-quarantine-reason")
     assert store.reserve_capacity(
         admission_id="health-analyzer",
         category="analyzer",
@@ -1123,11 +1146,19 @@ def test_health_summary_reports_resource_and_capacity_pressure(tmp_path: Path) -
         limit=2,
     )["admitted"] is True
 
-    summary = store.health_summary()
+    now = "2026-11-15T00:00:09.000+00:00"
+    summary = store.health_summary(sample_limit=1)
+    assert summary["active_resource_request_count"] == 1
+    assert summary["pending_resource_request_count"] == 2
     assert summary["quarantined_resource_request_count"] == 1
     assert summary["active_analyzer_capacity_weight"] == 1
     assert summary["runtime_capacity_counts"]["analyzer:active"] == 1
-    assert summary["oldest_quarantined_resources"][0]["reason"] == "health-test"
+    assert summary["oldest_active_resources"] == [{"category": "native.command", "state": "active", "age_sec": 9}]
+    assert summary["oldest_waiting_resources"] == [
+        {"category": "other", "state": "pending", "age_sec": 4, "reason": "resource_conflict"},
+    ]
+    assert summary["oldest_quarantined_resources"][0]["reason"] == "ownership_unresolved"
+    assert "secret-" not in json.dumps(summary)
 
 
 def test_expired_workflow_lease_quarantines_active_resources(tmp_path: Path) -> None:

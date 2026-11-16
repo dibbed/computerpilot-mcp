@@ -64,6 +64,7 @@ def bound_runtime_health(payload: dict[str, Any]) -> dict[str, Any]:
         "snapshot_schema_version", "runtime_generation", "collected_at", "collected_monotonic", "extensions",
         "workflow_total", "workflow_operation_total", "workflow_event_total", "workflow_db_bytes", "active_workflow_leases",
         "queued_workflows", "running_workflows", "uncertain_workflows", "unresolved_workflow_operations", "resource_pressure",
+        "resource_admission",
     }
     summary = {key: value for key, value in result.items() if key in keep}
     for key in ("operation_recovery", "workflow_health", "execution_router", "lsp"):
@@ -248,5 +249,13 @@ async def collect_server_health(
         "recent_workflows": recent_workflows,
         "resource_budgets": settings.resource_budgets(),
         "resource_usage": resource_usage,
+        "resource_admission": {
+            "active": workflow_health.get("active_resource_request_count", 0),
+            "waiting": workflow_health.get("pending_resource_request_count", 0),
+            "quarantined": workflow_health.get("quarantined_resource_request_count", 0),
+            "oldest_active": workflow_health.get("oldest_active_resources", []),
+            "oldest_waiting": workflow_health.get("oldest_waiting_resources", []),
+            "oldest_quarantined": workflow_health.get("oldest_quarantined_resources", []),
+        },
         **resources,
     })
