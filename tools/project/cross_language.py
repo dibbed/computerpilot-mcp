@@ -20,19 +20,14 @@ _EXCLUDED = frozenset({
 })
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
 _CSS_TOKEN = re.compile(r"(?<![A-Za-z0-9_-])([.#])([A-Za-z_][A-Za-z0-9_-]*)")
-_CSS_RULE = re.compile(r"([^{}]+)\{")
 _JS_CALL = re.compile(r"\b(querySelector(?:All)?|getElementById|getElementsByClassName)\s*\(")
-_JS_STATIC = re.compile(
-    r"\b(querySelector(?:All)?|getElementById|getElementsByClassName)\s*\(\s*(['\"])(.*?)\2\s*\)",
-    re.DOTALL,
-)
-_JS_CLASS = re.compile(
-    r"\bclassList\s*\.\s*(?:add|remove|toggle|contains)\s*\(\s*(['\"])(.*?)\1", re.DOTALL,
-)
+_JS_CLASS_CALL = re.compile(r"\bclassList\s*\.\s*(?:add|remove|toggle|contains)\s*\(")
+_JS_LITERAL = re.compile(r"""\s*(["'])([^\\\r\n]*)\1\s*\Z""", re.DOTALL)
 _JSX_TAG = re.compile(r"<[A-Za-z][A-Za-z0-9_.:-]*\b[^<>]{0,2000}>")
 _JSX_ATTR = re.compile(r"\b(className|id)\s*=\s*(['\"])(.*?)\2", re.DOTALL)
 _MAX_FILE_BYTES = 1024 * 1024
 _MAX_TOTAL_BYTES = 16 * 1024 * 1024
+_MAX_CALL_ARGUMENT_CHARS = 4096
 
 
 def _line_offsets(text: str) -> list[int]:
@@ -44,8 +39,42 @@ def _location(start: int, offsets: list[int]) -> tuple[int, int]:
     return index + 1, start - offsets[index] + 1
 
 
+def _regex_end(text: str, start: int) -> int | None:
+    """Find an unescaped slash after a JS regex literal, respecting character classes."""
+    in_class = False
+    index = start + 1
+    while index < len(text) and text[index] not in "\r\n":
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            in_class = True
+        elif char == "]":
+            in_class = False
+        elif char == "/" and not in_class:
+            index += 1
+            while index < len(text) and text[index].isalpha():
+                index += 1
+            return index
+        index += 1
+    return None
+
+
+def _looks_like_regex(text: str, start: int) -> bool:
+    """Conservative lexical disambiguation for common regex expression starts."""
+    index = start - 1
+    while index >= 0 and text[index].isspace():
+        index -= 1
+    if index < 0:
+        return True
+    if text[index] in "=([{,:;!?&|+-*%^~<>":
+        return True
+    return bool(re.search(r"\b(?:return|throw|case|yield|await)\Z", text[max(0, index - 16):index + 1]))
+
+
 def _masked(text: str, *, javascript: bool) -> str:
-    """Blank strings and comments while retaining offsets and newlines."""
+    """Blank strings, comments and recognizable JS regex literals, preserving offsets."""
     output = list(text)
     index = 0
     while index < len(text):
@@ -68,6 +97,12 @@ def _masked(text: str, *, javascript: bool) -> str:
             end = text.find("\n", index + 2)
             if end == -1:
                 end = len(text)
+        elif javascript and char == "/" and next_char != "=" and _looks_like_regex(text, index):
+            matched_end = _regex_end(text, index)
+            if matched_end is None:
+                index += 1
+                continue
+            end = matched_end
         else:
             index += 1
             continue
@@ -82,14 +117,20 @@ def _css_locations(text: str, symbol: str, kind: str, *, base: int = 0) -> list[
     filtered = _masked(text, javascript=False)
     matches: list[tuple[int, str]] = []
     marker = "." if kind == "class" else "#"
-    for rule in _CSS_RULE.finditer(filtered):
-        selector = rule.group(1)
-        if selector.lstrip().startswith("@"):
-            continue  # Feature-test arguments are not selector declarations.
-        selector = re.sub(r"\[[^\]]*\]", lambda m: " " * len(m.group()), selector)
-        for item in _CSS_TOKEN.finditer(selector):
-            if item.group(1) == marker and item.group(2) == symbol:
-                matches.append((base + rule.start(1) + item.start(), "css_selector"))
+    # Walk delimiters once: a broad "anything before {" regexp is quadratic
+    # on a long CSS file without a brace.
+    start = 0
+    for position, char in enumerate(filtered):
+        if char not in "{}":
+            continue
+        if char == "{":
+            selector = filtered[start:position]
+            if not selector.lstrip().startswith("@"):
+                selector = re.sub(r"\[[^\]]*\]", lambda m: " " * len(m.group()), selector)
+                for item in _CSS_TOKEN.finditer(selector):
+                    if item.group(1) == marker and item.group(2) == symbol:
+                        matches.append((base + start + item.start(), "css_selector"))
+        start = position + 1
     return matches
 
 
@@ -101,19 +142,38 @@ class _HtmlLocations(HTMLParser):
         self.offsets = _line_offsets(text)
         self.matches: list[tuple[int, str]] = []
         self.style_depth = 0
+        self.script_depth = 0
+        self.dynamic_count = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         line, column = self.getpos()
         start = self.offsets[line - 1] + column
         for name, value in attrs:
+            normalized = name.casefold()
+            if normalized in {
+                ":class", ":id", "v-bind:class", "v-bind:id",
+                "x-bind:class", "x-bind:id", "[class]", "[id]",
+                "class.bind", "id.bind", "class:list", "ngclass",
+            }:
+                self.dynamic_count += 1
             if not isinstance(value, str):
                 continue
-            if self.kind == "class" and name.lower() == "class" and self.symbol in value.split():
+            if normalized in {"class", "id"} and any(
+                marker in value for marker in ("{{", "{%", "<%", chr(36) + "{")
+            ):
+                self.dynamic_count += 1
+            if self.kind == "class" and normalized == "class" and self.symbol in value.split():
                 self.matches.append((start, "html_attribute"))
-            if self.kind == "id" and name.lower() == "id" and self.symbol == value:
+            if self.kind == "id" and normalized == "id" and self.symbol == value:
                 self.matches.append((start, "html_attribute"))
         if tag.lower() == "style":
             self.style_depth += 1
+        if tag.lower() == "script":
+            script_type = next((value for name, value in attrs if name.casefold() == "type"), None)
+            if script_type is None or script_type.casefold() in {
+                "module", "text/javascript", "application/javascript",
+            }:
+                self.script_depth += 1
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
@@ -121,24 +181,68 @@ class _HtmlLocations(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "style" and self.style_depth:
             self.style_depth -= 1
+        if tag.lower() == "script":
+            self.script_depth = 0
 
     def handle_data(self, data: str) -> None:
+        line, column = self.getpos()
+        start = self.offsets[line - 1] + column
         if self.style_depth:
-            line, column = self.getpos()
-            self.matches.extend(_css_locations(
-                data, self.symbol, self.kind, base=self.offsets[line - 1] + column,
-            ))
+            self.matches.extend(_css_locations(data, self.symbol, self.kind, base=start))
+        if self.script_depth:
+            matches, unresolved = _script_locations(data, self.symbol, self.kind, ".js")
+            self.matches.extend((start + offset, role) for offset, role in matches)
+            self.dynamic_count += unresolved
+
+
+def _call_arguments(text: str, masked: str, opened: int) -> tuple[list[str], bool]:
+    """Extract bounded literal arguments and flag unsupported expressions."""
+    limit = min(len(text), opened + _MAX_CALL_ARGUMENT_CHARS)
+    if masked.find(")", opened, limit) < 0:
+        return [], True
+    pieces: list[str] = []
+    index = opened
+    nesting = 0
+    start = opened
+    while index < limit:
+        char = masked[index]
+        if char in "([{":
+            nesting += 1
+        elif char in ")]}":
+            if not nesting and char == ")":
+                pieces.append(text[start:index])
+                break
+            nesting = max(nesting - 1, 0)
+        elif char == "," and not nesting:
+            pieces.append(text[start:index])
+            start = index + 1
+        index += 1
+    else:
+        return [], True
+    literals: list[str] = []
+    dynamic = False
+    for piece in pieces:
+        value = _JS_LITERAL.fullmatch(piece)
+        if value is None:
+            dynamic = True
+        else:
+            literals.append(value.group(2))
+    return literals, dynamic
 
 
 def _script_locations(text: str, symbol: str, kind: str, suffix: str) -> tuple[list[tuple[int, str]], int]:
     code = _masked(text, javascript=True)
     matches: list[tuple[int, str]] = []
-    static_starts: set[int] = set()
-    for hit in _JS_STATIC.finditer(text):
-        if code[hit.start()] == " ":
+    dynamic = 0
+    # Read at most one bounded argument span per call. A regex with an
+    # unclosed quote previously re-scanned the rest of the file per match.
+    for hit in _JS_CALL.finditer(code):
+        arguments, unresolved = _call_arguments(text, code, hit.end())
+        if unresolved or len(arguments) != 1:
+            dynamic += 1
             continue
-        static_starts.add(hit.start())
-        method, selector = hit.group(1), hit.group(3)
+        method = hit.group(1)
+        selector = arguments[0]
         if method.startswith("querySelector"):
             filtered = re.sub(r"\[[^\]]*\]", "", selector)
             marker = "." if kind == "class" else "#"
@@ -150,11 +254,12 @@ def _script_locations(text: str, symbol: str, kind: str, suffix: str) -> tuple[l
         if found:
             role = "js_selector" if method.startswith("querySelector") else "js_id_lookup" if kind == "id" else "js_class_lookup"
             matches.append((hit.start(), role))
-    dynamic = sum(1 for m in _JS_CALL.finditer(text) if code[m.start()] != " " and m.start() not in static_starts)
-    if kind == "class":
-        for hit in _JS_CLASS.finditer(text):
-            if code[hit.start()] != " " and hit.group(2) == symbol:
-                matches.append((hit.start(), "js_class_list"))
+    for hit in _JS_CLASS_CALL.finditer(code):
+        arguments, unresolved = _call_arguments(text, code, hit.end())
+        if unresolved:
+            dynamic += 1
+        if kind == "class" and symbol in arguments:
+            matches.append((hit.start(), "js_class_list"))
     if suffix in {".jsx", ".tsx"}:
         for tag in _JSX_TAG.finditer(text):
             if code[tag.start()] == " ":
@@ -167,7 +272,14 @@ def _script_locations(text: str, symbol: str, kind: str, suffix: str) -> tuple[l
                     matches.append((tag.start() + attr.start(), "jsx_attribute"))
             if re.search(r"\b(?:className|id)\s*=\s*\{", tag.group()):
                 dynamic += 1
+            if re.search(r"\{\s*\.\.\.", tag.group()):
+                dynamic += 1
     return matches, dynamic
+
+
+def _indirect_path(path: Path) -> bool:
+    """Exclude symlinks and Windows directory junctions without following them."""
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
 
 
 def _candidates(root: Path, max_files: int) -> tuple[list[Path], bool]:
@@ -177,11 +289,11 @@ def _candidates(root: Path, max_files: int) -> tuple[list[Path], bool]:
         directories[:] = sorted(
             name for name in directories
             if name not in _EXCLUDED and not name.startswith(".pytest-tmp-")
-            and not (Path(current) / name).is_symlink()
+            and not _indirect_path(Path(current) / name)
         )
         for name in sorted(names):
             file = Path(current) / name
-            if file.suffix.lower() not in _EXTENSIONS or file.is_symlink():
+            if file.suffix.lower() not in _EXTENSIONS or _indirect_path(file):
                 continue
             if not file.resolve(strict=False).is_relative_to(root):
                 continue
@@ -222,6 +334,7 @@ def scan_references(
             parser = _HtmlLocations(text, symbol, kind)
             parser.feed(text)
             evidence = parser.matches
+            dynamic += parser.dynamic_count
         elif suffix in {".css", ".scss", ".less"}:
             evidence = _css_locations(text, symbol, kind)
         else:
